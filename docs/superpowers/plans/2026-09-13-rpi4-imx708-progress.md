@@ -55,6 +55,15 @@ Dependency review: 2026-09-13, following highlight-protection commits
    select the fit and highlights; inspect the untouched final scenes only
    after settings are fixed. No IMX708 quality claim exists yet.
 
+## Open: faces too dark under the starter (2026-09-20)
+
+One indoor frame from the Pi 4 shows skin losing a third of its luminance under the
+starter LUT; the normaliser was a no-op on it. Cause and a measured fix (the existing
+`shadows` control in `candidates.py`) are in
+[the face chromatic fix suggestion](../../experiments/2026-09-20-face-chromatic-fix-suggestion.md).
+Not decided: the user is collecting more frames with faces, above all outdoors, first.
+Can be done alongside the Phase 5 corpus collection since it changes only the starter.
+
 ## Next implementation unit
 
 **Phase 5: IMX708 retraining, starting with the source corpus.** Phase 6 is
