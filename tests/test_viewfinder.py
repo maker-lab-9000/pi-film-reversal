@@ -477,24 +477,34 @@ def _spy_live(monkeypatch):
     return readings
 
 
-def _sharp_frame(shape=(48, 64), block=4):
-    ys, xs = np.indices(shape)
-    frame = np.where(((ys // block) + (xs // block)) % 2 == 0, 20, 235).astype(np.uint8)
-    return np.repeat(frame[:, :, None], 3, axis=2)
+def _sharp_frame(shape=(96, 128), seed=0):
+    """Rectangles of random size and grey: edges at every scale, like a subject."""
+    rng = np.random.default_rng(seed)
+    frame = np.full(shape, 128.0)
+    for _ in range(60):
+        h, w = rng.integers(3, shape[0] // 3), rng.integers(3, shape[1] // 3)
+        y, x = rng.integers(0, shape[0] - h), rng.integers(0, shape[1] - w)
+        frame[y:y + h, x:x + w] = rng.integers(20, 236)
+    return np.repeat(frame.astype(np.uint8)[:, :, None], 3, axis=2)
 
 
-def _blurred(rgb, k=5):
-    acc = np.zeros(rgb.shape, dtype=np.float32)
+def _blurred(rgb, k=15):
+    """Near-Gaussian (three box passes): far out of focus at k=15."""
+    out = rgb.astype(np.float32)
     pad = k // 2
-    padded = np.pad(rgb.astype(np.float32), ((pad, pad), (pad, pad), (0, 0)), mode="edge")
-    for dy in range(k):
-        for dx in range(k):
-            acc += padded[dy:dy + rgb.shape[0], dx:dx + rgb.shape[1]]
-    return (acc / (k * k)).astype(np.uint8)
+    for _ in range(3):
+        padded = np.pad(out, ((pad, pad), (pad, pad), (0, 0)), mode="edge")
+        acc = np.zeros_like(out)
+        for dy in range(k):
+            for dx in range(k):
+                acc += padded[dy:dy + rgb.shape[0], dx:dx + rgb.shape[1]]
+        out = acc / (k * k)
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def test_focus_bar_peaks_on_a_sharp_frame_and_drops_when_it_blurs(controller, monkeypatch):
-    """The IMX477 is focused by hand: racking past best focus must show on the bar."""
+    """The IMX477 is focused by hand: racking past best focus must show on the
+    bar, while the mark stays at the best level seen."""
     _, ctl = controller
     readings = _spy_live(monkeypatch)
     sharp = _sharp_frame()
@@ -503,13 +513,29 @@ def test_focus_bar_peaks_on_a_sharp_frame_and_drops_when_it_blurs(controller, mo
     loop.step()
     clock.t += 0.1
     loop.step()
-    assert readings[0].focus == pytest.approx(1.0)
-    assert 0.0 < readings[1].focus < 0.5
+    assert readings[0].focus >= 0.8
+    assert readings[1].focus <= 0.2
+    assert readings[1].focus_peak == pytest.approx(readings[0].focus, rel=0.05)
+
+
+def test_an_out_of_focus_lens_reads_low_from_start_up(controller, monkeypatch):
+    """The defect found on the device: a lens left out of focus showed a full bar,
+    because the bar was relative to its own recent peak and a blurred frame was
+    the only thing it had seen. The bar must stay low however long it looks."""
+    _, ctl = controller
+    readings = _spy_live(monkeypatch)
+    camera = FakeCamera([_blurred(_sharp_frame())] * 40)
+    loop, touch, display, clock = _loop(camera, ctl)
+    for _ in range(40):
+        loop.step()
+        clock.t += 0.1
+    assert all(r.focus <= 0.2 for r in readings)
+    assert readings[-1].focus_peak <= 0.2
 
 
 def test_the_focus_peak_decays_by_wall_time_across_a_review(controller, monkeypatch):
     """Nothing is reset on review: the mark fades on the clock, so after a pause
-    on another subject the bar can reach the top again."""
+    it no longer holds the old subject's level."""
     _, ctl = controller
     readings = _spy_live(monkeypatch)
     sharp = _sharp_frame()
@@ -524,4 +550,5 @@ def test_the_focus_peak_decays_by_wall_time_across_a_review(controller, monkeypa
     loop.step()                                  # review times out
     assert loop.state == "LIVE"
     loop.step()                                  # the blurred frame, a minute later
-    assert readings[-1].focus == pytest.approx(1.0)
+    assert readings[-1].focus <= 0.2
+    assert readings[-1].focus_peak == pytest.approx(readings[-1].focus)

@@ -136,12 +136,24 @@ def test_no_focus_bar_is_drawn_when_focus_is_not_computed():
     assert FOCUS_GREEN not in column
 
 
-def test_focus_bar_carries_an_amber_peak_mark_at_the_top():
-    """The mark is what the user turns the ring towards; it must be visible even
-    at full fill, so it is drawn over the green."""
-    img = _live(1.0)
-    column = [img.getpixel((_BAR_MID_X, y)) for y in range(FOCUS_BAR_Y0, FOCUS_BAR_Y0 + 6)]
-    assert AMBER in column
+def _amber_rows(img):
+    return [y for y in range(FOCUS_BAR_Y0, FOCUS_BAR_Y1 + 1)
+            if img.getpixel((_BAR_MID_X, y)) == AMBER]
+
+
+def test_focus_bar_peak_mark_sits_at_the_peak_level_over_the_green():
+    """The mark is what the user turns the ring back towards; it is drawn over
+    the green so a bar at the peak still shows it."""
+    frame = np.full((480, 640, 3), 128, dtype=np.uint8)
+    full = render_live(frame, _reading(focus=1.0, focus_peak=1.0))
+    assert _amber_rows(full) and max(_amber_rows(full)) <= FOCUS_BAR_Y0 + 3
+    half = render_live(frame, _reading(focus=0.2, focus_peak=0.5))
+    mid = (FOCUS_BAR_Y0 + FOCUS_BAR_Y1) // 2
+    assert _amber_rows(half) and all(abs(y - mid) <= 3 for y in _amber_rows(half))
+
+
+def test_focus_bar_has_no_peak_mark_before_anything_has_scored():
+    assert _amber_rows(_live(0.0)) == []
 
 
 def test_focus_bar_clears_the_ev_minus_button_and_its_hit_region():
