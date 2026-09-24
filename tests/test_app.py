@@ -1555,3 +1555,40 @@ def test_display_breaker_keeps_the_remote_api_alive(camera_cli, monkeypatch, tmp
     assert slept == [1]                     # the remote sleep loop was entered
     assert display.closed and touch.closed  # and the panel was released first
     assert "display failed repeatedly" in capsys.readouterr().err
+
+
+def _viewfinder_kwargs(monkeypatch, tmp_path, extra):
+    """Run main with --display fake and return the kwargs ViewfinderLoop got."""
+    from pifilm.capture import app
+
+    monkeypatch.setattr(app.Artifacts, "resolve", lambda _: Artifacts.default())
+    seen = {}
+
+    class LoopDouble:
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+
+        def run(self, stop):
+            return None
+
+    monkeypatch.setattr(app, "ViewfinderLoop", LoopDouble)
+    out = tmp_path / "shots"
+    assert app.main(["--fake", "--display", "fake", "--no-preview", "--out", str(out), *extra]) == 0
+    return seen
+
+
+def test_idle_dimming_defaults_to_one_and_five_minutes(tmp_path, monkeypatch):
+    kwargs = _viewfinder_kwargs(monkeypatch, tmp_path, [])
+    assert kwargs["dim_after"] == 60.0 and kwargs["off_after"] == 300.0
+
+
+def test_idle_dimming_delays_come_from_the_command_line(tmp_path, monkeypatch):
+    kwargs = _viewfinder_kwargs(
+        monkeypatch, tmp_path, ["--display-dim-after", "30", "--display-off-after", "0"],
+    )
+    assert kwargs["dim_after"] == 30.0 and kwargs["off_after"] == 0.0
+
+
+def test_negative_idle_delays_are_refused(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit):
+        _viewfinder_kwargs(monkeypatch, tmp_path, ["--display-off-after", "-5"])

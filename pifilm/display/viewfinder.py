@@ -30,6 +30,7 @@ from ..capture.errors import CameraError
 from ..imageio import load_rgb
 from . import DisplayError
 from .cst3530 import Tap, TapDetector
+from .idle import IdleDimmer, Screen
 from .meter import FocusTracker, compute_reading, focus_score, format_ev
 from .ui import (
     Action,
@@ -45,6 +46,11 @@ from .ui import (
 EV_STEP = 1.0 / 3.0
 EV_LIMIT = 2.0
 RATE_LOG_INTERVAL = 10.0
+# Idle dimming: half brightness after a minute untouched, off after five. The
+# normal level is the panel driver's own default (st7789.BACKLIGHT_DEFAULT).
+DIM_AFTER = 60.0
+OFF_AFTER = 300.0
+FULL_BACKLIGHT = 80
 
 
 class ViewfinderLoop:
@@ -53,7 +59,8 @@ class ViewfinderLoop:
         clock: Any = time, power_snapshot: Callable[[], Any] | None = None,
         frame_period: float = 0.1, review_timeout: float = 30.0,
         max_display_failures: int = 5, log: Callable[..., None] = print,
-        touch_debug: bool = False,
+        touch_debug: bool = False, dim_after: float = DIM_AFTER,
+        off_after: float = OFF_AFTER, full_backlight: int = FULL_BACKLIGHT,
     ) -> None:
         self._camera, self._controller = camera, controller
         self._display, self._touch = display, touch
@@ -75,6 +82,18 @@ class ViewfinderLoop:
         # the peak fades on wall time alone, so a review or a spell of colour bars
         # leaves the mark where a few seconds of decay put it.
         self._focus = FocusTracker()
+        # Activity is a touch or a capture (in progress or just finished, from
+        # this screen or the Stick). The backlight is written only when its level
+        # changes; None forces the first step to set it. A display that cannot
+        # dim (``--display fake``) gets no idle handling at all: treating it as
+        # off would freeze a screen that is still lit.
+        if not callable(getattr(display, "backlight", None)):
+            dim_after = off_after = 0.0
+        self._idle = IdleDimmer(
+            full=full_backlight, dim_after=dim_after, off_after=off_after,
+            now=clock.monotonic(),
+        )
+        self._backlight: int | None = None
 
     # -- plumbing -------------------------------------------------------------
 
@@ -124,6 +143,26 @@ class ViewfinderLoop:
             return
         self._display_failures = 0
 
+    def _apply_backlight(self, now: float) -> None:
+        """Drive the panel's backlight to the idle level, if it has one.
+
+        A display without ``backlight`` is skipped (and was given no idle
+        delays in ``__init__``). A failure is logged once per level and not retried
+        every frame, and it never stops the viewfinder: a stuck backlight is a
+        brighter screen, not a broken camera.
+        """
+        level = self._idle.backlight(now)
+        if level == self._backlight:
+            return
+        self._backlight = level
+        setter = getattr(self._display, "backlight", None)
+        if not callable(setter):
+            return
+        try:
+            setter(level)
+        except Exception as exc:
+            self._log(f"display: backlight {level}%: {exc}")
+
     def _set_ev(self, value: float) -> None:
         value = max(-EV_LIMIT, min(EV_LIMIT, round(value / EV_STEP) * EV_STEP))
         try:
@@ -163,7 +202,17 @@ class ViewfinderLoop:
 
     def step(self) -> None:
         tap = self._poll_tap()
+        now = self._clock.monotonic()
+        if tap is not None:
+            # On a dark screen the user cannot see what they touch, so the tap
+            # only wakes it. Dimmed, the buttons are visible and the tap acts.
+            if self._idle.screen(now) is Screen.OFF:
+                tap = None
+            self._idle.wake(now)
         snap = self._controller.snapshot()
+        if snap.active_job is not None or snap.finished_count != self._seen_finished:
+            self._idle.wake(now)
+        self._apply_backlight(now)
         if snap.finished_count != self._seen_finished and snap.last_finished_job is not None:
             self._seen_finished = snap.finished_count
             self.state = "REVIEW"
@@ -197,6 +246,11 @@ class ViewfinderLoop:
             if not self._processing_shown:
                 self._show(render_processing())
                 self._processing_shown = True
+            self._restart_rate_window()
+            return
+        if self._idle.screen(now) is Screen.OFF:
+            # Dark screen: neither read nor draw the preview, which is most of the
+            # loop's CPU. Touch and the controller are still polled above.
             self._restart_rate_window()
             return
         try:

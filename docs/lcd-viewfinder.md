@@ -112,6 +112,9 @@ None of the LCD/touch pins above collide with this list.
 # Orientation check: prints raw and mapped touch coordinates for each tap
 .venv/bin/pifilm-capture --camera picamera2 --display waveshare28 --touch-debug --no-preview --out ~/Pictures/pifilm-lcd
 
+# Idle dimming: halve the backlight after 30 s, never turn it off (defaults: 60 s and 300 s)
+.venv/bin/pifilm-capture --camera picamera2 --display waveshare28 --display-dim-after 30 --display-off-after 0 --no-preview --out ~/Pictures/pifilm-lcd
+
 # No hardware: writes each frame to OUT/viewfinder-last.png instead of driving SPI
 .venv/bin/pifilm-capture --fake --display fake --no-preview --out /tmp/pifilm-viewfinder
 open /tmp/pifilm-viewfinder/viewfinder-last.png   # see the layout without a panel
@@ -149,6 +152,20 @@ restart.
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Battery badge (top-right) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | Review screen | Full-screen graded result, one-line caption (`shutter  ISO NNN  EV ±N.N`), "tap to continue" hint | Any tap, or 30 s untouched, returns to live view |
+
+### Idle dimming
+
+Left untouched, the panel saves itself and the battery:
+
+| Untouched for | Screen | A tap |
+| --- | --- | --- |
+| under 1 minute | full brightness (backlight 80 %) | acts normally |
+| 1 minute (`--display-dim-after`) | half brightness, live view still running | restores full brightness **and** acts (the buttons are visible) |
+| 5 minutes (`--display-off-after`) | backlight off; the camera preview is neither read nor drawn | **only wakes** the screen; it never fires the shutter, since you cannot see what you touch |
+
+Any capture counts as activity: while one is being graded the screen stays
+lit, and a finished shot, from the LCD or the Stick, wakes it into the review.
+`0` disables either step. `--display fake` has no backlight and is never dimmed.
 
 A tap that lands during the roughly one second of still acquisition is
 **dropped, not queued**: the camera lock is held for the whole capture request,
@@ -231,6 +248,10 @@ per spec §4:
    the bar must start near zero (the first version read full here). At best focus
    it should be well above half; it must fall away on **both** sides of the peak,
    with the amber tick left at the best level.
+10. Idle dimming: leave the screen untouched: at 1 minute it halves in brightness
+    and the live view keeps moving; at 5 minutes it goes dark. A tap on the dark
+    screen lights it without taking a photo (no new `captures.jsonl` line); a
+    Stick shot while dark wakes it into the review.
 
 ## 8. Troubleshooting
 

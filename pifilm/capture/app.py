@@ -612,6 +612,8 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
         camera, controller, display, touch,
         power_snapshot=power.snapshot if power is not None else None,
         touch_debug=args.touch_debug,
+        dim_after=args.display_dim_after,
+        off_after=args.display_off_after,
     )
     print("LCD viewfinder running. Tap the shutter to capture; Ctrl-C to stop.")
     failure: DisplayError | None = None
@@ -634,6 +636,13 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     if not args.remote_listen:
         return 1
     return _serve_until_interrupt()
+
+
+def _idle_seconds(text: str) -> float:
+    value = float(text)
+    if not value >= 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more seconds, got {text}")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -722,6 +731,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="rotate the LCD image and touch mapping by 180 degrees")
     parser.add_argument("--touch-debug", action="store_true",
                         help="print raw and mapped touch coordinates (orientation check)")
+    parser.add_argument("--display-dim-after", type=_idle_seconds, default=60.0,
+                        metavar="SECONDS",
+                        help="halve the LCD backlight after this long untouched; 0 disables")
+    parser.add_argument("--display-off-after", type=_idle_seconds, default=300.0,
+                        metavar="SECONDS",
+                        help="turn the LCD backlight off after this long untouched "
+                             "(a tap wakes it); 0 disables")
     args = parser.parse_args(argv)
 
     if args.camera == "picamera2" and args.device is not None:
