@@ -1,4 +1,20 @@
-"""Inspect and optionally restart the Pi capture service without exposing secrets."""
+"""Inspect and optionally restart the Pi capture service without exposing secrets.
+
+The restart is guarded: it refuses while anything but the service itself holds
+the camera, so two processes never compete for it. Two things made that guard
+refuse every restart on the Pi 4 (2026-09-24) and are handled here:
+
+- ``fuser -v`` prints its PID/COMMAND table on stderr, and stdout carries bare
+  PIDs, so the owners were never named. ``CAMERA_OWNERS_COMMAND`` names them with
+  ``ps``.
+- A desktop session's PipeWire and WirePlumber keep every ``/dev/video*`` node
+  open to monitor it without capturing; the service runs beside them. They are
+  allowed by name (``PASSIVE_DEVICE_MONITORS``). If one ever did take the camera,
+  the service's own start would fail and say so in its journal.
+
+The capture process is looked up as ``pifilm-capture``; the pre-rename
+``parr-capture`` search matched nothing, so it never guarded anything.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +31,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from firmware.sticks3.scripts.generate_config import parse_env_file
 
 DEFAULT_LISTEN = "0.0.0.0:8765"
+SERVICE = "pifilm-capture.service"
+CAPTURE_PROCESS_COMMAND = "pgrep -af '[p]ifilm-capture' || true"
+# PID and name of every process with a video node open, one per line.
+CAMERA_OWNERS_COMMAND = (
+    "pids=$(fuser /dev/video* 2>/dev/null | tr -cs '0-9' ',' | sed 's/^,//; s/,$//'); "
+    'if [ -n "$pids" ]; then ps -o pid=,comm= -p "$pids"; fi; true'
+)
+PASSIVE_DEVICE_MONITORS = frozenset({"pipewire", "wireplumber"})
 
 
 @dataclass(frozen=True)
@@ -95,18 +119,18 @@ def inspection_commands(config: DeploymentConfig) -> list[tuple[str, str]]:
     project = shlex.quote(config.project_dir)
     artifact = shlex.quote(config.artifact_dir)
     return [
-        ("project", f"test -d {project}"),
+        ("project", f"if test -d {project}; then echo present; else echo missing; fi"),
         (
             "artifact",
-            f"test -d {artifact} && test -f {artifact}/params.json "
-            f"&& test -f {artifact}/pifilm.cube",
+            f"if test -d {artifact} && test -f {artifact}/params.json "
+            f"&& test -f {artifact}/pifilm.cube; then echo present; else echo missing; fi",
         ),
         (
             "service pid",
             "systemctl show -p MainPID --value pifilm-capture.service 2>/dev/null || true",
         ),
-        ("capture process", "pgrep -af '[p]arr-capture' || true"),
-        ("camera owners", "fuser -v /dev/video* 2>/dev/null || true"),
+        ("capture process", CAPTURE_PROCESS_COMMAND),
+        ("camera owners", CAMERA_OWNERS_COMMAND),
         ("desktop session", "loginctl list-sessions --no-legend 2>/dev/null || true"),
     ]
 
@@ -135,22 +159,39 @@ def _process_ids(output: str) -> set[str]:
     }
 
 
-def _camera_owner_ids(output: str) -> set[str]:
-    return set(re.findall(r"(?<![A-Za-z/])(\d+)(?:[A-Za-z])?\b", output))
+def _camera_owners(output: str) -> dict[str, str] | None:
+    """``{pid: command}`` from ``CAMERA_OWNERS_COMMAND``; None if unparseable."""
+    owners: dict[str, str] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        match = re.match(r"\s*(\d+)\s+(\S+)\s*$", line)
+        if match is None:
+            return None
+        owners[match.group(1)] = match.group(2)
+    return owners
+
+
+def _foreign_camera_owners(output: str, allowed: set[str]) -> bool:
+    owners = _camera_owners(output)
+    if owners is None:
+        return True
+    return any(
+        pid not in allowed and name not in PASSIVE_DEVICE_MONITORS
+        for pid, name in owners.items()
+    )
 
 
 def _has_foreign_initial_owner(inspection: Mapping[str, str]) -> bool:
     service_pid = inspection.get("service pid", "").strip()
     allowed = {service_pid} if service_pid.isdecimal() and service_pid != "0" else set()
     capture_output = inspection.get("capture process", "")
-    camera_output = inspection.get("camera owners", "")
     capture_ids = _process_ids(capture_output)
-    camera_ids = _camera_owner_ids(camera_output)
-    if capture_ids - allowed or camera_ids - allowed:
+    if capture_ids - allowed:
         return True
     if capture_output and (not capture_ids or "pifilm-capture" not in capture_output):
         return True
-    return bool(camera_output and not camera_ids)
+    return _foreign_camera_owners(inspection.get("camera owners", ""), allowed)
 
 
 def restart_headless_service(client: Any, inspection: Mapping[str, str]) -> None:
@@ -159,20 +200,20 @@ def restart_headless_service(client: Any, inspection: Mapping[str, str]) -> None
         raise RuntimeError("refusing restart: foreign capture or camera owner is active")
     # A known service-owned process may hold the camera initially. Stop it, then
     # recheck before starting a replacement so two processes cannot compete.
-    status, _output, error = _run(client, "sudo -n systemctl stop pifilm-capture.service")
+    status, _output, error = _run(client, f"sudo -n systemctl stop {SERVICE}")
     if status:
         detail = error.strip() or "command failed"
-        raise RuntimeError(f"could not stop pifilm-capture.service: {detail}")
-    status, process_output, _error = _run(client, "pgrep -af '[p]arr-capture' || true")
+        raise RuntimeError(f"could not stop {SERVICE}: {detail}")
+    status, process_output, _error = _run(client, CAPTURE_PROCESS_COMMAND)
     if status or process_output.strip():
         raise RuntimeError("refusing restart: a capture process remains after service stop")
-    status, camera_output, _error = _run(client, "fuser -v /dev/video* 2>/dev/null || true")
-    if status or camera_output.strip():
+    status, camera_output, _error = _run(client, CAMERA_OWNERS_COMMAND)
+    if status or _foreign_camera_owners(camera_output, set()):
         raise RuntimeError("refusing restart: a process still owns a camera after service stop")
-    status, _output, error = _run(client, "sudo -n systemctl start pifilm-capture.service")
+    status, _output, error = _run(client, f"sudo -n systemctl start {SERVICE}")
     if status:
         detail = error.strip() or "command failed"
-        raise RuntimeError(f"could not start pifilm-capture.service: {detail}")
+        raise RuntimeError(f"could not start {SERVICE}: {detail}")
 
 
 def main(argv: list[str] | None = None) -> int:
