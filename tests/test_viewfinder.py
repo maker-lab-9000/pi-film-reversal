@@ -88,6 +88,61 @@ def _make_controller(tmp_path, metadata=DEFAULT_METADATA):
     return camera, CaptureController(session)
 
 
+class GatedSession:
+    """A session whose capture blocks until released, so a job stays active.
+
+    Without it the fake capture finishes in milliseconds and "while the job is
+    processing" is a race rather than a state the loop can be stepped through.
+    """
+
+    def __init__(self, session):
+        self._session = session
+        self.camera = session.camera
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def capture(self):
+        self.started.set()
+        assert self.release.wait(5.0), "capture was never released"
+        return self._session.capture()
+
+
+def _gated_controller(tmp_path):
+    art = tmp_path / "art"
+    if not art.exists():
+        write_artifact(art, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    camera = FakeCamera([synthetic_frame(48, 64)], metadata=DEFAULT_METADATA)
+    session = GatedSession(CaptureSession(camera, Pipeline(Artifacts.load(art)),
+                                          tmp_path / "shots",
+                                          seed_rng=np.random.default_rng(0)))
+    return camera, CaptureController(session), session
+
+
+def _count_reads(camera):
+    """Wrap ``camera.read`` with a counter, returning the counter dict."""
+    reads = {"n": 0}
+    real = camera.read
+
+    def counting(*, full=True):
+        reads["n"] += 1
+        return real(full=full)
+
+    camera.read = counting
+    return reads
+
+
+def _spy_processing(monkeypatch):
+    calls = {"n": 0}
+    real = viewfinder.render_processing
+
+    def spy(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(viewfinder, "render_processing", spy)
+    return calls
+
+
 @pytest.fixture
 def controller(tmp_path):
     camera, ctl = _make_controller(tmp_path)
@@ -156,6 +211,48 @@ def test_shutter_tap_submits_through_the_controller_and_reviews_the_result(
     assert len(display.images) == before + 1
     assert calls["message"] == []
     assert len(calls["review"]) == 1 and "ISO" in calls["review"][0]
+
+
+def test_processing_shows_colour_bars_instead_of_the_live_view(tmp_path, monkeypatch):
+    """A grade takes about 3 s; the LCD must say so the way the Stick does."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        bars = _spy_processing(monkeypatch)
+        loop, touch, display, clock = _loop(camera, ctl)
+        touch.tap(*SHUTTER_CENTRE)
+        loop.step()  # down
+        loop.step()  # up -> tap -> submit
+        _until(lambda: session.started.is_set())
+        reads = _count_reads(camera)
+        loop.step()
+        assert bars["n"] == 1
+        assert reads["n"] == 0  # no live frame while the job runs
+        assert loop.state == "LIVE"
+        session.release.set()
+        _until(lambda: ctl.snapshot().finished_count == 1)
+        loop.step()
+        assert loop.state == "REVIEW"
+    finally:
+        session.release.set()
+        ctl.close()
+
+
+def test_processing_screen_is_pushed_once_not_every_step(tmp_path, monkeypatch):
+    """Re-blitting identical bars at 10 fps would waste the SPI bus for 3 s."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        bars = _spy_processing(monkeypatch)
+        loop, touch, display, clock = _loop(camera, ctl)
+        ctl.submit("gated")
+        _until(lambda: session.started.is_set())
+        before = len(display.images)
+        for _ in range(3):
+            loop.step()
+        assert len(display.images) == before + 1
+        assert bars["n"] == 1
+    finally:
+        session.release.set()
+        ctl.close()
 
 
 def test_review_ends_on_tap_or_timeout(controller):

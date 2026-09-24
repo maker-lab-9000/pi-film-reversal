@@ -31,7 +31,16 @@ from ..imageio import load_rgb
 from . import DisplayError
 from .cst3530 import Tap, TapDetector
 from .meter import compute_reading, format_ev
-from .ui import Action, hit, iso_label, render_live, render_message, render_review, text_or_dash
+from .ui import (
+    Action,
+    hit,
+    iso_label,
+    render_live,
+    render_message,
+    render_processing,
+    render_review,
+    text_or_dash,
+)
 
 EV_STEP = 1.0 / 3.0
 EV_LIMIT = 2.0
@@ -61,6 +70,7 @@ class ViewfinderLoop:
         self._touch_suppressed = 0
         self._frames = 0
         self._rate_since = clock.monotonic()
+        self._processing_shown = False
 
     # -- plumbing -------------------------------------------------------------
 
@@ -153,6 +163,7 @@ class ViewfinderLoop:
         if snap.finished_count != self._seen_finished and snap.last_finished_job is not None:
             self._seen_finished = snap.finished_count
             self.state = "REVIEW"
+            self._processing_shown = False
             self._review_since = self._clock.monotonic()
             self._show(self._review_image(snap.last_finished_job))
             return
@@ -160,6 +171,7 @@ class ViewfinderLoop:
             held = self._clock.monotonic() - self._review_since
             if tap is not None or held >= self._review_timeout:
                 self.state = "LIVE"
+                self._processing_shown = False
                 self._restart_rate_window()
             return
         if tap is not None:
@@ -170,6 +182,19 @@ class ViewfinderLoop:
                 self._set_ev(self.ev_comp - EV_STEP)
             elif action is Action.EV_PLUS:
                 self._set_ev(self.ev_comp + EV_STEP)
+        if snap.active_job is not None:
+            # The grade takes about three seconds, and the camera belongs to the
+            # capture worker for the still in front of it: show the same colour
+            # bars the Stick and the OpenCV window show rather than a stale live
+            # frame. Drawn once per job, because re-blitting identical bars at
+            # 10 fps would only occupy the SPI bus. Touch keeps being polled
+            # above, so a shutter tap still reaches the controller (which
+            # answers busy) and EV taps still work.
+            if not self._processing_shown:
+                self._show(render_processing())
+                self._processing_shown = True
+            self._restart_rate_window()
+            return
         try:
             frame = self._camera.read(full=False)
         except CameraError as exc:
@@ -178,7 +203,7 @@ class ViewfinderLoop:
             return
         power = self._power() if self._power is not None else None
         reading = compute_reading(frame.metadata, frame.rgb, self.ev_comp, power)
-        self._show(render_live(frame.rgb, reading, busy=snap.active_job is not None))
+        self._show(render_live(frame.rgb, reading))
         self._frames += 1
         now = self._clock.monotonic()
         if now - self._rate_since >= RATE_LOG_INTERVAL:
