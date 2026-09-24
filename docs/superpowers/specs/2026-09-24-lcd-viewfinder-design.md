@@ -1,7 +1,8 @@
 # LCD viewfinder with exposure meter — design
 
 **Date:** 2026-09-24
-**Status:** approved in discussion; spec for review
+**Status:** approved in discussion; implemented, then amended in place by the
+whole-branch review of 2026-09-24 (every amended paragraph says so).
 **Hardware:** Waveshare 2.8" Capacitive Touch LCD V2 (ST7789 over SPI0, CST3530 touch over
 I2C1) wired to the Pi 4's GPIO through the Geekworm X728 pass-through header. First sensor
 under test: Sony IMX477 (HQ camera, fixed lens). The IMX708 must keep working.
@@ -20,7 +21,7 @@ from either trigger shows up on both.
 | --- | --- |
 | Meter | Light-meter readout from camera metadata: shutter, ISO, EV compensation, lux, a needle for stops from mid-grey; plus clipped-highlight percentage and the X728 battery badge. No histogram, no zebra. |
 | Feed | Ungraded ISP preview. The look is shown only on the result screen. |
-| Trigger | On-screen shutter button. The Stick and the SPACE key remain. |
+| Trigger | On-screen shutter button. The Stick remains. *(Review amendment: the SPACE key does not — the viewfinder loop owns the process's main thread, so there is no terminal key reader while it runs. The triggers are the Stick and the LCD.)* |
 | After a shot | Graded result held until a tap, or 30 s, whichever first. Stick-triggered shots are shown too. |
 | Process model | Inside `pifilm-capture`, sharing the existing `CaptureController`. Not a separate process, not an fbtft framebuffer. |
 | Out of scope | Focus peaking, manual shutter/gain, backlight dimming, menus, video. |
@@ -75,8 +76,14 @@ table from the hardware handover in the docstring.
   address, data at `0xD0070000`, next-coordinates at `0xD0070900`, end-read at
   `0xD00002AB`, address `0x58`) reimplemented as a pure function
   `decode_points(buf: bytes, extra: bytes) -> list[RawPoint]` so it is unit-tested with the
-  vendor byte layout, plus the two I2C transactions around it. Reset on open: RST low 100 ms,
-  high 500 ms, as the vendor does.
+  vendor byte layout, plus the I2C transfers around it. *(Review amendment: "the two I2C
+  transactions" was wrong: one report is one block write to set the register address, nine
+  single-byte reads, and the closing write to `REG_END_READ`.)* Reset on open: RST low 100 ms,
+  high 500 ms, as the vendor does. *(Review amendment: the factory then does one probe read
+  and raises `DisplayError("touch controller at 0x58 not answering on /dev/i2c-1: ...")` when
+  nothing answers, because opening the bus succeeds whether or not the panel is connected and
+  every frame's `read()` would otherwise raise. The `TP_RST` device also stays open for the
+  panel's lifetime, closed by `CST3530Touch.close()`, instead of right after the pulse.)*
 - Polling, not interrupt callbacks: the loop calls `read()` each frame, which always queries
   the bus. Deviation from the original design (which gated on an `int_pin.is_active` check
   before touching the bus): capacitive controllers pulse `INT` per report rather than holding
@@ -154,11 +161,20 @@ States and transitions:
 
 ### 3.6 Picamera2 backend changes (`pifilm/capture/picamera.py`)
 
-1. **Preview mode.** `Picamera2Camera(..., preview: tuple[int, int] | None = None)`. When
-   set, the camera is configured with `create_preview_configuration(main={"size":
-   preview, "format": "RGB888"}, raw={"size": binned})` where `binned` is the largest sensor
-   mode with both dimensions ≤ half the native size (IMX477: 2028×1520; IMX708:
-   2304×1296), and `read(full=False)` returns that frame with its metadata.
+1. **Preview mode.** `Picamera2Camera(..., preview: bool | tuple[int, int] | None = None)`.
+   When set, the camera is configured with `create_preview_configuration(main={"size":
+   preview, "format": "RGB888"}, raw={"size": binned})` where `binned` is half the native
+   size (IMX477: 2028×1520; IMX708: 2304×1296), and `read(full=False)` returns that frame
+   with its metadata. *(Review amendments: `binned` was "the largest sensor mode at or below
+   half native", which means reading `Picamera2.sensor_modes`; that reconfigures the camera
+   once per raw mode and costs seconds at start-up, so half the native size is requested and
+   libcamera picks the nearest. `preview=True` derives the main size from the sensor's own
+   aspect ratio — 640 wide, even height, IMX708 640×360 and IMX477 640×480 — because
+   libcamera crops the sensor to the output aspect, so a fixed 4:3 preview frames a 16:9
+   still as a centre crop. The neutral ISP control set is passed as `controls=` to **both**
+   configurations, because every `configure` resets Picamera2's controls to the
+   configuration's own dict and `switch_mode_and_capture_request` configures twice per shot;
+   `set_ev` updates both dicts as well as the live camera.)*
    `read(full=True)` calls `switch_mode_and_capture_request(self._still_config)` and then
    processes the request exactly as today (array check, RGB conversion, metadata, DNG),
    after which Picamera2 returns to the preview configuration. When `preview` is `None`,
@@ -190,17 +206,26 @@ Stick shot reaches the LCD without the controller knowing about displays.
 - `--display {none,waveshare28,fake}` (default `none`), `--display-rotate {0,180}` (default 0),
   `--touch-debug` (print raw and mapped touch coordinates to stdout, for the orientation check).
   `--display` is Picamera2-only for now (the V4L2 backend has no preview-mode split and the
-  meter needs libcamera metadata); it is added to `_reject_picamera2_only_flags` except for
-  `--fake`, which is allowed so the loop can be exercised without hardware using
-  `FakeCamera`; `--display fake` renders each frame to `OUT/viewfinder-last.png` instead
-  of SPI and reads no touch. `--display waveshare28` sets `preview=(640, 480)`
-  on the backend.
+  meter needs libcamera metadata). *(Review amendment: it is **not** in
+  `_reject_picamera2_only_flags`. The service unit ships `--display waveshare28`, so an error
+  on a V4L2 deployment meant exit 2 and a systemd restart loop; instead `pifilm-capture`
+  prints `warning: display unavailable (the V4L2 backend has no preview mode); continuing
+  without it` and runs without a display.)* `--display fake` renders each frame to
+  `OUT/viewfinder-last.png` instead of SPI and reads no touch, so the loop can be exercised
+  without hardware against `FakeCamera`. `--display waveshare28` sets `preview=True` on the
+  backend.
 - Wiring: when a display is requested, a `CaptureController` is always created (shared with
   the remote server when `--remote-listen` is also given), the display and touch are opened,
   and `ViewfinderLoop.run()` runs on the main thread until SIGTERM/Ctrl-C. If opening the
   display or touch raises `DisplayError`, the error is printed and the process continues in
   the mode it would have used without `--display` (headless remote, or terminal), so the
-  systemd service never crash-loops on a display fault.
+  systemd service never crash-loops on a display fault. *(Review amendments: the display is
+  opened **before** the camera and `preview=` is passed only when it opened, because
+  otherwise a display fault left the camera in preview mode — a continuous binned stream
+  plus a mode switch per Stick shot — for nothing. And when the loop gives up after five
+  consecutive `show()` failures, the panel is closed and, with `--remote-listen`, the
+  process falls into the same "no terminal controls" sleep loop instead of exiting 1 for
+  systemd to restart it seconds later.)*
 - `--no-preview` continues to mean "no OpenCV window"; it does not disable the LCD.
 
 ### 3.9 Service and setup
@@ -234,9 +259,13 @@ Stick shot reaches the LCD without the controller knowing about displays.
    `camera_metadata.ExposureTime` is longer than at `0`.
 6. Meter sanity: cover the lens → needle hard left, lux near 0; point at a lamp → `clip %`
    rises.
-7. Service: `systemctl restart pifilm-capture` with the LCD → live view at boot;
-   unplug the LCD's DC wire, restart → journal shows the `DisplayError` line and the Stick
-   still captures.
+7. Service: `systemctl restart pifilm-capture` with the LCD → live view at boot. Then
+   provoke a fault the *open* path can detect and restart again: unplug the panel's ribbon
+   cable entirely, so the touch probe at `0x58` gets no answer, or remove the service user
+   from the `spi` group so `/dev/spidev0.0` cannot be opened. The journal must show one
+   `warning: display unavailable (...)` line and the Stick must still capture. *(Review
+   amendment: the original "unplug the DC wire" cannot produce the fallback — SPI writes are
+   not acknowledged, so a blank panel is indistinguishable from a working one.)*
 8. IMX477 DNG opens per the existing DNG acceptance test.
 
 ## 5. Testing summary
@@ -269,3 +298,7 @@ Stick shot reaches the LCD without the controller knowing about displays.
   driver's error message names the group when it sees `PermissionError`.
 - **CPU during grade.** The viewfinder keeps drawing during the 3 s grade; the frame period
   will stretch. Acceptable and visible as the busy dot.
+- **A tap during a still acquisition is dropped, not delayed.** The camera lock is held for
+  the whole capture request (roughly 1 s) and touch is not polled while the step is blocked
+  on it, so a tap that begins and ends inside that window is never seen. The controller
+  would refuse a second job anyway; the busy dot is the cue to wait.

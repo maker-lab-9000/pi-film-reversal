@@ -156,10 +156,12 @@ come from Raspberry Pi OS apt (never pip), so the venv uses `--system-site-packa
 | Command | What it captures |
 | --- | --- |
 | `pifilm-capture --camera v4l2 --device /dev/video0` | USB (UVC) camera at 1920×1080 |
-| `pifilm-capture --camera picamera2 --tuning-file imx708_wide.json` | Pi Camera Module 3 (IMX708) at native 4608×2592 |
+| `pifilm-capture --camera picamera2` | Pi Camera Module 3 (IMX708) at native 4608×2592 |
 
-> Once Picamera2 is installed it becomes the default, so a Pi still on the USB
-> camera must pass `--camera v4l2` until it is migrated. First-time bring-up
+> The tuning file is libcamera's own automatic choice for the detected sensor;
+> `--tuning-file imx708_wide.json` pins it, for a module variant whose tuning
+> libcamera would not pick. Once Picamera2 is installed it becomes the default,
+> so a Pi still on the USB camera must pass `--camera v4l2` until it is migrated. First-time bring-up
 > (`rpicam-hello --list-cameras`, an RGB patch check, dimensions and metadata) is
 > in [the Picamera2 bring-up checklist](docs/picamera2-bringup.md).
 

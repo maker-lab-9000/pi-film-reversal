@@ -67,6 +67,11 @@ backend selection.
 After the new backend is installed on the identified Pi, run from its checkout.
 This example assumes the Wide variant has been confirmed:
 
+The tuning file below is pinned deliberately: the default is libcamera's own
+automatic choice for the detected sensor (recorded as `tuning_file:
+auto:imx708_wide`), and `--tuning-file` is how a confirmed variant is fixed for
+the bring-up record.
+
 ```sh
 .venv/bin/pifilm-capture --camera picamera2 --tuning-file imx708_wide.json \
   --no-preview --out ~/Pictures/pifilm-imx708-bringup

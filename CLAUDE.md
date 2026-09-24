@@ -183,8 +183,10 @@ no passwordless sudo, so `deploy_remote.py --restart` needs the narrow sudoers r
 
 `deploy_remote.py` uses Paramiko with system known_hosts and `RejectPolicy`; it inspects the Pi
 (project dir, artifact, running `pifilm-capture`, `/dev/video*` owners, desktop sessions) and refuses
-to restart when a foreign process owns the camera. The systemd unit is the headless Stick-only mode
-and reads `PIFILM_REMOTE_TOKEN` from `/etc/pifilm-capture.env`. Two-screen mode (`--show-captures`) must
+to restart when a foreign process owns the camera. The systemd unit runs the LCD viewfinder when a
+panel is present and falls back to headless Stick-only otherwise (a missing panel, or a V4L2
+backend, is one warning line, not a failure to start); it reads `PIFILM_REMOTE_TOKEN` from
+`/etc/pifilm-capture.env`. Two-screen mode (`--show-captures`) must
 be launched from the Pi's desktop session, not over SSH. Full guide: `docs/sticks3-remote.md`.
 
 ## Conventions and constraints
