@@ -11,6 +11,8 @@ from pifilm.display.ui import (
     FOCUS_BAR_Y0,
     FOCUS_BAR_Y1,
     HEIGHT,
+    PROCESSING_BARS,
+    PROCESSING_DIM,
     SHUTTER_CENTRE,
     SHUTTER_RADIUS,
     WIDTH,
@@ -56,8 +58,20 @@ def test_render_processing_draws_the_same_colour_bars_as_the_opencv_screen():
     """
     img = render_processing()
     assert isinstance(img, Image.Image) and img.size == (WIDTH, HEIGHT) and img.mode == "RGB"
-    assert img.getpixel((WIDTH // 14, 10)) == (191, 191, 191)
-    assert img.getpixel((WIDTH * 13 // 14, 10)) == (0, 0, 191)
+    grey, blue = img.getpixel((WIDTH // 14, 10)), img.getpixel((WIDTH * 13 // 14, 10))
+    assert grey[0] == grey[1] == grey[2] > 0
+    assert blue[0] == blue[1] == 0 and blue[2] > 0
+
+
+def test_render_processing_bars_are_dimmed_on_the_lcd():
+    """Full-strength bars glared on the panel in a dim room (asked 2026-09-24);
+    they are drawn at PROCESSING_DIM of the shared colours, the label is not."""
+    img = render_processing()
+    for index, colour in enumerate(PROCESSING_BARS):
+        x = (2 * index + 1) * WIDTH // 14
+        expected = tuple(round(c * PROCESSING_DIM) for c in colour)
+        assert img.getpixel((x, 10)) == expected
+    assert 0.4 <= PROCESSING_DIM <= 0.7
 
 
 def test_render_processing_is_black_below_the_bars_and_carries_a_label():
