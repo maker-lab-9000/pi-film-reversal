@@ -33,10 +33,38 @@ void StickDisplay::begin() {
   M5.Display.setRotation(1);
   width_ = M5.Display.width();
   height_ = M5.Display.height();
+  // Read the working brightness once, so setPower(true) restores exactly what
+  // the panel ran at. A panel that reports 0 here would never come back, so
+  // fall back to M5Unified's own default.
+  brightness_ = M5.Display.getBrightness();
+  if (brightness_ == 0) brightness_ = 128;
   M5.Display.setTextDatum(middle_center);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.setTextSize(1);
   drawColourBars();
+}
+
+void StickDisplay::setPower(bool on) {
+  if (on == powered_) return;
+  powered_ = on;
+  if (!on) {
+    // Brightness first: sleep() alone leaves the backlight burning, which is
+    // most of what this saves.
+    M5.Display.setBrightness(0);
+    M5.Display.sleep();
+    Serial.println("[display] panel off");
+    return;
+  }
+  M5.Display.wakeup();
+  M5.Display.setBrightness(brightness_);
+  // Whatever is in the panel's memory is stale by however long it was dark, and
+  // render() draws only on a change. Ask for one full repaint of the current
+  // screen, badge included.
+  force_redraw_ = true;
+  last_state_ = ClientState::Connecting;
+  last_elapsed_seconds_ = UINT32_MAX;
+  last_ready_ = false;
+  Serial.println("[display] panel on");
 }
 
 void StickDisplay::drawColourBars() {
@@ -71,6 +99,9 @@ void StickDisplay::setPiBatteryLabel(const char* label, bool low) {
 }
 
 void StickDisplay::drawBatteryBadge() {
+  // The labels above are still stored while the panel is off, so the badge is
+  // correct the moment the screen comes back.
+  if (!powered_) return;
   M5.Display.setTextSize(1);
   M5.Display.setTextDatum(middle_center);
   const int16_t y = height_ - kBatteryBadgeHeight;
@@ -190,6 +221,10 @@ bool StickDisplay::decodeAndStore(const uint8_t* jpeg, size_t jpeg_size) {
 }
 
 void StickDisplay::render(const CaptureClient& client, uint32_t now_ms) {
+  // Nothing is drawn while the panel sleeps. decodeAndStore() is called
+  // independently of this, so a capture taken in the dark is still stored and
+  // appears when the screen is turned back on.
+  if (!powered_) return;
   const ClientState state = client.state();
   const uint32_t elapsed = client.elapsedSeconds(now_ms);
   const bool ready = client.readyForCapture();
@@ -197,13 +232,14 @@ void StickDisplay::render(const CaptureClient& client, uint32_t now_ms) {
   // capture the Pi reports itself busy, which flips `ready`; that must not
   // trigger a full repaint of the colour bars.
   const bool ready_matters = state == ClientState::Photo;
-  const bool screen_changed = state != last_state_ || (ready_matters && ready != last_ready_);
+  const bool screen_changed = force_redraw_ || state != last_state_ || (ready_matters && ready != last_ready_);
   const bool counter_changed = elapsed != last_elapsed_seconds_;
   if (!screen_changed && !counter_changed) return;
   if (state != last_state_) {
     Serial.printf("[display] render %s (pi ready=%d, stored photo=%u bytes)\n", clientStateName(state), ready,
                   static_cast<unsigned>(photo_size_));
   }
+  force_redraw_ = false;
   last_state_ = state;
   last_elapsed_seconds_ = elapsed;
   last_ready_ = ready;

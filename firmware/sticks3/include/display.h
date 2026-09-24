@@ -19,6 +19,11 @@ class StickDisplay {
 
   void begin();
   void render(const CaptureClient& client, uint32_t now_ms);
+  // Panel power, toggled by the side button to save battery. While off the
+  // panel sleeps at zero brightness and nothing is drawn; captures continue,
+  // and turning it back on repaints the current screen in full.
+  void setPower(bool on);
+  bool powered() const { return powered_; }
   // Candidate bytes are decoded before they replace the persistent photo.
   bool decodeAndStore(const uint8_t* jpeg, size_t jpeg_size);
   bool hasPhoto() const { return photo_size_ > 0; }
@@ -46,6 +51,10 @@ class StickDisplay {
   bool battery_low_ = false;
   char pi_battery_label_[12] = "";
   bool pi_battery_low_ = false;
+  bool powered_ = true;
+  // Brightness as configured at boot, restored when the panel comes back.
+  uint8_t brightness_ = 0;
+  bool force_redraw_ = false;
   ClientState last_state_ = ClientState::Connecting;
   uint32_t last_elapsed_seconds_ = UINT32_MAX;
   bool last_ready_ = false;
