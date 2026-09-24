@@ -97,7 +97,9 @@ def test_starter_normalisation_trusts_the_isp_and_damps_the_lift(tmp_path):
 
 
 def test_bundled_params_match_write_starter_and_the_cube_is_unchanged(tmp_path):
+    # exp/kodachrome-look: pifilm/data holds the Kodachrome experiment and the
+    # starter lives beside it under looks/starter.
     out = write_starter(tmp_path / "s")
-    bundled = Artifacts.default()
+    bundled = Artifacts.load(Artifacts.default().path / "looks" / "starter")
     assert Artifacts.load(out).normalize == bundled.normalize
     assert (out / "pifilm.cube").read_bytes() == (bundled.path / "pifilm.cube").read_bytes()

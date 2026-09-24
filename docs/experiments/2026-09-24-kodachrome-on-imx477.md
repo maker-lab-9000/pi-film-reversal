@@ -6,7 +6,13 @@ far a look trained for another camera carries before an IMX477 corpus exists.
 
 ## What was copied
 
-`pifilm/data/looks/kodachrome-k14/`: `params.json` and the cube from
+On this branch the Kodachrome look **replaces the bundled starter** in
+`pifilm/data/` (`params.json`, `pifilm.cube`, `training-summary.txt`), and the
+starter moves to `pifilm/data/looks/starter/`. Everything that loads the default
+look - the deployed service, `pifilm-process` without `--artifacts` - gets
+Kodachrome. `main` is unchanged.
+
+The files are `params.json` and the cube from
 `kodachrome-film/artifacts/` (training code revision `e4729e8`, LUT
 `b8ccf30cc719241c98ff3c4a9f73a1cdf8cb000b`), unchanged except that the cube is
 renamed `pifilm.cube` (what `scripts/deploy_remote.py` checks for) and
@@ -44,13 +50,14 @@ keep.
 
 ## Running it on the Pi
 
-The look is in the checkout, so only the service's `--artifacts` changes:
+The deployed unit already points `--artifacts` at `pifilm/data`, so checking out
+the branch and restarting is all it takes:
 
 ```sh
-sudo sed -i 's#--artifacts [^ ]*#--artifacts /home/george/repos/pi-film-reversal/pifilm/data/looks/kodachrome-k14#' \
-  /etc/systemd/system/pifilm-capture.service
-sudo systemctl daemon-reload && sudo systemctl restart pifilm-capture.service
+cd ~/repos/pi-film-reversal && git fetch && git checkout exp/kodachrome-look
+sudo systemctl restart pifilm-capture.service
 ```
 
-`lut_sha1` in `captures.jsonl` then reads `b8ccf30c...`. Roll back with the same
-edit pointing at `.../pifilm/data`.
+`lut_sha1` in `captures.jsonl` then reads `b8ccf30c...`. Roll back with
+`git checkout main` (or `feat/lcd-focus-bar`) and the same restart, or point
+`--artifacts` at `pifilm/data/looks/starter` to keep this branch's code.

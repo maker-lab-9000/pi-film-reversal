@@ -1,0 +1,37 @@
+{
+  "version": 2,
+  "lut_file": "pifilm.cube",
+  "lut_sha1": "fa89d3b2075f2d3ebaf6cd3c080e5fcaf5683bca",
+  "normalize": {
+    "white_balance": false,
+    "wb_gain_min": 0.6,
+    "wb_gain_max": 1.6,
+    "exposure_target_median": 0.25,
+    "exposure_gain_min": 0.5,
+    "exposure_gain_max": 3.0,
+    "stats_lum_min": 0.02,
+    "stats_lum_max": 0.9,
+    "levels": true,
+    "levels_low_pct": 0.5,
+    "levels_high_pct": 99.5,
+    "levels_max_stretch": 4.0,
+    "levels_gamma_min": 0.5,
+    "levels_gamma_max": 2.0,
+    "levels_tone": "luma",
+    "levels_target_median": null,
+    "levels_lift_highlight_ref": 0.02
+  },
+  "grain": {
+    "strength": 0.004,
+    "blur_sigma": 0.7,
+    "enabled": true
+  },
+  "training": {
+    "kind": "handcrafted-preset",
+    "trained": false,
+    "preset_version": 1,
+    "highlights": 0.0,
+    "note": "Untrained saturated color-negative starter. No Martin Parr images used. Not a calibrated film-stock or photographer emulation.",
+    "normalisation_frozen": "2026-09-19 IMX708 pilot"
+  }
+}
