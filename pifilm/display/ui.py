@@ -31,6 +31,10 @@ PROCESSING_BARS = (
     (191, 191, 191), (191, 191, 0), (0, 191, 191), (0, 191, 0),
     (191, 0, 191), (191, 0, 0), (0, 0, 191),
 )
+# The LCD sits close to the eye and is often used in a dim room, where the bars
+# at full strength glared; it draws them at this fraction. Only the LCD: the
+# Stick and the OpenCV window keep PROCESSING_BARS as they are.
+PROCESSING_DIM = 0.55
 # One placeholder for every missing readout, on the live bar and the review
 # caption alike: a plain hyphen, because the default font has no en dash glyph
 # and renders one as a tofu box.
@@ -181,14 +185,16 @@ def render_processing(label: str = "Processing photo...") -> Image.Image:
     small marker read as "nothing happened"; the bars are what the Stick and the
     Pi's own OpenCV window already show, so every screen says "working" the same
     way. Bar order and geometry mirror ``pifilm.capture.app``'s
-    ``_capture_loading_screen``; the label is ASCII because the default font has
-    no glyphs beyond it.
+    ``_capture_loading_screen``, dimmed to ``PROCESSING_DIM`` for the panel; the
+    label stays full white and is ASCII because the default font has no glyphs
+    beyond it.
     """
     img = Image.new("RGB", (WIDTH, HEIGHT), (0, 0, 0))
     draw = ImageDraw.Draw(img)
     for index, colour in enumerate(PROCESSING_BARS):
         left, right = index * WIDTH // 7, (index + 1) * WIDTH // 7
-        draw.rectangle((left, 0, right - 1, HEIGHT * 3 // 4 - 1), fill=colour)
+        dimmed = tuple(round(c * PROCESSING_DIM) for c in colour)
+        draw.rectangle((left, 0, right - 1, HEIGHT * 3 // 4 - 1), fill=dimmed)
     draw.text((WIDTH // 2, HEIGHT * 7 // 8), label,
               fill=(255, 255, 255), font=_font(14), anchor="mm")
     return img
