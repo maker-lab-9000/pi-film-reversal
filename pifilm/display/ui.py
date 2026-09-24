@@ -54,7 +54,7 @@ def _letterbox(rgb: np.ndarray, size: tuple[int, int] = (WIDTH, HEIGHT)) -> Imag
 
 
 def _text_or_dash(value: str | None) -> str:
-    return value if value else "—"
+    return value if value else "-"
 
 
 def render_live(frame_rgb: np.ndarray, reading: MeterReading, busy: bool) -> Image.Image:
@@ -66,20 +66,20 @@ def render_live(frame_rgb: np.ndarray, reading: MeterReading, busy: bool) -> Ima
     draw.rectangle((0, BAR_TOP, EV_BUTTON_W, HEIGHT), outline=(255, 255, 255, 200))
     draw.rectangle((WIDTH - EV_BUTTON_W, BAR_TOP, WIDTH, HEIGHT), outline=(255, 255, 255, 200))
     big = _font(18)
-    draw.text((EV_BUTTON_W // 2, BAR_TOP + 18), "−",
+    draw.text((EV_BUTTON_W // 2, BAR_TOP + 18), "-",
               fill=(255, 255, 255, 255), font=big, anchor="mm")
     draw.text((WIDTH - EV_BUTTON_W // 2, BAR_TOP + 18), "+",
               fill=(255, 255, 255, 255), font=big, anchor="mm")
     # readout
     font = _font(14)
     small = _font(11)
-    iso = f"ISO {reading.iso}" if reading.iso is not None else "ISO —"
+    iso = f"ISO {reading.iso}" if reading.iso is not None else "ISO -"
     line1 = f"{_text_or_dash(reading.shutter)}  {iso}  EV {format_ev(reading.ev_comp)}"
-    lux = f"{reading.lux:.0f} lx" if reading.lux is not None else "— lx"
+    lux = f"{reading.lux:.0f} lx" if reading.lux is not None else "- lx"
     line2 = f"{lux}   clip {reading.clip_pct:.0f}%"
     draw.text((EV_BUTTON_W + 6, BAR_TOP + 3), line1, fill=(255, 255, 255, 255), font=font)
     draw.text((EV_BUTTON_W + 6, BAR_TOP + 21), line2, fill=(220, 220, 220, 255), font=small)
-    # needle: scale −3..+3 stops
+    # needle: scale -3..+3 stops
     draw.line((NEEDLE_X0, NEEDLE_Y, NEEDLE_X1, NEEDLE_Y), fill=(255, 255, 255, 200), width=1)
     for k in range(-3, 4):
         x = _needle_x(float(k))
