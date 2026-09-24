@@ -85,6 +85,27 @@ resolution only for the saved original and DNG. Grading 2–3 MP is several time
 faster, which closes the camera-servicing gap that trips the watchdog. Raising
 `buffer_count` and/or CMA is a secondary lever where there is room.
 
+## A libcamera update could silently retune a deployed trained LUT
+
+**Status:** understood, mitigated by a documented deployment step, not enforced
+in code.
+
+**Description:** the Picamera2 backend defaults `--tuning-file` to `None`,
+meaning libcamera's own automatic tuning choice for the detected sensor
+(recorded as `tuning_file: auto:<model>` in `captures.jsonl`); the example
+systemd unit runs with this default. A trained LUT is fitted against whatever
+colour science its source corpus was captured under. If the automatic tuning
+file libcamera picks ever changes — an OS or libcamera package update, or a
+sensor firmware/variant change read differently — a deployment running the
+default would start feeding a **different** colour response through an
+unchanged LUT, with no error and no changed `lut_sha1` to flag it.
+
+**Mitigation:** when deploying a trained (not the bundled starter) LUT, pin
+`--tuning-file` to the exact file the corpus was captured under (see
+[docs/training.md](training.md), Step 7). This is a documentation-only
+safeguard; nothing currently checks that a running service's tuning file
+matches what a deployed artifact was trained against.
+
 ## Capture records written before 2026-09-19 cannot be told apart by `lut_sha1`
 
 **Status:** understood, not fixed retroactively. New records carry the missing

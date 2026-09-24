@@ -77,9 +77,12 @@ table from the hardware handover in the docstring.
   `decode_points(buf: bytes, extra: bytes) -> list[RawPoint]` so it is unit-tested with the
   vendor byte layout, plus the two I2C transactions around it. Reset on open: RST low 100 ms,
   high 500 ms, as the vendor does.
-- Polling, not interrupt callbacks: the loop calls `read()` each frame; `read()` returns an
-  empty list without touching the bus when `int_pin.is_active` is False, so the shared I2C
-  bus (X728 gauge at 0x36, RTC at 0x68) is only used on a real touch.
+- Polling, not interrupt callbacks: the loop calls `read()` each frame, which always queries
+  the bus. Deviation from the original design (which gated on an `int_pin.is_active` check
+  before touching the bus): capacitive controllers pulse `INT` per report rather than holding
+  it, and a 10 Hz poll could miss the pulse, so gating on it risked dropping taps. Reading the
+  bus every step instead costs two short I2C transactions per frame, negligible on the shared
+  bus (X728 gauge at 0x36, RTC at 0x68); no `INT` wiring is required.
 - Rotation: raw coordinates are in 240×320 portrait space. `to_display(raw, rotate)` maps
   them to 320×240; at `rotate=0`, `x = raw.y`, `y = 239 - raw.x`; at 180, `x = 319 - raw.y`,
   `y = raw.x`. Both mappings unit-tested; which one is right is a hardware acceptance item.
@@ -259,8 +262,9 @@ Stick shot reaches the LCD without the controller knowing about displays.
   `--touch-debug` printout exist for that.
 - **Shared I2C bus.** The gauge poll (every 10 s) and touch reads use separate `SMBus`
   handles; each vendor transaction is a single kernel ioctl, and the CST3530's internal
-  pointer is not disturbed by transactions to other addresses. Touch reads only happen on
-  `INT` active, so bus traffic stays low.
+  pointer is not disturbed by transactions to other addresses. Touch is polled every frame
+  (see §3.2) rather than gated on `INT`, but each poll is only two short transactions, so
+  bus traffic stays low.
 - **GPIO permissions under systemd.** The service user must be in `spi`, `i2c`, `gpio`; the
   driver's error message names the group when it sees `PermissionError`.
 - **CPU during grade.** The viewfinder keeps drawing during the 3 s grade; the frame period

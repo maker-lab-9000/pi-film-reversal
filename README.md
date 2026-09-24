@@ -108,6 +108,9 @@ Pi saves original + graded JPEG + captures.jsonl → job complete
   re-grading on the Stick.
 - **Display** — shown until the next capture. Full-res stays on the Pi (the Stick
   isn't the archive); failures show an error, not a fake success.
+- **LCD too** — an optional Waveshare panel on the Pi (`--display waveshare28`)
+  shows the same live view and shutter; a Stick shot appears on the LCD and an
+  LCD shot appears on the Stick, since both go through the same controller.
 
 **Running modes:**
 
@@ -133,6 +136,7 @@ Capture modes:
 | `--no-preview` | terminal controls, no window |
 | `--fake` | synthetic frames, no camera (for testing) |
 | `--device /dev/videoN` | select a specific USB camera |
+| `--display waveshare28` | LCD viewfinder with exposure meter and touch shutter ([guide](docs/lcd-viewfinder.md)) |
 
 With the default artifact, `pifilm-process` now grades any folder — including old USB
 captures — without white balance and with the damped highlight lift (see

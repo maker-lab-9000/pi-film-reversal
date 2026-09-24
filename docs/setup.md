@@ -287,7 +287,16 @@ offline captures the right date, and a verification checklist. With `--ups
 x728`, the service publishes `pi_battery` and the Stick shows it bottom-left
 as `Pi 77%`, `Pi 77%+` on external power, and `Pi --%` when unknown.
 
-### 4.8 Nextcloud photo sync (optional)
+### 4.8 Optional: LCD viewfinder
+
+For a live viewfinder with a light-meter readout and an on-screen shutter,
+wire up the Waveshare 2.8" Capacitive Touch LCD and add `--display waveshare28`
+to the service (already in the example unit). It needs `sudo usermod -aG
+spi,i2c,gpio george` and `sudo apt install python3-spidev python3-smbus2
+python3-gpiozero python3-lgpio`; full wiring, `config.txt` requirements and the
+hardware acceptance checklist are in [docs/lcd-viewfinder.md](lcd-viewfinder.md).
+
+### 4.9 Nextcloud photo sync (optional)
 
 To keep an off-device archive of every capture, push `~/Pictures/pifilm` to a
 Nextcloud folder over WebDAV. It runs from the Pi only when the wired LAN is

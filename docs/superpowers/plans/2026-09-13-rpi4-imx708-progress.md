@@ -22,6 +22,18 @@ Dependency review: 2026-09-13, following highlight-protection commits
 | 10: classifier | Not implemented; conditional | Labelled data and evidence simple scene rules are insufficient. |
 | F′: final flash | **Dropped** | Superseded by the no-flash decision of 2026-09-14. |
 
+## 2026-09-24 — LCD viewfinder implemented (hardware acceptance pending)
+
+A Waveshare 2.8" Capacitive Touch LCD viewfinder (`pifilm/display/`,
+`--display waveshare28`) is implemented and fake-backed tested: ST7789 display
+driver, CST3530 touch driver, exposure-meter readout, renderer, and a
+LIVE/REVIEW loop sharing the `CaptureController` with the Stick. Design:
+[docs/superpowers/specs/2026-09-24-lcd-viewfinder-design.md](../specs/2026-09-24-lcd-viewfinder-design.md).
+Documentation: [docs/lcd-viewfinder.md](../../lcd-viewfinder.md). The hardware
+acceptance checklist (spec §4, reproduced in that guide) has not been run —
+the Pi was unreachable while this was written; run it against the IMX477
+first and record results in this log.
+
 ## Dependency review completed
 
 - Removed the dependency of baked highlight protection on scene statistics.
