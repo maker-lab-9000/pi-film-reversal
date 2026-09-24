@@ -108,6 +108,9 @@ Pi saves original + graded JPEG + captures.jsonl → job complete
   re-grading on the Stick.
 - **Display** — shown until the next capture. Full-res stays on the Pi (the Stick
   isn't the archive); failures show an error, not a fake success.
+- **LCD too** — an optional Waveshare panel on the Pi (`--display waveshare28`)
+  shows the same live view and shutter; a Stick shot appears on the LCD and an
+  LCD shot appears on the Stick, since both go through the same controller.
 
 **Running modes:**
 
@@ -133,6 +136,7 @@ Capture modes:
 | `--no-preview` | terminal controls, no window |
 | `--fake` | synthetic frames, no camera (for testing) |
 | `--device /dev/videoN` | select a specific USB camera |
+| `--display waveshare28` | LCD viewfinder with exposure meter and touch shutter ([guide](docs/lcd-viewfinder.md)) |
 
 With the default artifact, `pifilm-process` now grades any folder — including old USB
 captures — without white balance and with the damped highlight lift (see
@@ -152,10 +156,12 @@ come from Raspberry Pi OS apt (never pip), so the venv uses `--system-site-packa
 | Command | What it captures |
 | --- | --- |
 | `pifilm-capture --camera v4l2 --device /dev/video0` | USB (UVC) camera at 1920×1080 |
-| `pifilm-capture --camera picamera2 --tuning-file imx708_wide.json` | Pi Camera Module 3 (IMX708) at native 4608×2592 |
+| `pifilm-capture --camera picamera2` | Pi Camera Module 3 (IMX708) at native 4608×2592 |
 
-> Once Picamera2 is installed it becomes the default, so a Pi still on the USB
-> camera must pass `--camera v4l2` until it is migrated. First-time bring-up
+> The tuning file is libcamera's own automatic choice for the detected sensor;
+> `--tuning-file imx708_wide.json` pins it, for a module variant whose tuning
+> libcamera would not pick. Once Picamera2 is installed it becomes the default,
+> so a Pi still on the USB camera must pass `--camera v4l2` until it is migrated. First-time bring-up
 > (`rpicam-hello --list-cameras`, an RGB patch check, dimensions and metadata) is
 > in [the Picamera2 bring-up checklist](docs/picamera2-bringup.md).
 

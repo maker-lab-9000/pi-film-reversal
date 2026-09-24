@@ -13,6 +13,10 @@ with ``FakeCamera``:
   ``imshow`` rather than at ``namedWindow``, and a failure there must fall
   back to headless rather than end the session.
 * ``run_headless_loop`` reads single keys from the terminal.
+* ``--display`` runs the LCD viewfinder (``pifilm/display/viewfinder.py``) on the
+  Pi's SPI panel instead of any OpenCV window. It shares one
+  ``CaptureController`` with the remote API, so a tap on the panel and a Stick
+  request are the same kind of job and never two owners of the camera.
 
 A dropped frame prints and continues in both loops. The spec promises the
 session survives frame read failures, and that promise is only worth
@@ -56,8 +60,10 @@ import argparse
 import json
 import os
 import select
+import signal
 import sys
 import termios
+import threading
 import time
 import tty
 import uuid
@@ -71,11 +77,13 @@ import numpy as np
 from .. import __version__
 from .._cv2 import require_cv2
 from ..artifacts import PARAMS_VERSION, Artifacts, ArtifactsError
+from ..display import DisplayError
+from ..display.viewfinder import ViewfinderLoop
 from ..imageio import load_rgb, save_jpeg
 from ..pipeline import Pipeline
 from .camera import Camera, CameraError, FakeCamera, V4L2Camera
 from .controller import CaptureController, JobSnapshot
-from .picamera import DEFAULT_TUNING_FILE, Picamera2Camera
+from .picamera import Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
 from .remote import RemoteCaptureServer
 
@@ -498,8 +506,27 @@ def _picamera2_available() -> bool:
     return True
 
 
+def _drop_display_on_v4l2(args: argparse.Namespace) -> None:
+    """Downgrade ``--display`` to a warning when the backend is V4L2.
+
+    The shipped service unit passes ``--display waveshare28``; on a deployment
+    whose camera is USB, refusing the flag would exit 2 and systemd would
+    restart the service forever. The viewfinder genuinely cannot run there (the
+    V4L2 backend has no preview-mode split and the meter needs libcamera
+    metadata), so say so once and serve the Stick.
+    """
+    if args.display == "none":
+        return
+    print(
+        "warning: display unavailable (the V4L2 backend has no preview mode); "
+        "continuing without it",
+        file=sys.stderr,
+    )
+    args.display = "none"
+
+
 def _reject_picamera2_only_flags(
-    parser: argparse.ArgumentParser, args: argparse.Namespace, *, reason: str
+    parser: argparse.ArgumentParser, args: argparse.Namespace, *, reason: str,
 ) -> None:
     """Refuse Picamera2-only options whenever no real Picamera2 will be opened,
     whether that is V4L2 (however it was chosen) or ``--fake``.
@@ -508,7 +535,10 @@ def _reject_picamera2_only_flags(
     ``--awb-lock``, ``--colour-gains``, ``--ae-constraint``, ``--ae-metering``
     and ``--ev``. ``--device`` (which itself selects V4L2) and ``--no-dng``
     (wired independently into ``CaptureSession`` and meaningful on any backend)
-    are deliberately excluded.
+    are deliberately excluded, and so is ``--display``: it is a warning rather
+    than an error (see ``_drop_display_on_v4l2``), and it runs against
+    ``FakeCamera`` under ``--fake`` so the panel and its touch mapping can be
+    exercised without a sensor.
     """
     picamera_only = [
         ("--tuning-file", args.tuning_file is not None),
@@ -526,6 +556,79 @@ def _reject_picamera2_only_flags(
         parser.error(f"{', '.join(offenders)} {reason}")
 
 
+def _open_display(args: argparse.Namespace, out_root: Path):
+    """Open the requested display and touch, or None for --display none.
+
+    Raises DisplayError; the caller downgrades that to a warning so a service
+    with a broken or absent LCD keeps serving the Stick instead of crash-looping.
+    """
+    if args.display == "none":
+        return None
+    if args.display == "fake":
+        from ..display.fake import FileDisplay, NoTouch
+        return FileDisplay(Path(out_root).expanduser() / "viewfinder-last.png"), NoTouch()
+    from ..display.cst3530 import open_waveshare28_touch
+    from ..display.st7789 import open_waveshare28
+    display = open_waveshare28(args.display_rotate)
+    try:
+        touch = open_waveshare28_touch(args.display_rotate)
+    except DisplayError:
+        display.close()
+        raise
+    return display, touch
+
+
+def _close_display(display_pair) -> None:
+    """Release the panel when the process is giving up before the loop starts."""
+    if display_pair is None:
+        return
+    display, touch = display_pair
+    touch.close()
+    display.close()
+
+
+def _serve_until_interrupt() -> int:
+    """Hold the process open for the remote API with no terminal controls."""
+    print("Remote capture API active without terminal controls. Press Ctrl-C to stop.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return 0
+
+
+def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
+    display, touch = display_pair
+    stop = threading.Event()
+    previous = signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    loop = ViewfinderLoop(
+        camera, controller, display, touch,
+        power_snapshot=power.snapshot if power is not None else None,
+        touch_debug=args.touch_debug,
+    )
+    print("LCD viewfinder running. Tap the shutter to capture; Ctrl-C to stop.")
+    failure: DisplayError | None = None
+    try:
+        loop.run(stop)
+    except KeyboardInterrupt:
+        pass
+    except DisplayError as exc:
+        failure = exc
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        touch.close()
+        display.close()
+    if failure is None:
+        return 0
+    print(f"error: display failed repeatedly: {failure}", file=sys.stderr)
+    # A dead screen must cost the screen only. Exiting here would be a restart
+    # loop under systemd, and the Stick would get a few seconds of service per
+    # cycle; without a remote API there is nothing left to serve, so 1 stands.
+    if not args.remote_listen:
+        return 1
+    return _serve_until_interrupt()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="pifilm-capture",
@@ -533,7 +636,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--camera", choices=("v4l2", "picamera2"))
     parser.add_argument("--device", default=None, help="index, /dev/videoN or /dev/v4l/by-id/...")
-    parser.add_argument("--tuning-file", help="Picamera2 tuning filename or absolute path")
+    parser.add_argument(
+        "--tuning-file",
+        help="Picamera2 tuning filename or absolute path "
+             "(default: libcamera's automatic choice for the detected sensor)",
+    )
     parser.add_argument(
         "--autofocus", choices=("continuous", "auto", "manual"), default=None,
         help="Picamera2 autofocus mode (default: continuous)",
@@ -599,11 +706,21 @@ def main(argv: list[str] | None = None) -> int:
         "--ups", choices=UPS_CHOICES, default="none",
         help="UPS to read the Pi's battery from and publish in /v1/status (default: none)",
     )
+    parser.add_argument(
+        "--display", choices=("none", "waveshare28", "fake"), default="none",
+        help="LCD viewfinder with exposure meter (Picamera2 or --fake only); "
+             "'fake' writes OUT/viewfinder-last.png instead of driving SPI",
+    )
+    parser.add_argument("--display-rotate", type=int, choices=(0, 180), default=0,
+                        help="rotate the LCD image and touch mapping by 180 degrees")
+    parser.add_argument("--touch-debug", action="store_true",
+                        help="print raw and mapped touch coordinates (orientation check)")
     args = parser.parse_args(argv)
 
     if args.camera == "picamera2" and args.device is not None:
         parser.error("--device cannot be used with --camera picamera2")
     if args.camera == "v4l2":
+        _drop_display_on_v4l2(args)
         _reject_picamera2_only_flags(parser, args, reason="cannot be used with --camera v4l2")
 
     autofocus = args.autofocus or "continuous"
@@ -625,19 +742,38 @@ def main(argv: list[str] | None = None) -> int:
     except ArtifactsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # The backend is resolved before the panel is opened, and the panel before
+    # the camera. Preview mode is a continuous binned stream plus a mode switch
+    # per shot, so it is only worth paying for once there is a panel to feed;
+    # opening the camera first would leave a failed display with the camera
+    # stuck in preview mode for the whole session, and opening the panel before
+    # knowing the backend would claim the SPI bus only to abandon it on V4L2.
+    backend = None
+    if not args.fake:
+        backend = args.camera
+        if backend is None:
+            backend = "v4l2" if args.device is not None else (
+                "picamera2" if _picamera2_available() else "v4l2"
+            )
+        if backend == "v4l2":
+            _drop_display_on_v4l2(args)
+    if args.fake:
+        # Argument errors must precede any hardware side effect: the panel below
+        # claims SPI, GPIO and I2C and pulses the touch reset line.
+        _reject_picamera2_only_flags(parser, args, reason="cannot be used with --fake")
+    display_pair = None
+    if args.display != "none":
+        try:
+            display_pair = _open_display(args, args.out)
+        except DisplayError as exc:
+            print(f"warning: display unavailable ({exc}); continuing without it", file=sys.stderr)
     try:
         if args.fake:
-            _reject_picamera2_only_flags(parser, args, reason="cannot be used with --fake")
             camera: Camera = FakeCamera()
         else:
-            backend = args.camera
-            if backend is None:
-                backend = "v4l2" if args.device is not None else (
-                    "picamera2" if _picamera2_available() else "v4l2"
-                )
             if backend == "picamera2":
                 camera = Picamera2Camera(
-                    args.tuning_file or DEFAULT_TUNING_FILE,
+                    args.tuning_file,
                     save_dng=not args.no_dng,
                     autofocus=autofocus,
                     af_range=af_range,
@@ -647,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
                     ae_constraint=args.ae_constraint or "normal",
                     ae_metering=args.ae_metering or "centre",
                     ev=args.ev if args.ev is not None else 0.0,
+                    preview=True if display_pair is not None else None,
                 )
             else:
                 _reject_picamera2_only_flags(
@@ -655,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
                 camera = V4L2Camera(args.device)
     except CameraError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        _close_display(display_pair)
         return 2
 
     session = CaptureSession(
@@ -666,12 +804,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     controller: CaptureController | None = None
     remote: RemoteCaptureServer | None = None
+    if display_pair is not None:
+        controller = CaptureController(session)
     try:
         if power is not None:
             power.start()
             print(f"Reading the {args.ups} UPS every 10 s.")
         if args.remote_listen:
-            controller = CaptureController(session)
+            controller = controller or CaptureController(session)
             try:
                 remote = RemoteCaptureServer(
                     controller, remote_token, args.remote_listen,
@@ -684,6 +824,9 @@ def main(argv: list[str] | None = None) -> int:
             host, port = args.remote_listen
             print(f"Remote capture API listening on {host}:{port}.")
             try:
+                if display_pair is not None:
+                    assert controller is not None
+                    return _run_viewfinder(camera, controller, display_pair, power, args)
                 if has_display() and (args.show_captures or not args.no_preview):
                     if sys.stdin.isatty():
                         with TerminalKeys() as keys:
@@ -702,11 +845,12 @@ def main(argv: list[str] | None = None) -> int:
                     with TerminalKeys() as keys:
                         run_headless_loop(session, keys.read, controller=controller)
                     return 0
-                print("Remote capture API active without terminal controls. Press Ctrl-C to stop.")
-                while True:
-                    time.sleep(1)
+                return _serve_until_interrupt()
             except KeyboardInterrupt:
                 return 0
+        if display_pair is not None:
+            assert controller is not None
+            return _run_viewfinder(camera, controller, display_pair, power, args)
         if args.show_captures and has_display():
             if sys.stdin.isatty():
                 with TerminalKeys() as keys:

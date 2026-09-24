@@ -34,6 +34,20 @@ venv using `--system-site-packages`, as in the [setup guide](setup.md). Do not
 install Picamera2 from pip into an otherwise isolated venv. Confirm imports
 using the same interpreter that will run the service.
 
+### IMX477
+
+The Sony IMX477 (Raspberry Pi HQ Camera) is a fixed-lens sensor: it has no
+focus motor, so `AfMode` is absent from its libcamera control set and the
+backend records `"autofocus": "none"` in `camera_metadata` — a non-default
+`--autofocus`/`--af-range` on this sensor is rejected as an error, not silently
+ignored. Native resolution is 4056 × 3040, 12-bit raw
+(`SBGGR12_CSI2P`). `--tuning-file` is unnecessary: the backend is
+sensor-agnostic and libcamera selects its own tuning file for the detected
+sensor by default (recorded as `tuning_file: auto:imx477`), the same as for
+the IMX708. The [DNG acceptance test](#dng-acceptance-test) below applies
+unchanged: its red-is-red check is exactly what catches a wrong
+colour-filter-order tag on a new sensor.
+
 ## 2. Establish tuning and exclusive camera ownership
 
 Confirm the module's tuning file before acquiring it. The roadmap assumes
@@ -52,6 +66,11 @@ backend selection.
 
 After the new backend is installed on the identified Pi, run from its checkout.
 This example assumes the Wide variant has been confirmed:
+
+The tuning file below is pinned deliberately: the default is libcamera's own
+automatic choice for the detected sensor (recorded as `tuning_file:
+auto:imx708_wide`), and `--tuning-file` is how a confirmed variant is fixed for
+the bring-up record.
 
 ```sh
 .venv/bin/pifilm-capture --camera picamera2 --tuning-file imx708_wide.json \

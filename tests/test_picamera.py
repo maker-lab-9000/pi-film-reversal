@@ -11,7 +11,7 @@ from PIL import Image
 from pifilm.artifacts import Artifacts, write_artifact
 from pifilm.capture.app import CaptureSession
 from pifilm.capture.camera import CameraError, Frame
-from pifilm.capture.picamera import DEFAULT_TUNING_FILE, Picamera2Camera
+from pifilm.capture.picamera import Picamera2Camera
 from pifilm.capture.thumbnail import fitted_jpeg
 from pifilm.grain import GrainParams
 from pifilm.lut import LUT3D
@@ -149,6 +149,11 @@ def install_picamera(monkeypatch):
         autofocus_cycle_error=None,
         with_noise_reduction=True,
         with_ae_enums=True,
+        sensor_resolution=NATIVE_SIZE,
+        sensor_modes=None,
+        fixed_lens=False,
+        model="imx708_wide",
+        missing_attributes=(),
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
 
@@ -160,10 +165,26 @@ def install_picamera(monkeypatch):
                     raise tuning_error
                 return {"loaded-from": filename}
 
-            def __init__(self, *, tuning):
+            def __init__(self, *, tuning=None):
                 self.tuning = tuning
+                self.sensor_resolution = tuple(sensor_resolution)
+                self.camera_properties = {"Model": model}
+                self.camera_controls = {
+                    "ExposureValue": (-8.0, 8.0, 0.0),
+                    "AeConstraintMode": (0, 3, 0),
+                }
+                if not fixed_lens:
+                    self.camera_controls["AfMode"] = (0, 2, 0)
+                    self.camera_controls["AfRange"] = (0, 2, 0)
+                self.sensor_modes = sensor_modes if sensor_modes is not None else [
+                    {"size": (1536, 864)}, {"size": (2304, 1296)}, {"size": (4608, 2592)},
+                ]
                 self.created_config = None
+                self.preview_config = None
                 self.configured_with = None
+                self.configure_calls = []
+                self.configured_controls = []
+                self.switch_calls = []
                 self.configure_count = 0
                 self.start_count = 0
                 self.capture_count = 0
@@ -171,21 +192,53 @@ def install_picamera(monkeypatch):
                 self.close_count = 0
                 self.set_controls_calls = []
                 self.autofocus_cycle_count = 0
+                for attribute in missing_attributes:
+                    delattr(self, attribute)
                 state.instance = self
                 if init_error is not None:
                     raise init_error
 
             def create_still_configuration(self, **kwargs):
                 self.created_config = kwargs
-                return {"created": kwargs}
+                # Picamera2 puts the requested controls into the returned
+                # configuration, and applies them again on every configure();
+                # set_ev mutates that entry, so the fake must expose it.
+                return {"created": kwargs, "controls": kwargs.get("controls", {})}
+
+            def create_preview_configuration(self, **kwargs):
+                self.preview_config = kwargs
+                return {"preview": kwargs, "controls": kwargs.get("controls", {})}
 
             def configure(self, config):
                 self.configure_count += 1
                 self.configured_with = config
+                self.configure_calls.append(config)
+                self.configured_controls.append(dict(config.get("controls", {})))
                 if configure_error is not None:
                     raise configure_error
 
             def camera_configuration(self):
+                # Picamera2 only ever describes the configuration currently in
+                # force, so the fake must too: with the preview configured it
+                # reports the small main stream on the binned sensor mode. That
+                # is what makes "stream_info describes the still" testable -
+                # building it after the preview configure fails loudly.
+                configured = self.configured_with
+                if isinstance(configured, dict) and "preview" in configured:
+                    preview = configured["preview"]
+                    main_size = tuple(preview["main"]["size"])
+                    raw_size = tuple(preview["raw"]["size"])
+                    return {
+                        "main": {
+                            "size": main_size,
+                            "format": preview["main"]["format"],
+                            "stride": main_size[0] * 3,
+                        },
+                        "raw": {"size": raw_size, "format": RAW_FORMAT, "stride": raw_size[0] * 2},
+                        "sensor": {"output_size": raw_size, "bit_depth": 10},
+                        "buffer_count": 4,
+                        "queue": True,
+                    }
                 return actual if actual is not None else _actual_configuration()
 
             def set_controls(self, controls):
@@ -197,6 +250,13 @@ def install_picamera(monkeypatch):
                     raise start_error
 
             def capture_request(self):
+                self.capture_count += 1
+                if capture_error is not None:
+                    raise capture_error
+                return request
+
+            def switch_mode_and_capture_request(self, config):
+                self.switch_calls.append(config)
                 self.capture_count += 1
                 if capture_error is not None:
                     raise capture_error
@@ -233,13 +293,17 @@ def test_constructor_uses_explicit_native_still_configuration(install_picamera):
 
     assert state.loaded_tuning == ["delivered-lens.json"]
     assert state.instance.tuning == {"loaded-from": "delivered-lens.json"}
+    # The controls entry is deliberate: Picamera2 resets its controls to the
+    # configuration's own dict on every configure(), so the neutral ISP set has
+    # to travel with the configuration, not only through set_controls().
     assert state.instance.created_config == {
         "main": {"size": NATIVE_SIZE, "format": "RGB888"},
         "raw": {"size": NATIVE_SIZE},
         "buffer_count": 2,
         "queue": False,
+        "controls": state.instance.set_controls_calls[0],
     }
-    assert state.instance.configured_with == {"created": state.instance.created_config}
+    assert state.instance.configured_with["created"] is state.instance.created_config
     assert state.instance.start_count == 1
     assert camera.stream_info.to_dict() == {
         "width": 4608,
@@ -250,16 +314,103 @@ def test_constructor_uses_explicit_native_still_configuration(install_picamera):
         "sensor_mode": "4608x2592 SBGGR10_CSI2P",
         "bit_depth": 10,
         "tuning_file": "delivered-lens.json",
+        "autofocus": "continuous",
     }
     camera.close()
 
 
-def test_default_tuning_file_matches_the_initial_camera_variant(install_picamera):
-    state = install_picamera()
+def test_default_tuning_is_libcameras_automatic_choice(install_picamera):
+    state = install_picamera(model="imx477")
     camera = Picamera2Camera()
-    assert state.loaded_tuning == [DEFAULT_TUNING_FILE]
+    assert state.loaded_tuning == []
+    assert state.instance.tuning is None
+    assert camera.stream_info.tuning_file == "auto:imx477"
+    camera.close()
+
+
+def test_explicit_tuning_file_is_still_loaded(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera("imx708_wide.json")
+    assert state.loaded_tuning == ["imx708_wide.json"]
     assert camera.stream_info.tuning_file == "imx708_wide.json"
     camera.close()
+
+
+IMX477_SIZE = (4056, 3040)
+
+
+def _imx477_configuration():
+    return {
+        "main": {"size": IMX477_SIZE, "format": "RGB888", "stride": 12192},
+        "raw": {"size": IMX477_SIZE, "format": "SRGGB12_CSI2P", "stride": 6112},
+        "sensor": {"output_size": IMX477_SIZE, "bit_depth": 12},
+        "buffer_count": 2,
+        "queue": False,
+    }
+
+
+def test_native_size_comes_from_the_sensor(install_picamera):
+    state = install_picamera(
+        actual=_imx477_configuration(), sensor_resolution=IMX477_SIZE, fixed_lens=True,
+        model="imx477",
+    )
+    camera = Picamera2Camera()
+    assert state.instance.created_config["main"]["size"] == IMX477_SIZE
+    assert state.instance.created_config["raw"]["size"] == IMX477_SIZE
+    assert (camera.stream_info.width, camera.stream_info.height) == IMX477_SIZE
+    assert camera.stream_info.sensor_mode == "4056x3040 SRGGB12_CSI2P"
+    assert camera.stream_info.bit_depth == 12
+    camera.close()
+
+
+def test_fixed_lens_sensor_skips_autofocus_controls_and_records_none(install_picamera):
+    state = install_picamera(
+        actual=_imx477_configuration(), sensor_resolution=IMX477_SIZE, fixed_lens=True,
+    )
+    camera = Picamera2Camera()
+    controls = state.instance.set_controls_calls[0]
+    assert "AfMode" not in controls and "AfRange" not in controls
+    assert camera.stream_info.autofocus == "none"
+    assert camera.stream_info.to_dict()["autofocus"] == "none"
+    camera.close()
+
+
+def test_autofocus_sensor_still_records_its_mode(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera(autofocus="auto")
+    assert camera.stream_info.autofocus == "auto"
+    camera.close()
+
+
+@pytest.mark.parametrize("kwargs", [{"autofocus": "auto"}, {"af_range": "macro"}])
+def test_fixed_lens_sensor_rejects_non_default_autofocus(install_picamera, kwargs):
+    state = install_picamera(
+        actual=_imx477_configuration(), sensor_resolution=IMX477_SIZE, fixed_lens=True,
+    )
+    with pytest.raises(CameraError, match="no autofocus"):
+        Picamera2Camera(**kwargs)
+    assert state.instance.close_count == 1
+
+
+@pytest.mark.parametrize("attribute", ["camera_controls", "camera_properties"])
+def test_missing_capability_attribute_is_not_diagnosed_as_a_fixed_lens(
+    install_picamera, attribute
+):
+    """A camera that cannot describe itself is a broken camera, not a fixed lens.
+
+    Defaulting the capability lookups would turn a missing ``camera_controls``
+    into "<model> has no autofocus", sending the user after their --autofocus
+    flag instead of the real fault; ``sensor_resolution`` on the neighbouring
+    line already fails loudly, so these two do the same.
+    """
+    state = install_picamera(missing_attributes=(attribute,))
+    with pytest.raises(CameraError) as exc_info:
+        Picamera2Camera(autofocus="auto")
+    message = str(exc_info.value)
+    assert "no autofocus" not in message
+    assert message.startswith("Failed to configure or start Picamera2 camera:")
+    assert attribute in message
+    assert state.instance.close_count == 1
 
 
 def test_import_is_lazy_and_missing_picamera2_is_actionable(monkeypatch):
@@ -294,7 +445,7 @@ def test_native_library_load_failure_is_wrapped_as_camera_error(monkeypatch):
 def test_tuning_load_failure_is_actionable_without_creating_camera(install_picamera):
     state = install_picamera(tuning_error=OSError("bad tuning data"))
     with pytest.raises(CameraError, match="imx708_wide.json") as exc_info:
-        Picamera2Camera()
+        Picamera2Camera("imx708_wide.json")
     assert isinstance(exc_info.value.__cause__, OSError)
     assert state.instance is None
 
@@ -1016,3 +1167,177 @@ def test_native_capture_session_omits_dng_when_backend_disables_it(
     record = json.loads(record_path.read_text())
     assert "dng" not in record
     assert record["camera_metadata"] == {"FrameDuration": 40_000}
+
+
+def test_preview_mode_configures_binned_preview_after_validating_the_still(install_picamera):
+    # sensor_modes is deleted: reading it makes Picamera2 reconfigure the camera
+    # through every raw mode, seconds of start-up, so the backend must not.
+    state = install_picamera(missing_attributes=("sensor_modes",))
+    camera = Picamera2Camera(preview=(640, 480))
+    inst = state.instance
+    assert inst.configure_calls[0]["created"] is inst.created_config
+    assert inst.configure_calls[1]["preview"] is inst.preview_config
+    assert inst.preview_config["main"] == {"size": (640, 480), "format": "RGB888"}
+    assert inst.preview_config["raw"] == {"size": (2304, 1296)}
+    assert (camera.stream_info.width, camera.stream_info.height) == NATIVE_SIZE
+    camera.close()
+
+
+def test_binned_mode_is_half_the_native_size():
+    from pifilm.capture.picamera import _binned_mode
+
+    assert _binned_mode((4056, 3040)) == (2028, 1520)
+    assert _binned_mode(NATIVE_SIZE) == (2304, 1296)
+
+
+@pytest.mark.parametrize(
+    "native, expected",
+    [(NATIVE_SIZE, (640, 360)), (IMX477_SIZE, (640, 480))],
+)
+def test_preview_true_derives_the_size_from_the_sensor_aspect(
+    install_picamera, native, expected,
+):
+    """libcamera crops the sensor to the output aspect, so a fixed 4:3 preview on
+    a 16:9 sensor would frame the viewfinder differently from the still."""
+    state = install_picamera(
+        actual=_imx477_configuration() if native == IMX477_SIZE else None,
+        sensor_resolution=native,
+        fixed_lens=native == IMX477_SIZE,
+    )
+    camera = Picamera2Camera(preview=True)
+    assert camera.preview_size == expected
+    assert state.instance.preview_config["main"]["size"] == expected
+    camera.close()
+
+
+def test_without_preview_there_is_no_preview_size(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera()
+    assert camera.preview_size is None
+    camera.close()
+
+
+def test_neutral_controls_travel_with_both_configurations(install_picamera):
+    """Picamera2 resets its controls to the configuration's own dict on every
+    configure, and switch_mode_and_capture_request configures twice; without the
+    controls in both configurations the still would be taken with the ISP's
+    defaults and the preview would come back without them."""
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    neutral = {
+        "Sharpness": 1.0,
+        "Contrast": 1.0,
+        "Saturation": 1.0,
+        "NoiseReductionMode": _NoiseReductionModeEnum.HighQuality,
+        "AfMode": _AfModeEnum.Continuous,
+        "AfRange": _AfRangeEnum.Normal,
+        "AeConstraintMode": _AeConstraintModeEnum.Normal,
+        "AeMeteringMode": _AeMeteringModeEnum.CentreWeighted,
+        "ExposureValue": 0.0,
+    }
+    assert inst.created_config["controls"] == neutral
+    assert inst.preview_config["controls"] == neutral
+    assert inst.configured_controls == [neutral, neutral]
+    camera.close()
+
+
+def test_set_ev_updates_both_configurations(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    camera.set_ev(0.5)
+    inst = state.instance
+    assert inst.created_config["controls"]["ExposureValue"] == pytest.approx(0.5)
+    assert inst.preview_config["controls"]["ExposureValue"] == pytest.approx(0.5)
+    camera.close()
+
+
+def test_without_preview_the_configuration_calls_are_unchanged(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    assert len(state.instance.configure_calls) == 1
+    assert state.instance.preview_config is None
+    camera.close()
+
+
+def test_preview_read_uses_the_preview_stream_and_full_read_switches_mode(install_picamera):
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small, metadata={"ExposureTime": 5000}))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    frame = camera.read(full=False)
+    assert frame.rgb.shape == (480, 640, 3)
+    assert frame.metadata == {"ExposureTime": 5000}
+    assert state.instance.switch_calls == []
+    state.instance.capture_request = lambda: (_ for _ in ()).throw(AssertionError("no switch"))
+    inst = state.instance
+    inst.switch_mode_and_capture_request = lambda cfg: (inst.switch_calls.append(cfg),
+                                                        FakeRequest(big))[1]
+    full = camera.read(full=True)
+    assert full.rgb.shape == (NATIVE_SIZE[1], NATIVE_SIZE[0], 3)
+    assert len(inst.switch_calls) == 1 and inst.switch_calls[0]["created"] is inst.created_config
+    camera.close()
+
+
+def test_set_ev_applies_exposure_value_at_runtime(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    camera.set_ev(1.0 / 3)
+    assert state.instance.set_controls_calls[-1] == {"ExposureValue": pytest.approx(1 / 3)}
+    assert camera.ev == pytest.approx(1 / 3)
+    with pytest.raises(CameraError):
+        camera.set_ev(9.0)
+    camera.close()
+
+
+def test_requests_are_serialised_by_a_lock(install_picamera):
+    import threading
+
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(big))
+    camera = Picamera2Camera(save_dng=False)
+    inside = threading.Event()
+    release = threading.Event()
+    overlaps = []
+
+    original = state.instance.capture_request
+
+    def slow_capture():
+        if inside.is_set():
+            overlaps.append(True)
+        inside.set()
+        release.wait(1.0)
+        inside.clear()
+        return original()
+
+    state.instance.capture_request = slow_capture
+    t = threading.Thread(target=camera.read)
+    t.start()
+    inside.wait(1.0)
+    t2 = threading.Thread(target=camera.read)
+    t2.start()
+    release.set()
+    t.join(2.0)
+    t2.join(2.0)
+    assert overlaps == []
+    camera.close()
+
+
+def test_preview_reads_do_not_overwrite_the_measured_still_fps(install_picamera):
+    """``stream_info`` is the audit of the still, and ``fps`` is part of it: a
+    binned viewfinder frame must not be what a capture record claims the still
+    was shot at."""
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small, metadata={"FrameDuration": 20_000}))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    assert camera.stream_info.fps == 0.0
+    camera.read(full=False)
+    assert camera.stream_info.fps == 0.0
+    inst = state.instance
+    inst.switch_mode_and_capture_request = lambda cfg: FakeRequest(
+        big, metadata={"FrameDuration": 50_000}
+    )
+    camera.read(full=True)
+    assert camera.stream_info.fps == 20.0
+    camera.close()

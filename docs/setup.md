@@ -163,9 +163,11 @@ python3 -m venv --system-site-packages .venv
 which is built with GTK. The pip wheel would work headless but not for the
 two-screen mode. On a Pi with a native camera (Camera Module 3 / IMX708) it also
 exposes the apt `python3-picamera2` and libcamera, which must never be installed
-from pip; select that backend with `--camera picamera2 --tuning-file
-imx708_wide.json`, and follow [the Picamera2 bring-up checklist](picamera2-bringup.md)
-for first-time hardware acceptance. A Pi still on the USB camera should pass
+from pip; select that backend with `--camera picamera2`, and follow
+[the Picamera2 bring-up checklist](picamera2-bringup.md)
+for first-time hardware acceptance. The tuning file is libcamera's automatic choice for
+the detected sensor by default; `--tuning-file imx708_wide.json` pins it, which is only
+needed for a non-default module variant. A Pi still on the USB camera should pass
 `--camera v4l2` explicitly once this code is installed, because an installed
 Picamera2 changes the default backend.
 
@@ -229,7 +231,11 @@ curl -s -o /dev/null -w '%{http_code}\n' http://10.42.0.1:8765/v1/status   # 401
 ```
 
 The unit runs `pifilm-capture --no-preview --remote-listen 0.0.0.0:8765
---artifacts <dir> --ups x728`. `--no-preview` because there is no screen;
+--artifacts <dir> --ups x728 --display waveshare28`. It runs the LCD viewfinder
+when the [Waveshare panel](lcd-viewfinder.md) is fitted and falls back to
+headless Stick-only service when it is not, or when the camera is USB;
+`--no-preview` because it suppresses the OpenCV window, which needs a desktop
+session the service does not have (it does not disable the LCD);
 `0.0.0.0` because the hotspot address may not exist yet at the moment the
 service starts, and binding to all interfaces avoids that race; `--ups x728`
 reads the Geekworm fuel gauge for the Stick's Pi-battery badge and is dropped
@@ -287,7 +293,16 @@ offline captures the right date, and a verification checklist. With `--ups
 x728`, the service publishes `pi_battery` and the Stick shows it bottom-left
 as `Pi 77%`, `Pi 77%+` on external power, and `Pi --%` when unknown.
 
-### 4.8 Nextcloud photo sync (optional)
+### 4.8 Optional: LCD viewfinder
+
+For a live viewfinder with a light-meter readout and an on-screen shutter,
+wire up the Waveshare 2.8" Capacitive Touch LCD and add `--display waveshare28`
+to the service (already in the example unit). It needs `sudo usermod -aG
+spi,i2c,gpio george` and `sudo apt install python3-spidev python3-smbus2
+python3-gpiozero python3-lgpio`; full wiring, `config.txt` requirements and the
+hardware acceptance checklist are in [docs/lcd-viewfinder.md](lcd-viewfinder.md).
+
+### 4.9 Nextcloud photo sync (optional)
 
 To keep an off-device archive of every capture, push `~/Pictures/pifilm` to a
 Nextcloud folder over WebDAV. It runs from the Pi only when the wired LAN is

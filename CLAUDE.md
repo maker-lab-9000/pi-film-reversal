@@ -17,8 +17,9 @@ Pi network, Pi service, Stick, optional training) and says which machine each st
 `docs/training.md` is the step-by-step training procedure and explains every report gate;
 `docs/x728-ups.md` covers the Geekworm X728 UPS shield (pins, I2C, services, shutdown policy, RTC);
 `docs/how-it-works.md` explains the colour model (capture pipeline, training steps, libraries, dependency-by-role table);
-`docs/nextcloud-sync.md` the optional Pi→Nextcloud photo archive; and `docs/known-issues.md` tracks
-understood-but-unfixed defects. The bundled LUT in `pifilm/data/` is a handcrafted,
+`docs/nextcloud-sync.md` the optional Pi→Nextcloud photo archive; `docs/lcd-viewfinder.md` the optional
+Waveshare LCD viewfinder (wiring, setup, screen layout, meter, hardware acceptance); and
+`docs/known-issues.md` tracks understood-but-unfixed defects. The bundled LUT in `pifilm/data/` is a handcrafted,
 untrained starter preset (`trained: false`). Trained artifacts, training data, `data/`, `artifacts/`,
 `ektar100/`, `velvia/` are all gitignored and not in a clone.
 
@@ -99,9 +100,14 @@ fitted on normalized input; grain runs last because it models developed film.
 - `camera.py`: V4L2 UVC camera forcing MJPEG at 1920×1080. Grabs the raw compressed buffer so the
   saved `*_original.jpg` is the camera's own bytes; falls back to decoded mode (file becomes
   `*_ungraded.jpg`) if raw mode fails. `FakeCamera` for tests and `--fake`.
+- `picamera.py`: Picamera2 backend, sensor-agnostic (native size and tuning are derived from the
+  attached sensor via `Picamera2.sensor_resolution`/libcamera's automatic tuning, not hard-coded
+  per model). An optional `preview` mode adds a second, cheap stream for the LCD viewfinder;
+  `read(full=True)` switches to the still configuration, captures, and returns to preview.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
   captures-only display (`--show-captures`, shows TV colour bars while processing), and headless
-  terminal. Output: `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,pifilm}.jpg` plus an audit
+  terminal. `--display waveshare28` runs the LCD viewfinder instead of any OpenCV window. Output:
+  `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,pifilm}.jpg` plus an audit
   line in `captures.jsonl` (LUT hash, normalisation hash and grain seed allow regenerating the
   graded file).
 - `controller.py`: `CaptureController` serializes captures on one worker thread, one active job at
@@ -113,6 +119,17 @@ fitted on normalized input; grain runs last because it models developed film.
 - `thumbnail.py`: 240×135 letterboxed JPEG, ≤64 KiB, served to the Stick.
 - `batch.py`: `pifilm-process`. Skips `*_graded.*`, defaults to only `_original`/`_ungraded` files in a
   capture folder, refuses an output dir equal to or inside the input.
+
+### Display (`pifilm/display/`)
+
+Optional SPI/I2C LCD viewfinder, wired up by `--display waveshare28`: `st7789.py` and `cst3530.py`
+drive the panel and its touch controller; `meter.py` computes the light-meter readout (pure,
+from preview metadata + pixels); `ui.py` renders the live/review/message screens and hit-tests
+taps (pure); `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine. All hardware
+imports (`spidev`, `gpiozero`, `smbus2`) are lazy, inside the `open_*` factories, so the package
+imports on a Mac and in tests. `fake.py` (`--display fake`) writes frames to a PNG instead of SPI.
+The loop shares the `CaptureController` with the Stick's remote server, so an LCD tap and a Stick
+request are the same kind of job.
 
 ### Trainer (`pifilm/train/`, Mac only; needs `[train]` extra: SciPy, requests)
 
@@ -166,8 +183,10 @@ no passwordless sudo, so `deploy_remote.py --restart` needs the narrow sudoers r
 
 `deploy_remote.py` uses Paramiko with system known_hosts and `RejectPolicy`; it inspects the Pi
 (project dir, artifact, running `pifilm-capture`, `/dev/video*` owners, desktop sessions) and refuses
-to restart when a foreign process owns the camera. The systemd unit is the headless Stick-only mode
-and reads `PIFILM_REMOTE_TOKEN` from `/etc/pifilm-capture.env`. Two-screen mode (`--show-captures`) must
+to restart when a foreign process owns the camera. The systemd unit runs the LCD viewfinder when a
+panel is present and falls back to headless Stick-only otherwise (a missing panel, or a V4L2
+backend, is one warning line, not a failure to start); it reads `PIFILM_REMOTE_TOKEN` from
+`/etc/pifilm-capture.env`. Two-screen mode (`--show-captures`) must
 be launched from the Pi's desktop session, not over SSH. Full guide: `docs/sticks3-remote.md`.
 
 ## Conventions and constraints

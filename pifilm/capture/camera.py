@@ -44,16 +44,16 @@ from typing import Protocol
 import numpy as np
 
 from .._cv2 import require_cv2
+from .errors import CameraError
 
 cv2 = require_cv2()
+
+# CameraError is defined in .errors, which needs no OpenCV, and re-exported
+# here so that `from .camera import CameraError` keeps working unchanged.
 
 _SOI = b"\xff\xd8"
 _EOI = b"\xff\xd9"
 _MIN_JPEG_BYTES = 128
-
-
-class CameraError(Exception):
-    """Camera could not be opened or read."""
 
 
 @dataclass
@@ -66,6 +66,7 @@ class StreamInfo:
     sensor_mode: str | None = None
     bit_depth: int | None = None
     tuning_file: str | None = None
+    autofocus: str | None = None
 
     def to_dict(self) -> dict:
         values = {
@@ -81,6 +82,8 @@ class StreamInfo:
             values["bit_depth"] = int(self.bit_depth)
         if self.tuning_file is not None:
             values["tuning_file"] = self.tuning_file
+        if self.autofocus is not None:
+            values["autofocus"] = self.autofocus
         return values
 
 
@@ -142,8 +145,11 @@ class FakeCamera:
         jpeg_bytes: list[bytes] | None = None,
         source: str = "decoded",
         stream_info: StreamInfo | None = None,
+        metadata: dict | None = None,
     ) -> None:
         self._jpegs = jpeg_bytes
+        self._metadata = metadata
+        self.ev = 0.0
         if jpeg_bytes is not None:
             decoded = [
                 cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR) for b in jpeg_bytes
@@ -169,7 +175,17 @@ class FakeCamera:
         idx = self._i % len(self._frames)
         self._i += 1
         jpeg = self._jpegs[idx % len(self._jpegs)] if self._jpegs else None
-        return Frame(rgb=self._frames[idx].copy(), jpeg=jpeg, source=self._source)
+        return Frame(
+            rgb=self._frames[idx].copy(),
+            jpeg=jpeg,
+            source=self._source,
+            metadata=self._metadata,
+        )
+
+    def set_ev(self, value: float) -> None:
+        # Mirrors Picamera2Camera.set_ev so viewfinder EV buttons can be driven
+        # without hardware; there is no exposure to change, so it only records.
+        self.ev = float(value)
 
     def close(self) -> None:
         return None

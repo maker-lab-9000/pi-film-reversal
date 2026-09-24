@@ -41,6 +41,11 @@ class ControllerSnapshot:
     active_job: JobSnapshot | None
     last_completed_job: JobSnapshot | None
     closed: bool
+    # Every job that ended, complete or failed. A display polls this counter to
+    # notice a shot taken from any trigger (Stick, SPACE, LCD) without the
+    # controller knowing that displays exist.
+    finished_count: int = 0
+    last_finished_job: JobSnapshot | None = None
 
 
 class CaptureController:
@@ -52,6 +57,8 @@ class CaptureController:
         self._jobs: dict[str, JobSnapshot] = {}
         self._active_request_id: str | None = None
         self._last_completed_job: JobSnapshot | None = None
+        self._finished_count = 0
+        self._last_finished_job: JobSnapshot | None = None
         self._closed = False
         self._work: queue.Queue[str | None] = queue.Queue()
         self._worker = threading.Thread(
@@ -90,7 +97,13 @@ class CaptureController:
                 if self._active_request_id is not None
                 else None
             )
-            return ControllerSnapshot(active, self._last_completed_job, self._closed)
+            return ControllerSnapshot(
+                active,
+                self._last_completed_job,
+                self._closed,
+                self._finished_count,
+                self._last_finished_job,
+            )
 
     def close(self) -> None:
         """Finish an in-flight capture, then close the camera on its worker thread."""
@@ -146,5 +159,7 @@ class CaptureController:
             job = JobSnapshot(request_id, state, error_code, result, error_message)
             self._jobs[request_id] = job
             self._active_request_id = None
+            self._finished_count += 1
+            self._last_finished_job = job
             if state == "complete":
                 self._last_completed_job = job

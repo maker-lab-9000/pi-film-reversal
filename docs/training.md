@@ -383,6 +383,15 @@ grep lut_sha1 ~/repos/pi-film-reversal/artifacts/pifilm-2026-09-v1/params.json
 Update `PI_ARTIFACT_DIR` in `.env` on the Mac to match. Rollback is the same
 edit pointing back at `pifilm/data`.
 
+**Pin the tuning file for a trained look.** The Picamera2 backend defaults to
+libcamera's automatic tuning for the detected sensor (`tuning_file:
+auto:<model>` in `captures.jsonl`), which is what the deployed systemd unit
+uses. Once you deploy a **trained** LUT, add `--tuning-file` to the unit's
+`ExecStart` naming the exact tuning file the source corpus was captured
+under (for example `imx708_wide.json`). Otherwise a future libcamera or OS
+update could silently change the default tuning and shift colour science out
+from under a LUT that was fitted against the old one.
+
 ## 9. Step 8: write it down
 
 Add `docs/training-<date>-<name>.md`, in the style of the three existing
