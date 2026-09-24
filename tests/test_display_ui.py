@@ -4,14 +4,16 @@ from PIL import Image, ImageDraw, ImageFont
 from pifilm.display.meter import MeterReading
 from pifilm.display.ui import (
     BAR_TOP,
+    DASH,
     SHUTTER_CENTRE,
     SHUTTER_RADIUS,
     Action,
-    _text_or_dash,
     hit,
+    iso_label,
     render_live,
     render_message,
     render_review,
+    text_or_dash,
 )
 
 
@@ -62,7 +64,8 @@ def test_missing_value_placeholder_is_ascii_dash_not_tofu_box():
     # ImageFont.load_default's bundled bitmap font has no glyph for U+2014 (em dash) or
     # U+2212 (minus sign): both rasterise as a hollow square "tofu" box under it, not a dash.
     # Missing-value placeholders and the EV-minus label must use ASCII "-" instead.
-    assert _text_or_dash(None) == "-"
+    assert text_or_dash(None) == DASH == "-"
+    assert iso_label(None) == "ISO -"
     font = ImageFont.load_default(size=14)
 
     def render(ch):

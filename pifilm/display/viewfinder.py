@@ -31,7 +31,7 @@ from ..imageio import load_rgb
 from . import DisplayError
 from .cst3530 import Tap, TapDetector
 from .meter import compute_reading, format_ev
-from .ui import Action, hit, render_live, render_message, render_review
+from .ui import Action, hit, iso_label, render_live, render_message, render_review, text_or_dash
 
 EV_STEP = 1.0 / 3.0
 EV_LIMIT = 2.0
@@ -90,6 +90,15 @@ class ViewfinderLoop:
             self._log(f"touch: {[(p.x, p.y) for p in points]}")
         return self._taps.feed(points, self._clock.monotonic())
 
+    def _restart_rate_window(self) -> None:
+        """Begin a fresh frame-rate window after a gap that was not the live view.
+
+        The printed rate is what acceptance item 1 is read against, so the up
+        to 30 s a review screen is held, or a stretch of camera errors, must
+        not be averaged in as dropped frames.
+        """
+        self._frames, self._rate_since = 0, self._clock.monotonic()
+
     def _show(self, image: Image.Image) -> None:
         try:
             self._display.show(image)
@@ -127,8 +136,10 @@ class ViewfinderLoop:
             rgb, _ = load_rgb(job.result.pifilm)
             meta = job.result.record.get("camera_metadata") or {}
             reading = compute_reading(meta, rgb, self.ev_comp, None)
-            iso = f"ISO {reading.iso}" if reading.iso is not None else "ISO -"
-            caption = f"{reading.shutter or '-'}  {iso}  EV {format_ev(self.ev_comp)}"
+            caption = (
+                f"{text_or_dash(reading.shutter)}  {iso_label(reading.iso)}  "
+                f"EV {format_ev(self.ev_comp)}"
+            )
             return render_review(rgb, caption)
         except Exception as exc:
             self._log(f"review: {exc}")
@@ -149,6 +160,7 @@ class ViewfinderLoop:
             held = self._clock.monotonic() - self._review_since
             if tap is not None or held >= self._review_timeout:
                 self.state = "LIVE"
+                self._restart_rate_window()
             return
         if tap is not None:
             action = hit(tap.x, tap.y)
@@ -162,6 +174,7 @@ class ViewfinderLoop:
             frame = self._camera.read(full=False)
         except CameraError as exc:
             self._log(f"camera: {exc}")
+            self._restart_rate_window()
             return
         power = self._power() if self._power is not None else None
         reading = compute_reading(frame.metadata, frame.rgb, self.ev_comp, power)
@@ -170,7 +183,7 @@ class ViewfinderLoop:
         now = self._clock.monotonic()
         if now - self._rate_since >= RATE_LOG_INTERVAL:
             self._log(f"viewfinder: {self._frames / (now - self._rate_since):.1f} fps")
-            self._frames, self._rate_since = 0, now
+            self._restart_rate_window()
 
     def run(self, stop: threading.Event) -> None:
         while not stop.is_set():

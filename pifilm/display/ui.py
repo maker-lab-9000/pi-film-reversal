@@ -24,6 +24,10 @@ SHUTTER_RADIUS = 28
 EV_BUTTON_W = 40
 HIT_MARGIN = 6
 BUSY_CENTRE, BUSY_RADIUS = (10, 10), 5
+# One placeholder for every missing readout, on the live bar and the review
+# caption alike: a plain hyphen, because the default font has no en dash glyph
+# and renders one as a tofu box.
+DASH = "-"
 AMBER = (255, 176, 0)
 NEEDLE_X0, NEEDLE_X1, NEEDLE_Y = 200, 272, 222
 NEEDLE_RANGE = 3.0
@@ -37,10 +41,8 @@ class Action(Enum):
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:  # Pillow < 10.1 has no bundled scalable default
-        return ImageFont.load_default()
+    # Pillow >= 10.1 (the floor in pyproject.toml) ships a scalable default.
+    return ImageFont.load_default(size=size)
 
 
 def _letterbox(rgb: np.ndarray, size: tuple[int, int] = (WIDTH, HEIGHT)) -> Image.Image:
@@ -53,8 +55,12 @@ def _letterbox(rgb: np.ndarray, size: tuple[int, int] = (WIDTH, HEIGHT)) -> Imag
     return canvas
 
 
-def _text_or_dash(value: str | None) -> str:
-    return value if value else "-"
+def text_or_dash(value: str | None) -> str:
+    return value if value else DASH
+
+
+def iso_label(iso: int | None) -> str:
+    return f"ISO {iso}" if iso is not None else f"ISO {DASH}"
 
 
 def render_live(frame_rgb: np.ndarray, reading: MeterReading, busy: bool) -> Image.Image:
@@ -73,9 +79,11 @@ def render_live(frame_rgb: np.ndarray, reading: MeterReading, busy: bool) -> Ima
     # readout
     font = _font(14)
     small = _font(11)
-    iso = f"ISO {reading.iso}" if reading.iso is not None else "ISO -"
-    line1 = f"{_text_or_dash(reading.shutter)}  {iso}  EV {format_ev(reading.ev_comp)}"
-    lux = f"{reading.lux:.0f} lx" if reading.lux is not None else "- lx"
+    line1 = (
+        f"{text_or_dash(reading.shutter)}  {iso_label(reading.iso)}  "
+        f"EV {format_ev(reading.ev_comp)}"
+    )
+    lux = f"{reading.lux:.0f} lx" if reading.lux is not None else f"{DASH} lx"
     line2 = f"{lux}   clip {reading.clip_pct:.0f}%"
     draw.text((EV_BUTTON_W + 6, BAR_TOP + 3), line1, fill=(255, 255, 255, 255), font=font)
     draw.text((EV_BUTTON_W + 6, BAR_TOP + 21), line2, fill=(220, 220, 220, 255), font=small)

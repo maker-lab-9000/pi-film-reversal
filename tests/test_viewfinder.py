@@ -299,6 +299,27 @@ def test_touch_errors_are_logged_at_most_once_per_interval(controller):
     assert "Remote I/O error" in touch_lines[0]
 
 
+def test_frame_rate_excludes_the_review_pause(controller):
+    """Acceptance item 1 reads the fps line to judge the live view; counting
+    the up-to-30 s review screen as dropped frames makes it lie."""
+    camera, ctl = controller
+    logs = []
+    loop, touch, display, clock = _loop(camera, ctl, log=logs.append)
+    loop.step()                       # a live frame
+    touch.tap(*SHUTTER_CENTRE)
+    loop.step()                       # finger down
+    loop.step()                       # release -> submit, plus a live frame
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "REVIEW"
+    clock.t = 300.0
+    loop.step()                       # review times out
+    assert loop.state == "LIVE"
+    clock.t = 310.0
+    loop.step()                       # one frame, 10 s into a fresh window
+    assert [line for line in logs if line.startswith("viewfinder:")] == ["viewfinder: 0.1 fps"]
+
+
 def test_five_display_failures_end_the_loop(controller):
     camera, ctl = controller
     loop, touch, display, clock = _loop(camera, ctl, display=FakeDisplay(fail_after=0))
