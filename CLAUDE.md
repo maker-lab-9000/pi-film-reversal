@@ -158,7 +158,9 @@ in `docs/experiments/`. `scripts/prepare_refinement.py` is a dated curation reci
 
 `capture_client.{h,cpp}` is a pure state machine (Connecting → Ready → Requesting → Processing →
 Downloading → Photo/Error) with no Arduino/Wi-Fi/display dependency so it can run under the `native`
-Unity test env. `main.cpp` runs networking in a FreeRTOS task and the UI loop on the main task;
+Unity test env; `display_power.{h,cpp}` is the second such pure module, the BtnB screen-off/on toggle
+(a debounced click toggles; `StickDisplay::setPower` sleeps the panel and forces a repaint on wake,
+and captures continue while the screen is dark). `main.cpp` runs networking in a FreeRTOS task and the UI loop on the main task;
 `display.cpp` draws colour bars, status, and the decoded JPEG. Config enters only as four
 `STICKS3_*` compile defines appended by `scripts/generate_config.py` from `.env`; empty defaults on a
 clean clone leave the device unable to join a network. Build outputs contain credentials.
