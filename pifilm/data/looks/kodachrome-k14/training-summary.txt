@@ -1,0 +1,13 @@
+Kodachrome fit summary
+
+held-out distance to Kodachrome: 0.02009 before -> 0.01536 after (seed spread 0.00121)
+training-pool distance:          0.01342 -> 0.00246
+transport clipped out of gamut:  0.00082 dE
+LUT fit residual:                0.00749 dE
+
+Gates:
+  [PASS] improvement_exceeds_noise: 0.00473 - evaluation distance fell by 0.00473; needs to beat 3.0x the seed spread (0.00363)
+  [PASS] grey_axis_monotone: True - neutral greys must not darken as input brightens
+  [PASS] channel_monotone: True - each output channel must rise with its own input
+  [PASS] neutral_axis_chroma: 0.00513 - neutral input must stay close to neutral output
+  [PASS] clipped_volume: 7e-05 - the interior of the colour cube must stay off the gamut boundary

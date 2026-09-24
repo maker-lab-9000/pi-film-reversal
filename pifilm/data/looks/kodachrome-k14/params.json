@@ -1,0 +1,179 @@
+{
+  "version": 2,
+  "lut_file": "pifilm.cube",
+  "lut_sha1": "b8ccf30cc719241c98ff3c4a9f73a1cdf8cb000b",
+  "normalize": {
+    "white_balance": true,
+    "wb_gain_min": 0.6,
+    "wb_gain_max": 1.6,
+    "exposure_target_median": 0.25,
+    "exposure_gain_min": 0.5,
+    "exposure_gain_max": 3.0,
+    "stats_lum_min": 0.02,
+    "stats_lum_max": 0.9,
+    "levels": true,
+    "levels_low_pct": 0.5,
+    "levels_high_pct": 99.5,
+    "levels_max_stretch": 4.0,
+    "levels_gamma_min": 0.5,
+    "levels_gamma_max": 2.0,
+    "levels_tone": "luma",
+    "levels_target_median": null
+  },
+  "grain": {
+    "strength": 0.01,
+    "blur_sigma": 0.7,
+    "enabled": true
+  },
+  "training": {
+    "date": "2026-09-04T15:54:30Z",
+    "code_revision": "e4729e8",
+    "package_version": "0.1.0",
+    "dependency_versions": {
+      "numpy": "2.5.2",
+      "scipy": "1.18.1",
+      "Pillow": "12.3.0",
+      "opencv-python": "5.0.0.93"
+    },
+    "command": "kodachrome-train --source data/proxy-large --target data/kodachrome-k14 --out artifacts --proxy-source",
+    "target": {
+      "dir": "data/kodachrome-k14",
+      "n_images": 761,
+      "corpus_sha1": "d20f328f83b497133f28a4e84fb7a0411ff67a6b",
+      "licences": {
+        "policy": [
+          "cc-by",
+          "cc-by-sa",
+          "pd"
+        ],
+        "counts": {
+          "Attribution": 2,
+          "CC BY 2.0": 58,
+          "CC BY 2.5": 21,
+          "CC BY 3.0": 112,
+          "CC BY 4.0": 2,
+          "CC BY-SA 2.0": 6,
+          "CC BY-SA 3.0": 90,
+          "CC BY-SA 4.0": 364,
+          "CC0": 18,
+          "No restrictions": 56,
+          "Public domain": 32
+        }
+      },
+      "normalize": {
+        "white_balance": false,
+        "wb_gain_min": 0.6,
+        "wb_gain_max": 1.6,
+        "exposure_target_median": 0.25,
+        "exposure_gain_min": 0.5,
+        "exposure_gain_max": 3.0,
+        "stats_lum_min": 0.02,
+        "stats_lum_max": 0.9,
+        "levels": true,
+        "levels_low_pct": 0.5,
+        "levels_high_pct": 99.5,
+        "levels_max_stretch": 4.0,
+        "levels_gamma_min": 0.5,
+        "levels_gamma_max": 2.0,
+        "levels_tone": "luma",
+        "levels_target_median": null
+      },
+      "n_pixels": 400000,
+      "clamp_rate": 0.1034,
+      "profiles": {
+        "Adobe RGB (1998)": 45,
+        "c2": 370,
+        "sRGB (assumed)": 130,
+        "sRGB IEC61966-2.1": 2,
+        "Display": 32,
+        "uRGB": 1,
+        "Apple Wide Color Sharing Profile": 1,
+        "Nikon ColorMatch RGB 1.0.0.3001": 1,
+        "EPSON  Standard RGB - Gamma 1.8": 5,
+        "GIMP built-in sRGB": 3,
+        "EPSON  sRGB": 5,
+        "sRGB": 1,
+        "Nikon sRGB 4.0.0.3001": 12,
+        "Nikon ColorMatch RGB 4.0.0.3000": 1
+      }
+    },
+    "source": {
+      "dir": "data/proxy-large",
+      "n_images": 399,
+      "corpus_sha1": "ccc1fe961998f00f307e558c989cf1d93a77af0d",
+      "licences": {
+        "policy": [
+          "pd"
+        ],
+        "counts": {
+          "Public domain": 399
+        }
+      },
+      "n_pixels": 400000,
+      "proxy": true,
+      "clamp_rate": 0.2281,
+      "profiles": {
+        "c2": 115,
+        "Adobe RGB (1998)": 97,
+        "sRGB (assumed)": 88,
+        "Display P3": 9,
+        "ProPhoto RGB": 6,
+        "uRGB": 1,
+        "U.S. Web Coated (SWOP) v2": 1,
+        "sRGB IEC61966-2.1": 1,
+        "sRGB IEC61966-2-1 black scaled": 1,
+        "Camera RGB Profile": 1
+      }
+    },
+    "split": {
+      "val_fraction": 0.2,
+      "n_source_val_images": 79,
+      "n_target_val_images": 152,
+      "seed": 0
+    },
+    "fit": {
+      "lut_size": 33,
+      "iterations": 40,
+      "hue_bins": 24,
+      "chroma_floor": 0.03,
+      "lambda_smooth": 0.01,
+      "lambda_identity": 1.0,
+      "strength": 1.0,
+      "seed": 0,
+      "neutral_axis_cap": 0.005,
+      "fit_seconds": 31.5
+    },
+    "sample": {
+      "crop_frac": 0.06,
+      "max_side": 512,
+      "pixels_per_image": 3000,
+      "l_min": 0.02,
+      "l_max": 0.98,
+      "max_pixels": 400000,
+      "val_fraction": 0.2,
+      "seed": 0
+    },
+    "metrics": {
+      "swd_before": 0.020091,
+      "swd_after": 0.015361,
+      "swd_identity": 0.020091,
+      "swd_seed_spread": 0.001209,
+      "train_swd_before": 0.013418,
+      "train_swd_after": 0.002464,
+      "transport_gamut_clip_deltaE": 0.000821,
+      "lut_fit_rms_deltaE": 0.007491,
+      "grey_axis_monotone": true,
+      "channel_monotone": true,
+      "neutral_axis_max_chroma": 0.005126,
+      "clipped_volume_fraction": 6.7e-05,
+      "n_val_source_pixels": 237000,
+      "n_val_target_pixels": 400000,
+      "held_out_eval": true
+    },
+    "origin": {
+      "repository": "kodachrome-film",
+      "code_revision": "e4729e8",
+      "note": "Copied unchanged except lut_file; trained for the Innomaker U20CAM with a proxy (web photo) source. Experimental on the IMX477."
+    }
+  }
+}

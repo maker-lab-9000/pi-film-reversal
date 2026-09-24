@@ -31,7 +31,7 @@ pifilm-battery = "pifilm.capture.power:main"
 include = ["pifilm*"]
 
 [tool.setuptools.package-data]
-pifilm = ["data/*.cube", "data/*.json"]
+pifilm = ["data/*.cube", "data/*.json", "data/looks/*/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
