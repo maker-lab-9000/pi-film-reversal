@@ -1347,6 +1347,22 @@ def test_display_on_v4l2_still_serves_the_stick(camera_cli, monkeypatch):
     assert seen["viewfinder"] == 0
 
 
+def test_display_is_dropped_before_the_panel_is_opened_on_an_auto_v4l2_backend(
+    camera_cli, monkeypatch, capsys,
+):
+    """The backend can resolve to V4L2 without --camera: with no Picamera2
+    installed. The panel must not be opened only to be abandoned, and the
+    viewfinder must not then run against a V4L2 camera."""
+    opened = []
+    monkeypatch.setattr(camera_cli, "_picamera2_available", lambda: False)
+    monkeypatch.setattr(camera_cli, "V4L2Camera", lambda device: _CameraDouble())
+    monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: opened.append(1))
+    monkeypatch.setattr(camera_cli, "_run_viewfinder", lambda *a, **k: 1)
+    assert camera_cli.main(["--display", "waveshare28", "--no-preview"]) == 0
+    assert opened == []
+    assert "the V4L2 backend has no preview mode" in capsys.readouterr().err
+
+
 def test_display_requests_preview_mode_from_picamera2(camera_cli, monkeypatch):
     """The camera must be opened in preview mode only once the panel is open:
     preview mode is a continuous binned stream plus a mode switch per shot, and

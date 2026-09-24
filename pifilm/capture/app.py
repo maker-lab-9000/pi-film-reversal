@@ -742,10 +742,21 @@ def main(argv: list[str] | None = None) -> int:
     except ArtifactsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    # Before the camera: preview mode is a continuous binned stream plus a mode
-    # switch per shot, so it is only worth paying for once there is a panel to
-    # feed. Opening it after would leave a failed display with the camera stuck
-    # in preview mode for the whole session.
+    # The backend is resolved before the panel is opened, and the panel before
+    # the camera. Preview mode is a continuous binned stream plus a mode switch
+    # per shot, so it is only worth paying for once there is a panel to feed;
+    # opening the camera first would leave a failed display with the camera
+    # stuck in preview mode for the whole session, and opening the panel before
+    # knowing the backend would claim the SPI bus only to abandon it on V4L2.
+    backend = None
+    if not args.fake:
+        backend = args.camera
+        if backend is None:
+            backend = "v4l2" if args.device is not None else (
+                "picamera2" if _picamera2_available() else "v4l2"
+            )
+        if backend == "v4l2":
+            _drop_display_on_v4l2(args)
     display_pair = None
     if args.display != "none":
         try:
@@ -757,11 +768,6 @@ def main(argv: list[str] | None = None) -> int:
             _reject_picamera2_only_flags(parser, args, reason="cannot be used with --fake")
             camera: Camera = FakeCamera()
         else:
-            backend = args.camera
-            if backend is None:
-                backend = "v4l2" if args.device is not None else (
-                    "picamera2" if _picamera2_available() else "v4l2"
-                )
             if backend == "picamera2":
                 camera = Picamera2Camera(
                     args.tuning_file,
@@ -777,7 +783,6 @@ def main(argv: list[str] | None = None) -> int:
                     preview=True if display_pair is not None else None,
                 )
             else:
-                _drop_display_on_v4l2(args)
                 _reject_picamera2_only_flags(
                     parser, args, reason="cannot be used with the selected V4L2 backend"
                 )
