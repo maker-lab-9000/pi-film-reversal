@@ -26,6 +26,7 @@ DEFAULT_METADATA = {"ExposureTime": 4000, "AnalogueGain": 1.0, "Lux": 500.0}
 class FakeDisplay:
     def __init__(self, fail_after=None):
         self.images = []
+        self.levels = []
         self.fail_after = fail_after
         self.closed = False
 
@@ -33,6 +34,9 @@ class FakeDisplay:
         if self.fail_after is not None and len(self.images) >= self.fail_after:
             raise DisplayError("spi")
         self.images.append(image)
+
+    def backlight(self, percent):
+        self.levels.append(percent)
 
     def close(self):
         self.closed = True
@@ -401,7 +405,10 @@ def test_frame_rate_excludes_the_review_pause(controller):
     the up-to-30 s review screen as dropped frames makes it lie."""
     camera, ctl = controller
     logs = []
-    loop, touch, display, clock = _loop(camera, ctl, log=logs.append)
+    # Idle dimming off: the clock jumps 5 minutes, which would darken the screen.
+    loop, touch, display, clock = _loop(
+        camera, ctl, log=logs.append, dim_after=0, off_after=0,
+    )
     loop.step()                       # a live frame
     touch.tap(*SHUTTER_CENTRE)
     loop.step()                       # finger down
@@ -552,3 +559,126 @@ def test_the_focus_peak_decays_by_wall_time_across_a_review(controller, monkeypa
     loop.step()                                  # the blurred frame, a minute later
     assert readings[-1].focus <= 0.2
     assert readings[-1].focus_peak == pytest.approx(readings[-1].focus)
+
+
+# -- idle dimming ---------------------------------------------------------------
+
+
+def _idle_loop(camera, ctl, **kw):
+    kw.setdefault("dim_after", 60.0)
+    kw.setdefault("off_after", 300.0)
+    kw.setdefault("full_backlight", 80)
+    return _loop(camera, ctl, **kw)
+
+
+def _tap(loop, touch, clock, xy):
+    touch.tap(*xy)
+    loop.step()   # down
+    clock.t += 0.1
+    loop.step()   # up -> tap
+
+
+def test_the_screen_dims_after_a_minute_and_turns_off_after_five(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _idle_loop(camera, ctl)
+    loop.step()
+    assert display.levels[-1] == 80
+    clock.t = 60.0
+    loop.step()
+    assert display.levels[-1] == 40
+    clock.t = 300.0
+    loop.step()
+    assert display.levels[-1] == 0
+
+
+def test_the_backlight_is_only_written_when_its_level_changes(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _idle_loop(camera, ctl)
+    for _ in range(5):
+        loop.step()
+        clock.t += 0.1
+    assert display.levels == [80]
+
+
+def test_no_camera_reads_or_frames_while_the_screen_is_off(controller):
+    """Off is for the battery: the preview is neither read nor drawn."""
+    camera, ctl = controller
+    loop, touch, display, clock = _idle_loop(camera, ctl)
+    reads = _count_reads(camera)
+    clock.t = 300.0
+    loop.step()
+    before_reads, before_frames = reads["n"], len(display.images)
+    for _ in range(10):
+        clock.t += 0.1
+        loop.step()
+    assert reads["n"] == before_reads and len(display.images) == before_frames
+
+
+def test_a_tap_on_a_dark_screen_only_wakes_it(controller, monkeypatch):
+    """The user cannot see what they are touching: the shutter must not fire."""
+    camera, ctl = controller
+    loop, touch, display, clock = _idle_loop(camera, ctl)
+    submitted = []
+    monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
+    clock.t = 300.0
+    loop.step()
+    assert display.levels[-1] == 0
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    assert submitted == []
+    assert display.levels[-1] == 80
+    assert loop.state == "LIVE"
+
+
+def test_a_tap_on_a_dimmed_screen_restores_it_and_acts(controller, monkeypatch):
+    """Dimmed, the buttons are still visible, so the tap does what it hits."""
+    camera, ctl = controller
+    loop, touch, display, clock = _idle_loop(camera, ctl)
+    submitted = []
+    monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
+    clock.t = 60.0
+    loop.step()
+    assert display.levels[-1] == 40
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    assert len(submitted) == 1
+    assert display.levels[-1] == 80
+
+
+def test_a_stick_capture_wakes_the_screen_into_review(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _idle_loop(camera, ctl)
+    clock.t = 300.0
+    loop.step()
+    assert display.levels[-1] == 0
+    ctl.submit("from-the-stick")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "REVIEW"
+    assert display.levels[-1] == 80
+
+
+def test_a_capture_in_progress_keeps_the_screen_awake(tmp_path):
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        loop, touch, display, clock = _idle_loop(camera, ctl)
+        loop.step()
+        ctl.submit("slow")
+        _until(lambda: session.started.is_set())
+        clock.t = 500.0
+        loop.step()
+        assert display.levels[-1] == 80
+    finally:
+        session.release.set()
+        ctl.close()
+
+
+def test_a_display_without_a_backlight_is_never_dimmed(controller):
+    camera, ctl = controller
+
+    class NoBacklight(FakeDisplay):
+        backlight = None
+
+    display = NoBacklight()
+    loop, touch, _, clock = _idle_loop(camera, ctl, display=display)
+    clock.t = 400.0
+    loop.step()   # must not raise; the frame is still drawn
+    assert display.images
