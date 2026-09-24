@@ -153,6 +153,7 @@ def install_picamera(monkeypatch):
         sensor_modes=None,
         fixed_lens=False,
         model="imx708_wide",
+        missing_attributes=(),
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
 
@@ -190,6 +191,8 @@ def install_picamera(monkeypatch):
                 self.close_count = 0
                 self.set_controls_calls = []
                 self.autofocus_cycle_count = 0
+                for attribute in missing_attributes:
+                    delattr(self, attribute)
                 state.instance = self
                 if init_error is not None:
                     raise init_error
@@ -356,6 +359,27 @@ def test_fixed_lens_sensor_rejects_non_default_autofocus(install_picamera, kwarg
     )
     with pytest.raises(CameraError, match="no autofocus"):
         Picamera2Camera(**kwargs)
+    assert state.instance.close_count == 1
+
+
+@pytest.mark.parametrize("attribute", ["camera_controls", "camera_properties"])
+def test_missing_capability_attribute_is_not_diagnosed_as_a_fixed_lens(
+    install_picamera, attribute
+):
+    """A camera that cannot describe itself is a broken camera, not a fixed lens.
+
+    Defaulting the capability lookups would turn a missing ``camera_controls``
+    into "<model> has no autofocus", sending the user after their --autofocus
+    flag instead of the real fault; ``sensor_resolution`` on the neighbouring
+    line already fails loudly, so these two do the same.
+    """
+    state = install_picamera(missing_attributes=(attribute,))
+    with pytest.raises(CameraError) as exc_info:
+        Picamera2Camera(autofocus="auto")
+    message = str(exc_info.value)
+    assert "no autofocus" not in message
+    assert message.startswith("Failed to configure or start Picamera2 camera:")
+    assert attribute in message
     assert state.instance.close_count == 1
 
 

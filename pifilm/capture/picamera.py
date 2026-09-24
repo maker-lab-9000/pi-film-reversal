@@ -165,9 +165,15 @@ class Picamera2Camera:
             if len(native) != 2 or min(native) <= 0:
                 raise CameraError(f"Picamera2 reported an unusable sensor resolution {native!r}")
             self._native_size: tuple[int, int] = (native[0], native[1])
-            model = str(getattr(camera, "camera_properties", {}).get("Model", "unknown"))
+            # Read straight off the camera, like sensor_resolution above: a
+            # Picamera2 that cannot describe itself is a broken camera, and
+            # defaulting these would report a missing control set as
+            # "<model> has no autofocus", pointing the user at their --autofocus
+            # flag instead of the real fault. A missing attribute reaches the
+            # generic wrapper below instead.
+            model = str(camera.camera_properties.get("Model", "unknown"))
             tuning_label = tuning_file if tuning_file is not None else f"auto:{model}"
-            has_autofocus = "AfMode" in getattr(camera, "camera_controls", {})
+            has_autofocus = "AfMode" in camera.camera_controls
             if not has_autofocus and (autofocus != "continuous" or af_range != "normal"):
                 raise CameraError(
                     f"{model} has no autofocus; --autofocus and --af-range cannot be used"
