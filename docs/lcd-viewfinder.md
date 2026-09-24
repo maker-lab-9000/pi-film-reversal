@@ -143,16 +143,16 @@ restart.
 | Live image | Full-screen letterboxed, ungraded ISP preview | — |
 | Meter bar (bottom strip, translucent black) | Shutter, ISO, EV compensation, lux, clip % | — |
 | Needle | Deviation from mid-grey in stops, −3 to +3, amber marker | — |
-| Shutter button (circle, right edge) | White ring, filled centre | Submits a capture through the shared controller; the busy dot lights until it finishes |
+| Shutter button (circle, right edge) | White ring, filled centre | Submits a capture through the shared controller; the processing screen holds until it finishes |
 | EV `−` / EV `+` buttons (bar's left/right ends) | `-` / `+` labels | Adjusts exposure compensation by 1/3 stop, clamped to ±2; resets to `0` every time `pifilm-capture` restarts |
-| Busy dot (small amber dot, top-left) | Lit while any capture — from this screen or the Stick — is being processed | — |
+| Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show. The camera is not read during it | — |
 | Battery badge (top-right) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | Review screen | Full-screen graded result, one-line caption (`shutter  ISO NNN  EV ±N.N`), "tap to continue" hint | Any tap, or 30 s untouched, returns to live view |
 
 A tap that lands during the roughly one second of still acquisition is
 **dropped, not queued**: the camera lock is held for the whole capture request,
 so the loop is not polling touch at all during it, and the controller is busy
-anyway (it runs one job at a time). Wait for the busy dot to clear.
+anyway (it runs one job at a time). Wait for the colour bars to clear.
 
 ## 6. Reading the meter
 
@@ -179,7 +179,7 @@ per spec §4:
 2. `--display-rotate 0` vs `180`: image upright for the mounted cable; touch
    lands where the finger is (tap the four corners; `--touch-debug` prints the
    mapped coordinates).
-3. Shutter tap → busy dot → result → tap returns to live. `captures.jsonl`
+3. Shutter tap → colour bars → result → tap returns to live. `captures.jsonl`
    gains a record with `sensor_mode 4056x3040`, `tuning_file auto:imx477`,
    `autofocus none`.
 4. Stick shot while the LCD is live: appears on both; the LCD returns to live

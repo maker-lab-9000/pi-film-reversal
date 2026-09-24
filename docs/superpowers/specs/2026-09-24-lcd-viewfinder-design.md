@@ -120,13 +120,18 @@ half-white frame → `clip_pct` 50).
 
 - Layout constants for 320×240: image area full screen; meter bar `y ∈ [204, 240)` filled
   black at 60 % alpha; shutter button a 56 px circle centred at (288, 102) with a 2 px white
-  ring; EV buttons 40×36 at the bar's left (`−`) and right (`+`) ends; busy marker a 10 px
-  amber dot at (10, 10); battery badge at top-right; text via `ImageFont.load_default(size=14)` (Pillow ≥ 10.1 ships a TrueType default; the
+  ring; EV buttons 40×36 at the bar's left (`−`) and right (`+`) ends; battery badge at
+  top-right; text via `ImageFont.load_default(size=14)` (Pillow ≥ 10.1 ships a TrueType default; the
   `Pillow` floor in `pyproject.toml` moves from 10.0 to 10.1), 11 px for labels.
-- `render_live(frame_rgb, reading, busy: bool) -> PIL.Image`: fits the whole preview frame
+- `render_live(frame_rgb, reading) -> PIL.Image`: fits the whole preview frame
   into 320×240 by letterboxing, never cropping (a 4:3 IMX477 preview fills exactly; a 16:9
   IMX708 preview gets 30 px black bands top and bottom, the lower one under the meter bar),
   then draws the bar, needle, buttons and badge.
+- `render_processing(label="Processing photo...") -> PIL.Image`: TV colour bars over the top
+  three quarters, label below. *(Amendment after the first hardware run: a small busy dot was
+  not readable as "working". The bars are the same seven `pifilm/capture/app.py`'s
+  `_capture_loading_screen` draws for the OpenCV window and the Stick shows, so every screen
+  in the system says "working" the same way.)*
 - `render_review(graded_rgb, caption: str) -> PIL.Image`: letterboxed result with a one-line
   caption (`"1/250  ISO 100  +0.3"`), "tap to continue" hint.
 - `render_message(title, detail) -> PIL.Image`: for errors and start-up.
@@ -145,7 +150,7 @@ States and transitions:
 
 | State | Each step | Transitions |
 | --- | --- | --- |
-| `LIVE` | read preview (`camera.read(full=False)`), poll touch, render live with `busy = controller has active job`, `display.show` | `SHUTTER` tap → `controller.submit(uuid4)` → stays `LIVE` (busy). `EV_±` tap → `camera.set_ev(ev ± 1/3)` clamped ±2. Controller's `completed_count` increased since last seen → load graded result → `REVIEW`. |
+| `LIVE` | poll touch; if the controller has an active job, show `render_processing()` once (no camera read, no frame counted for the rate) and stop there; otherwise read preview (`camera.read(full=False)`), render live, `display.show` | `SHUTTER` tap → `controller.submit(uuid4)` → stays `LIVE`, now showing colour bars. `EV_±` tap → `camera.set_ev(ev ± 1/3)` clamped ±2. Controller's `completed_count` increased since last seen → load graded result → `REVIEW`. |
 | `REVIEW` | render review once; poll touch | any tap or `review_timeout` elapsed → `LIVE`. |
 | `ERROR` | render message | camera or display errors: after 5 consecutive `show()` failures the loop exits with `DisplayError`; a `CameraError` on a preview read shows "camera busy" and retries next step (the existing headless promise that a dropped frame never ends the session holds here too). |
 
@@ -253,7 +258,7 @@ Stick shot reaches the LCD without the controller knowing about displays.
    one-line rate every 10 s to stdout).
 2. `--display-rotate 0` vs `180`: image upright for the mounted cable; touch lands where
    the finger is (tap the four corners; the loop prints mapped coordinates with `--touch-debug`).
-3. Shutter tap → busy dot → result → tap returns to live. `captures.jsonl` gains a record
+3. Shutter tap → colour bars → result → tap returns to live. `captures.jsonl` gains a record
    with `sensor_mode 4056x3040`, `tuning_file auto:imx477`, `autofocus none`.
 4. Stick shot while the LCD is live: appears on both; LCD returns to live after 30 s untouched.
 5. EV `+` three times: readout shows `+1.0`, live view brightens, and a shot's
@@ -297,9 +302,10 @@ Stick shot reaches the LCD without the controller knowing about displays.
   bus traffic stays low.
 - **GPIO permissions under systemd.** The service user must be in `spi`, `i2c`, `gpio`; the
   driver's error message names the group when it sees `PermissionError`.
-- **CPU during grade.** The viewfinder keeps drawing during the 3 s grade; the frame period
-  will stretch. Acceptable and visible as the busy dot.
+- **CPU during grade.** The viewfinder does not draw during the 3 s grade: it shows the
+  colour bars once and reads neither the camera nor a new frame until the job ends, so the
+  grade gets the CPU.
 - **A tap during a still acquisition is dropped, not delayed.** The camera lock is held for
   the whole capture request (roughly 1 s) and touch is not polled while the step is blocked
   on it, so a tap that begins and ends inside that window is never seen. The controller
-  would refuse a second job anyway; the busy dot is the cue to wait.
+  would refuse a second job anyway; the colour bars are the cue to wait.
