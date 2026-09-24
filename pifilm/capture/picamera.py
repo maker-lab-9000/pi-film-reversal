@@ -33,6 +33,21 @@ take, not the viewfinder frames it discards. Each full read then uses
 captures, and returns the camera to the preview configuration itself - so the
 viewfinder keeps running afterwards without this module reconfiguring anything.
 
+``preview=True`` derives the preview size from the sensor's own aspect ratio
+rather than fixing 4:3: libcamera crops the sensor to the output aspect, so a
+640x480 preview on a 16:9 IMX708 would show a centre crop of the frame the
+still will actually record. The raw stream is simply asked for half the native
+size and libcamera picks the nearest mode it has; ``Picamera2.sensor_modes`` is
+deliberately never read, because enumerating it reconfigures the camera through
+every raw mode and costs seconds at start-up.
+
+Every ``configure`` resets Picamera2's controls to the configuration's own
+``controls`` dict, and ``switch_mode_and_capture_request`` configures twice per
+shot. The neutral ISP set therefore travels inside *both* configurations, not
+only through ``set_controls``; otherwise the still would be taken with the
+ISP's default sharpening and saturation and the viewfinder would come back
+without them. ``set_ev`` updates those dicts as well as the live camera.
+
 Previews and captures arrive on different threads (the viewfinder loop and the
 capture controller), so one lock is held from acquiring a request through
 releasing it: the pixel buffer belongs to the request, and a second thread that
@@ -111,7 +126,7 @@ class Picamera2Camera:
         ae_constraint: str = "normal",
         ae_metering: str = "centre",
         ev: float = 0.0,
-        preview: tuple[int, int] | None = None,
+        preview: bool | tuple[int, int] | None = None,
     ) -> None:
         if autofocus not in _AUTOFOCUS_MODES:
             raise CameraError(
@@ -131,9 +146,11 @@ class Picamera2Camera:
             raise CameraError(f"ev must be within {_EV_RANGE}, got {ev}")
 
         self._request_lock = threading.Lock()
-        self._preview = tuple(preview) if preview else None
+        self._preview: tuple[int, int] | None = None
+        self.preview_size: tuple[int, int] | None = None
         self.ev = float(ev)
         self._still_config: Any | None = None
+        self._preview_config: Any | None = None
 
         try:
             from picamera2 import Picamera2
@@ -178,11 +195,21 @@ class Picamera2Camera:
                 raise CameraError(
                     f"{model} has no autofocus; --autofocus and --af-range cannot be used"
                 )
+            if preview is True:
+                self._preview = _preview_size(self._native_size)
+            elif preview:
+                self._preview = (int(preview[0]), int(preview[1]))
+            self.preview_size = self._preview
+            controls = _camera_controls(
+                autofocus, af_range, ae_lock, awb_lock, colour_gains,
+                ae_constraint, ae_metering, ev, has_autofocus=has_autofocus,
+            )
             config = camera.create_still_configuration(
                 main={"size": self._native_size, "format": _MAIN_FORMAT},
                 raw={"size": self._native_size},
                 buffer_count=2,
                 queue=False,
+                controls=dict(controls),
             )
             camera.configure(config)
             actual = camera.camera_configuration()
@@ -190,16 +217,14 @@ class Picamera2Camera:
             self._stream_info.autofocus = autofocus if has_autofocus else "none"
             self._still_config = config
             if self._preview is not None:
-                binned = _binned_mode(getattr(camera, "sensor_modes", []), self._native_size)
                 preview_config = camera.create_preview_configuration(
                     main={"size": self._preview, "format": _MAIN_FORMAT},
-                    raw={"size": binned},
+                    raw={"size": _binned_mode(self._native_size)},
+                    controls=dict(controls),
                 )
                 camera.configure(preview_config)
-            _apply_camera_controls(
-                camera, autofocus, af_range, ae_lock, awb_lock, colour_gains,
-                ae_constraint, ae_metering, ev, has_autofocus=has_autofocus,
-            )
+                self._preview_config = preview_config
+            camera.set_controls(controls)
             start_attempted = True
             camera.start()
             self._started = True
@@ -314,6 +339,12 @@ class Picamera2Camera:
                 camera.set_controls({"ExposureValue": value})
             except Exception as exc:
                 raise CameraError(f"Picamera2 failed to set ExposureValue: {exc}") from exc
+            # Every configure (including the two inside
+            # switch_mode_and_capture_request) reapplies the configuration's own
+            # controls, so a runtime EV change that only reached the camera
+            # would be undone by the next shot.
+            for config in (self._still_config, self._preview_config):
+                _set_config_control(config, "ExposureValue", value)
         self.ev = value
 
     def close(self) -> None:
@@ -339,24 +370,41 @@ class Picamera2Camera:
             raise CameraError(f"Failed to close Picamera2 camera: {first_error}") from first_error
 
 
-def _binned_mode(sensor_modes: Any, native: tuple[int, int]) -> tuple[int, int]:
-    """The largest sensor mode no bigger than half the native size in each axis.
+PREVIEW_WIDTH = 640
+
+
+def _binned_mode(native: tuple[int, int]) -> tuple[int, int]:
+    """Half the native size, for libcamera to match to a real binned mode.
 
     The viewfinder runs the sensor here: cheap frames at the sensor's binned
-    rate, with the full-resolution still taken by a mode switch per shot. When
-    the driver lists no modes, half the native size is requested and libcamera
-    picks the nearest.
+    rate, with the full-resolution still taken by a mode switch per shot.
+    Asking ``Picamera2.sensor_modes`` which modes exist would be more precise
+    and costs seconds, because reading it configures the camera once per raw
+    mode; libcamera picks the nearest mode to this request by itself.
     """
-    half = (native[0] // 2, native[1] // 2)
-    best: tuple[int, int] | None = None
-    for mode in sensor_modes or []:
-        try:
-            w, h = (int(v) for v in mode["size"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if w <= half[0] and h <= half[1] and (best is None or w * h > best[0] * best[1]):
-            best = (w, h)
-    return best or half
+    return (native[0] // 2, native[1] // 2)
+
+
+def _preview_size(native: tuple[int, int]) -> tuple[int, int]:
+    """A ``PREVIEW_WIDTH``-wide stream with the sensor's own aspect ratio.
+
+    libcamera crops the sensor to the requested output aspect, so a fixed 4:3
+    preview on a 16:9 sensor would frame the viewfinder differently from the
+    still it is composing. The height is rounded to an even number because
+    subsampled YUV/raw pipelines want even dimensions.
+    """
+    height = int(round(PREVIEW_WIDTH * native[1] / native[0]))
+    return PREVIEW_WIDTH, max(2, height - (height % 2))
+
+
+def _set_config_control(config: Any, name: str, value: Any) -> None:
+    """Update one control inside a Picamera2 configuration, if it has any."""
+    if config is None:
+        return
+    try:
+        config["controls"][name] = value
+    except (TypeError, KeyError, IndexError):  # a configuration without controls
+        pass
 
 
 def _stream_info(actual: Any, tuning_file: str, native_size: tuple[int, int]) -> StreamInfo:
@@ -415,8 +463,7 @@ def _warn_missing_ae_enum(control: str, flag: str, requested: str, default: str)
     )
 
 
-def _apply_camera_controls(
-    camera: Any,
+def _camera_controls(
     autofocus: str,
     af_range: str,
     ae_lock: bool,
@@ -426,9 +473,13 @@ def _apply_camera_controls(
     ae_metering: str,
     ev: float,
     has_autofocus: bool,
-) -> None:
-    """Neutral ISP rendering plus autofocus and AE shaping, applied once after
-    ``configure``.
+) -> dict:
+    """Neutral ISP rendering plus autofocus and AE shaping, as one control dict.
+
+    Returned rather than applied so the same set can be handed to
+    ``create_still_configuration`` and ``create_preview_configuration`` as well
+    as to ``set_controls``: Picamera2 reapplies a configuration's controls on
+    every ``configure``, and a shot in preview mode configures twice.
 
     Imports libcamera's control enums lazily so USB and fake-camera use never
     require the Raspberry Pi camera stack. ``autofocus``/``af_range``/
@@ -486,7 +537,7 @@ def _apply_camera_controls(
         cam_controls["AwbEnable"] = False
     if ae_lock:
         cam_controls["AeEnable"] = False
-    camera.set_controls(cam_controls)
+    return cam_controls
 
 
 def _cleanup_camera(camera: Any, *, stop: bool) -> None:

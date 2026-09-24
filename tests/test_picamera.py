@@ -183,6 +183,7 @@ def install_picamera(monkeypatch):
                 self.preview_config = None
                 self.configured_with = None
                 self.configure_calls = []
+                self.configured_controls = []
                 self.switch_calls = []
                 self.configure_count = 0
                 self.start_count = 0
@@ -199,16 +200,20 @@ def install_picamera(monkeypatch):
 
             def create_still_configuration(self, **kwargs):
                 self.created_config = kwargs
-                return {"created": kwargs}
+                # Picamera2 puts the requested controls into the returned
+                # configuration, and applies them again on every configure();
+                # set_ev mutates that entry, so the fake must expose it.
+                return {"created": kwargs, "controls": kwargs.get("controls", {})}
 
             def create_preview_configuration(self, **kwargs):
                 self.preview_config = kwargs
-                return {"preview": kwargs}
+                return {"preview": kwargs, "controls": kwargs.get("controls", {})}
 
             def configure(self, config):
                 self.configure_count += 1
                 self.configured_with = config
                 self.configure_calls.append(config)
+                self.configured_controls.append(dict(config.get("controls", {})))
                 if configure_error is not None:
                     raise configure_error
 
@@ -288,13 +293,17 @@ def test_constructor_uses_explicit_native_still_configuration(install_picamera):
 
     assert state.loaded_tuning == ["delivered-lens.json"]
     assert state.instance.tuning == {"loaded-from": "delivered-lens.json"}
+    # The controls entry is deliberate: Picamera2 resets its controls to the
+    # configuration's own dict on every configure(), so the neutral ISP set has
+    # to travel with the configuration, not only through set_controls().
     assert state.instance.created_config == {
         "main": {"size": NATIVE_SIZE, "format": "RGB888"},
         "raw": {"size": NATIVE_SIZE},
         "buffer_count": 2,
         "queue": False,
+        "controls": state.instance.set_controls_calls[0],
     }
-    assert state.instance.configured_with == {"created": state.instance.created_config}
+    assert state.instance.configured_with["created"] is state.instance.created_config
     assert state.instance.start_count == 1
     assert camera.stream_info.to_dict() == {
         "width": 4608,
@@ -1161,24 +1170,86 @@ def test_native_capture_session_omits_dng_when_backend_disables_it(
 
 
 def test_preview_mode_configures_binned_preview_after_validating_the_still(install_picamera):
-    state = install_picamera()
+    # sensor_modes is deleted: reading it makes Picamera2 reconfigure the camera
+    # through every raw mode, seconds of start-up, so the backend must not.
+    state = install_picamera(missing_attributes=("sensor_modes",))
     camera = Picamera2Camera(preview=(640, 480))
     inst = state.instance
-    assert inst.configure_calls[0] == {"created": inst.created_config}
-    assert inst.configure_calls[1] == {"preview": inst.preview_config}
+    assert inst.configure_calls[0]["created"] is inst.created_config
+    assert inst.configure_calls[1]["preview"] is inst.preview_config
     assert inst.preview_config["main"] == {"size": (640, 480), "format": "RGB888"}
     assert inst.preview_config["raw"] == {"size": (2304, 1296)}
     assert (camera.stream_info.width, camera.stream_info.height) == NATIVE_SIZE
     camera.close()
 
 
-def test_binned_mode_is_the_largest_at_or_below_half_native():
+def test_binned_mode_is_half_the_native_size():
     from pifilm.capture.picamera import _binned_mode
 
-    modes = [{"size": (1332, 990)}, {"size": (2028, 1080)}, {"size": (2028, 1520)},
-             {"size": (4056, 3040)}]
-    assert _binned_mode(modes, (4056, 3040)) == (2028, 1520)
-    assert _binned_mode([], (4056, 3040)) == (2028, 1520)
+    assert _binned_mode((4056, 3040)) == (2028, 1520)
+    assert _binned_mode(NATIVE_SIZE) == (2304, 1296)
+
+
+@pytest.mark.parametrize(
+    "native, expected",
+    [(NATIVE_SIZE, (640, 360)), (IMX477_SIZE, (640, 480))],
+)
+def test_preview_true_derives_the_size_from_the_sensor_aspect(
+    install_picamera, native, expected,
+):
+    """libcamera crops the sensor to the output aspect, so a fixed 4:3 preview on
+    a 16:9 sensor would frame the viewfinder differently from the still."""
+    state = install_picamera(
+        actual=_imx477_configuration() if native == IMX477_SIZE else None,
+        sensor_resolution=native,
+        fixed_lens=native == IMX477_SIZE,
+    )
+    camera = Picamera2Camera(preview=True)
+    assert camera.preview_size == expected
+    assert state.instance.preview_config["main"]["size"] == expected
+    camera.close()
+
+
+def test_without_preview_there_is_no_preview_size(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera()
+    assert camera.preview_size is None
+    camera.close()
+
+
+def test_neutral_controls_travel_with_both_configurations(install_picamera):
+    """Picamera2 resets its controls to the configuration's own dict on every
+    configure, and switch_mode_and_capture_request configures twice; without the
+    controls in both configurations the still would be taken with the ISP's
+    defaults and the preview would come back without them."""
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    neutral = {
+        "Sharpness": 1.0,
+        "Contrast": 1.0,
+        "Saturation": 1.0,
+        "NoiseReductionMode": _NoiseReductionModeEnum.HighQuality,
+        "AfMode": _AfModeEnum.Continuous,
+        "AfRange": _AfRangeEnum.Normal,
+        "AeConstraintMode": _AeConstraintModeEnum.Normal,
+        "AeMeteringMode": _AeMeteringModeEnum.CentreWeighted,
+        "ExposureValue": 0.0,
+    }
+    assert inst.created_config["controls"] == neutral
+    assert inst.preview_config["controls"] == neutral
+    assert inst.configured_controls == [neutral, neutral]
+    camera.close()
+
+
+def test_set_ev_updates_both_configurations(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    camera.set_ev(0.5)
+    inst = state.instance
+    assert inst.created_config["controls"]["ExposureValue"] == pytest.approx(0.5)
+    assert inst.preview_config["controls"]["ExposureValue"] == pytest.approx(0.5)
+    camera.close()
 
 
 def test_without_preview_the_configuration_calls_are_unchanged(install_picamera):
@@ -1204,7 +1275,7 @@ def test_preview_read_uses_the_preview_stream_and_full_read_switches_mode(instal
                                                         FakeRequest(big))[1]
     full = camera.read(full=True)
     assert full.rgb.shape == (NATIVE_SIZE[1], NATIVE_SIZE[0], 3)
-    assert inst.switch_calls == [{"created": inst.created_config}]
+    assert len(inst.switch_calls) == 1 and inst.switch_calls[0]["created"] is inst.created_config
     camera.close()
 
 
