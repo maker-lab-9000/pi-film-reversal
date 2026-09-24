@@ -227,7 +227,10 @@ up the camera first, and on a Pi 3B that takes 15 to 25 seconds. Then power
 the Stick: colour
 bars, READY, one capture per deliberate press, graded thumbnail displayed. The
 Stick's serial log shows each step; `firmware/sticks3/README.md` explains how to
-read it and how to prove the displayed image is the graded file. Pull photos
+read it and how to prove the displayed image is the graded file. The small side
+button (BtnB) turns the Stick's screen off and back on to save battery; the
+shutter keeps working while the screen is dark, and a new photo does not wake
+it. Pull photos
 over Ethernet with:
 
 ```sh

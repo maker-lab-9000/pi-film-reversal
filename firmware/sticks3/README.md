@@ -50,6 +50,25 @@ On first flash, verify physical hardware before enabling network credentials:
 2. The boot smoke screen appears, the short speaker tone is audible, and colour bars follow.
 3. Press and hold the primary button: it should yield only one shutter tone and one request.
 
+## Buttons
+
+- **M5 button (BtnA)**, the large front button: the shutter. One deliberate
+  press is one capture; holding it yields one request, not a stream.
+- **Side button (BtnB)**, the small button on the edge: turns the screen off
+  and back on to save battery, which on this board is mostly the backlight.
+  A click is a press and release, so holding the button does nothing until it
+  is let go. While the screen is dark the Stick still connects, submits
+  captures, downloads and stores the thumbnail, and sounds the shutter tone -
+  that tone is the only feedback in the dark, because a new photo deliberately
+  does not wake the screen. Turning it back on repaints the current screen,
+  including the most recent photo and both battery badges.
+- The **power button** is untouched; it still powers the Stick off and on as
+  the hardware defines.
+
+The toggle lives in `DisplayPower` (`include/display_power.h`), an
+Arduino-free module covered by the native tests, with the same 30 ms debounce
+as the shutter path.
+
 ## Battery indicator
 
 The bottom-right corner of every screen shows the Stick's own battery as a
@@ -117,6 +136,7 @@ prefixed with the uptime in milliseconds. A healthy capture looks like this:
 [33972] state DOWNLOADING -> PHOTO
 [33973] [display] render PHOTO (pi ready=1, stored photo=18342 bytes)
 [33990] [display] drawPhoto: M5GFX drawJpg 18342 bytes at 0,0 240x135 on 240x135 screen -> ok
+[41022] ui: display off (BtnB)
 ```
 
 Where the sequence stops tells you which side to look at:
@@ -130,7 +150,9 @@ Where the sequence stops tells you which side to look at:
 - `drawJpg ... -> FAILED`: JPEGDEC accepted the file but M5GFX's decoder did not
   draw it. The stored photo is kept; the screen shows black behind the overlay.
 - `render PHOTO` followed by `drawPhoto ... -> ok` with nothing visible: check
-  the panel itself (brightness, rotation), not the network path.
+  the panel itself (brightness, rotation), not the network path - and check for
+  an earlier `ui: display off (BtnB)` line, which means the screen was
+  deliberately turned off with the side button.
 
 Status and poll results are logged only when they change, so an idle Stick is
 quiet apart from Wi-Fi events.

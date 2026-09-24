@@ -9,6 +9,7 @@
 #include "battery_status.h"
 #include "capture_client.h"
 #include "display.h"
+#include "display_power.h"
 #include "status_fields.h"
 
 // Task 4 injects these build flags or a generated local configuration file.
@@ -29,6 +30,7 @@
 namespace {
 CaptureClient capture;
 StickDisplay display;
+DisplayPower display_power;
 BatteryMonitor battery;
 BatteryMonitor pi_battery;   // fed from /v1/status, not from the Stick's PM1
 SemaphoreHandle_t capture_mutex = nullptr;
@@ -360,6 +362,14 @@ void loop() {
   CaptureClient::makeUuid(words, id);
   capture.onButtonSample(M5.BtnA.isPressed(), millis(), id);
   if (capture.consumeShutterSound()) playShutter();
+  // The side button only turns the panel off and on. The shutter, its tone,
+  // and the network task are untouched, and a new photo deliberately does not
+  // wake the screen: saving the backlight is the point of turning it off.
+  display_power.onButtonSample(M5.BtnB.isPressed(), millis());
+  if (display_power.consumeChanged()) {
+    display.setPower(display_power.on());
+    STICK_LOG("ui: display %s (BtnB)", display_power.on() ? "on" : "off");
+  }
   if (xSemaphoreTake(jpeg_mutex, 0) == pdTRUE) {
     if (jpeg_ready) {
       jpeg_ready = false;
