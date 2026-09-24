@@ -1357,3 +1357,43 @@ def test_fake_display_writes_a_png_and_exits_on_stop(tmp_path, monkeypatch):
     out = tmp_path / "shots"
     assert app.main(["--fake", "--display", "fake", "--no-preview", "--out", str(out)]) == 0
     assert (out / "viewfinder-last.png").exists()
+
+
+def test_remote_listener_and_display_share_one_controller(camera_cli, monkeypatch, tmp_path):
+    """The shipped service runs --remote-listen with --display: the viewfinder must
+    take over the foreground (not the sleep loop) and the Stick must submit jobs
+    through the very controller the panel is watching."""
+    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
+    seen = {"viewfinder_calls": 0}
+
+    class ServerDouble:
+        def __init__(self, controller, token, listen, power=None):
+            seen["server_controller"] = controller
+
+        def start(self):
+            return None
+
+        def close(self):
+            return None
+
+    def viewfinder_double(camera, controller, display_pair, power, args):
+        seen["viewfinder_calls"] += 1
+        seen["viewfinder_controller"] = controller
+        return 0
+
+    def no_sleep(_seconds):
+        raise KeyboardInterrupt  # the sleep loop must never be reached
+
+    monkeypatch.setattr(camera_cli, "RemoteCaptureServer", ServerDouble)
+    monkeypatch.setattr(camera_cli, "_run_viewfinder", viewfinder_double)
+    monkeypatch.setattr(
+        camera_cli, "time",
+        SimpleNamespace(sleep=no_sleep, perf_counter=time.perf_counter),
+    )
+
+    assert camera_cli.main([
+        "--fake", "--display", "fake", "--no-preview",
+        "--remote-listen", "127.0.0.1:8765", "--out", str(tmp_path / "shots"),
+    ]) == 0
+    assert seen["viewfinder_calls"] == 1
+    assert seen["viewfinder_controller"] is seen["server_controller"]
