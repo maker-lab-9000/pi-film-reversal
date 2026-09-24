@@ -111,7 +111,8 @@ power: PowerStatus | None) -> MeterReading`:
 | `deviation_ev` | preview frame | `log2(mean_linear_luma / 0.18)`, luma BT.709 on sRGB-linearised pixels of the frame downsampled 4×; clamped to ±3 |
 | `clip_pct` | preview frame | % of pixels with any channel ≥ 254 |
 | `battery` | `power.percent`, `power.external_power` | `None` when no UPS |
-| `focus` | preview frame, optional | `0..1` bar level from `focus_score` against `FocusTracker`'s decaying peak; `None` when not computed *(Review amendment: focus bar, 2026-09-24)* |
+| `focus` | preview frame, optional | `0..1` absolute sharpness from `focus_score`; `None` when not computed *(Review amendment: focus bar, 2026-09-24; hardware amendment below)* |
+| `focus_peak` | `FocusTracker`, optional | `0..1` best recent `focus`, decaying; where the amber tick sits *(Hardware amendment: focus bar, 2026-09-24)* |
 
 Missing metadata keys give `None` fields, rendered as `"—"`; the function never raises on
 an incomplete dict. Tested with synthetic frames (uniform grey 18 % → deviation 0 ± 0.05;
@@ -132,6 +133,23 @@ own contrast, and a peak that never faded would leave every later subject readin
 `compute_reading` takes `focus` as a keyword-only argument defaulting to `None`, so every
 existing caller is unchanged.
 
+*(Hardware amendment: focus bar, 2026-09-24.)* On the IMX477 the design above failed: a lens
+left far out of focus read a full bar. With no sharp frame since start-up the blurred frame
+*was* the peak, so `score / peak` was 1; a still, soft scene always converged there. The
+self-relative bar is replaced by an absolute one. `focus_score` now returns `0..1`, the
+Crete-Roffet no-reference blur ratio: smooth the centre's luma with a 5-tap binomial, re-blur it
+with a 9-tap box per axis, and take the neighbour-step contrast the re-blur removes as a share
+of the contrast there, over edge pixels only, divided by `FOCUS_FULL_SCALE` (0.55) and clamped.
+The ratio cancels scene contrast. Noise is handled with Immerkaer's noise estimate twice:
+edge pixels are those whose *re-blurred* step exceeds `FOCUS_NOISE_GATE` (4) times noise's
+re-blurred step (gating on the raw step favoured the sharpest pixels and read blurred
+low-contrast frames as sharp), and noise's own expected contribution (`_NOISE_LOST_STEP`) is
+subtracted per edge pixel. On 12 MP IMX708 captures reduced to 640x480 it reads ~0.8-1.0
+sharp, ~0.2 at Gaussian sigma 4 and ~0.05 at sigma 8, falling steadily at every tested
+contrast and noise level; about 4 ms per frame on the development Mac.
+`FocusTracker(decay_per_second=0.8)` now only places the tick: `update(level, now)` returns the
+decayed peak, never below the current level.
+
 ### 3.4 `pifilm/display/ui.py` — rendering and hit-testing (pure)
 
 - Layout constants for 320×240: image area full screen; meter bar `y ∈ [204, 240)` filled
@@ -150,7 +168,7 @@ existing caller is unchanged.
   in the system says "working" the same way.)*
 - `render_review(graded_rgb, caption: str) -> PIL.Image`: letterboxed result with a one-line
   caption (`"1/250  ISO 100  +0.3"`), "tap to continue" hint.
-- *(Review amendment: focus bar, 2026-09-24.)* When `reading.focus is not None`, `render_live` also draws the focus gauge: a vertical bar at the left edge (`FOCUS_BAR_X0..X1` = 6..14, `FOCUS_BAR_Y0..Y1` = 40..190) over a translucent black backing 4 px wider, white 1 px outline, filled from the bottom in green (0, 220, 90) to `focus` of the inner height, with a 2 px amber tick across the top of the inner area marking the peak and an `F` label in the 11 px font beneath it. The left edge is free (the shutter button owns the right) and the bar stops at `BAR_TOP - 14`, so neither it nor its baseline-anchored label reaches the EV minus button's hit region; `hit()` is unchanged, and a tap on the bar is still `Action.NONE`.
+- *(Review amendment: focus bar, 2026-09-24.)* When `reading.focus is not None`, `render_live` also draws the focus gauge: a vertical bar at the left edge (`FOCUS_BAR_X0..X1` = 6..14, `FOCUS_BAR_Y0..Y1` = 40..190) over a translucent black backing 4 px wider, white 1 px outline, filled from the bottom in green (0, 220, 90) to `focus` of the inner height, with a 2 px amber tick at `focus_peak`'s height (none while it is zero or `None`; originally pinned at the top, see the hardware amendment) and an `F` label in the 11 px font beneath it. The left edge is free (the shutter button owns the right) and the bar stops at `BAR_TOP - 14`, so neither it nor its baseline-anchored label reaches the EV minus button's hit region; `hit()` is unchanged, and a tap on the bar is still `Action.NONE`.
 - `render_message(title, detail) -> PIL.Image`: for errors and start-up.
 - `hit(x, y) -> Action`: `Action.SHUTTER`, `EV_MINUS`, `EV_PLUS`, or `NONE`; in review mode any
   tap is `DISMISS` (handled in the loop, not here). Hit regions are exactly the drawn regions
@@ -173,8 +191,8 @@ States and transitions:
 
 - *(Review amendment: focus bar, 2026-09-24.)* The loop owns one `FocusTracker`. In the
   `LIVE` draw path it computes `focus_score(frame.rgb)`, feeds it to the tracker with
-  `self._clock.monotonic()` and passes the resulting level to `compute_reading` as
-  `focus=`. Nothing is reset on a state change: the peak fades on wall time alone, so a
+  `self._clock.monotonic()` and passes the score and the tracker's peak to `compute_reading` as
+  `focus=`/`focus_peak=`. Nothing is reset on a state change: the peak fades on wall time alone, so a
   review screen or a spell of colour bars leaves the mark where a few seconds of decay
   put it, not where the code did.
 - Pacing: `clock.sleep(max(0, frame_period − elapsed))`; `frame_period` 0.1 s (10 fps
@@ -298,8 +316,8 @@ Stick shot reaches the LCD without the controller knowing about displays.
 8. IMX477 DNG opens per the existing DNG acceptance test.
 9. *(Review amendment: focus bar, 2026-09-24.)* Focus bar: with the IMX477, turn the
    focus ring slowly through best focus on a textured central subject. The bar rises to
-   the amber tick at the peak and falls away on both sides of it, and settles back to
-   full within a few seconds of stopping.
+   the amber tick at the peak and falls away on both sides of it. From far out of focus it
+   starts near zero (hardware amendment).
 
 ## 5. Testing summary
 

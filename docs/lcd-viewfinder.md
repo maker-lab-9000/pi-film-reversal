@@ -143,7 +143,7 @@ restart.
 | Live image | Full-screen letterboxed, ungraded ISP preview | — |
 | Meter bar (bottom strip, translucent black) | Shutter, ISO, EV compensation, lux, clip % | — |
 | Needle | Deviation from mid-grey in stops, −3 to +3, amber marker | — |
-| Focus bar (vertical gauge, left edge, labelled `F`) | Sharpness of the central quarter of the frame, as a fraction of the recently seen best; amber tick at the top is the remembered peak | — |
+| Focus bar (vertical gauge, left edge, labelled `F`) | Absolute sharpness of the central quarter of the frame, 0 (far out of focus, or nothing to focus on) to full; amber tick marks the best level of the last few seconds | — |
 | Shutter button (circle, right edge) | White ring, filled centre | Submits a capture through the shared controller; the processing screen holds until it finishes |
 | EV `−` / EV `+` buttons (bar's left/right ends) | `-` / `+` labels | Adjusts exposure compensation by 1/3 stop, clamped to ±2; resets to `0` every time `pifilm-capture` restarts |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show. The camera is not read during it | — |
@@ -172,21 +172,25 @@ anyway (it runs one job at a time). Wait for the colour bars to clear.
 
 The IMX477 has no autofocus, so the lens ring is the only focus control and the
 **focus bar** down the left edge is how the screen says which way to turn it.
-It measures contrast (Laplacian variance) over the central quarter of the frame
-— the middle half of the width and of the height — and shows it as a fraction
-of the sharpest thing seen in the last few seconds.
+It measures how much fine edge contrast there is over the central quarter of
+the frame (the middle half of the width and of the height), as a share of all
+the edge contrast there. Because it is a ratio, the scene's own brightness and
+contrast cancel out: a blurred frame reads low on its own, and a dim, flat
+subject in focus reads about as high as a bright one.
 
-- **Turn the ring until the green reaches the amber tick at the top.** The tick
-  is the best focus the bar remembers.
-- **Racking past best focus drops the bar**, immediately and on both sides of
-  it, which is what makes the peak findable: go past, come back.
-- **The mark decays** — the remembered peak halves every second — so pointing
-  the camera at a new subject lets the bar reach the top again within a few
-  seconds rather than leaving it pinned to an old, higher-contrast scene.
-- **It is a contrast measure, so it needs texture in the middle of the frame.**
-  A blank wall, clear sky or an evenly lit sheet of paper gives it nothing to
-  work with and the bar sits at zero however well focused the lens is. Aim the
-  centre at an edge, print or fabric.
+- **A full bar means sharp; a short bar means soft**, with no need to have seen
+  a sharp frame first. Far out of focus reads close to zero.
+- **The amber tick is the best level of the last few seconds.** Rack through
+  focus, then turn back until the green reaches the tick again.
+- **The tick fades** (it halves in about three seconds), so it lets go of an
+  old subject once the camera points elsewhere.
+- **At high ISO in a dim room the bar tops out lower**, typically two-thirds to
+  three-quarters at best focus: the noise allowance takes some of the reading.
+  The peak is still the peak, so focus to the tick.
+- **It needs edges in the middle of the frame.** A blank wall, clear sky or an
+  evenly lit sheet of paper gives it nothing to measure and the bar sits at
+  zero however well focused the lens is. Aim the centre at an edge, print or
+  fabric.
 
 ## 7. Hardware acceptance checklist
 
@@ -223,9 +227,10 @@ per spec §4:
    the process runs on happily, drawing into the void.
 8. IMX477 DNG opens per the existing [DNG acceptance test](picamera2-bringup.md#dng-acceptance-test).
 9. Focus bar: with the IMX477, turn the focus ring slowly through best focus on a
-   textured subject in the middle of the frame. The bar must rise to the amber tick
-   at the peak and fall away on **both** sides of it, and settle back to full within
-   a few seconds of stopping.
+   textured subject in the middle of the frame. From a lens left far out of focus
+   the bar must start near zero (the first version read full here). At best focus
+   it should be well above half; it must fall away on **both** sides of the peak,
+   with the amber tick left at the best level.
 
 ## 8. Troubleshooting
 

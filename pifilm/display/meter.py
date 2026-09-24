@@ -6,14 +6,14 @@ The needle (``deviation_ev``) is the scene's mean linear luminance against an
 swings when AE has run out of range or EV compensation is dialled in, which is
 exactly what a camera's meter shows in auto mode.
 
-``focus``/``FocusTracker`` serve the other manual control: the IMX477 has no
-autofocus, so the ring is turned by hand and the screen has to say which way is
-better. ``focus_score`` is a plain Laplacian-variance sharpness measure and its
-absolute value means nothing — it moves with the scene's own contrast — so the
-bar shows the score against a *decaying* peak instead. Racking past best focus
-drops the bar immediately; the peak fades over a few seconds so that pointing
-the camera at a new subject does not leave the mark stuck at an old scene's
-contrast forever.
+``focus_score``/``FocusTracker`` serve the other manual control: the IMX477 has
+no autofocus, so the ring is turned by hand and the screen has to say which way
+is better. The score must be *absolute* - a blurred frame reads low on its own.
+The first version showed a Laplacian variance against its own decaying peak, and
+on the device a lens left out of focus read full: with no sharp frame since
+switching on, the blurred frame *was* the peak. So the score is a blur ratio that
+the scene's contrast cancels out of, gated against sensor noise, and the tracker
+only places the "best seen" mark.
 """
 
 from __future__ import annotations
@@ -33,8 +33,22 @@ CLIP_LEVEL = 254
 # its area): the subject is what the user points the middle of the finder at, and
 # a sharp background at the edges must not hold the bar up while the subject is soft.
 FOCUS_REGION = 0.5
-FOCUS_DECAY_PER_SECOND = 0.5
-FOCUS_FLOOR = 1e-6
+# Only edges whose re-blurred step is this many times the step noise alone makes
+# there are scored: at 1/15 s and ISO 1580 the preview carries pixel noise that a
+# sharpness measure would otherwise read as detail.
+FOCUS_NOISE_GATE = 4.0
+# Neighbour-step standard deviation of unit white noise after the binomial smoothing
+# and the 9-tap re-blur in ``focus_score`` (measured): the noise estimate in step units.
+_REBLURRED_NOISE_STEP = 0.043
+# Step that the re-blur removes at an edge pixel from unit noise alone (measured on
+# a noisy ramp): subtracted per scored pixel so noise does not read as sharpness.
+_NOISE_LOST_STEP = 0.07
+# The raw blur ratio a sharply focused preview reaches (0.55-0.65 on real 12 MP
+# captures reduced to preview size, before noise), mapped to a full bar.
+FOCUS_FULL_SCALE = 0.55
+# The "best seen" mark halves in about three seconds: long enough to rack past
+# best focus and come back to it, short enough to let go of an old subject.
+FOCUS_DECAY_PER_SECOND = 0.8
 
 
 @dataclass(frozen=True)
@@ -48,6 +62,7 @@ class MeterReading:
     battery_percent: int | None
     external_power: bool | None
     focus: float | None = None
+    focus_peak: float | None = None
 
 
 def format_shutter(exposure_us: float) -> str:
@@ -72,18 +87,56 @@ def _number(metadata: dict, key: str) -> float | None:
     return float(value)
 
 
+def _smooth(x: np.ndarray, axis: int, taps: np.ndarray) -> np.ndarray:
+    """Convolve along one axis with edge padding, by summing shifted slices."""
+    pad = len(taps) // 2
+    widths = [(0, 0)] * x.ndim
+    widths[axis] = (pad, pad)
+    padded = np.pad(x, widths, mode="edge")
+    n = x.shape[axis]
+    out = np.zeros_like(x)
+    for i, tap in enumerate(taps):
+        window = [slice(None)] * x.ndim
+        window[axis] = slice(i, i + n)
+        out += tap * padded[tuple(window)]
+    return out
+
+
+_BINOMIAL = np.array([1, 4, 6, 4, 1], dtype=np.float32) / 16   # a Gaussian, sigma ~1
+_REBLUR = np.full(9, 1 / 9, dtype=np.float32)
+
+
+def _noise_sigma(luma: np.ndarray) -> float:
+    """Immerkaer's fast estimate: the [1,-2,1] x [1,-2,1] mask cancels smooth
+    image structure and leaves mostly noise."""
+    d2 = luma[:-2] - 2 * luma[1:-1] + luma[2:]
+    r = d2[:, :-2] - 2 * d2[:, 1:-1] + d2[:, 2:]
+    return float(np.sqrt(np.pi / 2) * np.mean(np.abs(r)) / 6)
+
+
 def focus_score(preview_rgb: np.ndarray) -> float:
-    """Laplacian variance over the frame's central region: higher is sharper.
+    """Sharpness of the frame's central region, 0.0 (no usable detail) to 1.0.
 
-    Deliberately plain arithmetic on the gamma-encoded bytes rather than
-    linearised light: this is a contrast measure, not a photometric one, and
-    sRGB encoding is what makes mid-tone detail visible to it. A 4-neighbour
-    Laplacian by array slicing keeps ``pifilm/display/`` free of OpenCV (see the
-    module note in ``viewfinder.py``) and costs well under a millisecond on a
-    640x480 preview, which has to fit inside a 100 ms frame period.
+    Crete-Roffet's no-reference blur measure: blur the image again and see how
+    much of its neighbour-to-neighbour contrast that removes. A sharp image
+    loses a lot of it; an already blurred one barely changes. Being a ratio of
+    two contrasts, the scene's own contrast cancels out, so a dim, flat subject
+    in focus reads as high as a bright one - which a Laplacian variance does not.
 
-    A frame with no detail in the centre scores 0.0, which the tracker reads as
-    "nothing to say" rather than "out of focus".
+    Noise would look like the finest detail of all, so the image is lightly
+    smoothed first, and only edges count: pixels whose *re-blurred* step stands
+    well clear of what noise alone would make there (``FOCUS_NOISE_GATE``). The
+    re-blurred step is nearly noise-free and barely changes with focus, so
+    choosing edges by it does not favour the sharp pixels - gating on the raw
+    step does, and made a blurred low-contrast frame read sharp. What noise
+    itself adds to the lost contrast at those pixels is known from the noise
+    estimate and subtracted (``_NOISE_LOST_STEP``). A frame with no
+    edges above the gate (a blank wall, or pure noise) scores 0.0: nothing to
+    focus on is not the same as sharp.
+
+    Plain gamma-encoded bytes, not linear light: this is a contrast measure and
+    sRGB encoding is what makes mid-tone detail visible to it. Array slicing only,
+    to keep ``pifilm/display/`` free of OpenCV (see ``viewfinder.py``).
     """
     h, w = preview_rgb.shape[:2]
     dh, dw = int(h * FOCUS_REGION / 2), int(w * FOCUS_REGION / 2)
@@ -95,30 +148,32 @@ def focus_score(preview_rgb: np.ndarray) -> float:
         + 0.587 * centre[..., 1].astype(np.float32)
         + 0.114 * centre[..., 2].astype(np.float32)
     )
-    lap = (
-        4.0 * luma[1:-1, 1:-1]
-        - luma[:-2, 1:-1] - luma[2:, 1:-1] - luma[1:-1, :-2] - luma[1:-1, 2:]
-    )
-    return float(np.var(lap))
+    noise = _noise_sigma(luma)
+    gate = FOCUS_NOISE_GATE * _REBLURRED_NOISE_STEP * noise
+    luma = _smooth(_smooth(luma, 0, _BINOMIAL), 1, _BINOMIAL)
+    lost = kept = 0.0
+    for axis in (0, 1):
+        step = np.abs(np.diff(luma, axis=axis))
+        reblurred = np.abs(np.diff(_smooth(luma, axis, _REBLUR), axis=axis))
+        edges = reblurred > max(gate, 1e-3)
+        kept += float(step[edges].sum())
+        lost += float(np.maximum(0.0, step - reblurred)[edges].sum())
+        lost -= _NOISE_LOST_STEP * noise * int(edges.sum())
+    if kept <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, lost / kept / FOCUS_FULL_SCALE))
 
 
 class FocusTracker:
-    """Turns raw sharpness scores into a 0..1 bar level against a decaying peak.
+    """The "best seen" mark on the focus bar: the highest recent score, decaying.
 
-    The peak is what the bar's mark sits at, and it must fade: without decay the
-    first sharp frame of a high-contrast scene would pin the mark so high that
-    every later subject reads as out of focus. With ``decay_per_second`` 0.5 the
-    remembered peak halves each second, so a few seconds after pointing
-    elsewhere the bar can reach the top again.
+    The bar itself is the absolute score; this only says where the best focus
+    was, so the user can rack past it and come back. It must fade, or pointing
+    the camera at a new, less detailed subject would leave the mark out of reach.
     """
 
-    def __init__(
-        self,
-        decay_per_second: float = FOCUS_DECAY_PER_SECOND,
-        floor: float = FOCUS_FLOOR,
-    ) -> None:
+    def __init__(self, decay_per_second: float = FOCUS_DECAY_PER_SECOND) -> None:
         self._decay = decay_per_second
-        self._floor = floor
         self._peak = 0.0
         self._last: float | None = None
 
@@ -126,21 +181,19 @@ class FocusTracker:
     def peak(self) -> float:
         return self._peak
 
-    def update(self, score: float, now: float) -> float:
-        score = max(0.0, float(score))
+    def update(self, level: float, now: float) -> float:
+        """Take this frame's score; return the mark's level."""
+        level = max(0.0, min(1.0, float(level)))
         if self._last is not None:
-            dt = max(0.0, now - self._last)
-            self._peak *= self._decay ** dt
+            self._peak *= self._decay ** max(0.0, now - self._last)
         self._last = now
-        self._peak = max(self._peak, score)
-        if self._peak <= self._floor:
-            return 0.0
-        return max(0.0, min(1.0, score / self._peak))
+        self._peak = max(self._peak, level)
+        return self._peak
 
 
 def compute_reading(
     metadata: dict | None, preview_rgb: np.ndarray, ev_comp: float, power: Any,
-    *, focus: float | None = None,
+    *, focus: float | None = None, focus_peak: float | None = None,
 ) -> MeterReading:
     meta = metadata or {}
     exposure = _number(meta, "ExposureTime")
@@ -161,5 +214,6 @@ def compute_reading(
     battery = int(power.percent) if power is not None else None
     external = bool(power.external_power) if power is not None else None
     return MeterReading(
-        shutter, iso, float(ev_comp), lux, deviation, clip_pct, battery, external, focus,
+        shutter, iso, float(ev_comp), lux, deviation, clip_pct, battery, external,
+        focus, focus_peak,
     )

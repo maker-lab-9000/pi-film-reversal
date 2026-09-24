@@ -111,7 +111,7 @@ def render_live(frame_rgb: np.ndarray, reading: MeterReading) -> Image.Image:
     draw.polygon([(nx, NEEDLE_Y - 8), (nx - 5, NEEDLE_Y - 15), (nx + 5, NEEDLE_Y - 15)],
                  fill=AMBER + (255,))
     if reading.focus is not None:
-        _draw_focus_bar(draw, reading.focus, small)
+        _draw_focus_bar(draw, reading.focus, reading.focus_peak, small)
     # shutter button
     cx, cy = SHUTTER_CENTRE
     draw.ellipse(
@@ -130,13 +130,15 @@ def render_live(frame_rgb: np.ndarray, reading: MeterReading) -> Image.Image:
     return Image.alpha_composite(base, overlay).convert("RGB")
 
 
-def _draw_focus_bar(draw: ImageDraw.ImageDraw, focus: float, font: Any) -> None:
-    """The manual-focus gauge: fill height is sharpness against the decaying peak.
+def _draw_focus_bar(
+    draw: ImageDraw.ImageDraw, focus: float, peak: float | None, font: Any,
+) -> None:
+    """The manual-focus gauge: fill height is the centre's absolute sharpness.
 
     The IMX477 has no autofocus, so this is the only feedback the user gets while
     turning the ring. It grows as the image sharpens and drops the moment focus
-    is racked past, and the amber tick at the top is the peak the tracker
-    remembers — turn the ring until the green reaches it.
+    is racked past, and the amber tick sits at the best level of the last few
+    seconds — rack through focus, then turn back until the green reaches it.
 
     Drawn on the left because the right edge is the shutter button, over its own
     translucent backing so it stays readable against a bright scene, and ending
@@ -151,15 +153,20 @@ def _draw_focus_bar(draw: ImageDraw.ImageDraw, focus: float, font: Any) -> None:
     draw.rectangle((FOCUS_BAR_X0, FOCUS_BAR_Y0, FOCUS_BAR_X1, FOCUS_BAR_Y1),
                    outline=(255, 255, 255, 255), width=1)
     inner_top, inner_bottom = FOCUS_BAR_Y0 + 1, FOCUS_BAR_Y1 - 1
-    filled = int(round(focus * (inner_bottom - inner_top + 1)))
+    span = inner_bottom - inner_top + 1
+    filled = int(round(focus * span))
     if filled > 0:
         draw.rectangle(
             (FOCUS_BAR_X0 + 1, inner_bottom - filled + 1, FOCUS_BAR_X1 - 1, inner_bottom),
             fill=FOCUS_GREEN + (255,),
         )
-    # The peak mark, drawn last so a full bar does not hide it.
-    draw.rectangle((FOCUS_BAR_X0 + 1, inner_top, FOCUS_BAR_X1 - 1, inner_top + 1),
-                   fill=AMBER + (255,))
+    # The peak mark, drawn last so the green does not hide it; two pixels tall,
+    # its top edge at the peak's fill height.
+    if peak is not None and peak > 0.0:
+        peak = max(0.0, min(1.0, float(peak)))
+        mark_top = min(inner_bottom - 1, inner_bottom - int(round(peak * span)) + 1)
+        draw.rectangle((FOCUS_BAR_X0 + 1, mark_top, FOCUS_BAR_X1 - 1, mark_top + 1),
+                       fill=AMBER + (255,))
     # Baseline-anchored: the glyph grows upwards from FOCUS_LABEL_Y, so it cannot
     # reach the EV minus button's hit region below it.
     draw.text(((FOCUS_BAR_X0 + FOCUS_BAR_X1) // 2, FOCUS_LABEL_Y), "F",

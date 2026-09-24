@@ -71,9 +71,9 @@ class ViewfinderLoop:
         self._frames = 0
         self._rate_since = clock.monotonic()
         self._processing_shown = False
-        # The focus gauge's memory. It is never reset on a state change: the peak
-        # fades on wall time alone, so a review or a spell of colour bars leaves the
-        # mark where a few seconds of decay put it rather than where the code did.
+        # The focus gauge's "best seen" mark. It is never reset on a state change:
+        # the peak fades on wall time alone, so a review or a spell of colour bars
+        # leaves the mark where a few seconds of decay put it.
         self._focus = FocusTracker()
 
     # -- plumbing -------------------------------------------------------------
@@ -206,12 +206,12 @@ class ViewfinderLoop:
             self._restart_rate_window()
             return
         power = self._power() if self._power is not None else None
-        # Manual focus aid: the score is meaningless on its own (it scales with the
-        # scene's contrast), so the tracker turns it into a level against a decaying
-        # peak. Costs well under a millisecond of the 100 ms frame period.
-        level = self._focus.update(focus_score(frame.rgb), self._clock.monotonic())
+        # Manual focus aid: the bar is the absolute sharpness of the frame's centre,
+        # the tracker only remembers the best of the last few seconds for the mark.
+        level = focus_score(frame.rgb)
+        peak = self._focus.update(level, self._clock.monotonic())
         reading = compute_reading(
-            frame.metadata, frame.rgb, self.ev_comp, power, focus=level,
+            frame.metadata, frame.rgb, self.ev_comp, power, focus=level, focus_peak=peak,
         )
         self._show(render_live(frame.rgb, reading))
         self._frames += 1
