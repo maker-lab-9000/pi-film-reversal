@@ -10,6 +10,10 @@ Display and touch objects are duck-typed (``show``/``close``, ``read``/``close``
 and the clock is injectable, so the loop is tested without hardware. The loop
 never closes the camera: the caller stops it through the stop event and only
 then closes the controller, which owns the camera's lifetime.
+
+``CameraError`` is imported from ``pifilm.capture.errors`` rather than
+``pifilm.capture.camera`` on purpose: that module runs ``require_cv2()`` at
+import time, and nothing under ``pifilm/display/`` may need OpenCV.
 """
 
 from __future__ import annotations
@@ -22,11 +26,11 @@ from typing import Any
 
 from PIL import Image
 
-from ..capture.camera import CameraError
+from ..capture.errors import CameraError
 from ..imageio import load_rgb
 from . import DisplayError
 from .cst3530 import Tap, TapDetector
-from .meter import compute_reading, format_ev, format_shutter
+from .meter import compute_reading, format_ev
 from .ui import Action, hit, render_live, render_message, render_review
 
 EV_STEP = 1.0 / 3.0
@@ -59,7 +63,16 @@ class ViewfinderLoop:
     # -- plumbing -------------------------------------------------------------
 
     def _poll_tap(self) -> Tap | None:
-        points = self._touch.read()
+        try:
+            points = self._touch.read()
+        except DisplayError as exc:
+            # The panel shares I2C1 with the X728 gauge and RTC, so a single NAK
+            # is a glitch, not a dead panel: report no finger and carry on. It
+            # does not count toward the display breaker, which is about the
+            # screen the user is looking at, and feeding the detector an empty
+            # list also stops a half-seen press from wedging it down forever.
+            self._log(f"touch: {exc}")
+            points = []
         if self._touch_debug and points:
             self._log(f"touch: {[(p.x, p.y) for p in points]}")
         return self._taps.feed(points, self._clock.monotonic())
@@ -85,17 +98,28 @@ class ViewfinderLoop:
         self.ev_comp = value
 
     def _review_image(self, job: Any) -> Image.Image:
+        """Render the review screen for a finished job, whatever state it is in.
+
+        The caption goes through ``compute_reading`` rather than formatting the
+        metadata here, so a zero or non-numeric ``ExposureTime`` is handled by
+        the meter's guards and the review agrees with the live readout instead
+        of doing its own arithmetic. Everything is caught: this runs on the loop
+        thread, and after Task 9 that is the process's main thread, so an
+        unreadable file or a malformed record must cost one screen, not the
+        Stick server.
+        """
         if job.state != "complete" or job.result is None:
             return render_message("Capture failed", job.error_message or job.error_code or "")
-        rgb, _ = load_rgb(job.result.pifilm)
-        meta = job.result.record.get("camera_metadata") or {}
-        parts = []
-        if "ExposureTime" in meta:
-            parts.append(format_shutter(float(meta["ExposureTime"])))
-        if "AnalogueGain" in meta:
-            parts.append(f"ISO {int(round(float(meta['AnalogueGain']) * 100 / 10) * 10)}")
-        parts.append(f"EV {format_ev(self.ev_comp)}")
-        return render_review(rgb, "  ".join(parts))
+        try:
+            rgb, _ = load_rgb(job.result.pifilm)
+            meta = job.result.record.get("camera_metadata") or {}
+            reading = compute_reading(meta, rgb, self.ev_comp, None)
+            iso = f"ISO {reading.iso}" if reading.iso is not None else "ISO -"
+            caption = f"{reading.shutter or '-'}  {iso}  EV {format_ev(self.ev_comp)}"
+            return render_review(rgb, caption)
+        except Exception as exc:
+            self._log(f"review: {exc}")
+            return render_message("Review unavailable", str(exc)[:60])
 
     # -- states -----------------------------------------------------------------
 

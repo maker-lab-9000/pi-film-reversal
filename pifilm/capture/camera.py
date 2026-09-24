@@ -44,16 +44,16 @@ from typing import Protocol
 import numpy as np
 
 from .._cv2 import require_cv2
+from .errors import CameraError
 
 cv2 = require_cv2()
+
+# CameraError is defined in .errors, which needs no OpenCV, and re-exported
+# here so that `from .camera import CameraError` keeps working unchanged.
 
 _SOI = b"\xff\xd8"
 _EOI = b"\xff\xd9"
 _MIN_JPEG_BYTES = 128
-
-
-class CameraError(Exception):
-    """Camera could not be opened or read."""
 
 
 @dataclass
