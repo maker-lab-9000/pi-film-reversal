@@ -5,13 +5,16 @@ from pifilm.display.meter import MeterReading
 from pifilm.display.ui import (
     BAR_TOP,
     DASH,
+    HEIGHT,
     SHUTTER_CENTRE,
     SHUTTER_RADIUS,
+    WIDTH,
     Action,
     hit,
     iso_label,
     render_live,
     render_message,
+    render_processing,
     render_review,
     text_or_dash,
 )
@@ -26,7 +29,7 @@ def _reading(**over):
 
 def test_render_live_is_320x240_rgb_with_a_darker_bar():
     frame = np.full((480, 640, 3), 200, dtype=np.uint8)
-    img = render_live(frame, _reading(), busy=False)
+    img = render_live(frame, _reading())
     assert isinstance(img, Image.Image) and img.size == (320, 240) and img.mode == "RGB"
     above = img.getpixel((160, BAR_TOP - 10))
     inside = img.getpixel((160, BAR_TOP + 4))
@@ -35,22 +38,34 @@ def test_render_live_is_320x240_rgb_with_a_darker_bar():
 
 def test_render_live_letterboxes_a_16_9_frame():
     frame = np.full((360, 640, 3), 200, dtype=np.uint8)
-    img = render_live(frame, _reading(), busy=False)
+    img = render_live(frame, _reading())
     assert img.getpixel((5, 5)) == (0, 0, 0)  # top band
     assert img.getpixel((160, 120)) != (0, 0, 0)
 
 
-def test_busy_marker_is_drawn_only_when_busy():
-    frame = np.full((480, 640, 3), 40, dtype=np.uint8)
-    idle = render_live(frame, _reading(), busy=False).getpixel((10, 10))
-    busy = render_live(frame, _reading(), busy=True).getpixel((10, 10))
-    assert idle != busy and busy[0] > 200
+def test_render_processing_draws_the_same_colour_bars_as_the_opencv_screen():
+    """The LCD shows the Stick's screen while a shot is graded, not the live view.
+
+    ``pifilm.capture.app._capture_loading_screen`` lists the same seven bars in
+    OpenCV's BGR order; the leftmost is grey and the rightmost blue on both.
+    """
+    img = render_processing()
+    assert isinstance(img, Image.Image) and img.size == (WIDTH, HEIGHT) and img.mode == "RGB"
+    assert img.getpixel((WIDTH // 14, 10)) == (191, 191, 191)
+    assert img.getpixel((WIDTH * 13 // 14, 10)) == (0, 0, 191)
+
+
+def test_render_processing_is_black_below_the_bars_and_carries_a_label():
+    img = render_processing()
+    assert img.getpixel((5, HEIGHT - 5)) == (0, 0, 0)
+    bottom = np.array(img)[HEIGHT * 3 // 4:]
+    assert bottom.max() > 200  # the label is drawn in white in the bottom quarter
 
 
 def test_render_live_handles_missing_fields():
     frame = np.full((480, 640, 3), 40, dtype=np.uint8)
     img = render_live(frame, _reading(shutter=None, iso=None, lux=None,
-                                       battery_percent=None, external_power=None), busy=False)
+                                       battery_percent=None, external_power=None))
     assert img.size == (320, 240)
 
 

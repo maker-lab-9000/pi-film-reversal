@@ -23,7 +23,13 @@ SHUTTER_CENTRE = (288, 102)
 SHUTTER_RADIUS = 28
 EV_BUTTON_W = 40
 HIT_MARGIN = 6
-BUSY_CENTRE, BUSY_RADIUS = (10, 10), 5
+# The seven TV colour bars, left to right in RGB. ``pifilm.capture.app``'s
+# ``_capture_loading_screen`` draws the same seven for the OpenCV window, listed
+# there in OpenCV's BGR order: keep the two visually identical.
+PROCESSING_BARS = (
+    (191, 191, 191), (191, 191, 0), (0, 191, 191), (0, 191, 0),
+    (191, 0, 191), (191, 0, 0), (0, 0, 191),
+)
 # One placeholder for every missing readout, on the live bar and the review
 # caption alike: a plain hyphen, because the default font has no en dash glyph
 # and renders one as a tofu box.
@@ -63,7 +69,7 @@ def iso_label(iso: int | None) -> str:
     return f"ISO {iso}" if iso is not None else f"ISO {DASH}"
 
 
-def render_live(frame_rgb: np.ndarray, reading: MeterReading, busy: bool) -> Image.Image:
+def render_live(frame_rgb: np.ndarray, reading: MeterReading) -> Image.Image:
     base = _letterbox(frame_rgb).convert("RGBA")
     overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -103,11 +109,6 @@ def render_live(frame_rgb: np.ndarray, reading: MeterReading, busy: bool) -> Ima
         fill=(255, 255, 255, 60), outline=(255, 255, 255, 255), width=2,
     )
     draw.ellipse((cx - 18, cy - 18, cx + 18, cy + 18), fill=(255, 255, 255, 180))
-    # busy marker
-    if busy:
-        bx, by = BUSY_CENTRE
-        draw.ellipse((bx - BUSY_RADIUS, by - BUSY_RADIUS, bx + BUSY_RADIUS, by + BUSY_RADIUS),
-                     fill=AMBER + (255,))
     # battery badge
     if reading.battery_percent is not None:
         label = f"{'AC ' if reading.external_power else ''}{reading.battery_percent}%"
@@ -117,6 +118,27 @@ def render_live(frame_rgb: np.ndarray, reading: MeterReading, busy: bool) -> Ima
         )
         draw.text((WIDTH - w - 9, 6), label, fill=(255, 255, 255, 255), font=small)
     return Image.alpha_composite(base, overlay).convert("RGB")
+
+
+def render_processing(label: str = "Processing photo...") -> Image.Image:
+    """TV colour bars while a shot is graded: the Stick's screen, on the LCD.
+
+    A grade takes about three seconds on the Pi 4, and during it the camera is
+    the capture worker's, not the viewfinder's. Showing the live view with a
+    small marker read as "nothing happened"; the bars are what the Stick and the
+    Pi's own OpenCV window already show, so every screen says "working" the same
+    way. Bar order and geometry mirror ``pifilm.capture.app``'s
+    ``_capture_loading_screen``; the label is ASCII because the default font has
+    no glyphs beyond it.
+    """
+    img = Image.new("RGB", (WIDTH, HEIGHT), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    for index, colour in enumerate(PROCESSING_BARS):
+        left, right = index * WIDTH // 7, (index + 1) * WIDTH // 7
+        draw.rectangle((left, 0, right - 1, HEIGHT * 3 // 4 - 1), fill=colour)
+    draw.text((WIDTH // 2, HEIGHT * 7 // 8), label,
+              fill=(255, 255, 255), font=_font(14), anchor="mm")
+    return img
 
 
 def _needle_x(deviation: float) -> int:
