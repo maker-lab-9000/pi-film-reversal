@@ -1307,24 +1307,82 @@ def test_v4l2_style_frame_without_metadata_is_unchanged(tmp_path):
     assert "dng" not in result.record
 
 
-def test_display_flag_is_rejected_on_v4l2(camera_cli, capsys):
-    with pytest.raises(SystemExit):
-        camera_cli.main(["--camera", "v4l2", "--display", "waveshare28"])
-    assert "--display" in capsys.readouterr().err
+def test_display_warns_and_continues_on_v4l2(camera_cli, monkeypatch, capsys):
+    """The shipped service unit passes --display; on a V4L2 deployment a
+    parser.error here would exit 2 and systemd would restart it forever."""
+    monkeypatch.setattr(camera_cli, "V4L2Camera", lambda device: _CameraDouble())
+    assert camera_cli.main(["--camera", "v4l2", "--display", "waveshare28", "--no-preview"]) == 0
+    assert (
+        "warning: display unavailable (the V4L2 backend has no preview mode); "
+        "continuing without it"
+    ) in capsys.readouterr().err
+
+
+def test_display_on_v4l2_still_serves_the_stick(camera_cli, monkeypatch):
+    """The service's own argument list: --display plus --remote-listen on a Pi
+    whose camera is USB must keep the remote API, not die."""
+    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
+    seen = {"viewfinder": 0}
+
+    class ServerDouble:
+        def __init__(self, controller, token, listen, power=None):
+            pass
+
+        def start(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(camera_cli, "V4L2Camera", lambda device: _CameraDouble())
+    monkeypatch.setattr(camera_cli, "RemoteCaptureServer", ServerDouble)
+    monkeypatch.setattr(
+        camera_cli, "_run_viewfinder",
+        lambda *a, **k: seen.__setitem__("viewfinder", seen["viewfinder"] + 1),
+    )
+    assert camera_cli.main([
+        "--camera", "v4l2", "--display", "waveshare28", "--no-preview",
+        "--remote-listen", "127.0.0.1:8765",
+    ]) == 0
+    assert seen["viewfinder"] == 0
 
 
 def test_display_requests_preview_mode_from_picamera2(camera_cli, monkeypatch):
+    """The camera must be opened in preview mode only once the panel is open:
+    preview mode is a continuous binned stream plus a mode switch per shot, and
+    paying for it with no display to feed is pure cost."""
     opened = {}
+    pair = (SimpleNamespace(close=lambda: None), SimpleNamespace(close=lambda: None))
 
     def open_picamera(tuning_file, **kwargs):
         opened.update(kwargs)
         return _CameraDouble()
 
     monkeypatch.setattr(camera_cli, "Picamera2Camera", open_picamera, raising=False)
-    monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: None)
+    monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: pair)
+    monkeypatch.setattr(camera_cli, "_run_viewfinder", lambda *a, **k: 0)
     argv = ["--camera", "picamera2", "--display", "waveshare28", "--no-preview"]
     assert camera_cli.main(argv) == 0
-    assert opened["preview"] == (640, 480)
+    assert opened["preview"] is True
+
+
+def test_display_fault_opens_the_camera_without_preview_mode(camera_cli, monkeypatch):
+    from pifilm.display import DisplayError
+
+    opened = {}
+
+    def open_picamera(tuning_file, **kwargs):
+        opened.update(kwargs)
+        return _CameraDouble()
+
+    def failing(args, out):
+        raise DisplayError("no spi")
+
+    monkeypatch.setattr(camera_cli, "Picamera2Camera", open_picamera, raising=False)
+    monkeypatch.setattr(camera_cli, "_open_display", failing)
+    argv = ["--camera", "picamera2", "--display", "waveshare28", "--no-preview"]
+    assert camera_cli.main(argv) == 0
+    assert opened["preview"] is None
 
 
 def test_display_fault_falls_back_to_the_terminal(camera_cli, monkeypatch, capsys):
@@ -1397,3 +1455,62 @@ def test_remote_listener_and_display_share_one_controller(camera_cli, monkeypatc
     ]) == 0
     assert seen["viewfinder_calls"] == 1
     assert seen["viewfinder_controller"] is seen["server_controller"]
+
+
+def test_display_breaker_keeps_the_remote_api_alive(camera_cli, monkeypatch, tmp_path, capsys):
+    """Five consecutive SPI failures must cost the screen, not the Stick: the
+    process used to return 1, systemd restarted it, and the Stick got a few
+    seconds of service per cycle."""
+    from pifilm.display import DisplayError
+
+    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
+    slept = []
+
+    class ServerDouble:
+        def __init__(self, controller, token, listen, power=None):
+            pass
+
+        def start(self):
+            return None
+
+        def close(self):
+            return None
+
+    class DeadDisplay:
+        closed = False
+
+        def show(self, image):
+            raise DisplayError("spi write failed")
+
+        def close(self):
+            self.closed = True
+
+    class Touch:
+        closed = False
+
+        def read(self):
+            return []
+
+        def close(self):
+            self.closed = True
+
+    display, touch = DeadDisplay(), Touch()
+
+    def no_sleep(seconds):
+        slept.append(seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(camera_cli, "RemoteCaptureServer", ServerDouble)
+    monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: (display, touch))
+    monkeypatch.setattr(
+        camera_cli, "time",
+        SimpleNamespace(sleep=no_sleep, perf_counter=time.perf_counter),
+    )
+
+    assert camera_cli.main([
+        "--fake", "--display", "waveshare28", "--no-preview",
+        "--remote-listen", "127.0.0.1:8765", "--out", str(tmp_path / "shots"),
+    ]) == 0
+    assert slept == [1]                     # the remote sleep loop was entered
+    assert display.closed and touch.closed  # and the panel was released first
+    assert "display failed repeatedly" in capsys.readouterr().err

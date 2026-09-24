@@ -92,7 +92,6 @@ cv2 = require_cv2()
 DEFAULT_OUT = Path("~/Pictures/pifilm")
 WINDOW_NAME = "Parr  [SPACE capture | P toggle grade | Q quit]"
 CAPTURE_WINDOW_NAME = "Parr captures  [SPACE capture | Q quit]"
-PREVIEW_SIZE = (640, 480)
 
 
 @dataclass
@@ -507,23 +506,41 @@ def _picamera2_available() -> bool:
     return True
 
 
+def _drop_display_on_v4l2(args: argparse.Namespace) -> None:
+    """Downgrade ``--display`` to a warning when the backend is V4L2.
+
+    The shipped service unit passes ``--display waveshare28``; on a deployment
+    whose camera is USB, refusing the flag would exit 2 and systemd would
+    restart the service forever. The viewfinder genuinely cannot run there (the
+    V4L2 backend has no preview-mode split and the meter needs libcamera
+    metadata), so say so once and serve the Stick.
+    """
+    if args.display == "none":
+        return
+    print(
+        "warning: display unavailable (the V4L2 backend has no preview mode); "
+        "continuing without it",
+        file=sys.stderr,
+    )
+    args.display = "none"
+
+
 def _reject_picamera2_only_flags(
     parser: argparse.ArgumentParser, args: argparse.Namespace, *, reason: str,
-    allow_display: bool = False,
 ) -> None:
     """Refuse Picamera2-only options whenever no real Picamera2 will be opened,
     whether that is V4L2 (however it was chosen) or ``--fake``.
 
     Covers ``--tuning-file``, ``--autofocus``, ``--af-range``, ``--ae-lock``,
-    ``--awb-lock``, ``--colour-gains``, ``--ae-constraint``, ``--ae-metering``,
-    ``--ev`` and ``--display``. ``--device`` (which itself selects V4L2) and
-    ``--no-dng`` (wired independently into ``CaptureSession`` and meaningful on
-    any backend) are deliberately excluded. ``allow_display=True`` is passed
-    from the ``--fake`` branch: the LCD viewfinder runs against ``FakeCamera``
-    so the panel and its touch mapping can be exercised without a sensor.
+    ``--awb-lock``, ``--colour-gains``, ``--ae-constraint``, ``--ae-metering``
+    and ``--ev``. ``--device`` (which itself selects V4L2) and ``--no-dng``
+    (wired independently into ``CaptureSession`` and meaningful on any backend)
+    are deliberately excluded, and so is ``--display``: it is a warning rather
+    than an error (see ``_drop_display_on_v4l2``), and it runs against
+    ``FakeCamera`` under ``--fake`` so the panel and its touch mapping can be
+    exercised without a sensor.
     """
     picamera_only = [
-        ("--display", args.display != "none" and not allow_display),
         ("--tuning-file", args.tuning_file is not None),
         ("--autofocus", args.autofocus is not None),
         ("--af-range", args.af_range is not None),
@@ -561,6 +578,25 @@ def _open_display(args: argparse.Namespace, out_root: Path):
     return display, touch
 
 
+def _close_display(display_pair) -> None:
+    """Release the panel when the process is giving up before the loop starts."""
+    if display_pair is None:
+        return
+    display, touch = display_pair
+    touch.close()
+    display.close()
+
+
+def _serve_until_interrupt() -> int:
+    """Hold the process open for the remote API with no terminal controls."""
+    print("Remote capture API active without terminal controls. Press Ctrl-C to stop.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return 0
+
+
 def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     display, touch = display_pair
     stop = threading.Event()
@@ -571,18 +607,26 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
         touch_debug=args.touch_debug,
     )
     print("LCD viewfinder running. Tap the shutter to capture; Ctrl-C to stop.")
+    failure: DisplayError | None = None
     try:
         loop.run(stop)
     except KeyboardInterrupt:
         pass
     except DisplayError as exc:
-        print(f"error: display failed repeatedly: {exc}", file=sys.stderr)
-        return 1
+        failure = exc
     finally:
         signal.signal(signal.SIGTERM, previous)
         touch.close()
         display.close()
-    return 0
+    if failure is None:
+        return 0
+    print(f"error: display failed repeatedly: {failure}", file=sys.stderr)
+    # A dead screen must cost the screen only. Exiting here would be a restart
+    # loop under systemd, and the Stick would get a few seconds of service per
+    # cycle; without a remote API there is nothing left to serve, so 1 stands.
+    if not args.remote_listen:
+        return 1
+    return _serve_until_interrupt()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -676,6 +720,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.camera == "picamera2" and args.device is not None:
         parser.error("--device cannot be used with --camera picamera2")
     if args.camera == "v4l2":
+        _drop_display_on_v4l2(args)
         _reject_picamera2_only_flags(parser, args, reason="cannot be used with --camera v4l2")
 
     autofocus = args.autofocus or "continuous"
@@ -697,11 +742,19 @@ def main(argv: list[str] | None = None) -> int:
     except ArtifactsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # Before the camera: preview mode is a continuous binned stream plus a mode
+    # switch per shot, so it is only worth paying for once there is a panel to
+    # feed. Opening it after would leave a failed display with the camera stuck
+    # in preview mode for the whole session.
+    display_pair = None
+    if args.display != "none":
+        try:
+            display_pair = _open_display(args, args.out)
+        except DisplayError as exc:
+            print(f"warning: display unavailable ({exc}); continuing without it", file=sys.stderr)
     try:
         if args.fake:
-            _reject_picamera2_only_flags(
-                parser, args, reason="cannot be used with --fake", allow_display=True
-            )
+            _reject_picamera2_only_flags(parser, args, reason="cannot be used with --fake")
             camera: Camera = FakeCamera()
         else:
             backend = args.camera
@@ -721,15 +774,17 @@ def main(argv: list[str] | None = None) -> int:
                     ae_constraint=args.ae_constraint or "normal",
                     ae_metering=args.ae_metering or "centre",
                     ev=args.ev if args.ev is not None else 0.0,
-                    preview=PREVIEW_SIZE if args.display != "none" else None,
+                    preview=True if display_pair is not None else None,
                 )
             else:
+                _drop_display_on_v4l2(args)
                 _reject_picamera2_only_flags(
                     parser, args, reason="cannot be used with the selected V4L2 backend"
                 )
                 camera = V4L2Camera(args.device)
     except CameraError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        _close_display(display_pair)
         return 2
 
     session = CaptureSession(
@@ -741,12 +796,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     controller: CaptureController | None = None
     remote: RemoteCaptureServer | None = None
-    display_pair = None
-    if args.display != "none":
-        try:
-            display_pair = _open_display(args, args.out)
-        except DisplayError as exc:
-            print(f"warning: display unavailable ({exc}); continuing without it", file=sys.stderr)
     if display_pair is not None:
         controller = CaptureController(session)
     try:
@@ -788,9 +837,7 @@ def main(argv: list[str] | None = None) -> int:
                     with TerminalKeys() as keys:
                         run_headless_loop(session, keys.read, controller=controller)
                     return 0
-                print("Remote capture API active without terminal controls. Press Ctrl-C to stop.")
-                while True:
-                    time.sleep(1)
+                return _serve_until_interrupt()
             except KeyboardInterrupt:
                 return 0
         if display_pair is not None:
