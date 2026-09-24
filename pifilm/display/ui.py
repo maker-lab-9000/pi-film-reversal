@@ -1,0 +1,150 @@
+"""Pillow rendering for the 320x240 viewfinder and its hit regions. Pure.
+
+Layout: the preview fills the screen letterboxed; a translucent bar along the
+bottom carries the meter; a round shutter button sits at the right edge; EV
+buttons occupy the bar's ends. ``hit`` mirrors the drawn regions plus a 6 px
+margin so the two cannot drift apart: both read the same constants.
+"""
+
+from __future__ import annotations
+
+import math
+from enum import Enum
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+from .meter import MeterReading, format_ev
+
+WIDTH, HEIGHT = 320, 240
+BAR_TOP = 204
+BAR_ALPHA = 153  # 60 %
+SHUTTER_CENTRE = (288, 102)
+SHUTTER_RADIUS = 28
+EV_BUTTON_W = 40
+HIT_MARGIN = 6
+BUSY_CENTRE, BUSY_RADIUS = (10, 10), 5
+AMBER = (255, 176, 0)
+NEEDLE_X0, NEEDLE_X1, NEEDLE_Y = 200, 272, 222
+NEEDLE_RANGE = 3.0
+
+
+class Action(Enum):
+    NONE = "none"
+    SHUTTER = "shutter"
+    EV_MINUS = "ev_minus"
+    EV_PLUS = "ev_plus"
+
+
+def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # Pillow < 10.1 has no bundled scalable default
+        return ImageFont.load_default()
+
+
+def _letterbox(rgb: np.ndarray, size: tuple[int, int] = (WIDTH, HEIGHT)) -> Image.Image:
+    src = Image.fromarray(np.ascontiguousarray(rgb))
+    scale = min(size[0] / src.width, size[1] / src.height)
+    fitted = src.resize((max(1, round(src.width * scale)), max(1, round(src.height * scale))),
+                        Image.BILINEAR)
+    canvas = Image.new("RGB", size, (0, 0, 0))
+    canvas.paste(fitted, ((size[0] - fitted.width) // 2, (size[1] - fitted.height) // 2))
+    return canvas
+
+
+def _text_or_dash(value: str | None) -> str:
+    return value if value else "—"
+
+
+def render_live(frame_rgb: np.ndarray, reading: MeterReading, busy: bool) -> Image.Image:
+    base = _letterbox(frame_rgb).convert("RGBA")
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    draw.rectangle((0, BAR_TOP, WIDTH, HEIGHT), fill=(0, 0, 0, BAR_ALPHA))
+    # EV buttons
+    draw.rectangle((0, BAR_TOP, EV_BUTTON_W, HEIGHT), outline=(255, 255, 255, 200))
+    draw.rectangle((WIDTH - EV_BUTTON_W, BAR_TOP, WIDTH, HEIGHT), outline=(255, 255, 255, 200))
+    big = _font(18)
+    draw.text((EV_BUTTON_W // 2, BAR_TOP + 18), "−",
+              fill=(255, 255, 255, 255), font=big, anchor="mm")
+    draw.text((WIDTH - EV_BUTTON_W // 2, BAR_TOP + 18), "+",
+              fill=(255, 255, 255, 255), font=big, anchor="mm")
+    # readout
+    font = _font(14)
+    small = _font(11)
+    iso = f"ISO {reading.iso}" if reading.iso is not None else "ISO —"
+    line1 = f"{_text_or_dash(reading.shutter)}  {iso}  EV {format_ev(reading.ev_comp)}"
+    lux = f"{reading.lux:.0f} lx" if reading.lux is not None else "— lx"
+    line2 = f"{lux}   clip {reading.clip_pct:.0f}%"
+    draw.text((EV_BUTTON_W + 6, BAR_TOP + 3), line1, fill=(255, 255, 255, 255), font=font)
+    draw.text((EV_BUTTON_W + 6, BAR_TOP + 21), line2, fill=(220, 220, 220, 255), font=small)
+    # needle: scale −3..+3 stops
+    draw.line((NEEDLE_X0, NEEDLE_Y, NEEDLE_X1, NEEDLE_Y), fill=(255, 255, 255, 200), width=1)
+    for k in range(-3, 4):
+        x = _needle_x(float(k))
+        draw.line((x, NEEDLE_Y - (4 if k == 0 else 2), x, NEEDLE_Y + (4 if k == 0 else 2)),
+                  fill=(255, 255, 255, 200))
+    nx = _needle_x(reading.deviation_ev)
+    draw.polygon([(nx, NEEDLE_Y - 8), (nx - 5, NEEDLE_Y - 15), (nx + 5, NEEDLE_Y - 15)],
+                 fill=AMBER + (255,))
+    # shutter button
+    cx, cy = SHUTTER_CENTRE
+    draw.ellipse(
+        (cx - SHUTTER_RADIUS, cy - SHUTTER_RADIUS, cx + SHUTTER_RADIUS, cy + SHUTTER_RADIUS),
+        fill=(255, 255, 255, 60), outline=(255, 255, 255, 255), width=2,
+    )
+    draw.ellipse((cx - 18, cy - 18, cx + 18, cy + 18), fill=(255, 255, 255, 180))
+    # busy marker
+    if busy:
+        bx, by = BUSY_CENTRE
+        draw.ellipse((bx - BUSY_RADIUS, by - BUSY_RADIUS, bx + BUSY_RADIUS, by + BUSY_RADIUS),
+                     fill=AMBER + (255,))
+    # battery badge
+    if reading.battery_percent is not None:
+        label = f"{'AC ' if reading.external_power else ''}{reading.battery_percent}%"
+        w = draw.textlength(label, font=small)
+        draw.rounded_rectangle(
+            (WIDTH - w - 14, 4, WIDTH - 4, 20), radius=4, fill=(0, 0, 0, BAR_ALPHA),
+        )
+        draw.text((WIDTH - w - 9, 6), label, fill=(255, 255, 255, 255), font=small)
+    return Image.alpha_composite(base, overlay).convert("RGB")
+
+
+def _needle_x(deviation: float) -> int:
+    t = (max(-NEEDLE_RANGE, min(NEEDLE_RANGE, deviation)) + NEEDLE_RANGE) / (2 * NEEDLE_RANGE)
+    return int(round(NEEDLE_X0 + t * (NEEDLE_X1 - NEEDLE_X0)))
+
+
+def render_review(graded_rgb: np.ndarray, caption: str) -> Image.Image:
+    base = _letterbox(graded_rgb).convert("RGBA")
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    draw.rectangle((0, HEIGHT - 22, WIDTH, HEIGHT), fill=(0, 0, 0, BAR_ALPHA))
+    draw.text((6, HEIGHT - 19), caption, fill=(255, 255, 255, 255), font=_font(12))
+    hint = "tap to continue"
+    w = draw.textlength(hint, font=_font(11))
+    draw.text((WIDTH - w - 6, HEIGHT - 18), hint, fill=(200, 200, 200, 255), font=_font(11))
+    return Image.alpha_composite(base, overlay).convert("RGB")
+
+
+def render_message(title: str, detail: str) -> Image.Image:
+    img = Image.new("RGB", (WIDTH, HEIGHT), (20, 20, 20))
+    draw = ImageDraw.Draw(img)
+    draw.text((WIDTH // 2, HEIGHT // 2 - 16), title,
+              fill=(255, 255, 255), font=_font(18), anchor="mm")
+    draw.text((WIDTH // 2, HEIGHT // 2 + 14), detail[:60],
+              fill=(200, 200, 200), font=_font(12), anchor="mm")
+    return img
+
+
+def hit(x: int, y: int) -> Action:
+    cx, cy = SHUTTER_CENTRE
+    if math.hypot(x - cx, y - cy) <= SHUTTER_RADIUS + HIT_MARGIN:
+        return Action.SHUTTER
+    if y >= BAR_TOP - HIT_MARGIN:
+        if x <= EV_BUTTON_W + HIT_MARGIN:
+            return Action.EV_MINUS
+        if x >= WIDTH - EV_BUTTON_W - HIT_MARGIN:
+            return Action.EV_PLUS
+    return Action.NONE
