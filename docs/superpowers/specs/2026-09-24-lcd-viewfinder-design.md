@@ -111,10 +111,26 @@ power: PowerStatus | None) -> MeterReading`:
 | `deviation_ev` | preview frame | `log2(mean_linear_luma / 0.18)`, luma BT.709 on sRGB-linearised pixels of the frame downsampled 4×; clamped to ±3 |
 | `clip_pct` | preview frame | % of pixels with any channel ≥ 254 |
 | `battery` | `power.percent`, `power.external_power` | `None` when no UPS |
+| `focus` | preview frame, optional | `0..1` bar level from `focus_score` against `FocusTracker`'s decaying peak; `None` when not computed *(Review amendment: focus bar, 2026-09-24)* |
 
 Missing metadata keys give `None` fields, rendered as `"—"`; the function never raises on
 an incomplete dict. Tested with synthetic frames (uniform grey 18 % → deviation 0 ± 0.05;
 half-white frame → `clip_pct` 50).
+
+*(Review amendment: focus bar, 2026-09-24.)* The IMX477 is focused by hand, so the module
+also carries the manual-focus aid. `focus_score(preview_rgb) -> float` is the variance of a
+4-neighbour Laplacian of BT.601 luma over the frame's central quarter (middle half of each
+axis), computed by array slicing on the gamma-encoded bytes — a contrast measure, not a
+photometric one, and no OpenCV, which `pifilm/display/` must not need. It costs 0.5 ms on a
+640×480 preview on the development Mac, inside a 100 ms frame period, so the full-resolution
+centre is used rather than a subsampled one. `FocusTracker(decay_per_second=0.5, floor=1e-6)`
+turns scores into the bar level: the remembered peak decays exponentially by wall time since
+the last update, then takes the new score if it is higher, and `update` returns
+`score / peak` clamped to `[0, 1]` (`0.0` below the floor). The decay is what makes the gauge
+usable across subjects — an absolute score means nothing, since it scales with the scene's
+own contrast, and a peak that never faded would leave every later subject reading as soft.
+`compute_reading` takes `focus` as a keyword-only argument defaulting to `None`, so every
+existing caller is unchanged.
 
 ### 3.4 `pifilm/display/ui.py` — rendering and hit-testing (pure)
 
@@ -134,6 +150,7 @@ half-white frame → `clip_pct` 50).
   in the system says "working" the same way.)*
 - `render_review(graded_rgb, caption: str) -> PIL.Image`: letterboxed result with a one-line
   caption (`"1/250  ISO 100  +0.3"`), "tap to continue" hint.
+- *(Review amendment: focus bar, 2026-09-24.)* When `reading.focus is not None`, `render_live` also draws the focus gauge: a vertical bar at the left edge (`FOCUS_BAR_X0..X1` = 6..14, `FOCUS_BAR_Y0..Y1` = 40..190) over a translucent black backing 4 px wider, white 1 px outline, filled from the bottom in green (0, 220, 90) to `focus` of the inner height, with a 2 px amber tick across the top of the inner area marking the peak and an `F` label in the 11 px font beneath it. The left edge is free (the shutter button owns the right) and the bar stops at `BAR_TOP - 14`, so neither it nor its baseline-anchored label reaches the EV minus button's hit region; `hit()` is unchanged, and a tap on the bar is still `Action.NONE`.
 - `render_message(title, detail) -> PIL.Image`: for errors and start-up.
 - `hit(x, y) -> Action`: `Action.SHUTTER`, `EV_MINUS`, `EV_PLUS`, or `NONE`; in review mode any
   tap is `DISMISS` (handled in the loop, not here). Hit regions are exactly the drawn regions
@@ -154,6 +171,12 @@ States and transitions:
 | `REVIEW` | render review once; poll touch | any tap or `review_timeout` elapsed → `LIVE`. |
 | `ERROR` | render message | camera or display errors: after 5 consecutive `show()` failures the loop exits with `DisplayError`; a `CameraError` on a preview read shows "camera busy" and retries next step (the existing headless promise that a dropped frame never ends the session holds here too). |
 
+- *(Review amendment: focus bar, 2026-09-24.)* The loop owns one `FocusTracker`. In the
+  `LIVE` draw path it computes `focus_score(frame.rgb)`, feeds it to the tracker with
+  `self._clock.monotonic()` and passes the resulting level to `compute_reading` as
+  `focus=`. Nothing is reset on a state change: the peak fades on wall time alone, so a
+  review screen or a spell of colour bars leaves the mark where a few seconds of decay
+  put it, not where the code did.
 - Pacing: `clock.sleep(max(0, frame_period − elapsed))`; `frame_period` 0.1 s (10 fps
   target). Touch is polled every step even while a read is slow. Every 10 s the loop prints
   one line with the achieved frame rate (`viewfinder: 9.6 fps`).
@@ -273,6 +296,10 @@ Stick shot reaches the LCD without the controller knowing about displays.
    amendment: the original "unplug the DC wire" cannot produce the fallback — SPI writes are
    not acknowledged, so a blank panel is indistinguishable from a working one.)*
 8. IMX477 DNG opens per the existing DNG acceptance test.
+9. *(Review amendment: focus bar, 2026-09-24.)* Focus bar: with the IMX477, turn the
+   focus ring slowly through best focus on a textured central subject. The bar rises to
+   the amber tick at the peak and falls away on both sides of it, and settles back to
+   full within a few seconds of stopping.
 
 ## 5. Testing summary
 

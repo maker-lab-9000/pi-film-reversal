@@ -143,6 +143,7 @@ restart.
 | Live image | Full-screen letterboxed, ungraded ISP preview | — |
 | Meter bar (bottom strip, translucent black) | Shutter, ISO, EV compensation, lux, clip % | — |
 | Needle | Deviation from mid-grey in stops, −3 to +3, amber marker | — |
+| Focus bar (vertical gauge, left edge, labelled `F`) | Sharpness of the central quarter of the frame, as a fraction of the recently seen best; amber tick at the top is the remembered peak | — |
 | Shutter button (circle, right edge) | White ring, filled centre | Submits a capture through the shared controller; the processing screen holds until it finishes |
 | EV `−` / EV `+` buttons (bar's left/right ends) | `-` / `+` labels | Adjusts exposure compensation by 1/3 stop, clamped to ±2; resets to `0` every time `pifilm-capture` restarts |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show. The camera is not read during it | — |
@@ -166,6 +167,26 @@ anyway (it runs one job at a time). Wait for the colour bars to clear.
   Aim low outdoors, where clipping is easy to get.
 - **`lux`** — libcamera's own scene-brightness estimate from the sensor, not an
   independently measured value.
+
+### Focusing by hand
+
+The IMX477 has no autofocus, so the lens ring is the only focus control and the
+**focus bar** down the left edge is how the screen says which way to turn it.
+It measures contrast (Laplacian variance) over the central quarter of the frame
+— the middle half of the width and of the height — and shows it as a fraction
+of the sharpest thing seen in the last few seconds.
+
+- **Turn the ring until the green reaches the amber tick at the top.** The tick
+  is the best focus the bar remembers.
+- **Racking past best focus drops the bar**, immediately and on both sides of
+  it, which is what makes the peak findable: go past, come back.
+- **The mark decays** — the remembered peak halves every second — so pointing
+  the camera at a new subject lets the bar reach the top again within a few
+  seconds rather than leaving it pinned to an old, higher-contrast scene.
+- **It is a contrast measure, so it needs texture in the middle of the frame.**
+  A blank wall, clear sky or an evenly lit sheet of paper gives it nothing to
+  work with and the bar sits at zero however well focused the lens is. Aim the
+  centre at an edge, print or fabric.
 
 ## 7. Hardware acceptance checklist
 
@@ -201,6 +222,10 @@ per spec §4:
    acknowledged, so the driver cannot tell a blank panel from a working one and
    the process runs on happily, drawing into the void.
 8. IMX477 DNG opens per the existing [DNG acceptance test](picamera2-bringup.md#dng-acceptance-test).
+9. Focus bar: with the IMX477, turn the focus ring slowly through best focus on a
+   textured subject in the middle of the frame. The bar must rise to the amber tick
+   at the peak and fall away on **both** sides of it, and settle back to full within
+   a few seconds of stopping.
 
 ## 8. Troubleshooting
 

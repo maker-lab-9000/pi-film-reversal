@@ -3,8 +3,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 from pifilm.display.meter import MeterReading
 from pifilm.display.ui import (
+    AMBER,
     BAR_TOP,
     DASH,
+    FOCUS_BAR_X0,
+    FOCUS_BAR_X1,
+    FOCUS_BAR_Y0,
+    FOCUS_BAR_Y1,
     HEIGHT,
     SHUTTER_CENTRE,
     SHUTTER_RADIUS,
@@ -102,3 +107,52 @@ def test_hit_regions():
     assert hit(310, BAR_TOP + 10) == Action.EV_PLUS
     assert hit(160, BAR_TOP + 10) == Action.NONE
     assert hit(160, 100) == Action.NONE
+
+
+FOCUS_GREEN = (0, 220, 90)
+_BAR_MID_X = (FOCUS_BAR_X0 + FOCUS_BAR_X1) // 2
+
+
+def _live(focus):
+    frame = np.full((480, 640, 3), 128, dtype=np.uint8)
+    return render_live(frame, _reading(focus=focus))
+
+
+def test_focus_bar_fills_to_the_top_when_the_image_is_at_its_sharpest():
+    img = _live(1.0)
+    assert img.getpixel((_BAR_MID_X, FOCUS_BAR_Y1 - 5)) == FOCUS_GREEN   # near the bottom
+    assert img.getpixel((_BAR_MID_X, FOCUS_BAR_Y0 + 6)) == FOCUS_GREEN   # near the top
+
+
+def test_focus_bar_only_fills_from_the_bottom_when_focus_is_low():
+    img = _live(0.2)
+    assert img.getpixel((_BAR_MID_X, FOCUS_BAR_Y1 - 5)) == FOCUS_GREEN
+    assert img.getpixel((_BAR_MID_X, FOCUS_BAR_Y0 + 6)) != FOCUS_GREEN
+
+
+def test_no_focus_bar_is_drawn_when_focus_is_not_computed():
+    img = _live(None)
+    column = [img.getpixel((_BAR_MID_X, y)) for y in range(FOCUS_BAR_Y0, FOCUS_BAR_Y1 + 1)]
+    assert FOCUS_GREEN not in column
+
+
+def test_focus_bar_carries_an_amber_peak_mark_at_the_top():
+    """The mark is what the user turns the ring towards; it must be visible even
+    at full fill, so it is drawn over the green."""
+    img = _live(1.0)
+    column = [img.getpixel((_BAR_MID_X, y)) for y in range(FOCUS_BAR_Y0, FOCUS_BAR_Y0 + 6)]
+    assert AMBER in column
+
+
+def test_focus_bar_clears_the_ev_minus_button_and_its_hit_region():
+    assert FOCUS_BAR_Y1 <= BAR_TOP - 8
+    for y in (FOCUS_BAR_Y0, (FOCUS_BAR_Y0 + FOCUS_BAR_Y1) // 2, FOCUS_BAR_Y1):
+        assert hit(_BAR_MID_X, y) == Action.NONE
+
+
+def test_focus_bar_does_not_disturb_the_rest_of_the_screen():
+    frame = np.full((480, 640, 3), 128, dtype=np.uint8)
+    with_bar = np.array(render_live(frame, _reading(focus=0.5)))
+    without = np.array(render_live(frame, _reading(focus=None)))
+    right_of_bar = np.s_[:, FOCUS_BAR_X1 + 6:]
+    assert np.array_equal(with_bar[right_of_bar], without[right_of_bar])

@@ -462,3 +462,66 @@ def test_viewfinder_imports_without_opencv(monkeypatch):
 
     assert fresh.ViewfinderLoop.__name__ == "ViewfinderLoop"
     assert "pifilm.capture.camera" not in sys.modules
+
+
+def _spy_live(monkeypatch):
+    """Record the ``MeterReading`` of every live frame, still drawing it."""
+    readings = []
+    real = viewfinder.render_live
+
+    def spy(frame_rgb, reading):
+        readings.append(reading)
+        return real(frame_rgb, reading)
+
+    monkeypatch.setattr(viewfinder, "render_live", spy)
+    return readings
+
+
+def _sharp_frame(shape=(48, 64), block=4):
+    ys, xs = np.indices(shape)
+    frame = np.where(((ys // block) + (xs // block)) % 2 == 0, 20, 235).astype(np.uint8)
+    return np.repeat(frame[:, :, None], 3, axis=2)
+
+
+def _blurred(rgb, k=5):
+    acc = np.zeros(rgb.shape, dtype=np.float32)
+    pad = k // 2
+    padded = np.pad(rgb.astype(np.float32), ((pad, pad), (pad, pad), (0, 0)), mode="edge")
+    for dy in range(k):
+        for dx in range(k):
+            acc += padded[dy:dy + rgb.shape[0], dx:dx + rgb.shape[1]]
+    return (acc / (k * k)).astype(np.uint8)
+
+
+def test_focus_bar_peaks_on_a_sharp_frame_and_drops_when_it_blurs(controller, monkeypatch):
+    """The IMX477 is focused by hand: racking past best focus must show on the bar."""
+    _, ctl = controller
+    readings = _spy_live(monkeypatch)
+    sharp = _sharp_frame()
+    camera = FakeCamera([sharp, _blurred(sharp)])
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    clock.t += 0.1
+    loop.step()
+    assert readings[0].focus == pytest.approx(1.0)
+    assert 0.0 < readings[1].focus < 0.5
+
+
+def test_the_focus_peak_decays_by_wall_time_across_a_review(controller, monkeypatch):
+    """Nothing is reset on review: the mark fades on the clock, so after a pause
+    on another subject the bar can reach the top again."""
+    _, ctl = controller
+    readings = _spy_live(monkeypatch)
+    sharp = _sharp_frame()
+    camera = FakeCamera([sharp, _blurred(sharp)])
+    loop, touch, display, clock = _loop(camera, ctl, review_timeout=30.0)
+    loop.step()                                  # sharp: sets the peak
+    ctl.submit("ext")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "REVIEW"
+    clock.t += 60.0                              # a minute on the review screen
+    loop.step()                                  # review times out
+    assert loop.state == "LIVE"
+    loop.step()                                  # the blurred frame, a minute later
+    assert readings[-1].focus == pytest.approx(1.0)
