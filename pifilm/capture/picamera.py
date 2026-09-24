@@ -258,7 +258,13 @@ class Picamera2Camera:
                         )
                     rgb = np.array(bgr[..., ::-1], dtype=np.uint8, order="C", copy=True)
                     metadata = serialisable_metadata(request.get_metadata())
-                    self._update_fps({"FrameDuration": metadata.get("FrameDuration", 0)})
+                    if full:
+                        # stream_info is the audit of the still (it is written
+                        # into every capture record), so only a still may set
+                        # its measured rate: in preview mode the cheap reads
+                        # come from the binned viewfinder stream and would
+                        # otherwise make a record claim the wrong frame rate.
+                        self._update_fps({"FrameDuration": metadata.get("FrameDuration", 0)})
                     dng = None
                     if full and self._save_dng:
                         # The ".dng" suffix is load-bearing: PiDNG (used by save_dng)

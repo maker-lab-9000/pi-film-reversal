@@ -213,6 +213,27 @@ def install_picamera(monkeypatch):
                     raise configure_error
 
             def camera_configuration(self):
+                # Picamera2 only ever describes the configuration currently in
+                # force, so the fake must too: with the preview configured it
+                # reports the small main stream on the binned sensor mode. That
+                # is what makes "stream_info describes the still" testable -
+                # building it after the preview configure fails loudly.
+                configured = self.configured_with
+                if isinstance(configured, dict) and "preview" in configured:
+                    preview = configured["preview"]
+                    main_size = tuple(preview["main"]["size"])
+                    raw_size = tuple(preview["raw"]["size"])
+                    return {
+                        "main": {
+                            "size": main_size,
+                            "format": preview["main"]["format"],
+                            "stride": main_size[0] * 3,
+                        },
+                        "raw": {"size": raw_size, "format": RAW_FORMAT, "stride": raw_size[0] * 2},
+                        "sensor": {"output_size": raw_size, "bit_depth": 10},
+                        "buffer_count": 4,
+                        "queue": True,
+                    }
                 return actual if actual is not None else _actual_configuration()
 
             def set_controls(self, controls):
@@ -1228,4 +1249,24 @@ def test_requests_are_serialised_by_a_lock(install_picamera):
     t.join(2.0)
     t2.join(2.0)
     assert overlaps == []
+    camera.close()
+
+
+def test_preview_reads_do_not_overwrite_the_measured_still_fps(install_picamera):
+    """``stream_info`` is the audit of the still, and ``fps`` is part of it: a
+    binned viewfinder frame must not be what a capture record claims the still
+    was shot at."""
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small, metadata={"FrameDuration": 20_000}))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    assert camera.stream_info.fps == 0.0
+    camera.read(full=False)
+    assert camera.stream_info.fps == 0.0
+    inst = state.instance
+    inst.switch_mode_and_capture_request = lambda cfg: FakeRequest(
+        big, metadata={"FrameDuration": 50_000}
+    )
+    camera.read(full=True)
+    assert camera.stream_info.fps == 20.0
     camera.close()
