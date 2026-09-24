@@ -1059,7 +1059,7 @@ def test_default_prefers_picamera2_when_module_imports(camera_cli, monkeypatch):
     )
 
     assert camera_cli.main(["--no-preview"]) == 0
-    assert opened[0][0] == "imx708_wide.json"
+    assert opened[0][0] is None
     assert opened[0][1].closed
 
 

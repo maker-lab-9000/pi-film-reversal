@@ -66,6 +66,7 @@ class StreamInfo:
     sensor_mode: str | None = None
     bit_depth: int | None = None
     tuning_file: str | None = None
+    autofocus: str | None = None
 
     def to_dict(self) -> dict:
         values = {
@@ -81,6 +82,8 @@ class StreamInfo:
             values["bit_depth"] = int(self.bit_depth)
         if self.tuning_file is not None:
             values["tuning_file"] = self.tuning_file
+        if self.autofocus is not None:
+            values["autofocus"] = self.autofocus
         return values
 
 

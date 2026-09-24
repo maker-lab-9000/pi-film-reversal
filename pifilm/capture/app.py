@@ -75,7 +75,7 @@ from ..imageio import load_rgb, save_jpeg
 from ..pipeline import Pipeline
 from .camera import Camera, CameraError, FakeCamera, V4L2Camera
 from .controller import CaptureController, JobSnapshot
-from .picamera import DEFAULT_TUNING_FILE, Picamera2Camera
+from .picamera import Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
 from .remote import RemoteCaptureServer
 
@@ -533,7 +533,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--camera", choices=("v4l2", "picamera2"))
     parser.add_argument("--device", default=None, help="index, /dev/videoN or /dev/v4l/by-id/...")
-    parser.add_argument("--tuning-file", help="Picamera2 tuning filename or absolute path")
+    parser.add_argument(
+        "--tuning-file",
+        help="Picamera2 tuning filename or absolute path "
+             "(default: libcamera's automatic choice for the detected sensor)",
+    )
     parser.add_argument(
         "--autofocus", choices=("continuous", "auto", "manual"), default=None,
         help="Picamera2 autofocus mode (default: continuous)",
@@ -637,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if backend == "picamera2":
                 camera = Picamera2Camera(
-                    args.tuning_file or DEFAULT_TUNING_FILE,
+                    args.tuning_file,
                     save_dng=not args.no_dng,
                     autofocus=autofocus,
                     af_range=af_range,

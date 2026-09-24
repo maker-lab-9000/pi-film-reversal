@@ -11,7 +11,7 @@ from PIL import Image
 from pifilm.artifacts import Artifacts, write_artifact
 from pifilm.capture.app import CaptureSession
 from pifilm.capture.camera import CameraError, Frame
-from pifilm.capture.picamera import DEFAULT_TUNING_FILE, Picamera2Camera
+from pifilm.capture.picamera import Picamera2Camera
 from pifilm.capture.thumbnail import fitted_jpeg
 from pifilm.grain import GrainParams
 from pifilm.lut import LUT3D
@@ -149,6 +149,9 @@ def install_picamera(monkeypatch):
         autofocus_cycle_error=None,
         with_noise_reduction=True,
         with_ae_enums=True,
+        sensor_resolution=NATIVE_SIZE,
+        fixed_lens=False,
+        model="imx708_wide",
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
 
@@ -160,8 +163,17 @@ def install_picamera(monkeypatch):
                     raise tuning_error
                 return {"loaded-from": filename}
 
-            def __init__(self, *, tuning):
+            def __init__(self, *, tuning=None):
                 self.tuning = tuning
+                self.sensor_resolution = tuple(sensor_resolution)
+                self.camera_properties = {"Model": model}
+                self.camera_controls = {
+                    "ExposureValue": (-8.0, 8.0, 0.0),
+                    "AeConstraintMode": (0, 3, 0),
+                }
+                if not fixed_lens:
+                    self.camera_controls["AfMode"] = (0, 2, 0)
+                    self.camera_controls["AfRange"] = (0, 2, 0)
                 self.created_config = None
                 self.configured_with = None
                 self.configure_count = 0
@@ -250,16 +262,82 @@ def test_constructor_uses_explicit_native_still_configuration(install_picamera):
         "sensor_mode": "4608x2592 SBGGR10_CSI2P",
         "bit_depth": 10,
         "tuning_file": "delivered-lens.json",
+        "autofocus": "continuous",
     }
     camera.close()
 
 
-def test_default_tuning_file_matches_the_initial_camera_variant(install_picamera):
-    state = install_picamera()
+def test_default_tuning_is_libcameras_automatic_choice(install_picamera):
+    state = install_picamera(model="imx477")
     camera = Picamera2Camera()
-    assert state.loaded_tuning == [DEFAULT_TUNING_FILE]
+    assert state.loaded_tuning == []
+    assert state.instance.tuning is None
+    assert camera.stream_info.tuning_file == "auto:imx477"
+    camera.close()
+
+
+def test_explicit_tuning_file_is_still_loaded(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera("imx708_wide.json")
+    assert state.loaded_tuning == ["imx708_wide.json"]
     assert camera.stream_info.tuning_file == "imx708_wide.json"
     camera.close()
+
+
+IMX477_SIZE = (4056, 3040)
+
+
+def _imx477_configuration():
+    return {
+        "main": {"size": IMX477_SIZE, "format": "RGB888", "stride": 12192},
+        "raw": {"size": IMX477_SIZE, "format": "SRGGB12_CSI2P", "stride": 6112},
+        "sensor": {"output_size": IMX477_SIZE, "bit_depth": 12},
+        "buffer_count": 2,
+        "queue": False,
+    }
+
+
+def test_native_size_comes_from_the_sensor(install_picamera):
+    state = install_picamera(
+        actual=_imx477_configuration(), sensor_resolution=IMX477_SIZE, fixed_lens=True,
+        model="imx477",
+    )
+    camera = Picamera2Camera()
+    assert state.instance.created_config["main"]["size"] == IMX477_SIZE
+    assert state.instance.created_config["raw"]["size"] == IMX477_SIZE
+    assert (camera.stream_info.width, camera.stream_info.height) == IMX477_SIZE
+    assert camera.stream_info.sensor_mode == "4056x3040 SRGGB12_CSI2P"
+    assert camera.stream_info.bit_depth == 12
+    camera.close()
+
+
+def test_fixed_lens_sensor_skips_autofocus_controls_and_records_none(install_picamera):
+    state = install_picamera(
+        actual=_imx477_configuration(), sensor_resolution=IMX477_SIZE, fixed_lens=True,
+    )
+    camera = Picamera2Camera()
+    controls = state.instance.set_controls_calls[0]
+    assert "AfMode" not in controls and "AfRange" not in controls
+    assert camera.stream_info.autofocus == "none"
+    assert camera.stream_info.to_dict()["autofocus"] == "none"
+    camera.close()
+
+
+def test_autofocus_sensor_still_records_its_mode(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera(autofocus="auto")
+    assert camera.stream_info.autofocus == "auto"
+    camera.close()
+
+
+@pytest.mark.parametrize("kwargs", [{"autofocus": "auto"}, {"af_range": "macro"}])
+def test_fixed_lens_sensor_rejects_non_default_autofocus(install_picamera, kwargs):
+    state = install_picamera(
+        actual=_imx477_configuration(), sensor_resolution=IMX477_SIZE, fixed_lens=True,
+    )
+    with pytest.raises(CameraError, match="no autofocus"):
+        Picamera2Camera(**kwargs)
+    assert state.instance.close_count == 1
 
 
 def test_import_is_lazy_and_missing_picamera2_is_actionable(monkeypatch):
@@ -294,7 +372,7 @@ def test_native_library_load_failure_is_wrapped_as_camera_error(monkeypatch):
 def test_tuning_load_failure_is_actionable_without_creating_camera(install_picamera):
     state = install_picamera(tuning_error=OSError("bad tuning data"))
     with pytest.raises(CameraError, match="imx708_wide.json") as exc_info:
-        Picamera2Camera()
+        Picamera2Camera("imx708_wide.json")
     assert isinstance(exc_info.value.__cause__, OSError)
     assert state.instance is None
 
