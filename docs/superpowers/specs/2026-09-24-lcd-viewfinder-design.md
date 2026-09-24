@@ -88,7 +88,8 @@ table from the hardware handover in the docstring.
   the bus. Deviation from the original design (which gated on an `int_pin.is_active` check
   before touching the bus): capacitive controllers pulse `INT` per report rather than holding
   it, and a 10 Hz poll could miss the pulse, so gating on it risked dropping taps. Reading the
-  bus every step instead costs two short I2C transactions per frame, negligible on the shared
+  bus every step instead costs about eleven small I2C transfers per frame (one block write,
+  nine byte reads, one end-read write), negligible on the shared
   bus (X728 gauge at 0x36, RTC at 0x68); no `INT` wiring is required.
 - Rotation: raw coordinates are in 240×320 portrait space. `to_display(raw, rotate)` maps
   them to 320×240; at `rotate=0`, `x = raw.y`, `y = 239 - raw.x`; at 180, `x = 319 - raw.y`,
@@ -292,7 +293,7 @@ Stick shot reaches the LCD without the controller knowing about displays.
 - **Shared I2C bus.** The gauge poll (every 10 s) and touch reads use separate `SMBus`
   handles; each vendor transaction is a single kernel ioctl, and the CST3530's internal
   pointer is not disturbed by transactions to other addresses. Touch is polled every frame
-  (see §3.2) rather than gated on `INT`, but each poll is only two short transactions, so
+  (see §3.2) rather than gated on `INT`, but each poll is only about eleven small transfers, so
   bus traffic stays low.
 - **GPIO permissions under systemd.** The service user must be in `spi`, `i2c`, `gpio`; the
   driver's error message names the group when it sees `PermissionError`.

@@ -757,6 +757,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         if backend == "v4l2":
             _drop_display_on_v4l2(args)
+    if args.fake:
+        # Argument errors must precede any hardware side effect: the panel below
+        # claims SPI, GPIO and I2C and pulses the touch reset line.
+        _reject_picamera2_only_flags(parser, args, reason="cannot be used with --fake")
     display_pair = None
     if args.display != "none":
         try:
@@ -765,7 +769,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"warning: display unavailable ({exc}); continuing without it", file=sys.stderr)
     try:
         if args.fake:
-            _reject_picamera2_only_flags(parser, args, reason="cannot be used with --fake")
             camera: Camera = FakeCamera()
         else:
             if backend == "picamera2":
