@@ -23,6 +23,22 @@ error rather than a silently ignored request.
 Auto-exposure shaping (constraint mode, metering mode, exposure compensation) is
 exposed as constructor arguments whose defaults are libcamera's own defaults, so
 an unflagged capture behaves exactly as it did before they existed.
+
+``preview`` adds the LCD viewfinder's second, cheap stream. The still
+configuration is created, applied and validated *first*, before the preview
+configuration replaces it: ``camera_configuration()`` only ever describes what
+is currently configured, and the record must describe the shot the camera will
+take, not the viewfinder frames it discards. Each full read then uses
+``switch_mode_and_capture_request``, which switches to the still configuration,
+captures, and returns the camera to the preview configuration itself - so the
+viewfinder keeps running afterwards without this module reconfiguring anything.
+
+Previews and captures arrive on different threads (the viewfinder loop and the
+capture controller), so one lock is held from acquiring a request through
+releasing it: the pixel buffer belongs to the request, and a second thread that
+captured or released in the middle would hand out or free memory the first is
+still copying. ``set_ev`` takes the same lock so a control change never lands
+between a capture and its release.
 """
 
 from __future__ import annotations
@@ -30,6 +46,7 @@ from __future__ import annotations
 import math
 import sys
 import tempfile
+import threading
 from typing import Any
 
 import numpy as np
@@ -94,6 +111,7 @@ class Picamera2Camera:
         ae_constraint: str = "normal",
         ae_metering: str = "centre",
         ev: float = 0.0,
+        preview: tuple[int, int] | None = None,
     ) -> None:
         if autofocus not in _AUTOFOCUS_MODES:
             raise CameraError(
@@ -111,6 +129,11 @@ class Picamera2Camera:
             )
         if not _EV_RANGE[0] <= float(ev) <= _EV_RANGE[1]:
             raise CameraError(f"ev must be within {_EV_RANGE}, got {ev}")
+
+        self._request_lock = threading.Lock()
+        self._preview = tuple(preview) if preview else None
+        self.ev = float(ev)
+        self._still_config: Any | None = None
 
         try:
             from picamera2 import Picamera2
@@ -159,6 +182,14 @@ class Picamera2Camera:
             actual = camera.camera_configuration()
             self._stream_info = _stream_info(actual, tuning_label, self._native_size)
             self._stream_info.autofocus = autofocus if has_autofocus else "none"
+            self._still_config = config
+            if self._preview is not None:
+                binned = _binned_mode(getattr(camera, "sensor_modes", []), self._native_size)
+                preview_config = camera.create_preview_configuration(
+                    main={"size": self._preview, "format": _MAIN_FORMAT},
+                    raw={"size": binned},
+                )
+                camera.configure(preview_config)
             _apply_camera_controls(
                 camera, autofocus, af_range, ae_lock, awb_lock, colour_gains,
                 ae_constraint, ae_metering, ev, has_autofocus=has_autofocus,
@@ -186,57 +217,69 @@ class Picamera2Camera:
         if camera is None:
             raise CameraError("Cannot read from a closed Picamera2 camera")
 
-        if full and self._autofocus == "auto":
+        with self._request_lock:
+            if full and self._autofocus == "auto" and self._stream_info.autofocus != "none":
+                try:
+                    camera.autofocus_cycle()
+                except Exception as exc:
+                    raise CameraError(f"Autofocus cycle failed: {exc}") from exc
+
             try:
-                camera.autofocus_cycle()
+                if full and self._preview is not None:
+                    # Switches to the still configuration, captures, and restores
+                    # the preview configuration itself.
+                    request = camera.switch_mode_and_capture_request(self._still_config)
+                else:
+                    request = camera.capture_request()
             except Exception as exc:
-                raise CameraError(f"Autofocus cycle failed: {exc}") from exc
+                raise CameraError(f"Picamera2 failed to capture a request: {exc}") from exc
 
-        try:
-            request = camera.capture_request()
-        except Exception as exc:
-            raise CameraError(f"Picamera2 failed to capture a request: {exc}") from exc
-
-        processing_failed = False
-        try:
-            try:
-                bgr = request.make_array("main")
+            if full or self._preview is None:
                 expected_shape = (self._native_size[1], self._native_size[0], 3)
-                if not isinstance(bgr, np.ndarray):
-                    raise CameraError("Picamera2 main array is not a NumPy array")
-                if bgr.dtype != np.uint8 or bgr.shape != expected_shape:
-                    raise CameraError(
-                        "Picamera2 main array must be "
-                        f"uint8 with shape {expected_shape}, got {bgr.dtype} {bgr.shape}"
-                    )
-                rgb = np.array(bgr[..., ::-1], dtype=np.uint8, order="C", copy=True)
-                metadata = serialisable_metadata(request.get_metadata())
-                self._update_fps({"FrameDuration": metadata.get("FrameDuration", 0)})
-                dng = None
-                if full and self._save_dng:
-                    # The ".dng" suffix is load-bearing: PiDNG (used by save_dng)
-                    # appends ".dng" to a path that lacks it, which would write
-                    # the payload to a different file than this one and leave
-                    # this handle's read empty.
-                    with tempfile.NamedTemporaryFile(suffix=".dng", delete=True) as tmp:
-                        request.save_dng(tmp.name)
-                        tmp.seek(0)
-                        dng = tmp.read()
-                return Frame(rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng)
-            except CameraError:
-                processing_failed = True
-                raise
-            except Exception as exc:
-                processing_failed = True
-                raise CameraError(f"Picamera2 failed while reading a frame: {exc}") from exc
-        finally:
+            else:
+                expected_shape = (self._preview[1], self._preview[0], 3)
+
+            processing_failed = False
             try:
-                request.release()
-            except Exception as exc:
-                if not processing_failed:
-                    raise CameraError(
-                        f"Picamera2 failed to release a capture request: {exc}"
-                    ) from exc
+                try:
+                    bgr = request.make_array("main")
+                    if not isinstance(bgr, np.ndarray):
+                        raise CameraError("Picamera2 main array is not a NumPy array")
+                    if bgr.dtype != np.uint8 or bgr.shape != expected_shape:
+                        raise CameraError(
+                            "Picamera2 main array must be "
+                            f"uint8 with shape {expected_shape}, got {bgr.dtype} {bgr.shape}"
+                        )
+                    rgb = np.array(bgr[..., ::-1], dtype=np.uint8, order="C", copy=True)
+                    metadata = serialisable_metadata(request.get_metadata())
+                    self._update_fps({"FrameDuration": metadata.get("FrameDuration", 0)})
+                    dng = None
+                    if full and self._save_dng:
+                        # The ".dng" suffix is load-bearing: PiDNG (used by save_dng)
+                        # appends ".dng" to a path that lacks it, which would write
+                        # the payload to a different file than this one and leave
+                        # this handle's read empty.
+                        with tempfile.NamedTemporaryFile(suffix=".dng", delete=True) as tmp:
+                            request.save_dng(tmp.name)
+                            tmp.seek(0)
+                            dng = tmp.read()
+                    return Frame(
+                        rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng
+                    )
+                except CameraError:
+                    processing_failed = True
+                    raise
+                except Exception as exc:
+                    processing_failed = True
+                    raise CameraError(f"Picamera2 failed while reading a frame: {exc}") from exc
+            finally:
+                try:
+                    request.release()
+                except Exception as exc:
+                    if not processing_failed:
+                        raise CameraError(
+                            f"Picamera2 failed to release a capture request: {exc}"
+                        ) from exc
 
     def _update_fps(self, metadata: Any) -> None:
         try:
@@ -245,6 +288,21 @@ class Picamera2Camera:
             return
         if duration > 0 and math.isfinite(duration):
             self._stream_info.fps = 1_000_000.0 / duration
+
+    def set_ev(self, value: float) -> None:
+        """Change exposure compensation on the running camera (viewfinder EV buttons)."""
+        value = float(value)
+        if not _EV_RANGE[0] <= value <= _EV_RANGE[1]:
+            raise CameraError(f"ev must be within {_EV_RANGE}, got {value}")
+        camera = self._camera
+        if camera is None:
+            raise CameraError("Cannot set EV on a closed Picamera2 camera")
+        with self._request_lock:
+            try:
+                camera.set_controls({"ExposureValue": value})
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to set ExposureValue: {exc}") from exc
+        self.ev = value
 
     def close(self) -> None:
         camera = self._camera
@@ -267,6 +325,26 @@ class Picamera2Camera:
                 first_error = exc
         if first_error is not None:
             raise CameraError(f"Failed to close Picamera2 camera: {first_error}") from first_error
+
+
+def _binned_mode(sensor_modes: Any, native: tuple[int, int]) -> tuple[int, int]:
+    """The largest sensor mode no bigger than half the native size in each axis.
+
+    The viewfinder runs the sensor here: cheap frames at the sensor's binned
+    rate, with the full-resolution still taken by a mode switch per shot. When
+    the driver lists no modes, half the native size is requested and libcamera
+    picks the nearest.
+    """
+    half = (native[0] // 2, native[1] // 2)
+    best: tuple[int, int] | None = None
+    for mode in sensor_modes or []:
+        try:
+            w, h = (int(v) for v in mode["size"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if w <= half[0] and h <= half[1] and (best is None or w * h > best[0] * best[1]):
+            best = (w, h)
+    return best or half
 
 
 def _stream_info(actual: Any, tuning_file: str, native_size: tuple[int, int]) -> StreamInfo:

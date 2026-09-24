@@ -150,6 +150,7 @@ def install_picamera(monkeypatch):
         with_noise_reduction=True,
         with_ae_enums=True,
         sensor_resolution=NATIVE_SIZE,
+        sensor_modes=None,
         fixed_lens=False,
         model="imx708_wide",
     ):
@@ -174,8 +175,14 @@ def install_picamera(monkeypatch):
                 if not fixed_lens:
                     self.camera_controls["AfMode"] = (0, 2, 0)
                     self.camera_controls["AfRange"] = (0, 2, 0)
+                self.sensor_modes = sensor_modes if sensor_modes is not None else [
+                    {"size": (1536, 864)}, {"size": (2304, 1296)}, {"size": (4608, 2592)},
+                ]
                 self.created_config = None
+                self.preview_config = None
                 self.configured_with = None
+                self.configure_calls = []
+                self.switch_calls = []
                 self.configure_count = 0
                 self.start_count = 0
                 self.capture_count = 0
@@ -191,9 +198,14 @@ def install_picamera(monkeypatch):
                 self.created_config = kwargs
                 return {"created": kwargs}
 
+            def create_preview_configuration(self, **kwargs):
+                self.preview_config = kwargs
+                return {"preview": kwargs}
+
             def configure(self, config):
                 self.configure_count += 1
                 self.configured_with = config
+                self.configure_calls.append(config)
                 if configure_error is not None:
                     raise configure_error
 
@@ -209,6 +221,13 @@ def install_picamera(monkeypatch):
                     raise start_error
 
             def capture_request(self):
+                self.capture_count += 1
+                if capture_error is not None:
+                    raise capture_error
+                return request
+
+            def switch_mode_and_capture_request(self, config):
+                self.switch_calls.append(config)
                 self.capture_count += 1
                 if capture_error is not None:
                     raise capture_error
@@ -1094,3 +1113,95 @@ def test_native_capture_session_omits_dng_when_backend_disables_it(
     record = json.loads(record_path.read_text())
     assert "dng" not in record
     assert record["camera_metadata"] == {"FrameDuration": 40_000}
+
+
+def test_preview_mode_configures_binned_preview_after_validating_the_still(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=(640, 480))
+    inst = state.instance
+    assert inst.configure_calls[0] == {"created": inst.created_config}
+    assert inst.configure_calls[1] == {"preview": inst.preview_config}
+    assert inst.preview_config["main"] == {"size": (640, 480), "format": "RGB888"}
+    assert inst.preview_config["raw"] == {"size": (2304, 1296)}
+    assert (camera.stream_info.width, camera.stream_info.height) == NATIVE_SIZE
+    camera.close()
+
+
+def test_binned_mode_is_the_largest_at_or_below_half_native():
+    from pifilm.capture.picamera import _binned_mode
+
+    modes = [{"size": (1332, 990)}, {"size": (2028, 1080)}, {"size": (2028, 1520)},
+             {"size": (4056, 3040)}]
+    assert _binned_mode(modes, (4056, 3040)) == (2028, 1520)
+    assert _binned_mode([], (4056, 3040)) == (2028, 1520)
+
+
+def test_without_preview_the_configuration_calls_are_unchanged(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    assert len(state.instance.configure_calls) == 1
+    assert state.instance.preview_config is None
+    camera.close()
+
+
+def test_preview_read_uses_the_preview_stream_and_full_read_switches_mode(install_picamera):
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small, metadata={"ExposureTime": 5000}))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    frame = camera.read(full=False)
+    assert frame.rgb.shape == (480, 640, 3)
+    assert frame.metadata == {"ExposureTime": 5000}
+    assert state.instance.switch_calls == []
+    state.instance.capture_request = lambda: (_ for _ in ()).throw(AssertionError("no switch"))
+    inst = state.instance
+    inst.switch_mode_and_capture_request = lambda cfg: (inst.switch_calls.append(cfg),
+                                                        FakeRequest(big))[1]
+    full = camera.read(full=True)
+    assert full.rgb.shape == (NATIVE_SIZE[1], NATIVE_SIZE[0], 3)
+    assert inst.switch_calls == [{"created": inst.created_config}]
+    camera.close()
+
+
+def test_set_ev_applies_exposure_value_at_runtime(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    camera.set_ev(1.0 / 3)
+    assert state.instance.set_controls_calls[-1] == {"ExposureValue": pytest.approx(1 / 3)}
+    assert camera.ev == pytest.approx(1 / 3)
+    with pytest.raises(CameraError):
+        camera.set_ev(9.0)
+    camera.close()
+
+
+def test_requests_are_serialised_by_a_lock(install_picamera):
+    import threading
+
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(big))
+    camera = Picamera2Camera(save_dng=False)
+    inside = threading.Event()
+    release = threading.Event()
+    overlaps = []
+
+    original = state.instance.capture_request
+
+    def slow_capture():
+        if inside.is_set():
+            overlaps.append(True)
+        inside.set()
+        release.wait(1.0)
+        inside.clear()
+        return original()
+
+    state.instance.capture_request = slow_capture
+    t = threading.Thread(target=camera.read)
+    t.start()
+    inside.wait(1.0)
+    t2 = threading.Thread(target=camera.read)
+    t2.start()
+    release.set()
+    t.join(2.0)
+    t2.join(2.0)
+    assert overlaps == []
+    camera.close()

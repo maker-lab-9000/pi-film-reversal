@@ -145,8 +145,11 @@ class FakeCamera:
         jpeg_bytes: list[bytes] | None = None,
         source: str = "decoded",
         stream_info: StreamInfo | None = None,
+        metadata: dict | None = None,
     ) -> None:
         self._jpegs = jpeg_bytes
+        self._metadata = metadata
+        self.ev = 0.0
         if jpeg_bytes is not None:
             decoded = [
                 cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR) for b in jpeg_bytes
@@ -172,7 +175,17 @@ class FakeCamera:
         idx = self._i % len(self._frames)
         self._i += 1
         jpeg = self._jpegs[idx % len(self._jpegs)] if self._jpegs else None
-        return Frame(rgb=self._frames[idx].copy(), jpeg=jpeg, source=self._source)
+        return Frame(
+            rgb=self._frames[idx].copy(),
+            jpeg=jpeg,
+            source=self._source,
+            metadata=self._metadata,
+        )
+
+    def set_ev(self, value: float) -> None:
+        # Mirrors Picamera2Camera.set_ev so viewfinder EV buttons can be driven
+        # without hardware; there is no exposure to change, so it only records.
+        self.ev = float(value)
 
     def close(self) -> None:
         return None
