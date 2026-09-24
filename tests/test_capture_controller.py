@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from unittest.mock import Mock
 
 from pifilm.capture.camera import CameraError
+from pifilm.capture.controller import CaptureController
 
 
 @dataclass
@@ -140,4 +142,53 @@ def test_snapshots_are_immutable_values():
             raise AssertionError("job snapshot was mutable")
     finally:
         session.release.set()
+        controller.close()
+
+
+class _Session:
+    def __init__(self, fail=False):
+        self.camera = None
+        self.fail = fail
+
+    def capture(self):
+        if self.fail:
+            raise CameraError("boom")
+        return "result"
+
+
+def _wait_finished(controller, request_id, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = controller.status(request_id)
+        if job is not None and job.state in ("complete", "failed"):
+            return job
+        time.sleep(0.005)
+    raise AssertionError("job did not finish")
+
+
+def test_snapshot_counts_finished_jobs_of_both_states():
+    controller = CaptureController(_Session())
+    try:
+        assert controller.snapshot().finished_count == 0
+        assert controller.snapshot().last_finished_job is None
+        controller.submit("a")
+        _wait_finished(controller, "a")
+        snap = controller.snapshot()
+        assert snap.finished_count == 1
+        assert snap.last_finished_job.request_id == "a"
+        assert snap.last_finished_job.state == "complete"
+    finally:
+        controller.close()
+
+
+def test_failed_job_counts_as_finished_but_not_completed():
+    controller = CaptureController(_Session(fail=True))
+    try:
+        controller.submit("b")
+        _wait_finished(controller, "b")
+        snap = controller.snapshot()
+        assert snap.finished_count == 1
+        assert snap.last_finished_job.state == "failed"
+        assert snap.last_completed_job is None
+    finally:
         controller.close()
