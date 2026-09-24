@@ -263,6 +263,15 @@ sudo chmod 440 /etc/sudoers.d/pifilm-capture
 sudo visudo -c
 ```
 
+A Pi set up before the `parr` → `pifilm` rename may still have
+`/etc/sudoers.d/parr-capture`, naming `parr-capture.service`. It matches nothing
+any more, so `sudo -n` asks for a password; `sudo -n -l` shows which rule is
+installed. Write the file above and `sudo rm /etc/sudoers.d/parr-capture`.
+
+The script refuses to restart while another process holds a video node. A
+desktop session's PipeWire and WirePlumber always do, only to monitor the
+devices, and are allowed; anything else (`rpicam-still`, a browser) blocks it.
+
 ### 4.6 Reboot test
 
 ```sh

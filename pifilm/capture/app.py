@@ -133,11 +133,16 @@ class CaptureSession:
 
     def capture(self) -> CaptureResult:
         shutter = time.perf_counter()
+        # Read before the frame: the EV the exposure was made at. The grade has to
+        # re-apply it, or normalisation cancels it (see ``pifilm.pipeline``).
+        ev = float(getattr(self.camera, "ev", 0.0))
         frame = self.camera.read()
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
         t0 = time.perf_counter()
-        graded, info = self.pipeline.process(frame.rgb, rng=np.random.default_rng(seed))
+        graded, info = self.pipeline.process(
+            frame.rgb, rng=np.random.default_rng(seed), ev=ev,
+        )
         pipeline_ms = (time.perf_counter() - t0) * 1000.0
 
         has_original = frame.jpeg is not None or frame.source == "picamera2"
@@ -180,7 +185,9 @@ class CaptureSession:
         # cycle or DNG extraction cost; capture() below keeps the full=True default.
         small = _resize_to_fit(self.camera.read(full=False).rgb, size)
         if graded:
-            small, _ = self.pipeline.process(small, grain=False)
+            small, _ = self.pipeline.process(
+                small, grain=False, ev=float(getattr(self.camera, "ev", 0.0)),
+            )
         return small
 
 
