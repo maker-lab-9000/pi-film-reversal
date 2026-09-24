@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from enum import Enum
+from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -37,6 +38,13 @@ DASH = "-"
 AMBER = (255, 176, 0)
 NEEDLE_X0, NEEDLE_X1, NEEDLE_Y = 200, 272, 222
 NEEDLE_RANGE = 3.0
+# Focus bar: a vertical gauge down the left edge, clear of the shutter button on
+# the right and stopping well above the meter bar so it never sits over the EV
+# minus button or its 6 px hit margin (BAR_TOP - 8).
+FOCUS_BAR_X0, FOCUS_BAR_X1 = 6, 14
+FOCUS_BAR_Y0, FOCUS_BAR_Y1 = 40, 190
+FOCUS_GREEN = (0, 220, 90)
+FOCUS_LABEL_Y = 196
 
 
 class Action(Enum):
@@ -102,6 +110,8 @@ def render_live(frame_rgb: np.ndarray, reading: MeterReading) -> Image.Image:
     nx = _needle_x(reading.deviation_ev)
     draw.polygon([(nx, NEEDLE_Y - 8), (nx - 5, NEEDLE_Y - 15), (nx + 5, NEEDLE_Y - 15)],
                  fill=AMBER + (255,))
+    if reading.focus is not None:
+        _draw_focus_bar(draw, reading.focus, small)
     # shutter button
     cx, cy = SHUTTER_CENTRE
     draw.ellipse(
@@ -118,6 +128,42 @@ def render_live(frame_rgb: np.ndarray, reading: MeterReading) -> Image.Image:
         )
         draw.text((WIDTH - w - 9, 6), label, fill=(255, 255, 255, 255), font=small)
     return Image.alpha_composite(base, overlay).convert("RGB")
+
+
+def _draw_focus_bar(draw: ImageDraw.ImageDraw, focus: float, font: Any) -> None:
+    """The manual-focus gauge: fill height is sharpness against the decaying peak.
+
+    The IMX477 has no autofocus, so this is the only feedback the user gets while
+    turning the ring. It grows as the image sharpens and drops the moment focus
+    is racked past, and the amber tick at the top is the peak the tracker
+    remembers — turn the ring until the green reaches it.
+
+    Drawn on the left because the right edge is the shutter button, over its own
+    translucent backing so it stays readable against a bright scene, and ending
+    at ``FOCUS_BAR_Y1`` so that neither the bar nor the label reaches the EV
+    minus button's hit region (``BAR_TOP - HIT_MARGIN``).
+    """
+    focus = max(0.0, min(1.0, float(focus)))
+    draw.rectangle(
+        (FOCUS_BAR_X0 - 4, FOCUS_BAR_Y0 - 4, FOCUS_BAR_X1 + 4, FOCUS_BAR_Y1 + 4),
+        fill=(0, 0, 0, BAR_ALPHA),
+    )
+    draw.rectangle((FOCUS_BAR_X0, FOCUS_BAR_Y0, FOCUS_BAR_X1, FOCUS_BAR_Y1),
+                   outline=(255, 255, 255, 255), width=1)
+    inner_top, inner_bottom = FOCUS_BAR_Y0 + 1, FOCUS_BAR_Y1 - 1
+    filled = int(round(focus * (inner_bottom - inner_top + 1)))
+    if filled > 0:
+        draw.rectangle(
+            (FOCUS_BAR_X0 + 1, inner_bottom - filled + 1, FOCUS_BAR_X1 - 1, inner_bottom),
+            fill=FOCUS_GREEN + (255,),
+        )
+    # The peak mark, drawn last so a full bar does not hide it.
+    draw.rectangle((FOCUS_BAR_X0 + 1, inner_top, FOCUS_BAR_X1 - 1, inner_top + 1),
+                   fill=AMBER + (255,))
+    # Baseline-anchored: the glyph grows upwards from FOCUS_LABEL_Y, so it cannot
+    # reach the EV minus button's hit region below it.
+    draw.text(((FOCUS_BAR_X0 + FOCUS_BAR_X1) // 2, FOCUS_LABEL_Y), "F",
+              fill=(255, 255, 255, 255), font=font, anchor="ms")
 
 
 def render_processing(label: str = "Processing photo...") -> Image.Image:
