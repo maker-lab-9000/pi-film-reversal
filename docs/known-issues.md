@@ -145,3 +145,15 @@ result.
 (`tests/test_app.py::test_log_line_carries_full_provenance`) and differs
 between two artifacts whose normalisation differs
 (`tests/test_pipeline.py::test_normalize_sha1_identifies_the_normalisation`).
+
+## `pifilm-process` regrades without the capture's EV compensation
+
+Since 2026-09-24 the capture path re-applies the viewfinder's EV compensation
+after normalisation (see the `pifilm/pipeline.py` docstring) and records it as
+`ev_comp` in `captures.jsonl`. Batch regrading with `pifilm-process` does not read
+the log, so it grades every original at EV 0: a shot taken at −2 EV regrades to
+the same brightness as a plain one. Captures before 2026-09-24 have no `ev_comp`
+field and were graded at EV 0 whatever the buttons said.
+
+Workaround: regrade such a file from Python with
+`Pipeline(Artifacts.default()).process(rgb, ev=<ev_comp>)`.

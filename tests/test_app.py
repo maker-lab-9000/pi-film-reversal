@@ -171,9 +171,34 @@ def test_log_line_carries_full_provenance(tmp_path, pipeline):
         "clamped", "grain_seed", "lut_sha1", "normalize_sha1", "params_version",
         "package_version",
         "width", "height", "fourcc", "fps", "pipeline_ms", "shutter_to_saved_ms",
+        "ev_comp",
     }
     assert line["shutter_to_saved_ms"] >= line["pipeline_ms"]
     assert isinstance(line["grain_seed"], int)
+
+
+def test_capture_grades_with_the_cameras_ev_compensation(tmp_path, pipeline):
+    """The viewfinder's EV buttons set the camera's EV; the grade must honour it
+    too, or normalisation undoes the darker exposure (found on the device)."""
+    from pifilm.color import luminance, srgb_to_linear
+
+    def mean_linear(path):
+        rgb = load_rgb(path)[0].astype(np.float32) / 255.0
+        return float(luminance(srgb_to_linear(rgb)).mean())
+
+    from pifilm.color import linear_to_srgb
+
+    frame = synthetic_frame(90, 160)
+    # What AE delivers at EV -2: the same scene, a quarter of the light.
+    dark = linear_to_srgb(srgb_to_linear(frame / 255.0) * 0.25)
+    dark = np.clip(dark * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    zero = _session(tmp_path / "a", pipeline, FakeCamera([frame])).capture()
+    cam = FakeCamera([dark])
+    cam.set_ev(-2.0)
+    minus = _session(tmp_path / "b", pipeline, cam).capture()
+    assert minus.record["ev_comp"] == -2.0 and zero.record["ev_comp"] == 0.0
+    stops = np.log2(mean_linear(minus.pifilm) / mean_linear(zero.pifilm))
+    assert stops == pytest.approx(-2.0, abs=0.3)
 
 
 def test_recorded_seed_reproduces_the_graded_file(tmp_path, pipeline):
