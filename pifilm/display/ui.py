@@ -40,7 +40,7 @@ NEEDLE_X0, NEEDLE_X1, NEEDLE_Y = 200, 272, 222
 NEEDLE_RANGE = 3.0
 # Focus bar: a vertical gauge down the left edge, clear of the shutter button on
 # the right and stopping well above the meter bar so it never sits over the EV
-# minus button or its 6 px hit margin (BAR_TOP - 8).
+# minus button or its hit margin (hit() starts the bar zone at BAR_TOP - HIT_MARGIN).
 FOCUS_BAR_X0, FOCUS_BAR_X1 = 6, 14
 FOCUS_BAR_Y0, FOCUS_BAR_Y1 = 40, 190
 FOCUS_GREEN = (0, 220, 90)
@@ -145,7 +145,7 @@ def _draw_focus_bar(draw: ImageDraw.ImageDraw, focus: float, font: Any) -> None:
     """
     focus = max(0.0, min(1.0, float(focus)))
     draw.rectangle(
-        (FOCUS_BAR_X0 - 4, FOCUS_BAR_Y0 - 4, FOCUS_BAR_X1 + 4, FOCUS_BAR_Y1 + 4),
+        (FOCUS_BAR_X0 - 4, FOCUS_BAR_Y0 - 4, FOCUS_BAR_X1 + 4, FOCUS_LABEL_Y + 1),
         fill=(0, 0, 0, BAR_ALPHA),
     )
     draw.rectangle((FOCUS_BAR_X0, FOCUS_BAR_Y0, FOCUS_BAR_X1, FOCUS_BAR_Y1),
