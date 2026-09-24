@@ -4,9 +4,18 @@ Register protocol as in the vendor ``Touch_CST3530.py``: 32-bit register
 addresses, the first byte sent as the SMBus "command" and the remaining three as
 data; a report is 9 bytes at ``REG_DATA`` holding the point count in ``buf[3] &
 0x0F`` and the first point, further points are 5 bytes each at ``REG_NEXT``, and
-every read ends with a write to ``REG_END_READ``. Raw coordinates are in the
-panel's 240x320 portrait space; ``to_display`` maps them to the 320x240 landscape
-frame the viewfinder draws.
+every read ends with a write to ``REG_END_READ``. One report is therefore one
+block write to set the address, nine single-byte reads, and the closing write
+(eleven transfers, not two). Raw coordinates are in the panel's 240x320 portrait
+space; ``to_display`` maps them to the 320x240 landscape frame the viewfinder
+draws.
+
+``open_waveshare28_touch`` probes the controller with one report read before
+returning: SPI has no acknowledgement and neither does opening ``/dev/i2c-1``,
+so without a probe the factory succeeds against a panel that is not connected
+and every frame's ``read()`` then raises. TP_RST is kept open for the panel's
+lifetime rather than closed after the reset pulse, which would return GPIO 17 to
+input and can leave the controller held in reset.
 
 The bus (I2C1) is shared with the X728's fuel gauge (0x36) and RTC (0x68). Each
 call here is one kernel ioctl and the controller's read pointer is not affected
@@ -77,10 +86,13 @@ def _split(reg: int) -> tuple[int, list[int]]:
 
 
 class CST3530Touch:
-    def __init__(self, i2c: Any, *, rotate: int = 0, address: int = ADDRESS) -> None:
+    def __init__(
+        self, i2c: Any, *, rotate: int = 0, address: int = ADDRESS, rst: Any = None,
+    ) -> None:
         self._i2c = i2c
         self._rotate = rotate
         self._address = address
+        self._rst = rst
 
     def _read(self, reg: int, count: int) -> bytes:
         first, rest = _split(reg)
@@ -104,10 +116,22 @@ class CST3530Touch:
             raise DisplayError(f"touch I2C read failed: {exc}") from exc
         return [to_display(p, self._rotate) for p in decode_points(buf + extra, count)]
 
+    def probe(self) -> None:
+        """Read one report, to prove the controller is actually there."""
+        try:
+            self._read(REG_DATA, 9)
+            self._write(REG_END_READ)
+        except OSError as exc:
+            raise DisplayError(
+                f"touch controller at {self._address:#04x} not answering "
+                f"on /dev/i2c-1: {exc}"
+            ) from exc
+
     def close(self) -> None:
-        close = getattr(self._i2c, "close", None)
-        if callable(close):
-            close()
+        for device in (self._i2c, self._rst):
+            close = getattr(device, "close", None)
+            if callable(close):
+                close()
 
 
 class TapDetector:
@@ -144,23 +168,33 @@ def open_waveshare28_touch(rotate: int = 0, sleep=time.sleep) -> CST3530Touch:
         raise DisplayError(
             "touch libraries missing; install python3-smbus2 and python3-gpiozero from apt"
         ) from exc
+    rst = None
     try:
         rst = DigitalOutputDevice(TP_RST_PIN, active_high=True, initial_value=True)
         rst.off()
         sleep(0.1)
         rst.on()
         sleep(0.5)
-        rst.close()
     except Exception as exc:
+        if rst is not None:
+            rst.close()
         raise DisplayError(
             f"cannot reset the touch controller on GPIO {TP_RST_PIN}: {exc}"
         ) from exc
     try:
         bus = SMBus(1)
     except PermissionError as exc:
+        rst.close()
         raise DisplayError(
             "no permission for /dev/i2c-1; add the service user to the i2c group"
         ) from exc
     except OSError as exc:
+        rst.close()
         raise DisplayError(f"cannot open /dev/i2c-1: {exc}; is dtparam=i2c_arm=on set?") from exc
-    return CST3530Touch(bus, rotate=rotate)
+    touch = CST3530Touch(bus, rotate=rotate, rst=rst)
+    try:
+        touch.probe()
+    except DisplayError:
+        touch.close()
+        raise
+    return touch

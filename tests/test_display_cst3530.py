@@ -1,3 +1,9 @@
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from pifilm.display import DisplayError
 from pifilm.display.cst3530 import (
     ADDRESS,
     CST3530Touch,
@@ -6,6 +12,7 @@ from pifilm.display.cst3530 import (
     TapDetector,
     TouchPoint,
     decode_points,
+    open_waveshare28_touch,
     to_display,
 )
 
@@ -82,6 +89,84 @@ def test_close_releases_the_bus():
     i2c = FakeI2C([])
     CST3530Touch(i2c).close()
     assert i2c.closed
+
+
+class FakeResetPin:
+    def __init__(self, pin, active_high=True, initial_value=True):
+        self.pin = pin
+        self.states = [initial_value]
+        self.closed = False
+
+    def on(self):
+        self.states.append(True)
+
+    def off(self):
+        self.states.append(False)
+
+    def close(self):
+        self.closed = True
+
+
+class DeadI2C:
+    """A bus with nothing at 0x58: every transfer NAKs, as it does with the
+    panel's ribbon unplugged."""
+
+    def __init__(self):
+        self.closed = False
+
+    def write_i2c_block_data(self, address, first, rest):
+        raise OSError(121, "Remote I/O error")
+
+    def read_byte(self, address):
+        raise OSError(121, "Remote I/O error")
+
+    def close(self):
+        self.closed = True
+
+
+def _install_touch_libraries(monkeypatch, bus):
+    pins = []
+
+    def make_pin(pin, active_high=True, initial_value=True):
+        pins.append(FakeResetPin(pin, active_high, initial_value))
+        return pins[-1]
+
+    monkeypatch.setitem(
+        sys.modules, "gpiozero", SimpleNamespace(DigitalOutputDevice=make_pin)
+    )
+    monkeypatch.setitem(sys.modules, "smbus2", SimpleNamespace(SMBus=lambda n: bus))
+    return pins
+
+
+def test_close_releases_the_bus_and_holds_the_reset_pin_until_then(monkeypatch):
+    """TP_RST must stay an output for the panel's lifetime: closing the pin
+    right after the reset pulse returns GPIO 17 to input and can leave the
+    controller in an undefined reset state."""
+    i2c = FakeI2C([(bytes(9), b"")])
+    pins = _install_touch_libraries(monkeypatch, i2c)
+    touch = open_waveshare28_touch(0, sleep=lambda _s: None)
+    rst, = pins
+    assert rst.closed is False
+    touch.close()
+    assert i2c.closed and rst.closed
+
+
+def test_open_probes_the_controller_before_returning(monkeypatch):
+    i2c = FakeI2C([(bytes(9), b"")])
+    _install_touch_libraries(monkeypatch, i2c)
+    open_waveshare28_touch(0, sleep=lambda _s: None)
+    assert i2c.writes == [0xD0070000, 0xD00002AB]
+
+
+def test_open_raises_when_the_controller_does_not_answer(monkeypatch):
+    """Without a probe the factory succeeds against a panel that is not there,
+    and every frame's read() then raises: a 10 Hz log flood forever."""
+    bus = DeadI2C()
+    pins = _install_touch_libraries(monkeypatch, bus)
+    with pytest.raises(DisplayError) as excinfo:
+        open_waveshare28_touch(0, sleep=lambda _s: None)
+    assert "touch controller at 0x58 not answering on /dev/i2c-1" in str(excinfo.value)
+    assert bus.closed and pins[0].closed
 
 
 def test_tap_detector_emits_on_release_within_limits():

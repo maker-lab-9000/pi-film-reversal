@@ -99,7 +99,8 @@ def _loop(camera, ctl, touch=None, display=None, clock=None, **kw):
     touch = touch or ScriptedTouch()
     display = display or FakeDisplay()
     clock = clock or FakeClock()
-    loop = ViewfinderLoop(camera, ctl, display, touch, clock=clock, log=lambda *a: None, **kw)
+    log = kw.pop("log", lambda *a: None)
+    loop = ViewfinderLoop(camera, ctl, display, touch, clock=clock, log=log, **kw)
     return loop, touch, display, clock
 
 
@@ -282,6 +283,20 @@ def test_touch_errors_do_not_count_toward_the_display_breaker(controller):
         loop.step()
     assert loop.state == "LIVE"
     assert len(display.images) == 10
+
+
+def test_touch_errors_are_logged_at_most_once_per_interval(controller):
+    """A panel that never answers must not write a line at 10 Hz for as long as
+    the service runs."""
+    camera, ctl = controller
+    logs = []
+    touch = GlitchyTouch(fail_on=range(20))
+    loop, _, display, clock = _loop(camera, ctl, touch=touch, log=logs.append)
+    for _ in range(10):
+        loop.step()
+    touch_lines = [line for line in logs if line.startswith("touch:")]
+    assert len(touch_lines) <= 2
+    assert "Remote I/O error" in touch_lines[0]
 
 
 def test_five_display_failures_end_the_loop(controller):

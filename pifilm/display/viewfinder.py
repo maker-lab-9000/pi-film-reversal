@@ -57,6 +57,8 @@ class ViewfinderLoop:
         self._seen_finished = controller.snapshot().finished_count
         self._review_since = 0.0
         self._display_failures = 0
+        self._touch_logged_at: float | None = None
+        self._touch_suppressed = 0
         self._frames = 0
         self._rate_since = clock.monotonic()
 
@@ -71,7 +73,18 @@ class ViewfinderLoop:
             # does not count toward the display breaker, which is about the
             # screen the user is looking at, and feeding the detector an empty
             # list also stops a half-seen press from wedging it down forever.
-            self._log(f"touch: {exc}")
+            # The log is rate-limited because a panel that never answers would
+            # otherwise write a line every frame for as long as the service runs.
+            now = self._clock.monotonic()
+            if (
+                self._touch_logged_at is None
+                or now - self._touch_logged_at >= RATE_LOG_INTERVAL
+            ):
+                more = f" ({self._touch_suppressed} more)" if self._touch_suppressed else ""
+                self._log(f"touch: {exc}{more}")
+                self._touch_logged_at, self._touch_suppressed = now, 0
+            else:
+                self._touch_suppressed += 1
             points = []
         if self._touch_debug and points:
             self._log(f"touch: {[(p.x, p.y) for p in points]}")
