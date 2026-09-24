@@ -24,7 +24,8 @@ EnvironmentFile=/etc/pifilm-capture.env
 # /home/george/repos/pi-film-reversal/artifacts/personal-collection-01-v1,
 # and use the same path for PI_ARTIFACT_DIR in .env.
 # --ups x728 reads the Geekworm X728 fuel gauge for the Stick's Pi-battery badge; drop it on a Pi without the shield.
-ExecStart=/home/george/repos/pi-film-reversal/.venv/bin/pifilm-capture --no-preview --remote-listen 0.0.0.0:8765 --artifacts /home/george/repos/pi-film-reversal/pifilm/data --ups x728
+# --display waveshare28 runs the LCD viewfinder; on a Pi without the panel the service logs a warning and continues for the Stick.
+ExecStart=/home/george/repos/pi-film-reversal/.venv/bin/pifilm-capture --no-preview --remote-listen 0.0.0.0:8765 --artifacts /home/george/repos/pi-film-reversal/pifilm/data --ups x728 --display waveshare28
 Restart=on-failure
 RestartSec=3
 StandardInput=null

@@ -823,6 +823,10 @@ class _CameraDouble:
 
     def __init__(self):
         self.closed = False
+        self.ev = 0.0
+
+    def set_ev(self, value):
+        self.ev = value
 
     def close(self):
         self.closed = True
@@ -1301,3 +1305,55 @@ def test_v4l2_style_frame_without_metadata_is_unchanged(tmp_path):
     assert result.original.name.endswith("_original.jpg")   # jpeg present -> original
     assert "camera_metadata" not in result.record
     assert "dng" not in result.record
+
+
+def test_display_flag_is_rejected_on_v4l2(camera_cli, capsys):
+    with pytest.raises(SystemExit):
+        camera_cli.main(["--camera", "v4l2", "--display", "waveshare28"])
+    assert "--display" in capsys.readouterr().err
+
+
+def test_display_requests_preview_mode_from_picamera2(camera_cli, monkeypatch):
+    opened = {}
+
+    def open_picamera(tuning_file, **kwargs):
+        opened.update(kwargs)
+        return _CameraDouble()
+
+    monkeypatch.setattr(camera_cli, "Picamera2Camera", open_picamera, raising=False)
+    monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: None)
+    argv = ["--camera", "picamera2", "--display", "waveshare28", "--no-preview"]
+    assert camera_cli.main(argv) == 0
+    assert opened["preview"] == (640, 480)
+
+
+def test_display_fault_falls_back_to_the_terminal(camera_cli, monkeypatch, capsys):
+    from pifilm.display import DisplayError
+
+    def failing(args, out):
+        raise DisplayError("no spi")
+
+    monkeypatch.setattr(camera_cli, "_open_display", failing)
+    assert camera_cli.main(["--fake", "--display", "waveshare28", "--no-preview"]) == 0
+    assert "no spi" in capsys.readouterr().err
+
+
+def test_fake_display_writes_a_png_and_exits_on_stop(tmp_path, monkeypatch):
+    from pifilm.capture import app
+
+    monkeypatch.setattr(app.Artifacts, "resolve", lambda _: Artifacts.default())
+
+    class StopSoon:
+        def __init__(self):
+            self.n = 0
+
+        def is_set(self):
+            self.n += 1
+            return self.n > 2
+
+    # Narrow the patch to app's own name: setattr on the real threading module
+    # would also replace the Event that Thread.start() uses internally.
+    monkeypatch.setattr(app, "threading", SimpleNamespace(Event=StopSoon))
+    out = tmp_path / "shots"
+    assert app.main(["--fake", "--display", "fake", "--no-preview", "--out", str(out)]) == 0
+    assert (out / "viewfinder-last.png").exists()
