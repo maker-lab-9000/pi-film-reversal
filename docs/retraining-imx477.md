@@ -5,6 +5,7 @@ Yes, you're right: it starts with photos from this sensor and lens. docs/trainin
 1. Shoot the source set on the Pi. Aim for 60–100 frames across at least 20 different scenes: tungsten indoors, window light, overcast and sunny outdoors, people and skin, food, signs, fabrics. Add 10–20 frames of deliberately colourful things (book spines, toys, a colour chart) so the rarer colours are covered.
 - Keep the EV buttons at 0. The trainer doesn't know about EV compensation, so a −1 frame would be learned as a normal exposure.
 - Leave auto exposure and auto white balance on, as the service uses them. Let each frame settle for a second.
+- Run the service with --ae-constraint highlight before shooting, and keep it for every source frame and afterwards. With the default (normal) constraint, auto exposure only ever raises exposure, and nothing stops a sky or window from clipping. In the first IMX477 set (2026-09-24 to 09-29), 35 of 98 EV-0 frames clipped more than 1% of pixels at the sensor, and the worst clipped 12%. Mid-tones were placed normally; only highlights were lost. Frames shot under a different constraint look different to the trainer, so don't mix the two in one source set. --ae-metering matrix is an option for scenes with a bright top edge, but it hasn't been tested on this camera yet.
 - Focus properly with the focus bar, and skip frames with blown highlights or near-black ones.
 
 2. Pull and sort on the Mac:
@@ -39,4 +40,4 @@ The two flags match how the Pi currently adjusts each frame: the camera does its
 .venv/bin/pifilm-process data/test-scenes out/starter
 .venv/bin/pifilm-process data/test-scenes out/imx477 --artifacts artifacts/imx477-2026-10-v1
 
-6. Deploy by rsyncing the artifact to the Pi and pointing --artifacts in the service at it (docs/training.md §8). Also add --tuning-file imx477.json to the service command, so a libcamera update can't shift the camera's colour under the trained look.
+6. Deploy by rsyncing the artifact to the Pi and pointing --artifacts in the service at it (docs/training.md §8). Keep --ae-constraint highlight on the service command (the example unit already has it). Also add --tuning-file imx477.json to the service command, so a libcamera update can't shift the camera's colour under the trained look.
