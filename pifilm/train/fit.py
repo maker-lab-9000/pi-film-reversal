@@ -59,7 +59,9 @@ from .report import write_report
 from .transport import hue_weights, iterative_distribution_transfer
 
 MIN_SOURCE_IMAGES = 30
-MIN_TARGET_IMAGES = 200
+# Lowered from 200 on the IMX477 retrain branch only: every local Parr set merged and
+# deduplicated gives 168 unique references (docs/retraining-imx477.md). Do not merge to main.
+MIN_TARGET_IMAGES = 150
 
 
 @dataclass
