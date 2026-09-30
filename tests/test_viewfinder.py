@@ -719,6 +719,10 @@ def test_badge_taps_during_processing_are_ignored(tmp_path):
         _tap(loop, touch, clock, _badge_centre())
         session.release.set()
         _until(lambda: ctl.snapshot().finished_count == 1)
+        # A toggle is queued behind the running job and applied after it finishes,
+        # so drain the FIFO worker queue with a follow-up job before asserting.
+        ctl.submit("drain")
+        _until(lambda: ctl.status("drain").state == "complete")
         assert ctl.snapshot().double_exposure is False
     finally:
         session.release.set()
