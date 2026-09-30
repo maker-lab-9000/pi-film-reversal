@@ -129,13 +129,13 @@ fitted on normalized input; grain runs last because it models developed film.
 ### Display (`pifilm/display/`)
 
 Optional SPI/I2C LCD viewfinder, wired up by `--display waveshare28`: `st7789.py` and `cst3530.py`
-drive the panel and its touch controller; `meter.py` computes the light-meter readout (pure,
-from preview metadata + pixels); `shutter.py` is the shutter-priority step scale (pure); `ui.py` renders the live/review/message screens and hit-tests
-taps (pure); `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine. All hardware
-imports (`spidev`, `gpiozero`, `smbus2`) are lazy, inside the `open_*` factories, so the package
-imports on a Mac and in tests. `fake.py` (`--display fake`) writes frames to a PNG instead of SPI.
-The loop shares the `CaptureController` with the Stick's remote server, so an LCD tap and a Stick
-request are the same kind of job.
+drive the panel and its touch controller; `meter.py` computes the light-meter readout (pure, from
+preview metadata + pixels); `shutter.py` is the shutter-priority step scale (pure); `ui.py` renders
+the live/review/message screens and hit-tests taps (pure); `viewfinder.py`'s `ViewfinderLoop` is the
+LIVE/REVIEW state machine. All hardware imports (`spidev`, `gpiozero`, `smbus2`) are lazy, inside
+the `open_*` factories, so the package imports on a Mac and in tests. `fake.py` (`--display fake`)
+writes frames to a PNG instead of SPI. The loop shares the `CaptureController` with the Stick's
+remote server, so an LCD tap and a Stick request are the same kind of job.
 
 ### Trainer (`pifilm/train/`, Mac only; needs `[train]` extra: SciPy, requests)
 

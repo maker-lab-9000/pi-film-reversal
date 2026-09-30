@@ -151,7 +151,7 @@ restart.
 | EV `−` / EV `+` buttons (bar's left/right ends) | `-` / `+` labels | Adjusts exposure compensation by 1/3 stop, clamped to ±2; resets to `0` every time `pifilm-capture` restarts. The graded file keeps it too (normalisation used to cancel it until 2026-09-24), and it is logged as `ev_comp` in `captures.jsonl` |
 | Shutter `+` / `−` buttons (right edge, above and below the shutter button) | `+` and `-` | Shutter priority: `+` one 1/3 stop faster, `−` slower, 1/2000 to 1 s; slower than 1 s returns to auto (`A`). The first tap from auto starts at the speed auto-exposure is using. ISO stays automatic; EV still works. Picamera2 only; resets to auto on restart |
 | Shutter readout `S 1/250` | `S` prefix when the shutter is fixed; otherwise the metered speed | — |
-| `ISO MAX` (amber, in the readout) | Gain is at the sensor's maximum: the fixed shutter is too fast for the light and the photo will be dark | — |
+| `ISO MAX` (amber, in the readout) | Gain is at or near the sensor's maximum (98 % or more): on a fixed shutter the speed is too fast for the light and the photo will be dark, so pick a slower speed or add light. It can also appear on auto in very dim light | — |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Battery badge (top-right) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | `2x` toggle (pill, top-left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
@@ -212,14 +212,20 @@ full auto.
 
 - At long speeds the live view slows to match: at 1/4 s it shows about 4 frames a
   second. That is the exposure, not a fault.
-- `ISO MAX` in amber means the camera has run out of gain for this speed. The photo
-  will come out dark and grainy (it is graded like any dark frame); pick a slower
-  speed or add light.
+- At long speeds the screen also responds to taps only once per frame (about once
+  a second at 1 s), so hold a tap briefly rather than flicking it.
+- `ISO MAX` in amber means the gain is at or near the sensor's maximum (98 % or
+  more), so the camera has run out of gain for this speed. The photo will come out
+  dark and grainy (it is graded like any dark frame); pick a slower speed or add
+  light. It can also appear on auto in very dim light.
 - Each photo's `captures.jsonl` line records `shutter_us` (null on auto); the real
   exposure time and gain are in `camera_metadata`.
 - At start-up the journal names how the shutter is fixed:
   `picamera2: shutter priority via ExposureTimeMode` on current libcamera, or
   `... ExposureTime (legacy libcamera)` on older stacks.
+- Do not combine shutter priority with `--ae-lock`: it is not meaningful there. On
+  legacy libcamera the lock freezes the gain too, and on libcamera 0.5 returning to
+  `A` re-enables auto exposure time.
 
 ## 6. Reading the meter
 
