@@ -62,6 +62,7 @@ import os
 import select
 import signal
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -79,13 +80,15 @@ from .._cv2 import require_cv2
 from ..artifacts import PARAMS_VERSION, Artifacts, ArtifactsError
 from ..display import DisplayError
 from ..display.viewfinder import ViewfinderLoop
+from ..double import COMPOSITE_METHOD, composite
 from ..imageio import load_rgb, save_jpeg
 from ..pipeline import Pipeline
-from .camera import Camera, CameraError, FakeCamera, V4L2Camera
+from .camera import Camera, CameraError, FakeCamera, Frame, V4L2Camera
 from .controller import CaptureController, JobSnapshot
 from .picamera import Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
 from .remote import RemoteCaptureServer
+from .thumbnail import render_exposure_card
 
 cv2 = require_cv2()
 
@@ -99,6 +102,19 @@ class CaptureResult:
     original: Path
     pifilm: Path
     record: dict
+    # (index, of) for a double-exposure shot, None for a single one. After exposure 1
+    # ``pifilm`` is the "Exposure 1/2" card, not a photo: nothing is graded until the
+    # second exposure lands on the same "negative" (see ``pifilm.double``).
+    exposure: tuple[int, int] | None = None
+
+
+@dataclass
+class _PendingExposure:
+    """Exposure 1 of a double, held in memory until exposure 2 arrives."""
+
+    rgb: np.ndarray
+    original: str
+    ev: float
 
 
 class CaptureSession:
@@ -119,6 +135,11 @@ class CaptureSession:
         self._seed_rng = seed_rng or np.random.default_rng()
         self._package_version = package_version
         self._save_dng = save_dng
+        # Double exposure: touched only on the controller's worker thread. Memory
+        # only, so a restart always begins with the mode off at 0/2.
+        self.double_exposure = False
+        self._pending: _PendingExposure | None = None
+        self._card_dir: Path | None = None
 
     def _allocate(self, suffix: str) -> tuple[Path, str, datetime]:
         t = self._now()
@@ -131,12 +152,29 @@ class CaptureSession:
             stem = f"{base}-{k}"
         return day_dir, stem, t
 
+    @property
+    def double_state(self) -> tuple[bool, int]:
+        """(mode on, exposures taken towards the current pair: 0 or 1)."""
+        return self.double_exposure, (1 if self._pending is not None else 0)
+
+    def set_double_exposure(self, enabled: bool) -> None:
+        """Turning the mode off drops a pending exposure 1; its original stays on disk.
+
+        Turning it on while already on keeps the pending frame, so a repeated tap
+        cannot silently restart a half-made pair.
+        """
+        self.double_exposure = bool(enabled)
+        if not self.double_exposure:
+            self._pending = None
+
     def capture(self) -> CaptureResult:
         shutter = time.perf_counter()
         # Read before the frame: the EV the exposure was made at. The grade has to
         # re-apply it, or normalisation cancels it (see ``pifilm.pipeline``).
         ev = float(getattr(self.camera, "ev", 0.0))
         frame = self.camera.read()
+        if self.double_exposure:
+            return self._capture_double(frame, ev, shutter)
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
         t0 = time.perf_counter()
@@ -145,19 +183,7 @@ class CaptureSession:
         )
         pipeline_ms = (time.perf_counter() - t0) * 1000.0
 
-        has_original = frame.jpeg is not None or frame.source == "picamera2"
-        suffix = "original" if has_original else "ungraded"
-        day_dir, stem, t = self._allocate(suffix)
-        original = day_dir / f"{stem}_{suffix}.jpg"
-        if frame.jpeg is not None:
-            original.write_bytes(frame.jpeg)
-        else:
-            save_jpeg(frame.rgb, original)
-        dng_name = None
-        if frame.dng is not None and self._save_dng:
-            dng_path = day_dir / f"{stem}.dng"
-            dng_path.write_bytes(frame.dng)
-            dng_name = dng_path.name
+        day_dir, stem, t, original, dng_name = self._write_original(frame)
         pifilm = save_jpeg(graded, day_dir / f"{stem}_graded.jpg")
         shutter_to_saved_ms = (time.perf_counter() - shutter) * 1000.0
 
@@ -176,9 +202,96 @@ class CaptureSession:
             **({"camera_metadata": frame.metadata} if frame.metadata else {}),
             **({"dng": dng_name} if dng_name else {}),
         }
+        self._append_record(day_dir, record)
+        return CaptureResult(original, pifilm, record)
+
+    def _capture_double(self, frame: Frame, ev: float, shutter: float) -> CaptureResult:
+        # The pending frame is taken off the session before anything that can fail, so
+        # any failure from here on returns the count to 0/2 (spec section 5). A camera
+        # error is raised by read() before this point and leaves 1/2 in place for a retry.
+        pending, self._pending = self._pending, None
+        day_dir, stem, t, original, dng_name = self._write_original(frame)
+        camera_fields = {
+            "frame_source": frame.source,
+            "package_version": self._package_version,
+            **self.camera.stream_info.to_dict(),
+            **({"camera_metadata": frame.metadata} if frame.metadata else {}),
+            **({"dng": dng_name} if dng_name else {}),
+        }
+        if pending is None:
+            record = {
+                "timestamp": t.isoformat(timespec="seconds"),
+                "original": original.name,
+                **camera_fields,
+                "ev_comp": ev,
+                "shutter_to_saved_ms": round((time.perf_counter() - shutter) * 1000.0, 1),
+                "double": {"index": 1, "of": 2},
+            }
+            self._append_record(day_dir, record)
+            card = self._exposure_card(1, 2)
+            self._pending = _PendingExposure(frame.rgb, original.name, ev)
+            return CaptureResult(original, card, record, exposure=(1, 2))
+
+        seed = int(self._seed_rng.integers(0, 2**31 - 1))
+        t0 = time.perf_counter()
+        # Each frame goes in as shot, EV included; the composite is graded at ev=0.
+        graded, info = self.pipeline.process(
+            composite(pending.rgb, frame.rgb), rng=np.random.default_rng(seed), ev=0.0,
+        )
+        pipeline_ms = (time.perf_counter() - t0) * 1000.0
+        pifilm = save_jpeg(graded, day_dir / f"{stem}_double_graded.jpg")
+        record = {
+            "timestamp": t.isoformat(timespec="seconds"),
+            "original": original.name,
+            "pifilm": pifilm.name,
+            **camera_fields,
+            **info,
+            "grain_seed": seed,
+            "params_version": PARAMS_VERSION,
+            "pipeline_ms": round(pipeline_ms, 1),
+            "shutter_to_saved_ms": round((time.perf_counter() - shutter) * 1000.0, 1),
+            "double": {
+                "index": 2, "of": 2, "method": COMPOSITE_METHOD,
+                "originals": [pending.original, original.name],
+                "ev_comp": [pending.ev, ev],
+            },
+        }
+        self._append_record(day_dir, record)
+        return CaptureResult(original, pifilm, record, exposure=(2, 2))
+
+    def _write_original(self, frame: Frame) -> tuple[Path, str, datetime, Path, str | None]:
+        has_original = frame.jpeg is not None or frame.source == "picamera2"
+        suffix = "original" if has_original else "ungraded"
+        day_dir, stem, t = self._allocate(suffix)
+        original = day_dir / f"{stem}_{suffix}.jpg"
+        if frame.jpeg is not None:
+            original.write_bytes(frame.jpeg)
+        else:
+            save_jpeg(frame.rgb, original)
+        dng_name = None
+        if frame.dng is not None and self._save_dng:
+            dng_path = day_dir / f"{stem}.dng"
+            dng_path.write_bytes(frame.dng)
+            dng_name = dng_path.name
+        return day_dir, stem, t, original, dng_name
+
+    @staticmethod
+    def _append_record(day_dir: Path, record: dict) -> None:
         with (day_dir / "captures.jsonl").open("a") as fh:
             fh.write(json.dumps(record) + "\n")
-        return CaptureResult(original, pifilm, record)
+
+    def _exposure_card(self, index: int, of: int) -> Path:
+        """The Stick's picture for a partial double; never under ``out_root``.
+
+        Everything under ``out_root`` is uploaded by the Nextcloud sync, and a card is
+        not a photograph, so it lives in a private temporary directory.
+        """
+        if self._card_dir is None:
+            self._card_dir = Path(tempfile.mkdtemp(prefix="pifilm-cards-"))
+        path = self._card_dir / f"exposure-{index}-of-{of}.jpg"
+        if not path.exists():
+            path.write_bytes(render_exposure_card(index, of))
+        return path
 
     def preview_frame(self, graded: bool = True, size: tuple[int, int] = (640, 360)) -> np.ndarray:
         # full=False: the live preview must not pay Picamera2's per-frame autofocus
@@ -193,6 +306,12 @@ class CaptureSession:
 
 def _announce(result: CaptureResult, out: Callable[[str], None]) -> None:
     r = result.record
+    if result.exposure == (1, 2):
+        out(
+            f"Saved {result.original.name} as exposure 1/2 in "
+            f"{r['shutter_to_saved_ms']:.0f} ms; waiting for the second exposure"
+        )
+        return
     clamps = [k for k, v in r["clamped"].items() if v]
     note = f" (clamped: {', '.join(clamps)})" if clamps else ""
     out(
