@@ -61,6 +61,7 @@ between a capture and its release.
 from __future__ import annotations
 
 import math
+import numbers
 import sys
 import tempfile
 import threading
@@ -249,9 +250,14 @@ class Picamera2Camera:
                 )
                 camera.configure(preview_config)
                 self._preview_config = preview_config
+            # A configuration built without FrameDurationLimits falls back to the
+            # camera's own control range, so a long shutter can still widen it.
+            default_limits = _control_frame_limits(camera.camera_controls)
             self._frame_limits = {
-                "still": _config_frame_limits(self._still_config),
-                "preview": _config_frame_limits(self._preview_config),
+                key: (_config_frame_limits(config) or default_limits)
+                if config is not None else None
+                for key, config in (("still", self._still_config),
+                                    ("preview", self._preview_config))
             }
             camera.set_controls(controls)
             start_attempted = True
@@ -385,10 +391,12 @@ class Picamera2Camera:
         controls. A long shutter also widens the frame-duration limit, which is why
         the live view slows at long shutters, and ``None`` restores the limits each
         configuration was built with. Nothing changes if the camera rejects the
-        controls.
+        controls. ``us`` must be ``None`` or a whole number of microseconds: an
+        integral float such as ``4000.0`` is accepted as ``4000``, while a bool,
+        a string or a fractional number is a ``CameraError``.
         """
         if us is not None:
-            us = int(us)
+            us = _shutter_us(us)
             if not _SHUTTER_RANGE_US[0] <= us <= _SHUTTER_RANGE_US[1]:
                 raise CameraError(f"shutter must be within {_SHUTTER_RANGE_US} us, got {us}")
         camera = self._camera
@@ -485,6 +493,24 @@ def _config_frame_limits(config: Any) -> tuple[int, int] | None:
         return int(low), int(high)
     except (TypeError, KeyError, IndexError, ValueError):
         return None
+
+
+def _control_frame_limits(camera_controls: Any) -> tuple[int, int] | None:
+    """The camera's own FrameDurationLimits range, a Picamera2 (min, max, default)."""
+    try:
+        entry = camera_controls["FrameDurationLimits"]
+        return int(entry[0]), int(entry[1])
+    except (TypeError, KeyError, IndexError, ValueError):
+        return None
+
+
+def _shutter_us(value: Any) -> int:
+    """A whole number of microseconds, or ``CameraError`` for anything else."""
+    if isinstance(value, numbers.Integral) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    raise CameraError(f"shutter must be a whole number of microseconds, got {value!r}")
 
 
 def _set_config_control(config: Any, name: str, value: Any) -> None:

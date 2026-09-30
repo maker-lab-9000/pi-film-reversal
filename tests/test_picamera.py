@@ -166,6 +166,7 @@ def install_picamera(monkeypatch):
         with_exposure_time_mode=False,
         analogue_gain=None,
         frame_limits=None,
+        control_frame_limits=None,
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
 
@@ -192,6 +193,8 @@ def install_picamera(monkeypatch):
                     self.camera_controls["ExposureTimeMode"] = (0, 1, 0)
                 if analogue_gain is not None:
                     self.camera_controls["AnalogueGain"] = analogue_gain
+                if control_frame_limits is not None:
+                    self.camera_controls["FrameDurationLimits"] = control_frame_limits
                 self.sensor_modes = sensor_modes if sensor_modes is not None else [
                     {"size": (1536, 864)}, {"size": (2304, 1296)}, {"size": (4608, 2592)},
                 ]
@@ -1432,13 +1435,40 @@ def test_a_short_shutter_keeps_the_frame_limits(install_picamera):
     camera.close()
 
 
-@pytest.mark.parametrize("bad", [99, 1_000_001, -5])
+@pytest.mark.parametrize("bad", [99, 1_000_001, -5, "x", 4000.5, True, "4000"])
 def test_shutter_outside_the_range_is_refused(install_picamera, bad):
     install_picamera()
     camera = Picamera2Camera()
     with pytest.raises(CameraError):
         camera.set_shutter(bad)
     assert camera.shutter_us is None
+    camera.close()
+
+
+def test_integral_float_shutter_is_accepted_as_whole_microseconds(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    camera.set_shutter(4000.0)
+    assert camera.shutter_us == 4000
+    assert type(state.instance.set_controls_calls[-1]["ExposureTime"]) is int
+    camera.close()
+
+
+def test_a_configuration_without_frame_limits_falls_back_to_the_camera_range(
+    install_picamera,
+):
+    state = install_picamera(
+        with_exposure_time_mode=True, control_frame_limits=(100, 83_333, 33_333),
+    )
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    camera.set_shutter(250_000)
+    assert inst.set_controls_calls[-1]["FrameDurationLimits"] == (100, 251_000)
+    assert inst.preview_config["controls"]["FrameDurationLimits"] == (100, 251_000)
+    assert inst.created_config["controls"]["FrameDurationLimits"] == (100, 251_000)
+    camera.set_shutter(None)
+    assert inst.set_controls_calls[-1]["FrameDurationLimits"] == (100, 83_333)
+    assert inst.preview_config["controls"]["FrameDurationLimits"] == (100, 83_333)
     camera.close()
 
 
