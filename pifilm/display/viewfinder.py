@@ -11,6 +11,18 @@ review and the loop returns to LIVE for the second exposure.
 Shutter taps go straight to the camera, like EV taps, so they also work while a
 job is processing.
 
+Under ``run()`` touch is polled on its own thread ("pifilm-touch"), not inside
+the frame loop. At the long shutter speeds (up to 1 s) the preview read blocks
+for a whole frame, so a frame loop that polled touch would look at the panel
+about once a second. The CST3530 is polled, not latched, and ``TapDetector``
+needs to see the finger down and then up within its 0.6 s hold limit, so a
+quick tap would fall between two polls and never register. The thread polls
+every ``touch_period`` of real time and queues finished taps; ``step()`` takes
+at most one per call and handles it on the loop's clock as before. While the
+thread runs it is the only code that touches the touch device, the
+``TapDetector`` and the touch-error log state. ``step()`` driven directly (the
+tests) has no thread and polls inline, exactly as before.
+
 Display and touch objects are duck-typed (``show``/``close``, ``read``/``close``)
 and the clock is injectable, so the loop is tested without hardware. The loop
 never closes the camera: the caller stops it through the stop event and only
@@ -23,6 +35,7 @@ import time, and nothing under ``pifilm/display/`` may need OpenCV.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import uuid
@@ -71,6 +84,7 @@ class ViewfinderLoop:
         max_display_failures: int = 5, log: Callable[..., None] = print,
         touch_debug: bool = False, dim_after: float = DIM_AFTER,
         off_after: float = OFF_AFTER, full_backlight: int = FULL_BACKLIGHT,
+        touch_period: float = 0.02,
     ) -> None:
         self._camera, self._controller = camera, controller
         self._display, self._touch = display, touch
@@ -78,6 +92,10 @@ class ViewfinderLoop:
         self._frame_period, self._review_timeout = frame_period, review_timeout
         self._max_failures, self._log, self._touch_debug = max_display_failures, log, touch_debug
         self._taps = TapDetector()
+        self._touch_period = touch_period
+        # Set only while run()'s touch thread is alive; step() then reads taps
+        # from it instead of polling the panel itself.
+        self._tap_queue: queue.Queue[Tap] | None = None
         self.state = "LIVE"
         self.ev_comp = float(getattr(camera, "ev", 0.0))
         # Shutter priority exists only on backends that can fix the exposure time
@@ -112,7 +130,13 @@ class ViewfinderLoop:
 
     # -- plumbing -------------------------------------------------------------
 
-    def _poll_tap(self) -> Tap | None:
+    def _poll_tap(self, monotonic: Callable[[], float] | None = None) -> Tap | None:
+        """Read the panel once and feed the tap detector.
+
+        ``monotonic`` is the time source for the detector and the error log:
+        the loop's clock when polled inline, real time on the touch thread.
+        """
+        monotonic = monotonic or self._clock.monotonic
         try:
             points = self._touch.read()
         except DisplayError as exc:
@@ -123,7 +147,7 @@ class ViewfinderLoop:
             # list also stops a half-seen press from wedging it down forever.
             # The log is rate-limited because a panel that never answers would
             # otherwise write a line every frame for as long as the service runs.
-            now = self._clock.monotonic()
+            now = monotonic()
             if (
                 self._touch_logged_at is None
                 or now - self._touch_logged_at >= RATE_LOG_INTERVAL
@@ -136,7 +160,37 @@ class ViewfinderLoop:
             points = []
         if self._touch_debug and points:
             self._log(f"touch: {[(p.x, p.y) for p in points]}")
-        return self._taps.feed(points, self._clock.monotonic())
+        return self._taps.feed(points, monotonic())
+
+    def _next_tap(self) -> Tap | None:
+        """One tap for this step: from the touch thread's queue when it runs,
+        otherwise by polling the panel inline."""
+        taps = self._tap_queue
+        if taps is None:
+            return self._poll_tap()
+        try:
+            return taps.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _touch_worker(self, stop: threading.Event, halt: threading.Event,
+                      taps: queue.Queue[Tap]) -> None:
+        """Poll the panel on real time until the loop stops, queueing taps.
+
+        ``halt`` is the loop's own signal for when ``run()`` ends by an
+        exception (a display breaker trip, Ctrl-C), which does not set the
+        caller's ``stop``. An unexpected error is logged and polling carries on
+        rather than letting the thread die and silently take touch with it.
+        """
+        while not (stop.is_set() or halt.is_set()):
+            try:
+                tap = self._poll_tap(time.monotonic)
+            except Exception as exc:
+                self._log(f"touch: {exc}")
+                tap = None
+            if tap is not None:
+                taps.put(tap)
+            halt.wait(self._touch_period)
 
     def _restart_rate_window(self) -> None:
         """Begin a fresh frame-rate window after a gap that was not the live view.
@@ -238,7 +292,7 @@ class ViewfinderLoop:
     # -- states -----------------------------------------------------------------
 
     def step(self) -> None:
-        tap = self._poll_tap()
+        tap = self._next_tap()
         now = self._clock.monotonic()
         if tap is not None:
             # On a dark screen the user cannot see what they touch, so the tap
@@ -339,8 +393,25 @@ class ViewfinderLoop:
             self._restart_rate_window()
 
     def run(self, stop: threading.Event) -> None:
-        while not stop.is_set():
-            started = self._clock.monotonic()
-            self.step()
-            elapsed = self._clock.monotonic() - started
-            self._clock.sleep(max(0.0, self._frame_period - elapsed))
+        taps: queue.Queue[Tap] = queue.Queue()
+        halt = threading.Event()
+        worker = threading.Thread(
+            target=self._touch_worker, args=(stop, halt, taps),
+            name="pifilm-touch", daemon=True,
+        )
+        self._tap_queue = taps
+        worker.start()
+        try:
+            while not stop.is_set():
+                started = self._clock.monotonic()
+                self.step()
+                elapsed = self._clock.monotonic() - started
+                self._clock.sleep(max(0.0, self._frame_period - elapsed))
+        finally:
+            # The caller closes the touch device as soon as run() returns, so
+            # the thread must be done with it first.
+            halt.set()
+            worker.join(1.0)
+            if worker.is_alive():
+                self._log("touch: poll thread did not stop within 1 s")
+            self._tap_queue = None

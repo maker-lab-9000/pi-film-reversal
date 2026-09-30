@@ -924,3 +924,98 @@ def test_a_rejected_shutter_is_logged_not_fatal(controller):
     _tap(loop, touch, clock, _centre(SHUTTER_PLUS_BOX))
     assert any("control rejected" in line for line in lines)
     assert loop.state == "LIVE"
+
+
+# -- touch on its own thread (long exposures) ---------------------------------------
+
+
+class TimedTouch:
+    """A finger that is down for ``hold`` seconds of real time after ``press``."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._press = None
+
+    def press(self, xy, hold=0.15):
+        with self._lock:
+            self._press = (xy, time.monotonic(), hold)
+
+    def read(self):
+        with self._lock:
+            press = self._press
+        if press is None:
+            return []
+        (x, y), t0, hold = press
+        return [TouchPoint(x, y, 10)] if time.monotonic() - t0 < hold else []
+
+    def close(self):
+        pass
+
+
+def _touch_thread_alive():
+    return any(t.name == "pifilm-touch" and t.is_alive() for t in threading.enumerate())
+
+
+def test_a_quick_tap_registers_while_a_long_exposure_blocks_the_preview(controller):
+    """At 1 s the preview read blocks a whole second, longer than a tap lasts.
+
+    Polled inline, the finger is down and up again between two polls and the
+    tap is lost; the touch thread sees it and hands it to the next step.
+    """
+    camera, ctl = controller
+    camera.set_shutter(1_000_000)  # one step slower is back to A
+    real_read = camera.read
+    reading = threading.Event()
+
+    def slow_read(*, full=True):
+        reading.set()
+        time.sleep(1.0)
+        return real_read(full=full)
+
+    camera.read = slow_read
+    touch = TimedTouch()
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=time)
+    stop = threading.Event()
+    runner = threading.Thread(target=loop.run, args=(stop,), daemon=True)
+    runner.start()
+    try:
+        assert reading.wait(2.0), "the loop never read a preview frame"
+        touch.press(_centre(SHUTTER_MINUS_BOX), hold=0.15)
+        _until(lambda: camera.shutter_us is None, timeout=3.0)
+    finally:
+        stop.set()
+        runner.join(5.0)
+    assert not runner.is_alive()
+
+
+def test_the_touch_thread_stops_with_the_loop(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl, clock=time, frame_period=0.02)
+    stop = threading.Event()
+    seen = {"alive": False}
+    real_step = loop.step
+
+    def watching_step():
+        seen["alive"] = seen["alive"] or _touch_thread_alive()
+        real_step()
+        if len(display.images) >= 3:
+            stop.set()
+
+    loop.step = watching_step
+    loop.run(stop)
+    assert seen["alive"], "run() never started the touch thread"
+    assert not _touch_thread_alive()
+
+
+def test_the_touch_thread_stops_when_the_loop_raises(controller):
+    """A display breaker trip ends run() by exception; the thread must not
+    outlive it, because the caller closes the touch device next."""
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(
+        camera, ctl, display=FakeDisplay(fail_after=0), clock=time, frame_period=0.01,
+    )
+    stop = threading.Event()
+    with pytest.raises(DisplayError):
+        loop.run(stop)
+    assert not stop.is_set()
+    assert not _touch_thread_alive()
