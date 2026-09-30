@@ -368,7 +368,7 @@ rsync -av artifacts/pifilm-2026-09-v1/ george@parr.local:repos/pi-film-reversal/
 On the Pi, point the service at it and restart:
 
 ```sh
-sudo sed -i 's#--artifacts [^ ]*#--artifacts /home/george/repos/pi-film-reversal/artifacts/pifilm-2026-09-v1#' /etc/systemd/system/pifilm-capture.service
+sudo sed -i '/^ExecStart=/ s#--artifacts [^ ]*#--artifacts /home/george/repos/pi-film-reversal/artifacts/pifilm-2026-09-v1#' /etc/systemd/system/pifilm-capture.service
 sudo systemctl daemon-reload
 sudo systemctl restart pifilm-capture.service
 ```
