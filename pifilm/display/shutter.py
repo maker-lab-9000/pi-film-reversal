@@ -3,7 +3,8 @@
 
 The series is the standard 1/3-stop shutter scale from 1/2000 s to 1 s, as
 (microseconds, label) pairs, with ``None`` meaning ``A``: full auto exposure. ``+``
-is faster and ``-`` is slower; one step slower than 1 s is back to ``A``.
+is faster and ``-`` is slower; one step slower than 1 s is back to ``A``. A value
+between steps moves to the next series value in that direction, never skipping one.
 
 From ``A`` the first tap in either direction lands on the step nearest the exposure
 auto-exposure is using right now, so switching into shutter priority never jumps the
@@ -16,6 +17,7 @@ The labels are ASCII only: the viewfinder's default font has no glyphs beyond it
 
 from __future__ import annotations
 
+import bisect
 import math
 
 SHUTTER_STEPS: tuple[tuple[int, str], ...] = (
@@ -46,28 +48,27 @@ def _start(metered_us: float | None) -> int:
     return SHUTTER_STEPS_US[_nearest_index(metered_us)]
 
 
+def _is_auto(us: float | None) -> bool:
+    return us is None or not math.isfinite(us) or us <= 0
+
+
 def faster(current_us: int | None, metered_us: float | None) -> int | None:
-    if current_us is None:
+    if _is_auto(current_us):
         return _start(metered_us)
-    i = _nearest_index(current_us)
-    if SHUTTER_STEPS_US[i] > current_us:  # off-series value between steps: snap down
-        return SHUTTER_STEPS_US[i - 1] if i > 0 else SHUTTER_STEPS_US[0]
+    i = bisect.bisect_left(SHUTTER_STEPS_US, current_us)  # steps below current: [0, i)
     return SHUTTER_STEPS_US[max(0, i - 1)]
 
 
 def slower(current_us: int | None, metered_us: float | None) -> int | None:
-    if current_us is None:
+    if _is_auto(current_us):
         return _start(metered_us)
-    i = _nearest_index(current_us)
-    if SHUTTER_STEPS_US[i] < current_us:  # off-series value between steps: snap up
-        i += 1
-        return SHUTTER_STEPS_US[i] if i < len(SHUTTER_STEPS_US) else None
-    return SHUTTER_STEPS_US[i + 1] if i + 1 < len(SHUTTER_STEPS_US) else None
+    i = bisect.bisect_right(SHUTTER_STEPS_US, current_us)  # first step above current
+    return SHUTTER_STEPS_US[i] if i < len(SHUTTER_STEPS_US) else None
 
 
 def label(us: int | None) -> str:
-    if us is None:
+    """Label of the nearest step; ``A`` for ``None`` and for a non-positive or
+    non-finite value (which ``faster``/``slower`` also treat as auto)."""
+    if _is_auto(us):
         return "A"
-    if us in _LABELS:
-        return _LABELS[us]
     return _LABELS[SHUTTER_STEPS_US[_nearest_index(us)]]

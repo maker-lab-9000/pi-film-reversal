@@ -50,9 +50,23 @@ def test_fastest_step_stays_put_and_slowest_returns_to_auto():
     assert slower(1_000_000, None) is None
 
 
-def test_an_off_series_value_snaps_to_the_nearest_step_first():
-    assert faster(4100, None) == 3125
+def test_an_off_series_value_moves_to_the_adjacent_step():
+    assert faster(4100, None) == 4000
     assert slower(4100, None) == 5000
+    assert slower(3900, None) == 4000
+    assert faster(3900, None) == 3125
+
+
+def test_out_of_range_values():
+    assert slower(1_200_000, None) is None
+    assert faster(400, None) == 500
+
+
+def test_non_positive_current_is_auto():
+    assert faster(0, 4000.0) == 4000
+    assert slower(-5, None) == 8000
+    assert label(0) == "A"
+    assert label(-1) == "A"
 
 
 @pytest.mark.parametrize("fn", [faster, slower])
