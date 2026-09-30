@@ -83,3 +83,25 @@ def test_exposure_card_is_a_stick_sized_jpeg(tmp_path):
 
 def test_exposure_card_text_depends_on_the_index():
     assert render_exposure_card(1, 2) != render_exposure_card(2, 2)
+
+
+def _reference_composite(first, second):
+    """Float64 sRGB -> linear -> mean -> sRGB, straight from the formulas."""
+    def to_linear(x):
+        x = x / 255.0
+        return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+    mean = 0.5 * (to_linear(first.astype(np.float64)) + to_linear(second.astype(np.float64)))
+    srgb = np.where(mean <= 0.0031308, mean * 12.92, 1.055 * mean ** (1.0 / 2.4) - 0.055)
+    return np.clip(np.round(srgb * 255.0), 0, 255).astype(np.uint8)
+
+
+@pytest.mark.slow
+def test_full_sensor_frame_matches_a_float64_reference_within_one_code():
+    rng = np.random.default_rng(2)
+    a = rng.integers(0, 256, size=(3040, 4056, 3), dtype=np.uint8)
+    b = rng.integers(0, 256, size=(3040, 4056, 3), dtype=np.uint8)
+    out = composite(a, b)
+    ref = _reference_composite(a, b)
+    assert out.shape == ref.shape and out.dtype == np.uint8
+    assert np.abs(out.astype(np.int16) - ref.astype(np.int16)).max() <= 1

@@ -21,6 +21,12 @@ shoulder could act; the mean never exceeds 1.0. Each frame goes in as shot, its 
 compensation included, so a frame shot darker contributes less light. The caller
 grades the composite with ``ev=0``: normalisation then sets the pair's overall
 exposure, and the ratio between the two exposures is what survives.
+
+The maths runs through lookup tables in float32, a band of rows at a time: a
+full-sensor frame (4056x3040) would otherwise need hundreds of MiB of float64
+temporaries and seconds of CPU, which a Pi 4 capturing next to a viewfinder cannot
+spare. Decoding is exact (a uint8 has 256 values); the mean is quantised to 65536
+linear levels before encoding, well under one output code.
 """
 
 from __future__ import annotations
@@ -30,6 +36,20 @@ import numpy as np
 from .color import linear_to_srgb, srgb_to_linear
 
 COMPOSITE_METHOD = "linear_mean"
+
+_ENCODE_LEVELS = 65536
+_ROWS_PER_CHUNK = 256
+# uint8 code -> linear light, halved (each frame one stop down).
+_HALF_LINEAR = 0.5 * srgb_to_linear(np.arange(256, dtype=np.float32) / 255.0)
+# Linear level index (mean scaled to [0, _ENCODE_LEVELS - 1]) -> sRGB uint8 code.
+_ENCODE = np.clip(
+    np.round(
+        linear_to_srgb(np.arange(_ENCODE_LEVELS, dtype=np.float32) / (_ENCODE_LEVELS - 1))
+        * 255.0
+    ),
+    0,
+    255,
+).astype(np.uint8)
 
 
 def composite(first: np.ndarray, second: np.ndarray) -> np.ndarray:
@@ -44,5 +64,15 @@ def composite(first: np.ndarray, second: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"double exposure frames differ in size: {first.shape} vs {second.shape}"
         )
-    linear = 0.5 * (srgb_to_linear(first / 255.0) + srgb_to_linear(second / 255.0))
-    return np.clip(np.round(linear_to_srgb(linear) * 255.0), 0, 255).astype(np.uint8)
+    out = np.empty_like(first)
+    scale = np.float32(_ENCODE_LEVELS - 1)
+    for top in range(0, first.shape[0], _ROWS_PER_CHUNK):
+        rows = slice(top, top + _ROWS_PER_CHUNK)
+        mean = _HALF_LINEAR[first[rows]]
+        mean += _HALF_LINEAR[second[rows]]
+        mean *= scale
+        mean += np.float32(0.5)
+        index = mean.astype(np.uint16)  # floor(x + 0.5): round to the nearest level
+        np.minimum(index, _ENCODE_LEVELS - 1, out=index)
+        out[rows] = _ENCODE[index]
+    return out
