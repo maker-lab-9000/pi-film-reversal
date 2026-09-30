@@ -1409,6 +1409,22 @@ def test_shutter_priority_falls_back_to_exposure_time_on_older_libcamera(
     camera.close()
 
 
+def test_returning_to_auto_drops_the_stale_exposure_time_from_both_configurations(
+    install_picamera,
+):
+    """Every configure reapplies a configuration's controls as one unordered set,
+    so an ``ExposureTime`` left beside ``ExposureTimeMode=Auto`` would be sent
+    again on every still; whether the IPA ignores it cannot be checked off the Pi."""
+    state = install_picamera(with_exposure_time_mode=True)
+    camera = Picamera2Camera(preview=True)
+    camera.set_shutter(4000)
+    camera.set_shutter(None)
+    for config in (state.instance.created_config, state.instance.preview_config):
+        assert config["controls"]["ExposureTimeMode"] == _ExposureTimeModeEnum.Auto
+        assert "ExposureTime" not in config["controls"]
+    camera.close()
+
+
 def test_a_long_shutter_widens_frame_limits_in_both_configurations_and_auto_restores(
     install_picamera,
 ):
@@ -1476,6 +1492,7 @@ def test_a_rejected_shutter_changes_nothing(install_picamera):
     state = install_picamera(with_exposure_time_mode=True)
     camera = Picamera2Camera(preview=True)
     before = dict(state.instance.preview_config["controls"])
+    still_before = dict(state.instance.created_config["controls"])
 
     def boom(controls):
         raise RuntimeError("control rejected")
@@ -1485,6 +1502,7 @@ def test_a_rejected_shutter_changes_nothing(install_picamera):
         camera.set_shutter(4000)
     assert camera.shutter_us is None
     assert state.instance.preview_config["controls"] == before
+    assert state.instance.created_config["controls"] == still_before
     camera.close()
 
 

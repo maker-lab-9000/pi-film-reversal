@@ -412,6 +412,11 @@ class Picamera2Camera:
                                 ("preview", self._preview_config)):
                 for name, value in self._shutter_controls(us, self._frame_limits[key]).items():
                     _set_config_control(config, name, value)
+                if us is None and self._shutter_mode == "mode":
+                    # Auto sends no ExposureTime, but the one a fixed shutter
+                    # wrote would stay in the configuration and be reapplied
+                    # beside ExposureTimeMode=Auto on every configure.
+                    _drop_config_control(config, "ExposureTime")
         self.shutter_us = us
 
     def _shutter_controls(
@@ -520,6 +525,16 @@ def _set_config_control(config: Any, name: str, value: Any) -> None:
     try:
         config["controls"][name] = value
     except (TypeError, KeyError, IndexError):  # a configuration without controls
+        pass
+
+
+def _drop_config_control(config: Any, name: str) -> None:
+    """Remove one control from a Picamera2 configuration, if it is there."""
+    if config is None:
+        return
+    try:
+        config["controls"].pop(name, None)
+    except (TypeError, KeyError, IndexError, AttributeError):  # no controls dict
         pass
 
 
