@@ -171,15 +171,28 @@ class CaptureController:
                 close()
 
     def _read_double(self) -> tuple[bool, int]:
-        state = getattr(self._session, "double_state", None)
-        if not isinstance(state, tuple) or len(state) != 2:
-            return False, 0
-        return bool(state[0]), int(state[1])
+        """The session's (mode, count), or the last value seen if it cannot be read.
+
+        This and ``_apply_toggle`` run on the worker outside a job's try block; an
+        exception here would end the worker with a job still active, and every later
+        request would be refused as busy for the life of the process.
+        """
+        last = getattr(self, "_double", (False, 0))
+        try:
+            state = getattr(self._session, "double_state", None)
+            if not isinstance(state, tuple) or len(state) != 2:
+                return False, 0
+            return bool(state[0]), int(state[1])
+        except Exception:
+            return last
 
     def _apply_toggle(self, enabled: bool) -> None:
         setter = getattr(self._session, "set_double_exposure", None)
         if callable(setter):
-            setter(enabled)
+            try:
+                setter(enabled)
+            except Exception:
+                pass  # the snapshot below reports whatever mode the session is in
         double = self._read_double()
         with self._lock:
             self._double = double

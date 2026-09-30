@@ -286,3 +286,41 @@ def test_a_session_without_double_exposure_ignores_the_toggle():
         assert controller.snapshot().double_exposure is False
     finally:
         controller.close()
+
+
+def test_a_toggle_that_raises_does_not_stop_the_worker():
+    class BrokenToggle(DoubleSession):
+        def set_double_exposure(self, enabled):
+            raise RuntimeError("toggle failed")
+
+    controller = CaptureController(BrokenToggle())
+    try:
+        controller.set_double_exposure(True)
+        controller.submit("after")
+        assert _wait_finished(controller, "after").state == "complete"
+        assert controller.snapshot().double_exposure is False
+    finally:
+        controller.close()
+
+
+def test_an_unreadable_double_state_keeps_the_last_known_value():
+    class Flaky(DoubleSession):
+        broken = False
+
+        @property
+        def double_state(self):
+            if self.broken:
+                raise RuntimeError("state unavailable")
+            return self.enabled, self.taken
+
+    session = Flaky()
+    controller = CaptureController(session)
+    try:
+        controller.set_double_exposure(True)
+        _until(lambda: controller.snapshot().double_exposure)
+        session.broken = True
+        controller.submit("x")
+        assert _wait_finished(controller, "x").state == "complete"
+        assert controller.snapshot().double_exposure is True
+    finally:
+        controller.close()
