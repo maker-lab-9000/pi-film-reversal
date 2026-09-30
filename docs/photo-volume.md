@@ -57,7 +57,9 @@ show the full size. If it doesn't, `sudo fallocate -l 30G
 /var/lib/pifilm/photos.img` fills the holes without touching the data.
 
 rsync keeps modification times and rclone compares size and time, so the sync
-does not re-upload anything after the move.
+does not re-upload anything after the move. The volume's root holds ext4's root-only
+`lost+found`; `scripts/nextcloud_sync.py` excludes it, since reading it made rclone
+fail every run.
 
 ## Check and grow
 

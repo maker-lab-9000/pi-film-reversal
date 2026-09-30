@@ -165,6 +165,10 @@ def rclone_copy_command(
         f"{REMOTE_NAME}:{cfg.target_dir}",
         "--min-age",
         min_age,
+        # The photo folder is its own ext4 volume (docs/photo-volume.md); its
+        # root-only lost+found made every run fail with "permission denied".
+        "--exclude",
+        "/lost+found/**",
         "--verbose",
     ]
     if dry_run:
