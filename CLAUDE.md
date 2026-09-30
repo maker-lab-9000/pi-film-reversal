@@ -107,7 +107,7 @@ fitted on normalized input; grain runs last because it models developed film.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
   captures-only display (`--show-captures`, shows TV colour bars while processing), and headless
   terminal. `--display waveshare28` runs the LCD viewfinder instead of any OpenCV window. Output:
-  `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,pifilm}.jpg` plus an audit
+  `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,graded|double_graded}.jpg` plus an audit
   line in `captures.jsonl` (LUT hash, normalisation hash and grain seed allow regenerating the
   graded file).
 - Double exposure: `CaptureSession` owns the mode and pending first frame; `pifilm/double.py`

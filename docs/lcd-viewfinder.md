@@ -184,15 +184,19 @@ or both mixed.
    about a second, then the live view with the badge at `1/2`. Only the original is
    saved; the Stick shows an "Exposure 1/2" card.
 2. **Exposure 2:** colour bars labelled `Developing double exposure...`, then the
-   review screen with the composite (caption starts `2x`). The badge returns to
-   `0/2` and the mode stays on.
+   review screen with the composite (caption starts `2x` and ends with both
+   exposures' EVs, `EV e1/e2`). The badge returns to `0/2` and the mode stays on.
 
 Files: each exposure keeps its own `HHMMSS_original.jpg` (and `.dng`). The composite
 is `HHMMSS_double_graded.jpg`, named after exposure 2. Its `captures.jsonl` line has a
-`double` block naming both originals, their EVs and the method (`linear_mean`).
-Exposure compensation per frame is the film shooter's control: shoot the frame you
-want to recede at −1 EV. The mode is not remembered across restarts. A camera error on
-exposure 2 keeps `1/2`, so just shoot again. See [how it works](how-it-works.md#double-exposure)
+`double` block naming both originals (as paths relative to the output folder, such as
+`2026-09-30/120000_original.jpg`, since a pair can straddle midnight), their EVs and the
+method (`linear_mean`). Exposure compensation per frame is the film shooter's control:
+shoot the frame you want to recede at −1 EV. Do not under-expose both frames as you
+would on film: the one-stop reduction is already applied, and normalisation cancels an
+offset common to both, so only the difference between the two EVs matters. A tap ends
+the `Exposure 1/2` notice early. The mode is not remembered across restarts. A camera
+error on exposure 2 keeps `1/2`, so just shoot again. See [how it works](how-it-works.md#double-exposure)
 for why the frames are added before grading.
 
 ## 6. Reading the meter
@@ -282,7 +286,8 @@ per spec §4:
     `_double_graded.jpg`, and no `_graded.jpg` for exposure 1. Repeat with the Stick
     as the trigger: it shows the `Exposure 1/2` card, then the composite. Tap `2x` at
     `1/2`: the badge goes to the outlined `2x`. `systemctl restart pifilm-capture`:
-    the mode comes back off.
+    the mode comes back off. Exposure 2 on the IMX477 finishes within a few seconds of
+    a single shot (colour bars not held noticeably longer).
 
 ## 8. Troubleshooting
 
