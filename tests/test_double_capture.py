@@ -222,3 +222,14 @@ def test_a_card_failure_fails_exposure_one_without_a_log_line(tmp_path, pipeline
         session.capture()
     assert _records(session) == []
     assert session.double_state == (True, 0)
+
+
+def test_both_double_exposure_records_carry_their_shutter(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    session.set_double_exposure(True)
+    session.camera.set_shutter(250_000)
+    first = session.capture()
+    session.camera.set_shutter(None)
+    second = session.capture()
+    assert first.record["shutter_us"] == 250_000
+    assert second.record["shutter_us"] is None
