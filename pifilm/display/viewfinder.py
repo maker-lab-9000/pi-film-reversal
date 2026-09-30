@@ -187,8 +187,10 @@ class ViewfinderLoop:
         The caption goes through ``compute_reading`` rather than formatting the
         metadata here, so a zero or non-numeric ``ExposureTime`` is handled by
         the meter's guards and the review agrees with the live readout instead
-        of doing its own arithmetic. Everything is caught: this runs on the loop
-        thread, and after Task 9 that is the process's main thread, so an
+        of doing its own arithmetic. A double's composite was graded at EV 0 from
+        two frames shot at their own EVs, so its caption shows the pair's recorded
+        EVs (``EV e1/e2``), not wherever the dial is now. Everything is caught: this
+        runs on the loop thread, and after Task 9 that is the process's main thread, so an
         unreadable file or a malformed record must cost one screen, not the
         Stick server.
         """
@@ -198,11 +200,14 @@ class ViewfinderLoop:
             rgb, _ = load_rgb(job.result.pifilm)
             meta = job.result.record.get("camera_metadata") or {}
             reading = compute_reading(meta, rgb, self.ev_comp, None)
-            caption = (
-                f"{text_or_dash(reading.shutter)}  {iso_label(reading.iso)}  "
-                f"EV {format_ev(self.ev_comp)}"
-            )
-            if getattr(job.result, "exposure", None) == (2, 2):
+            ev_text = format_ev(self.ev_comp)
+            double = getattr(job.result, "exposure", None) == (2, 2)
+            if double:
+                evs = (job.result.record.get("double") or {}).get("ev_comp")
+                if isinstance(evs, list) and len(evs) == 2:
+                    ev_text = "/".join(format_ev(float(ev)) for ev in evs)
+            caption = f"{text_or_dash(reading.shutter)}  {iso_label(reading.iso)}  EV {ev_text}"
+            if double:
                 caption = f"2x  {caption}"
             return render_review(rgb, caption)
         except Exception as exc:

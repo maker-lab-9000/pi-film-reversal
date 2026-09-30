@@ -13,6 +13,7 @@ from pifilm.capture.controller import CaptureController
 from pifilm.capture.errors import CameraError
 from pifilm.display import DisplayError, viewfinder
 from pifilm.display.cst3530 import TouchPoint
+from pifilm.display.meter import format_ev
 from pifilm.display.ui import BAR_TOP, DOUBLE_BOX, SHUTTER_CENTRE
 from pifilm.display.viewfinder import EV_STEP, NOTICE_SECONDS, ViewfinderLoop
 from pifilm.grain import GrainParams
@@ -788,9 +789,13 @@ def test_exposure_two_reviews_the_composite_with_a_2x_caption(controller, monkey
     loop.step()
     ctl.submit("exp-2")
     _until(lambda: ctl.snapshot().finished_count == 2)
+    loop._set_ev(1.0)  # the dial has moved since: the caption must show the shots' EVs
     loop.step()
     assert loop.state == "REVIEW"
-    assert calls["review"][-1].startswith("2x")
+    caption = calls["review"][-1]
+    assert caption.startswith("2x")
+    assert caption.endswith(f"EV {format_ev(0.0)}/{format_ev(0.0)}")
+    assert caption.isascii()
     job = ctl.snapshot().last_finished_job
     assert job.result.pifilm.name.endswith("_double_graded.jpg")
 
