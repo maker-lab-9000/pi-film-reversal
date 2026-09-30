@@ -129,7 +129,9 @@ fitted on normalized input; grain runs last because it models developed film.
   through this server instance are visible; `instance_id` changes on restart.
 - `thumbnail.py`: 240×135 letterboxed JPEG, ≤64 KiB, served to the Stick.
 - `batch.py`: `pifilm-process`. Skips `*_graded.*`, defaults to only `_original`/`_ungraded` files in a
-  capture folder, refuses an output dir equal to or inside the input.
+  capture folder, refuses an output dir equal to or inside the input. When the folder has a
+  `captures.jsonl`, each frame is graded with its logged `ev_comp` and `grain_seed`, so the same
+  artifact reproduces the Pi's graded file pixel for pixel (`--ignore-log` grades at EV 0).
 
 ### Display (`pifilm/display/`)
 
