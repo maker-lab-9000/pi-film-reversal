@@ -46,6 +46,16 @@ class ControllerSnapshot:
     # controller knowing that displays exist.
     finished_count: int = 0
     last_finished_job: JobSnapshot | None = None
+    # Double exposure, as the session reported it when the last job or toggle
+    # finished. Updated under the same lock as ``finished_count``, so a display that
+    # sees a job finish also sees the count that job left behind.
+    double_exposure: bool = False
+    exposures_taken: int = 0
+
+
+@dataclass(frozen=True)
+class _DoubleToggle:
+    enabled: bool
 
 
 class CaptureController:
@@ -60,7 +70,8 @@ class CaptureController:
         self._finished_count = 0
         self._last_finished_job: JobSnapshot | None = None
         self._closed = False
-        self._work: queue.Queue[str | None] = queue.Queue()
+        self._double = self._read_double()
+        self._work: queue.Queue[str | _DoubleToggle | None] = queue.Queue()
         self._worker = threading.Thread(
             target=self._run, name="pifilm-capture-worker", daemon=True,
         )
@@ -86,6 +97,17 @@ class CaptureController:
             self._work.put(request_id)
             return job
 
+    def set_double_exposure(self, enabled: bool) -> None:
+        """Queue a double-exposure toggle behind any capture already accepted.
+
+        It runs on the worker thread, which is the only thread that touches the
+        session, so it can never change the mode in the middle of a pair's capture.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._work.put(_DoubleToggle(bool(enabled)))
+
     def status(self, request_id: str) -> JobSnapshot | None:
         with self._lock:
             return self._jobs.get(request_id)
@@ -103,6 +125,8 @@ class CaptureController:
                 self._closed,
                 self._finished_count,
                 self._last_finished_job,
+                self._double[0],
+                self._double[1],
             )
 
     def close(self) -> None:
@@ -117,9 +141,13 @@ class CaptureController:
     def _run(self) -> None:
         try:
             while True:
-                request_id = self._work.get()
-                if request_id is None:
+                item = self._work.get()
+                if item is None:
                     return
+                if isinstance(item, _DoubleToggle):
+                    self._apply_toggle(item.enabled)
+                    continue
+                request_id = item
                 self._set_processing(request_id)
                 try:
                     result = self._session.capture()
@@ -142,6 +170,33 @@ class CaptureController:
             if callable(close):
                 close()
 
+    def _read_double(self) -> tuple[bool, int]:
+        """The session's (mode, count), or the last value seen if it cannot be read.
+
+        This and ``_apply_toggle`` run on the worker outside a job's try block; an
+        exception here would end the worker with a job still active, and every later
+        request would be refused as busy for the life of the process.
+        """
+        last = getattr(self, "_double", (False, 0))
+        try:
+            state = getattr(self._session, "double_state", None)
+            if not isinstance(state, tuple) or len(state) != 2:
+                return False, 0
+            return bool(state[0]), int(state[1])
+        except Exception:
+            return last
+
+    def _apply_toggle(self, enabled: bool) -> None:
+        setter = getattr(self._session, "set_double_exposure", None)
+        if callable(setter):
+            try:
+                setter(enabled)
+            except Exception:
+                pass  # the snapshot below reports whatever mode the session is in
+        double = self._read_double()
+        with self._lock:
+            self._double = double
+
     def _set_processing(self, request_id: str) -> None:
         with self._lock:
             self._jobs[request_id] = JobSnapshot(request_id, "processing")
@@ -155,6 +210,7 @@ class CaptureController:
         result: object | None = None,
         error_message: str | None = None,
     ) -> None:
+        double = self._read_double()
         with self._lock:
             job = JobSnapshot(request_id, state, error_code, result, error_message)
             self._jobs[request_id] = job
@@ -163,3 +219,4 @@ class CaptureController:
             self._last_finished_job = job
             if state == "complete":
                 self._last_completed_job = job
+            self._double = double

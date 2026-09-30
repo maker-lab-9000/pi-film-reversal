@@ -49,6 +49,10 @@ FOCUS_BAR_X0, FOCUS_BAR_X1 = 6, 14
 FOCUS_BAR_Y0, FOCUS_BAR_Y1 = 40, 190
 FOCUS_GREEN = (0, 220, 90)
 FOCUS_LABEL_Y = 196
+# Double-exposure toggle: a pill in the top-left corner. It sits above the focus
+# bar's backing (y >= FOCUS_BAR_Y0 - 4) even with its hit margin, and away from the
+# battery badge (top-right) and the shutter (right edge).
+DOUBLE_BOX = (4, 4, 74, 24)
 
 
 class Action(Enum):
@@ -56,6 +60,7 @@ class Action(Enum):
     SHUTTER = "shutter"
     EV_MINUS = "ev_minus"
     EV_PLUS = "ev_plus"
+    DOUBLE_TOGGLE = "double_toggle"
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -81,7 +86,9 @@ def iso_label(iso: int | None) -> str:
     return f"ISO {iso}" if iso is not None else f"ISO {DASH}"
 
 
-def render_live(frame_rgb: np.ndarray, reading: MeterReading) -> Image.Image:
+def render_live(
+    frame_rgb: np.ndarray, reading: MeterReading, double: tuple[bool, int] | None = None,
+) -> Image.Image:
     base = _letterbox(frame_rgb).convert("RGBA")
     overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -123,6 +130,8 @@ def render_live(frame_rgb: np.ndarray, reading: MeterReading) -> Image.Image:
         fill=(255, 255, 255, 60), outline=(255, 255, 255, 255), width=2,
     )
     draw.ellipse((cx - 18, cy - 18, cx + 18, cy + 18), fill=(255, 255, 255, 180))
+    if double is not None:
+        _draw_double_badge(draw, double[0], double[1], small)
     # battery badge
     if reading.battery_percent is not None:
         label = f"{'AC ' if reading.external_power else ''}{reading.battery_percent}%"
@@ -175,6 +184,22 @@ def _draw_focus_bar(
     # reach the EV minus button's hit region below it.
     draw.text(((FOCUS_BAR_X0 + FOCUS_BAR_X1) // 2, FOCUS_LABEL_Y), "F",
               fill=(255, 255, 255, 255), font=font, anchor="ms")
+
+
+def _draw_double_badge(draw: ImageDraw.ImageDraw, enabled: bool, taken: int, font: Any) -> None:
+    """The double-exposure toggle. Off: an outlined ``2x``. On: amber, with progress.
+
+    ASCII only: the default font has no multiplication sign.
+    """
+    x0, y0, x1, y1 = DOUBLE_BOX
+    if enabled:
+        draw.rounded_rectangle(DOUBLE_BOX, radius=8, fill=AMBER + (255,))
+        label, colour = f"2x {taken}/2", (0, 0, 0, 255)
+    else:
+        draw.rounded_rectangle(DOUBLE_BOX, radius=8, fill=(0, 0, 0, BAR_ALPHA),
+                               outline=(255, 255, 255, 255), width=1)
+        label, colour = "2x", (255, 255, 255, 255)
+    draw.text(((x0 + x1) // 2, (y0 + y1) // 2), label, fill=colour, font=font, anchor="mm")
 
 
 def render_processing(label: str = "Processing photo...") -> Image.Image:
@@ -231,6 +256,9 @@ def hit(x: int, y: int) -> Action:
     cx, cy = SHUTTER_CENTRE
     if math.hypot(x - cx, y - cy) <= SHUTTER_RADIUS + HIT_MARGIN:
         return Action.SHUTTER
+    x0, y0, x1, y1 = DOUBLE_BOX
+    if x0 - HIT_MARGIN <= x <= x1 + HIT_MARGIN and y0 - HIT_MARGIN <= y <= y1 + HIT_MARGIN:
+        return Action.DOUBLE_TOGGLE
     if y >= BAR_TOP - HIT_MARGIN:
         if x <= EV_BUTTON_W + HIT_MARGIN:
             return Action.EV_MINUS

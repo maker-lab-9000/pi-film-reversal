@@ -6,11 +6,13 @@ from pifilm.display.ui import (
     AMBER,
     BAR_TOP,
     DASH,
+    DOUBLE_BOX,
     FOCUS_BAR_X0,
     FOCUS_BAR_X1,
     FOCUS_BAR_Y0,
     FOCUS_BAR_Y1,
     HEIGHT,
+    HIT_MARGIN,
     PROCESSING_BARS,
     PROCESSING_DIM,
     SHUTTER_CENTRE,
@@ -182,3 +184,51 @@ def test_focus_bar_does_not_disturb_the_rest_of_the_screen():
     without = np.array(render_live(frame, _reading(focus=None)))
     right_of_bar = np.s_[:, FOCUS_BAR_X1 + 6:]
     assert np.array_equal(with_bar[right_of_bar], without[right_of_bar])
+
+
+def _box_pixels(img):
+    x0, y0, x1, y1 = DOUBLE_BOX
+    return np.asarray(img)[y0:y1 + 1, x0:x1 + 1]
+
+
+def test_no_badge_unless_asked():
+    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
+    assert np.array_equal(
+        np.asarray(render_live(frame, _reading())),
+        np.asarray(render_live(frame, _reading(), None)),
+    )
+    # the corner is the plain frame
+    assert np.all(_box_pixels(render_live(frame, _reading()))[6:10, 2:6] == 200)
+
+
+def test_badge_off_is_dark_on_is_amber():
+    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
+    off = np.asarray(render_live(frame, _reading(), (False, 0)))
+    on = np.asarray(render_live(frame, _reading(), (True, 0)))
+    x, y = DOUBLE_BOX[0] + 4, (DOUBLE_BOX[1] + DOUBLE_BOX[3]) // 2
+    assert off[y, x].max() < 150
+    assert tuple(on[y, x]) == AMBER
+
+
+def test_badge_shows_progress():
+    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
+    zero = _box_pixels(render_live(frame, _reading(), (True, 0)))
+    one = _box_pixels(render_live(frame, _reading(), (True, 1)))
+    assert not np.array_equal(zero, one)
+
+
+def test_badge_tap_is_the_double_toggle():
+    x0, y0, x1, y1 = DOUBLE_BOX
+    assert hit((x0 + x1) // 2, (y0 + y1) // 2) is Action.DOUBLE_TOGGLE
+    assert hit(x1 + HIT_MARGIN, y1 + HIT_MARGIN) is Action.DOUBLE_TOGGLE
+    assert hit(x1 + HIT_MARGIN + 1, (y0 + y1) // 2) is Action.NONE
+
+
+def test_badge_region_overlaps_no_other_control():
+    x0, y0, x1, y1 = DOUBLE_BOX
+    for x in range(max(0, x0 - HIT_MARGIN), x1 + HIT_MARGIN + 1):
+        for y in range(max(0, y0 - HIT_MARGIN), y1 + HIT_MARGIN + 1):
+            assert hit(x, y) is Action.DOUBLE_TOGGLE
+    # clear of the focus bar's backing, which starts at FOCUS_BAR_Y0 - 4
+    assert y1 + HIT_MARGIN < FOCUS_BAR_Y0 - 4
+    assert hit(*SHUTTER_CENTRE) is Action.SHUTTER

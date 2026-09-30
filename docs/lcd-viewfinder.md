@@ -151,6 +151,7 @@ restart.
 | EV `−` / EV `+` buttons (bar's left/right ends) | `-` / `+` labels | Adjusts exposure compensation by 1/3 stop, clamped to ±2; resets to `0` every time `pifilm-capture` restarts. The graded file keeps it too (normalisation used to cancel it until 2026-09-24), and it is logged as `ev_comp` in `captures.jsonl` |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Battery badge (top-right) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
+| `2x` toggle (pill, top-left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
 | Review screen | Full-screen graded result, one-line caption (`shutter  ISO NNN  EV ±N.N`), "tap to continue" hint | Any tap, or 30 s untouched, returns to live view |
 
 ### Idle dimming
@@ -171,6 +172,32 @@ A tap that lands during the roughly one second of still acquisition is
 **dropped, not queued**: the camera lock is held for the whole capture request,
 so the loop is not polling touch at all during it, and the controller is busy
 anyway (it runs one job at a time). Wait for the colour bars to clear.
+
+### Double exposure
+
+With `2x` on, every two shots become one picture, the way two exposures on one frame
+of colour negative film do. Light adds: a dark area in one frame lets the other show
+through, and bright areas stack. Any trigger counts: the shutter button, the Stick,
+or both mixed.
+
+1. **Exposure 1:** colour bars labelled `Exposure 1 of 2...`, then `Exposure 1/2` for
+   about a second, then the live view with the badge at `1/2`. Only the original is
+   saved; the Stick shows an "Exposure 1/2" card.
+2. **Exposure 2:** colour bars labelled `Developing double exposure...`, then the
+   review screen with the composite (caption starts `2x` and ends with both
+   exposures' EVs, `EV e1/e2`). The badge returns to `0/2` and the mode stays on.
+
+Files: each exposure keeps its own `HHMMSS_original.jpg` (and `.dng`). The composite
+is `HHMMSS_double_graded.jpg`, named after exposure 2. Its `captures.jsonl` line has a
+`double` block naming both originals (as paths relative to the output folder, such as
+`2026-09-30/120000_original.jpg`, since a pair can straddle midnight), their EVs and the
+method (`linear_mean`). Exposure compensation per frame is the film shooter's control:
+shoot the frame you want to recede at −1 EV. Do not under-expose both frames as you
+would on film: the one-stop reduction is already applied, and normalisation cancels an
+offset common to both, so only the difference between the two EVs matters. A tap ends
+the `Exposure 1/2` notice early. The mode is not remembered across restarts. A camera
+error on exposure 2 keeps `1/2`, so just shoot again. See [how it works](how-it-works.md#double-exposure)
+for why the frames are added before grading.
 
 ## 6. Reading the meter
 
@@ -252,6 +279,15 @@ per spec §4:
     and the live view keeps moving; at 5 minutes it goes dark. A tap on the dark
     screen lights it without taking a photo (no new `captures.jsonl` line); a
     Stick shot while dark wakes it into the review.
+11. Double exposure: tap `2x` → badge `2x 0/2` in amber. Shoot a dark silhouette
+    against a bright window, then a textured subject: `Exposure 1/2` shows briefly and
+    the badge reads `1/2`; the second shot reviews a composite in which the texture
+    fills the silhouette. The day folder gains two originals and one
+    `_double_graded.jpg`, and no `_graded.jpg` for exposure 1. Repeat with the Stick
+    as the trigger: it shows the `Exposure 1/2` card, then the composite. Tap `2x` at
+    `1/2`: the badge goes to the outlined `2x`. `systemctl restart pifilm-capture`:
+    the mode comes back off. Exposure 2 on the IMX477 finishes within a few seconds of
+    a single shot (colour bars not held noticeably longer).
 
 ## 8. Troubleshooting
 
