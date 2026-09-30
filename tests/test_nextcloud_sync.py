@@ -189,6 +189,13 @@ def test_copy_command_copies_not_syncs_with_target_and_min_age():
     assert "app-secret-123" not in " ".join(cmd)
 
 
+def test_copy_command_skips_lost_and_found_at_the_source_root():
+    """The photo folder is an ext4 volume (docs/photo-volume.md) whose root holds a
+    root-only lost+found; reading it failed every sync with exit 6."""
+    cmd = rclone_copy_command(_cfg(), dry_run=False)
+    assert cmd[cmd.index("--exclude") + 1] == "/lost+found/**"
+
+
 def test_copy_command_dry_run_adds_flag():
     assert "--dry-run" in rclone_copy_command(_cfg(), dry_run=True)
 
