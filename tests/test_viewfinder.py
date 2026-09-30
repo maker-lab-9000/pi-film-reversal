@@ -14,7 +14,13 @@ from pifilm.capture.errors import CameraError
 from pifilm.display import DisplayError, viewfinder
 from pifilm.display.cst3530 import TouchPoint
 from pifilm.display.meter import format_ev
-from pifilm.display.ui import BAR_TOP, DOUBLE_BOX, SHUTTER_CENTRE
+from pifilm.display.ui import (
+    BAR_TOP,
+    DOUBLE_BOX,
+    SHUTTER_CENTRE,
+    SHUTTER_MINUS_BOX,
+    SHUTTER_PLUS_BOX,
+)
 from pifilm.display.viewfinder import EV_STEP, NOTICE_SECONDS, ViewfinderLoop
 from pifilm.grain import GrainParams
 from pifilm.lut import LUT3D
@@ -482,9 +488,9 @@ def _spy_live(monkeypatch):
     readings = []
     real = viewfinder.render_live
 
-    def spy(frame_rgb, reading, double=None):
+    def spy(frame_rgb, reading, double=None, shutter_buttons=False):
         readings.append(reading)
-        return real(frame_rgb, reading, double)
+        return real(frame_rgb, reading, double, shutter_buttons)
 
     monkeypatch.setattr(viewfinder, "render_live", spy)
     return readings
@@ -735,9 +741,9 @@ def test_live_view_draws_the_badge_from_the_snapshot(controller, monkeypatch):
     seen = []
     real = viewfinder.render_live
 
-    def spy(frame, reading, double=None):
+    def spy(frame, reading, double=None, shutter_buttons=False):
         seen.append(double)
-        return real(frame, reading, double)
+        return real(frame, reading, double, shutter_buttons)
 
     monkeypatch.setattr(viewfinder, "render_live", spy)
     loop, touch, display, clock = _loop(camera, ctl)
@@ -828,3 +834,93 @@ def test_processing_labels_follow_the_pair(tmp_path, monkeypatch):
     finally:
         session.release.set()
         ctl.close()
+
+
+# -- shutter priority -------------------------------------------------------------
+
+
+def _centre(box):
+    x0, y0, x1, y1 = box
+    return (x0 + x1) // 2, (y0 + y1) // 2
+
+
+def test_first_shutter_tap_from_auto_lands_on_the_metered_speed(controller):
+    camera, ctl = controller  # FakeCamera with ExposureTime 4000 in its metadata
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()  # one live frame, so the loop has a metered exposure
+    _tap(loop, touch, clock, _centre(SHUTTER_PLUS_BOX))
+    assert camera.shutter_us == 4000
+    _tap(loop, touch, clock, _centre(SHUTTER_PLUS_BOX))
+    assert camera.shutter_us == 3125
+    _tap(loop, touch, clock, _centre(SHUTTER_MINUS_BOX))
+    _tap(loop, touch, clock, _centre(SHUTTER_MINUS_BOX))
+    assert camera.shutter_us == 5000
+
+
+def test_a_shutter_tap_before_any_metered_frame_starts_at_1_125(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl)
+    touch.tap(*_centre(SHUTTER_MINUS_BOX))
+    camera.read = lambda **k: (_ for _ in ()).throw(CameraError("no frame"))
+    loop.step()
+    clock.t += 0.1
+    loop.step()
+    assert camera.shutter_us == 8000
+
+
+def test_live_view_passes_shutter_state_to_meter_and_renderer(controller, monkeypatch):
+    camera, ctl = controller
+    seen = {}
+    real_render, real_compute = viewfinder.render_live, viewfinder.compute_reading
+
+    def render(frame, reading, double=None, shutter_buttons=False):
+        seen["buttons"], seen["fixed"] = shutter_buttons, reading.shutter_fixed
+        return real_render(frame, reading, double, shutter_buttons)
+
+    def compute(*a, **k):
+        seen["max_gain"] = k.get("max_gain")
+        return real_compute(*a, **k)
+
+    monkeypatch.setattr(viewfinder, "render_live", render)
+    monkeypatch.setattr(viewfinder, "compute_reading", compute)
+    camera.max_gain = 16.0
+    camera.set_shutter(4000)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert seen == {"buttons": True, "fixed": True, "max_gain": 16.0}
+
+
+def test_a_camera_without_set_shutter_draws_no_buttons_and_ignores_taps(
+    controller, monkeypatch,
+):
+    camera, ctl = controller
+    seen = []
+    real_render = viewfinder.render_live
+
+    def render(frame, reading, double=None, shutter_buttons=False):
+        seen.append(shutter_buttons)
+        return real_render(frame, reading, double, shutter_buttons)
+
+    monkeypatch.setattr(viewfinder, "render_live", render)
+    monkeypatch.setattr(type(camera), "set_shutter", None, raising=False)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _centre(SHUTTER_PLUS_BOX))
+    assert seen and not any(seen)
+    assert camera.shutter_us is None
+    assert ctl.snapshot().finished_count == 0
+
+
+def test_a_rejected_shutter_is_logged_not_fatal(controller):
+    camera, ctl = controller
+    lines = []
+
+    def reject(us):
+        raise CameraError("control rejected")
+
+    camera.set_shutter = reject
+    loop, touch, display, clock = _loop(camera, ctl, log=lines.append)
+    loop.step()
+    _tap(loop, touch, clock, _centre(SHUTTER_PLUS_BOX))
+    assert any("control rejected" in line for line in lines)
+    assert loop.state == "LIVE"
