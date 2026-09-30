@@ -150,6 +150,8 @@ class FakeCamera:
         self._jpegs = jpeg_bytes
         self._metadata = metadata
         self.ev = 0.0
+        self.shutter_us: int | None = None
+        self.max_gain: float | None = None
         if jpeg_bytes is not None:
             decoded = [
                 cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR) for b in jpeg_bytes
@@ -186,6 +188,10 @@ class FakeCamera:
         # Mirrors Picamera2Camera.set_ev so viewfinder EV buttons can be driven
         # without hardware; there is no exposure to change, so it only records.
         self.ev = float(value)
+
+    def set_shutter(self, us: int | None) -> None:
+        # Mirrors Picamera2Camera.set_shutter for the viewfinder's shutter buttons.
+        self.shutter_us = None if us is None else int(us)
 
     def close(self) -> None:
         return None
