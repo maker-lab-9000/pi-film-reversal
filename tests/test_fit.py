@@ -205,6 +205,32 @@ def test_main_reports_inverted_source_gamma_limits_instead_of_a_traceback(tmp_pa
     assert "levels_gamma_min" in capsys.readouterr().err
 
 
+def test_train_records_source_max_stretch_in_the_artifact(tmp_path):
+    _image_dir(tmp_path / "src", 8, 0)
+    _image_dir(tmp_path / "tgt", 8, 1, transform=lambda im: im**1.3)
+    out = tmp_path / "out"
+    cfg = FitConfig(lut_size=9, iterations=5)
+    sample = SampleConfig(crop_frac=0.0, max_side=64, pixels_per_image=500, val_fraction=0.25)
+    train(tmp_path / "src", tmp_path / "tgt", out, cfg, sample, None, allow_small=True,
+          source_max_stretch=1.5)
+    assert Artifacts.load(out).normalize.levels_max_stretch == 1.5
+
+
+def test_cli_exposes_source_max_stretch_defaulting_to_normalize_default():
+    assert build_parser().parse_args(
+        ["--source", "s", "--source-max-stretch", "1.5"]).source_max_stretch == 1.5
+    assert build_parser().parse_args(["--source", "s"]).source_max_stretch is None
+
+
+def test_main_reports_a_source_max_stretch_below_one_instead_of_a_traceback(tmp_path, capsys):
+    _image_dir(tmp_path / "src", 2, 0)
+    _image_dir(tmp_path / "tgt", 2, 1)
+    code = main(["--source", str(tmp_path / "src"), "--target", str(tmp_path / "tgt"),
+                 "--out", str(tmp_path / "o"), "--source-max-stretch", "0.5"])
+    assert code == 1
+    assert "levels_max_stretch" in capsys.readouterr().err
+
+
 def test_train_leaves_the_previous_artifact_intact_if_publication_fails(tmp_path, monkeypatch):
     _image_dir(tmp_path / "src", 8, 0)
     _image_dir(tmp_path / "tgt", 8, 1, transform=lambda im: im**1.3)

@@ -192,6 +192,7 @@ def train(
     source_lift_highlight_ref: float | None = None,
     source_gamma_min: float | None = None,
     source_gamma_max: float | None = None,
+    source_max_stretch: float | None = None,
     command: str = "",
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict, list]:
@@ -202,7 +203,7 @@ def train(
         white_balance=source_white_balance,
         levels=source_levels,
         levels_lift_highlight_ref=source_lift_highlight_ref,
-        **_gamma_limits(source_gamma_min, source_gamma_max),
+        **_levels_limits(source_gamma_min, source_gamma_max, source_max_stretch),
     )
     target_normalize = NormalizeParams(
         white_balance=False, levels=target_levels, levels_target_median=target_median
@@ -302,20 +303,27 @@ def train(
     return metrics, gates
 
 
-def _gamma_limits(gamma_min: float | None, gamma_max: float | None) -> dict:
-    """NormalizeParams overrides for the levels gamma clamp; None keeps its default.
+def _levels_limits(
+    gamma_min: float | None, gamma_max: float | None, max_stretch: float | None
+) -> dict:
+    """NormalizeParams overrides for the levels clamps; None keeps each default.
 
-    The clamp decides how far normalisation may move a frame the median rule
-    misjudges. The 0.5 floor lifted a deliberately dark street to slate grey,
-    and the 2.0 ceiling crushed a face against a white wall to a tenth of its
-    brightness (IMX477 frames 160707 and 155821, 2026-09-30). The LUT is fitted
-    on normalised input, so a changed clamp needs a retrain, not a params edit.
+    The clamps decide how far normalisation may move a frame the median rule
+    misjudges. The 0.5 gamma floor lifted a deliberately dark street to slate
+    grey, and the 2.0 ceiling crushed a face against a white wall to a tenth of
+    its brightness (IMX477 frames 160707 and 155821, 2026-09-30). The stretch is
+    a second lift: at its 4.0 default it alone brightened a night frame by two
+    stops (213816), so keeping dark scenes dark needs both a gamma floor of 1.0
+    and a low stretch cap. The LUT is fitted on normalised input, so a changed
+    clamp needs a retrain, not a params edit.
     """
     limits = {}
     if gamma_min is not None:
         limits["levels_gamma_min"] = gamma_min
     if gamma_max is not None:
         limits["levels_gamma_max"] = gamma_max
+    if max_stretch is not None:
+        limits["levels_max_stretch"] = max_stretch
     return limits
 
 
@@ -372,6 +380,12 @@ def build_parser() -> argparse.ArgumentParser:
              "keeps a subject against a bright wall from being crushed. Recorded in the "
              "artifact",
     )
+    parser.add_argument(
+        "--source-max-stretch", type=float, default=None, metavar="FACTOR",
+        help="largest black-to-white levels stretch allowed on a camera frame (default "
+             "4.0). Near 1 stops the stretch brightening a dark scene. Recorded in the "
+             "artifact",
+    )
     parser.add_argument("--target-levels", action=argparse.BooleanOptionalAction, default=False,
                         help="stretch target levels; default uses exposure matching only")
     parser.add_argument("--target-median", type=float, default=None,
@@ -415,7 +429,8 @@ def main(argv: list[str] | None = None) -> int:
             white_balance=args.source_white_balance,
             levels=args.source_levels,
             levels_lift_highlight_ref=args.source_lift_highlight_ref,
-            **_gamma_limits(args.source_gamma_min, args.source_gamma_max),
+            **_levels_limits(args.source_gamma_min, args.source_gamma_max,
+                              args.source_max_stretch),
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -430,6 +445,7 @@ def main(argv: list[str] | None = None) -> int:
             source_white_balance=args.source_white_balance,
             source_lift_highlight_ref=args.source_lift_highlight_ref,
             source_gamma_min=args.source_gamma_min, source_gamma_max=args.source_gamma_max,
+            source_max_stretch=args.source_max_stretch,
             command=" ".join(["pifilm-train", *(argv or sys.argv[1:])]), progress=print,
         )
     # Deliberately narrow: a ValueError from inside the fit (a diverging LUT, say) is a

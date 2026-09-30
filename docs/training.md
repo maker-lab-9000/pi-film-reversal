@@ -46,9 +46,12 @@ Understanding this makes every flag and every gate in the report meaningful.
    (mirroring `NormalizeParams.levels` and `.white_balance`), and
    `--source-lift-highlight-ref FRACTION` sets the source's clipping-aware
    levels lift, and `--source-gamma-min`/`--source-gamma-max` (defaults 0.5
-   and 2.0) limit how far the levels gamma may brighten or darken a frame.
-   A higher minimum keeps a deliberately dark scene dark; a lower maximum
-   keeps a subject against a bright wall from being crushed. All of these are
+   and 2.0) limit how far the levels gamma may brighten or darken a frame,
+   and `--source-max-stretch` (default 4.0) limits the black-to-white stretch.
+   A higher gamma minimum keeps a deliberately dark scene dark, but the
+   stretch is a second lift, so a dark scene only stays dark with a low
+   stretch cap as well; a lower gamma maximum keeps a subject against a
+   bright wall from being crushed. All of these are
    recorded in the artifact's `params.json` so the
    Pi applies exactly what was trained. Use `--no-source-white-balance` and
    `--source-lift-highlight-ref` together when the source camera has its own
