@@ -17,7 +17,8 @@ Pi network, Pi service, Stick, optional training) and says which machine each st
 `docs/training.md` is the step-by-step training procedure and explains every report gate;
 `docs/x728-ups.md` covers the Geekworm X728 UPS shield (pins, I2C, services, shutdown policy, RTC);
 `docs/how-it-works.md` explains the colour model (capture pipeline, training steps, libraries, dependency-by-role table);
-`docs/nextcloud-sync.md` the optional Pi→Nextcloud photo archive; `docs/lcd-viewfinder.md` the optional
+`docs/nextcloud-sync.md` the optional Pi→Nextcloud photo archive; `docs/photo-volume.md` the fixed-size photo
+volume that keeps captures from filling the Pi's root filesystem; `docs/lcd-viewfinder.md` the optional
 Waveshare LCD viewfinder (wiring, setup, screen layout, meter, hardware acceptance); and
 `docs/known-issues.md` tracks understood-but-unfixed defects. The bundled LUT in `pifilm/data/` is a handcrafted,
 untrained starter preset (`trained: false`). Trained artifacts, training data, `data/`, `artifacts/`,
@@ -67,6 +68,10 @@ python3 firmware/sticks3/scripts/generate_config.py --env .env   # validate .env
 # Pi hotspot (run ON the Pi, over Ethernet; dry run prints the redacted keyfile)
 .venv/bin/python scripts/pi_hotspot.py --env .env
 sudo .venv/bin/python scripts/pi_hotspot.py --env .env --apply
+
+# Pi photo volume (run ON the Pi; dry run prints the steps)
+python3 scripts/pi_photo_volume.py
+sudo python3 scripts/pi_photo_volume.py --apply
 ```
 
 `pifilm-train` exit code 3 means an artifact was written but a quality gate failed.
