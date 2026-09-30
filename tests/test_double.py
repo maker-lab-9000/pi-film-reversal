@@ -1,6 +1,15 @@
+import io
+
 import numpy as np
 import pytest
+from PIL import Image
 
+from pifilm.capture.thumbnail import (
+    MAX_JPEG_BYTES,
+    THUMBNAIL_SIZE,
+    fitted_jpeg,
+    render_exposure_card,
+)
 from pifilm.double import COMPOSITE_METHOD, composite
 
 
@@ -59,3 +68,18 @@ def test_mismatched_or_malformed_frames_are_refused(second):
 
 def test_method_name_is_recorded_verbatim():
     assert COMPOSITE_METHOD == "linear_mean"
+
+
+def test_exposure_card_is_a_stick_sized_jpeg(tmp_path):
+    data = render_exposure_card(1, 2)
+    assert len(data) <= MAX_JPEG_BYTES
+    with Image.open(io.BytesIO(data)) as img:
+        assert img.format == "JPEG" and img.size == THUMBNAIL_SIZE
+    # The remote /image.jpg path serves it through fitted_jpeg from a file.
+    path = tmp_path / "card.jpg"
+    path.write_bytes(data)
+    assert len(fitted_jpeg(path)) <= MAX_JPEG_BYTES
+
+
+def test_exposure_card_text_depends_on_the_index():
+    assert render_exposure_card(1, 2) != render_exposure_card(2, 2)
