@@ -62,6 +62,29 @@ oranges (brickwork, cars), with a peachy warmth indoors under tungsten rather
 than a neutral correction. It is gentler than the handcrafted starter, which
 reads as punchier mainly through saturation.
 
+## v4: tone limits
+
+v3's normalisation used the default levels gamma clamp (0.5 to 2.0). Two frames
+from 2026-09-30 showed both ends failing. `160707`, a deliberately dark street,
+was lifted to slate grey at the 0.5 floor. `155821`, a face against a white wall,
+was darkened at the 2.0 ceiling until the face fell from 0.25 to 0.10 brightness.
+v4 retrains on the same 141 frames and references with
+`--source-gamma-min 0.65 --source-gamma-max 1.25 --allow-small` (the new flags are
+recorded in `params.json` as `levels_gamma_min`/`levels_gamma_max`).
+
+| | v3 | v4 |
+|---|---|---|
+| `lut_sha1` | `a2c96826…` | `98e36716…` |
+| Distance before → after | 0.0225 → 0.0151 | 0.0285 → 0.0187 (−34%) |
+| Gates | all pass | all pass |
+
+v4's distances are higher in both columns because the references are compared
+after exposure matching: a frame the limits keep dark, or leave brighter, is
+further from the references' median by construction. The metric cannot say
+whether a dark scene should stay dark, so the choice between v3 and v4 is
+made on the pictures. Frames the median rule already handles (gamma between
+0.65 and 1.25) get the same tone curve under both.
+
 ## Rollback
 
 Point `--artifacts` in the unit's `ExecStart` back at
