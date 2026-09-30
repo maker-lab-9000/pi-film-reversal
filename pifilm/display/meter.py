@@ -49,6 +49,7 @@ FOCUS_FULL_SCALE = 0.55
 # The "best seen" mark halves in about three seconds: long enough to rack past
 # best focus and come back to it, short enough to let go of an old subject.
 FOCUS_DECAY_PER_SECOND = 0.8
+ISO_MAX_FRACTION = 0.98
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,11 @@ class MeterReading:
     external_power: bool | None
     focus: float | None = None
     focus_peak: float | None = None
+    # Shutter priority: the user fixed the exposure time, so the readout marks it.
+    shutter_fixed: bool = False
+    # Analogue gain is at the sensor's maximum: a fixed shutter this fast cannot be
+    # compensated and the frame will be dark.
+    iso_max: bool = False
 
 
 def format_shutter(exposure_us: float) -> str:
@@ -194,6 +200,7 @@ class FocusTracker:
 def compute_reading(
     metadata: dict | None, preview_rgb: np.ndarray, ev_comp: float, power: Any,
     *, focus: float | None = None, focus_peak: float | None = None,
+    shutter_us: int | None = None, max_gain: float | None = None,
 ) -> MeterReading:
     meta = metadata or {}
     exposure = _number(meta, "ExposureTime")
@@ -213,7 +220,11 @@ def compute_reading(
 
     battery = int(power.percent) if power is not None else None
     external = bool(power.external_power) if power is not None else None
+    iso_max = bool(
+        max_gain is not None and analogue is not None
+        and analogue >= ISO_MAX_FRACTION * max_gain
+    )
     return MeterReading(
         shutter, iso, float(ev_comp), lux, deviation, clip_pct, battery, external,
-        focus, focus_peak,
+        focus, focus_peak, shutter_us is not None, iso_max,
     )
