@@ -110,6 +110,10 @@ fitted on normalized input; grain runs last because it models developed film.
   `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,pifilm}.jpg` plus an audit
   line in `captures.jsonl` (LUT hash, normalisation hash and grain seed allow regenerating the
   graded file).
+- Double exposure: `CaptureSession` owns the mode and pending first frame; `pifilm/double.py`
+  adds the two ungraded frames in linear light (one stop down each), and the composite is
+  graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card in a temp dir
+  (never under the synced output folder); toggled via `CaptureController.set_double_exposure`.
 - `controller.py`: `CaptureController` serializes captures on one worker thread, one active job at
   a time, idempotent by `request_id`. Shared by the local SPACE key and the remote API.
 - `remote.py`: `RemoteCaptureServer`, a stdlib `http.server` with bearer-token auth

@@ -49,6 +49,20 @@ Every graded frame goes through three steps, in a fixed order, in
    The seed is recorded per capture, so any graded file can be regenerated
    from its original.
 
+### Double exposure
+
+With the viewfinder's `2x` toggle on, two captures make one picture
+(`pifilm/double.py`). Film adds exposures, H = H₁ + H₂, and is developed once, so the
+two *ungraded* frames are added in linear light and the sum goes through the three
+steps above once. Grading each frame and blending the results would apply the LUT's
+tone curve twice, add values after the curve instead of light before it, lay grain
+down twice, and normalise twice, which normalisation does not support. Each frame is
+taken one stop down before the sum (`0.5·L₁ + 0.5·L₂`), the usual film starting
+point: the camera auto-exposes every frame fully, so a straight sum would sit a stop
+over and clip before the LUT's shoulder could act. Each frame keeps the EV it was
+shot at, so a frame shot darker contributes less light. The composite is graded at
+EV 0, and normalisation sets the pair's overall exposure.
+
 ## At training time, on the Mac
 
 `pifilm-train` (`pifilm/train/`) turns two folders of images into that LUT:
