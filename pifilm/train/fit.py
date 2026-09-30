@@ -190,6 +190,9 @@ def train(
     target_median: float | None = None,
     source_white_balance: bool = True,
     source_lift_highlight_ref: float | None = None,
+    source_gamma_min: float | None = None,
+    source_gamma_max: float | None = None,
+    source_max_stretch: float | None = None,
     command: str = "",
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict, list]:
@@ -200,6 +203,7 @@ def train(
         white_balance=source_white_balance,
         levels=source_levels,
         levels_lift_highlight_ref=source_lift_highlight_ref,
+        **_levels_limits(source_gamma_min, source_gamma_max, source_max_stretch),
     )
     target_normalize = NormalizeParams(
         white_balance=False, levels=target_levels, levels_target_median=target_median
@@ -299,6 +303,30 @@ def train(
     return metrics, gates
 
 
+def _levels_limits(
+    gamma_min: float | None, gamma_max: float | None, max_stretch: float | None
+) -> dict:
+    """NormalizeParams overrides for the levels clamps; None keeps each default.
+
+    The clamps decide how far normalisation may move a frame the median rule
+    misjudges. The 0.5 gamma floor lifted a deliberately dark street to slate
+    grey, and the 2.0 ceiling crushed a face against a white wall to a tenth of
+    its brightness (IMX477 frames 160707 and 155821, 2026-09-30). The stretch is
+    a second lift: at its 4.0 default it alone brightened a night frame by two
+    stops (213816), so keeping dark scenes dark needs both a gamma floor of 1.0
+    and a low stretch cap. The LUT is fitted on normalised input, so a changed
+    clamp needs a retrain, not a params edit.
+    """
+    limits = {}
+    if gamma_min is not None:
+        limits["levels_gamma_min"] = gamma_min
+    if gamma_max is not None:
+        limits["levels_gamma_max"] = gamma_max
+    if max_stretch is not None:
+        limits["levels_max_stretch"] = max_stretch
+    return limits
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Split out so the defaults can be asserted against FitConfig directly."""
     parser = argparse.ArgumentParser(prog="pifilm-train", description="Fit the Parr LUT.")
@@ -340,6 +368,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--source-lift-highlight-ref", type=float, default=None, metavar="FRACTION",
         help="clipping-aware lift: fraction of pixels at the ceiling at which the levels "
              "lift is fully suppressed (e.g. 0.05); default off. Recorded in the artifact",
+    )
+    parser.add_argument(
+        "--source-gamma-min", type=float, default=None, metavar="GAMMA",
+        help="strongest levels lift allowed on a camera frame (default 0.5). Higher keeps "
+             "a deliberately dark scene dark. Recorded in the artifact",
+    )
+    parser.add_argument(
+        "--source-gamma-max", type=float, default=None, metavar="GAMMA",
+        help="strongest levels darkening allowed on a camera frame (default 2.0). Lower "
+             "keeps a subject against a bright wall from being crushed. Recorded in the "
+             "artifact",
+    )
+    parser.add_argument(
+        "--source-max-stretch", type=float, default=None, metavar="FACTOR",
+        help="largest black-to-white levels stretch allowed on a camera frame (default "
+             "4.0). Near 1 stops the stretch brightening a dark scene. Recorded in the "
+             "artifact",
     )
     parser.add_argument("--target-levels", action=argparse.BooleanOptionalAction, default=False,
                         help="stretch target levels; default uses exposure matching only")
@@ -384,6 +429,8 @@ def main(argv: list[str] | None = None) -> int:
             white_balance=args.source_white_balance,
             levels=args.source_levels,
             levels_lift_highlight_ref=args.source_lift_highlight_ref,
+            **_levels_limits(args.source_gamma_min, args.source_gamma_max,
+                              args.source_max_stretch),
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -397,6 +444,8 @@ def main(argv: list[str] | None = None) -> int:
             source_levels=args.source_levels,
             source_white_balance=args.source_white_balance,
             source_lift_highlight_ref=args.source_lift_highlight_ref,
+            source_gamma_min=args.source_gamma_min, source_gamma_max=args.source_gamma_max,
+            source_max_stretch=args.source_max_stretch,
             command=" ".join(["pifilm-train", *(argv or sys.argv[1:])]), progress=print,
         )
     # Deliberately narrow: a ValueError from inside the fit (a diverging LUT, say) is a
