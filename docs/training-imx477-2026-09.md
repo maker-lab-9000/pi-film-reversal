@@ -1,18 +1,22 @@
 # IMX477 training, September 2026
 
 The first look trained for the Raspberry Pi HQ Camera (IMX477). Candidate v3 was
-deployed to the Pi 4 on 2026-09-30 at 16:40. The procedure is `docs/training.md`,
+deployed to the Pi 4 on 2026-09-30 at 16:40, then v4, then v4-dark (below), which
+is the deployed look. The procedure is `docs/training.md`,
 and `docs/retraining-imx477.md` has the IMX477-specific steps.
 
 ## Deployed artifact
 
 | | |
 |---|---|
-| Artifact | `artifacts/imx477-2026-09-v3-highlight` (gitignored; also on the Pi under `~/repos/pi-film-reversal/artifacts/`) |
-| `lut_sha1` | `a2c9682660875b9b811455930a0f6b2e9b6ba62d` |
-| Command | `pifilm-train --source data/source-imx477-v3-highlight --target data/references-merged-2026-09-29 --out artifacts/imx477-2026-09-v3-highlight --no-source-white-balance --source-lift-highlight-ref 0.02` |
-| Code | `90e5f34` on branch `train/imx477-2026-09`, which lowers `MIN_TARGET_IMAGES` from 200 to 150 (see References) |
-| Service flags | `--ae-constraint highlight --tuning-file imx477.json --artifacts …/imx477-2026-09-v3-highlight` |
+| Artifact | `artifacts/imx477-2026-09-v4-dark` (gitignored; also on the Pi under `~/repos/pi-film-reversal/artifacts/`) |
+| `lut_sha1` | `98e3671607763e659ae2e8755a6098e12422df8f` (v4's LUT) |
+| Normalisation | levels gamma 1.0–1.25, stretch cap 1.5, no white balance, lift highlight ref 0.02 |
+| LUT trained by | `pifilm-train --source data/source-imx477-v3-highlight --target data/references-merged-2026-09-29 --out artifacts/imx477-2026-09-v4-limits --no-source-white-balance --source-lift-highlight-ref 0.02 --source-gamma-min 0.65 --source-gamma-max 1.25 --allow-small` |
+| Service flags | `--ae-constraint highlight --tuning-file imx477.json --artifacts …/imx477-2026-09-v4-dark` |
+
+v3 (`a2c96826…`) was trained at `90e5f34` on `train/imx477-2026-09`, which lowered
+`MIN_TARGET_IMAGES` to 150; later runs use `--allow-small` instead.
 
 ## Sources
 
@@ -84,6 +88,42 @@ further from the references' median by construction. The metric cannot say
 whether a dark scene should stay dark, so the choice between v3 and v4 is
 made on the pictures. Frames the median rule already handles (gamma between
 0.65 and 1.25) get the same tone curve under both.
+
+## v4-dark: keep dark scenes dark (deployed)
+
+v4 still lifted night frames: with the 0.65 floor, 10 of 15 night frames from the
+evening of 2026-09-30 sat on the floor, and the black-to-white stretch (default cap
+4.0) was a second lift, brightening one frame (`213816`) by two stops by itself.
+Removing both lifts at normalisation keeps a dark scene as the camera exposed it.
+
+**v5, trained with the lifts removed, failed.** It was trained with
+`--source-gamma-min 1.0 --source-gamma-max 1.25 --source-max-stretch 1.5` and exited with 3: held-out distance
+0.0152 → 0.0244, training pool 0.0349 → 0.0068. The references are exposure-matched
+and the sources no longer were, so the fit learned to brighten: its grey ramp lifts
+the shadows and its hue sweeps are blotchy. The trainer compares at one exposure, so
+it cannot learn a look for frames that are deliberately left at another.
+
+**v4-dark is an untrained pairing.** It keeps v4's LUT unchanged (`lut_sha1`
+`98e36716…`) and changes only three normalisation limits in `params.json`:
+
+| | v4 | v4-dark |
+|---|---|---|
+| `levels_gamma_min` (brightening floor) | 0.65 | 1.0 (never brightens) |
+| `levels_gamma_max` (darkening cap) | 1.25 | 1.25 |
+| `levels_max_stretch` | 4.0 | 1.5 |
+
+`params.json` records the derivation under `training.derived`; the metrics in the
+file are v4's, not this pairing's. It was judged on pictures: all 316 IMX477
+frames from 2026-09-24 to 09-30 rendered as original / v4 / v4-dark. 134 came out
+darker than v4, none brighter. The typical brightness difference from the camera
+original was 0.026, against v4's 0.057. Daylight shot with the highlight AE
+constraint stays near the camera's exposure with more contrast; night scenes keep
+their lamps and screens as the light sources. Two things to expect:
+
+- The LUT was fitted to brighter input and slightly deepens the darkest tones, so
+  a night frame can end up a little darker than the camera original.
+- Normalisation no longer rescues underexposure; a backlit subject stays a
+  silhouette unless it is shot with positive EV.
 
 ## Rollback
 
