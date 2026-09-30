@@ -13,6 +13,7 @@ from pifilm.display.ui import (
     FOCUS_BAR_Y1,
     HEIGHT,
     HIT_MARGIN,
+    NEEDLE_X0,
     PROCESSING_BARS,
     PROCESSING_DIM,
     SHUTTER_CENTRE,
@@ -304,3 +305,23 @@ def test_iso_max_is_amber(monkeypatch):
     frame = np.full((240, 320, 3), 200, dtype=np.uint8)
     render_live(frame, _reading(iso_max=True))
     assert ("ISO MAX", AMBER + (255,)) in calls
+
+
+def test_fixed_or_maxed_readout_clears_the_needle(monkeypatch):
+    runs = []
+    real = ImageDraw.ImageDraw.text
+
+    def spy(self, xy, text, *a, **k):
+        if xy[1] == BAR_TOP + 3:  # line 1 only
+            runs.append((xy[0], text, k["font"]))
+        return real(self, xy, text, *a, **k)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
+    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
+    for over in (dict(iso_max=True, ev_comp=1.7, iso=3200),
+                 dict(iso_max=True, ev_comp=-1.7, iso=3200),
+                 dict(iso_max=False, ev_comp=-1.7, iso=2200)):
+        runs.clear()
+        render_live(frame, _reading(shutter="1/2000", shutter_fixed=True, **over))
+        right = max(x + font.getlength(text) for x, text, font in runs)
+        assert right <= NEEDLE_X0 - 6, (over, right)

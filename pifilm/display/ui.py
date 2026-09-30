@@ -118,6 +118,12 @@ def render_live(
     if reading.shutter_fixed:
         shutter_text = f"S {shutter_text}"
     x = EV_BUTTON_W + 6
+    # "S 1/2000  ISO MAX  EV +1.7" at 14 pt ends near x 218 and would run under the needle
+    # marker (its left edge can reach NEEDLE_X0 - 5). The fixed-shutter and ISO MAX
+    # readouts are the longer ones, so only they drop to 12 pt (worst case ends at x 192,
+    # under NEEDLE_X0 - 6); the ordinary readout keeps 14 pt exactly as before.
+    if reading.shutter_fixed or reading.iso_max:
+        font = _font(12)
     if reading.iso_max:
         # Drawn in three runs so only the ISO turns amber.
         for text, colour in ((f"{shutter_text}  ", (255, 255, 255, 255)),
