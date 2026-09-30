@@ -1,5 +1,7 @@
 # tests/test_double_capture.py
 import json
+import shutil
+from datetime import datetime
 
 import numpy as np
 import pytest
@@ -87,7 +89,10 @@ def test_exposure_two_grades_the_composite_once(tmp_path, pipeline, monkeypatch)
     record = _records(session)[1]
     assert record["pifilm"] == second.pifilm.name
     assert record["double"]["index"] == 2 and record["double"]["method"] == "linear_mean"
-    assert record["double"]["originals"] == [first.original.name, second.original.name]
+    assert record["double"]["originals"] == [
+        first.original.relative_to(session.out_root).as_posix(),
+        second.original.relative_to(session.out_root).as_posix(),
+    ]
     assert record["double"]["ev_comp"] == [0.0, 0.0]
     assert isinstance(record["grain_seed"], int) and "lut_sha1" in record
 
@@ -178,3 +183,42 @@ def test_announce_handles_an_exposure_one_result(tmp_path, pipeline):
     assert len(lines) == 1 and "exposure 1/2" in lines[0]
     _announce(session.capture(), lines.append)
     assert "_double_graded.jpg" in lines[1]
+
+
+def test_a_pair_across_midnight_names_both_day_folders(tmp_path, pipeline):
+    times = iter([datetime(2026, 9, 30, 23, 59, 58), datetime(2026, 10, 1, 0, 0, 3)])
+    camera = FakeCamera([DARK.copy(), BRIGHT.copy()])
+    session = CaptureSession(camera, pipeline, tmp_path / "shots", now=lambda: next(times),
+                             seed_rng=np.random.default_rng(0))
+    session.set_double_exposure(True)
+    session.capture()
+    second = session.capture()
+    first_name, second_name = second.record["double"]["originals"]
+    assert first_name == "2026-09-30/235958_ungraded.jpg"
+    assert second_name == "2026-10-01/000003_ungraded.jpg"
+    assert (session.out_root / first_name).exists() and (session.out_root / second_name).exists()
+
+
+def test_exposure_one_survives_the_card_directory_being_cleaned(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    session.set_double_exposure(True)
+    card = session.capture().pifilm
+    session.capture()
+    shutil.rmtree(card.parent)  # systemd-tmpfiles ages /tmp while the service runs
+    result = session.capture()
+    assert result.exposure == (1, 2)
+    assert result.pifilm.exists()
+
+
+def test_a_card_failure_fails_exposure_one_without_a_log_line(tmp_path, pipeline, monkeypatch):
+    session = _session(tmp_path, pipeline)
+    session.set_double_exposure(True)
+
+    def boom(*a, **k):
+        raise OSError("card failed")
+
+    monkeypatch.setattr("pifilm.capture.app.render_exposure_card", boom)
+    with pytest.raises(OSError):
+        session.capture()
+    assert _records(session) == []
+    assert session.double_state == (True, 0)

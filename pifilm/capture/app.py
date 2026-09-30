@@ -113,7 +113,7 @@ class _PendingExposure:
     """Exposure 1 of a double, held in memory until exposure 2 arrives."""
 
     rgb: np.ndarray
-    original: str
+    original: str  # relative to out_root, e.g. "2026-09-30/120000_original.jpg"
     ev: float
 
 
@@ -227,9 +227,11 @@ class CaptureSession:
                 "shutter_to_saved_ms": round((time.perf_counter() - shutter) * 1000.0, 1),
                 "double": {"index": 1, "of": 2},
             }
-            self._append_record(day_dir, record)
+            # The card before the log line: a failed exposure 1 leaves no ``index: 1``
+            # record behind for an exposure 2 that will never follow it.
             card = self._exposure_card(1, 2)
-            self._pending = _PendingExposure(frame.rgb, original.name, ev)
+            self._append_record(day_dir, record)
+            self._pending = _PendingExposure(frame.rgb, self._relative(original), ev)
             return CaptureResult(original, card, record, exposure=(1, 2))
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
@@ -252,7 +254,7 @@ class CaptureSession:
             "shutter_to_saved_ms": round((time.perf_counter() - shutter) * 1000.0, 1),
             "double": {
                 "index": 2, "of": 2, "method": COMPOSITE_METHOD,
-                "originals": [pending.original, original.name],
+                "originals": [pending.original, self._relative(original)],
                 "ev_comp": [pending.ev, ev],
             },
         }
@@ -275,6 +277,11 @@ class CaptureSession:
             dng_name = dng_path.name
         return day_dir, stem, t, original, dng_name
 
+    def _relative(self, path: Path) -> str:
+        """``YYYY-MM-DD/name`` under ``out_root``: a pair can straddle midnight, so the
+        two originals of one double may sit in different day folders."""
+        return path.relative_to(self.out_root).as_posix()
+
     @staticmethod
     def _append_record(day_dir: Path, record: dict) -> None:
         with (day_dir / "captures.jsonl").open("a") as fh:
@@ -284,10 +291,13 @@ class CaptureSession:
         """The Stick's picture for a partial double; never under ``out_root``.
 
         Everything under ``out_root`` is uploaded by the Nextcloud sync, and a card is
-        not a photograph, so it lives in a private temporary directory.
+        not a photograph, so it lives in a private temporary directory. The directory is
+        re-created if it has gone: systemd-tmpfiles ages /tmp under a long-running
+        service (the unit has no PrivateTmp), and a vanished card must not fail a shot.
         """
         if self._card_dir is None:
             self._card_dir = Path(tempfile.mkdtemp(prefix="pifilm-cards-"))
+        self._card_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = self._card_dir / f"exposure-{index}-of-{of}.jpg"
         if not path.exists():
             path.write_bytes(render_exposure_card(index, of))
