@@ -19,8 +19,9 @@ as root, it:
 5. makes the empty mount point immutable (``chattr +i``), so if the image ever
    fails to mount, writes into the bare folder fail loudly instead of quietly
    filling root again;
-6. adds an fstab line (``nofail``: a broken image must not stop the Pi booting)
-   and ``RequiresMountsFor`` drop-ins so capture and sync wait for the mount;
+6. adds an fstab line (``nofail``: a broken image must not stop the Pi booting;
+   ``X-fstrim.notrim``: the weekly trim must not punch holes in the image) and
+   ``RequiresMountsFor`` drop-ins so capture and sync wait for the mount;
 7. mounts it and restarts the services.
 
 rsync keeps modification times and rclone compares size and time, so the
@@ -62,8 +63,10 @@ class Step:
 
 
 def fstab_line(image: Path, mount_point: Path) -> str:
-    # Pass 0: systemd's fsck wants a block device, not a file.
-    return f"{image} {mount_point} ext4 loop,noatime,nofail 0 0\n"
+    # Pass 0: systemd's fsck wants a block device, not a file. X-fstrim.notrim:
+    # the weekly fstrim.timer trims every fstab mount, and trimming a loop mount
+    # punches holes in the image, giving its reserved space back to root.
+    return f"{image} {mount_point} ext4 loop,noatime,nofail,X-fstrim.notrim 0 0\n"
 
 
 def dropin_text(mount_point: Path) -> str:
@@ -98,8 +101,12 @@ def plan(user: str, mount_point: Path, image: Path, size_gib: int) -> list[Step]
         Step("create the image directory", ("mkdir", "-p", str(image.parent))),
         Step(f"reserve {size_gib} GiB", ("fallocate", "-l", f"{size_gib}G", str(image))),
         Step("restrict the image to root", ("chmod", "600", str(image))),
-        Step("format it (no reserved blocks: nothing but photos lives here)",
-             ("mkfs.ext4", "-q", "-m", "0", "-L", "pifilm-photos", str(image))),
+        # nodiscard: mkfs discards the whole device by default, which on a file
+        # punches holes and silently undoes the fallocate reservation (measured on
+        # the Pi, 2026-09-30: a 30 GiB image left 15 GiB allocated).
+        Step("format it (no reserved blocks, and no discard so the space stays reserved)",
+             ("mkfs.ext4", "-q", "-m", "0", "-E", "nodiscard", "-L", "pifilm-photos",
+              str(image))),
         Step("create the staging mount point", ("mkdir", "-p", str(STAGING))),
         Step("mount the image for the copy",
              ("mount", "-o", "loop,noatime", str(image), str(STAGING))),

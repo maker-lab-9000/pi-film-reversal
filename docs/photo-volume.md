@@ -36,9 +36,18 @@ finds any difference, it stops before the old folder is touched.
 
 - `/var/lib/pifilm/photos.img`, mode 600, label `pifilm-photos`, no reserved
   blocks.
-- An fstab line `… ext4 loop,noatime,nofail 0 0`. `nofail` means a damaged
-  image cannot stop the Pi booting. Pass `0` skips fsck, which expects a block
+- An fstab line `… ext4 loop,noatime,nofail,X-fstrim.notrim 0 0`. `nofail`
+  means a damaged image cannot stop the Pi booting. `X-fstrim.notrim` keeps the
+  weekly `fstrim.timer` off it. Pass `0` skips fsck, which expects a block
   device.
+
+The image must stay fully allocated for its size to be reserved. Trimming a
+loop mount punches holes in the backing file and hands that space back to root.
+`mkfs` is run with `-E nodiscard` because its default discard does exactly that:
+the first run on 2026-09-30, without the flag, left a 30 GiB image with only
+15 GiB allocated. Check with `du -h /var/lib/pifilm/photos.img`, which should
+show the full size. If it doesn't, `sudo fallocate -l 30G
+/var/lib/pifilm/photos.img` fills the holes without touching the data.
 - `RequiresMountsFor=` drop-ins for `pifilm-capture.service` and
   `pifilm-nextcloud-sync.service`: neither starts without the volume.
 - The bare folder under the mount is immutable (`chattr +i`). If the image

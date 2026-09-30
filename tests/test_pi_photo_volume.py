@@ -36,10 +36,10 @@ def test_preflight_refuses_an_existing_image(tmp_path):
     assert any("already exists" in p for p in _ok(tmp_path))
 
 
-def test_fstab_line_uses_nofail_and_skips_fsck():
+def test_fstab_line_uses_nofail_skips_fsck_and_opts_out_of_fstrim():
     line = fstab_line(Path("/var/lib/pifilm/photos.img"), Path("/home/g/Pictures/pifilm"))
     assert line == ("/var/lib/pifilm/photos.img /home/g/Pictures/pifilm "
-                    "ext4 loop,noatime,nofail 0 0\n")
+                    "ext4 loop,noatime,nofail,X-fstrim.notrim 0 0\n")
 
 
 def test_plan_verifies_the_copy_before_moving_the_old_folder_and_mounts_last():
@@ -58,6 +58,12 @@ def test_plan_verifies_the_copy_before_moving_the_old_folder_and_mounts_last():
     assert all(s.text == dropin_text(mp) for s in steps if s.path in dropins)
     # Nothing in the plan deletes the old copy; that is left to the user.
     assert not any(a[:1] == ("rm",) for a in argvs)
+
+
+def test_plan_formats_without_discard_so_the_reservation_survives():
+    steps = plan("g", Path("/home/g/Pictures/pifilm"), Path("/var/lib/pifilm/photos.img"), 30)
+    mkfs = next(s.argv for s in steps if s.argv[:1] == ("mkfs.ext4",))
+    assert "nodiscard" in mkfs
 
 
 def test_main_dry_run_changes_nothing_and_prints_the_plan(tmp_path, capsys, monkeypatch):
