@@ -192,3 +192,97 @@ def test_failed_job_counts_as_finished_but_not_completed():
         assert snap.last_completed_job is None
     finally:
         controller.close()
+
+
+class DoubleSession:
+    """Minimal session with the double-exposure surface of ``CaptureSession``."""
+
+    def __init__(self) -> None:
+        self.camera = Mock()
+        self.enabled = False
+        self.taken = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.release.set()
+
+    @property
+    def double_state(self):
+        return self.enabled, self.taken
+
+    def set_double_exposure(self, enabled):
+        self.enabled = enabled
+        if not enabled:
+            self.taken = 0
+
+    def capture(self):
+        self.started.set()
+        self.release.wait(timeout=2)
+        if self.enabled:
+            self.taken = (self.taken + 1) % 2
+        return Result("saved")
+
+
+def _until(pred):
+    for _ in range(200):
+        if pred():
+            return
+        threading.Event().wait(0.01)
+    raise AssertionError("condition not met")
+
+
+def test_double_exposure_toggle_reaches_the_snapshot():
+    session = DoubleSession()
+    controller = CaptureController(session)
+    try:
+        assert controller.snapshot().double_exposure is False
+        controller.set_double_exposure(True)
+        _until(lambda: controller.snapshot().double_exposure)
+        assert controller.snapshot().exposures_taken == 0
+    finally:
+        controller.close()
+
+
+def test_a_finished_job_and_its_exposure_count_arrive_in_one_snapshot():
+    """A display must never see exposure 1 finished with the count still at 0."""
+    session = DoubleSession()
+    controller = CaptureController(session)
+    try:
+        controller.set_double_exposure(True)
+        _until(lambda: controller.snapshot().double_exposure)
+        controller.submit("one")
+        _until(lambda: controller.snapshot().finished_count == 1)
+        snap = controller.snapshot()
+        assert snap.finished_count == 1 and snap.exposures_taken == 1
+    finally:
+        controller.close()
+
+
+def test_a_toggle_sent_during_a_capture_applies_after_it():
+    session = DoubleSession()
+    session.enabled = True
+    session.release.clear()
+    controller = CaptureController(session)
+    try:
+        controller.submit("busy")
+        assert session.started.wait(timeout=1)
+        controller.set_double_exposure(False)
+        assert session.enabled is True  # not applied mid-capture
+        session.release.set()
+        _until(lambda: controller.snapshot().double_exposure is False)
+        assert controller.snapshot().finished_count == 1
+    finally:
+        session.release.set()
+        controller.close()
+
+
+def test_a_session_without_double_exposure_ignores_the_toggle():
+    session = BlockingSession()
+    session.release.set()
+    controller = CaptureController(session)
+    try:
+        controller.set_double_exposure(True)
+        controller.submit("plain")
+        wait_for(controller, "plain", "complete")
+        assert controller.snapshot().double_exposure is False
+    finally:
+        controller.close()
