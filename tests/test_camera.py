@@ -419,3 +419,12 @@ def test_stream_info_to_dict_includes_available_sensor_details():
         "bit_depth": 10,
         "tuning_file": "imx708_wide.json",
     }
+
+
+def test_fake_camera_records_the_shutter():
+    camera = FakeCamera()
+    assert camera.shutter_us is None and camera.max_gain is None
+    camera.set_shutter(4000)
+    assert camera.shutter_us == 4000
+    camera.set_shutter(None)
+    assert camera.shutter_us is None

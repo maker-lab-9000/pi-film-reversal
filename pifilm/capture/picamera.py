@@ -47,6 +47,8 @@ shot. The neutral ISP set therefore travels inside *both* configurations, not
 only through ``set_controls``; otherwise the still would be taken with the
 ISP's default sharpening and saturation and the viewfinder would come back
 without them. ``set_ev`` updates those dicts as well as the live camera.
+``set_shutter`` does the same for a fixed exposure time (shutter priority), and
+also widens and restores ``FrameDurationLimits``.
 
 Previews and captures arrive on different threads (the viewfinder loop and the
 capture controller), so one lock is held from acquiring a request through
@@ -59,6 +61,7 @@ between a capture and its release.
 from __future__ import annotations
 
 import math
+import numbers
 import sys
 import tempfile
 import threading
@@ -75,6 +78,10 @@ _AF_RANGES = ("normal", "macro", "full")
 _AE_CONSTRAINTS = ("normal", "highlight", "shadows")
 _AE_METERING = ("centre", "spot", "matrix")
 _EV_RANGE = (-8.0, 8.0)
+_SHUTTER_RANGE_US = (100, 1_000_000)
+# A fixed exposure longer than a frame period is clipped by the sensor unless the
+# frame is allowed to last at least that long, plus readout headroom.
+_FRAME_MARGIN_US = 1000
 
 METADATA_KEYS = (
     "ExposureTime",
@@ -149,6 +156,10 @@ class Picamera2Camera:
         self._preview: tuple[int, int] | None = None
         self.preview_size: tuple[int, int] | None = None
         self.ev = float(ev)
+        self.shutter_us: int | None = None
+        self.max_gain: float | None = None
+        self._shutter_mode = "legacy"
+        self._frame_limits: dict[str, tuple[int, int] | None] = {"still": None, "preview": None}
         self._still_config: Any | None = None
         self._preview_config: Any | None = None
 
@@ -191,6 +202,21 @@ class Picamera2Camera:
             model = str(camera.camera_properties.get("Model", "unknown"))
             tuning_label = tuning_file if tuning_file is not None else f"auto:{model}"
             has_autofocus = "AfMode" in camera.camera_controls
+            # Shutter priority: libcamera 0.5 (Trixie) ignores ExposureTime unless
+            # ExposureTimeMode is Manual; older stacks take a non-zero ExposureTime with
+            # AE on. Either way analogue gain stays automatic.
+            self._shutter_mode = (
+                "mode" if "ExposureTimeMode" in camera.camera_controls else "legacy"
+            )
+            print(
+                "picamera2: shutter priority via "
+                + ("ExposureTimeMode" if self._shutter_mode == "mode"
+                   else "ExposureTime (legacy libcamera)"),
+                file=sys.stderr,
+            )
+            gain = camera.camera_controls.get("AnalogueGain")
+            if isinstance(gain, (tuple, list)) and len(gain) >= 2:
+                self.max_gain = float(gain[1])
             if not has_autofocus and (autofocus != "continuous" or af_range != "normal"):
                 raise CameraError(
                     f"{model} has no autofocus; --autofocus and --af-range cannot be used"
@@ -224,6 +250,15 @@ class Picamera2Camera:
                 )
                 camera.configure(preview_config)
                 self._preview_config = preview_config
+            # A configuration built without FrameDurationLimits falls back to the
+            # camera's own control range, so a long shutter can still widen it.
+            default_limits = _control_frame_limits(camera.camera_controls)
+            self._frame_limits = {
+                key: (_config_frame_limits(config) or default_limits)
+                if config is not None else None
+                for key, config in (("still", self._still_config),
+                                    ("preview", self._preview_config))
+            }
             camera.set_controls(controls)
             start_attempted = True
             camera.start()
@@ -347,6 +382,65 @@ class Picamera2Camera:
                 _set_config_control(config, "ExposureValue", value)
         self.ev = value
 
+    def set_shutter(self, us: int | None) -> None:
+        """Fix the exposure time (shutter priority), or return to auto with ``None``.
+
+        Gain stays automatic, so EV compensation still works through it. Like
+        ``set_ev``, the controls go to the running camera and into both
+        configurations, because every configure reapplies a configuration's own
+        controls. A long shutter also widens the frame-duration limit, which is why
+        the live view slows at long shutters, and ``None`` restores the limits each
+        configuration was built with. Nothing changes if the camera rejects the
+        controls. ``us`` must be ``None`` or a whole number of microseconds: an
+        integral float such as ``4000.0`` is accepted as ``4000``, while a bool,
+        a string or a fractional number is a ``CameraError``.
+        """
+        if us is not None:
+            us = _shutter_us(us)
+            if not _SHUTTER_RANGE_US[0] <= us <= _SHUTTER_RANGE_US[1]:
+                raise CameraError(f"shutter must be within {_SHUTTER_RANGE_US} us, got {us}")
+        camera = self._camera
+        if camera is None:
+            raise CameraError("Cannot set the shutter on a closed Picamera2 camera")
+        running = "preview" if self._preview_config is not None else "still"
+        with self._request_lock:
+            try:
+                camera.set_controls(self._shutter_controls(us, self._frame_limits[running]))
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to set the shutter: {exc}") from exc
+            for key, config in (("still", self._still_config),
+                                ("preview", self._preview_config)):
+                for name, value in self._shutter_controls(us, self._frame_limits[key]).items():
+                    _set_config_control(config, name, value)
+                if us is None and self._shutter_mode == "mode":
+                    # Auto sends no ExposureTime, but the one a fixed shutter
+                    # wrote would stay in the configuration and be reapplied
+                    # beside ExposureTimeMode=Auto on every configure.
+                    _drop_config_control(config, "ExposureTime")
+        self.shutter_us = us
+
+    def _shutter_controls(
+        self, us: int | None, limits: tuple[int, int] | None,
+    ) -> dict[str, Any]:
+        controls: dict[str, Any] = {}
+        if self._shutter_mode == "mode":
+            from libcamera import controls as _lc
+
+            mode = _lc.ExposureTimeModeEnum
+            if us is None:
+                controls["ExposureTimeMode"] = mode.Auto
+            else:
+                controls["ExposureTimeMode"] = mode.Manual
+                controls["ExposureTime"] = us
+        else:
+            controls["ExposureTime"] = 0 if us is None else us
+        if limits is not None:
+            low, high = limits
+            controls["FrameDurationLimits"] = (
+                (low, high) if us is None else (low, max(high, us + _FRAME_MARGIN_US))
+            )
+        return controls
+
     def close(self) -> None:
         camera = self._camera
         if camera is None:
@@ -397,6 +491,33 @@ def _preview_size(native: tuple[int, int]) -> tuple[int, int]:
     return PREVIEW_WIDTH, max(2, height - (height % 2))
 
 
+def _config_frame_limits(config: Any) -> tuple[int, int] | None:
+    """The FrameDurationLimits a configuration was built with, if it has any."""
+    try:
+        low, high = config["controls"]["FrameDurationLimits"]
+        return int(low), int(high)
+    except (TypeError, KeyError, IndexError, ValueError):
+        return None
+
+
+def _control_frame_limits(camera_controls: Any) -> tuple[int, int] | None:
+    """The camera's own FrameDurationLimits range, a Picamera2 (min, max, default)."""
+    try:
+        entry = camera_controls["FrameDurationLimits"]
+        return int(entry[0]), int(entry[1])
+    except (TypeError, KeyError, IndexError, ValueError):
+        return None
+
+
+def _shutter_us(value: Any) -> int:
+    """A whole number of microseconds, or ``CameraError`` for anything else."""
+    if isinstance(value, numbers.Integral) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    raise CameraError(f"shutter must be a whole number of microseconds, got {value!r}")
+
+
 def _set_config_control(config: Any, name: str, value: Any) -> None:
     """Update one control inside a Picamera2 configuration, if it has any."""
     if config is None:
@@ -404,6 +525,16 @@ def _set_config_control(config: Any, name: str, value: Any) -> None:
     try:
         config["controls"][name] = value
     except (TypeError, KeyError, IndexError):  # a configuration without controls
+        pass
+
+
+def _drop_config_control(config: Any, name: str) -> None:
+    """Remove one control from a Picamera2 configuration, if it is there."""
+    if config is None:
+        return
+    try:
+        config["controls"].pop(name, None)
+    except (TypeError, KeyError, IndexError, AttributeError):  # no controls dict
         pass
 
 

@@ -198,3 +198,25 @@ def test_reading_carries_focus_when_given_and_none_otherwise():
     assert r.focus is None and r.focus_peak is None
     r = compute_reading({}, _grey(118), 0.0, None, focus=0.4, focus_peak=0.7)
     assert r.focus == pytest.approx(0.4) and r.focus_peak == pytest.approx(0.7)
+
+
+def _frame():
+    return np.full((48, 64, 3), 118, dtype=np.uint8)
+
+
+def test_iso_max_flags_a_saturated_gain():
+    meta = {"ExposureTime": 1000, "AnalogueGain": 21.9}
+    assert compute_reading(meta, _frame(), 0.0, None, max_gain=22.26).iso_max is True
+    meta["AnalogueGain"] = 21.0
+    assert compute_reading(meta, _frame(), 0.0, None, max_gain=22.26).iso_max is False
+
+
+def test_no_iso_max_without_a_known_maximum_or_gain():
+    assert compute_reading({"AnalogueGain": 40.0}, _frame(), 0.0, None).iso_max is False
+    assert compute_reading({}, _frame(), 0.0, None, max_gain=22.26).iso_max is False
+
+
+def test_shutter_fixed_follows_the_chosen_value():
+    meta = {"ExposureTime": 4000, "AnalogueGain": 2.0}
+    assert compute_reading(meta, _frame(), 0.0, None, shutter_us=4000).shutter_fixed is True
+    assert compute_reading(meta, _frame(), 0.0, None).shutter_fixed is False

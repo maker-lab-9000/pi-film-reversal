@@ -1592,3 +1592,12 @@ def test_idle_dimming_delays_come_from_the_command_line(tmp_path, monkeypatch):
 def test_negative_idle_delays_are_refused(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         _viewfinder_kwargs(monkeypatch, tmp_path, ["--display-off-after", "-5"])
+
+
+def test_record_carries_the_shutter_setting(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    first = session.capture()
+    session.camera.set_shutter(4000)
+    second = session.capture()
+    assert first.record["shutter_us"] is None
+    assert second.record["shutter_us"] == 4000

@@ -123,13 +123,22 @@ class _AeMeteringModeEnum:
     Matrix = "AeMeteringMode.Matrix"
 
 
-def _fake_libcamera_module(*, with_noise_reduction=True, with_ae_enums=True):
+class _ExposureTimeModeEnum:
+    Auto = "exposure-time-auto"
+    Manual = "exposure-time-manual"
+
+
+def _fake_libcamera_module(
+    *, with_noise_reduction=True, with_ae_enums=True, with_exposure_time_mode=False
+):
     controls_ns = SimpleNamespace(AfModeEnum=_AfModeEnum, AfRangeEnum=_AfRangeEnum)
     if with_noise_reduction:
         controls_ns.draft = SimpleNamespace(NoiseReductionModeEnum=_NoiseReductionModeEnum)
     if with_ae_enums:
         controls_ns.AeConstraintModeEnum = _AeConstraintModeEnum
         controls_ns.AeMeteringModeEnum = _AeMeteringModeEnum
+    if with_exposure_time_mode:
+        controls_ns.ExposureTimeModeEnum = _ExposureTimeModeEnum
     return SimpleNamespace(controls=controls_ns)
 
 
@@ -154,6 +163,10 @@ def install_picamera(monkeypatch):
         fixed_lens=False,
         model="imx708_wide",
         missing_attributes=(),
+        with_exposure_time_mode=False,
+        analogue_gain=None,
+        frame_limits=None,
+        control_frame_limits=None,
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
 
@@ -176,6 +189,12 @@ def install_picamera(monkeypatch):
                 if not fixed_lens:
                     self.camera_controls["AfMode"] = (0, 2, 0)
                     self.camera_controls["AfRange"] = (0, 2, 0)
+                if with_exposure_time_mode:
+                    self.camera_controls["ExposureTimeMode"] = (0, 1, 0)
+                if analogue_gain is not None:
+                    self.camera_controls["AnalogueGain"] = analogue_gain
+                if control_frame_limits is not None:
+                    self.camera_controls["FrameDurationLimits"] = control_frame_limits
                 self.sensor_modes = sensor_modes if sensor_modes is not None else [
                     {"size": (1536, 864)}, {"size": (2304, 1296)}, {"size": (4608, 2592)},
                 ]
@@ -203,11 +222,18 @@ def install_picamera(monkeypatch):
                 # Picamera2 puts the requested controls into the returned
                 # configuration, and applies them again on every configure();
                 # set_ev mutates that entry, so the fake must expose it.
-                return {"created": kwargs, "controls": kwargs.get("controls", {})}
+                controls = kwargs.get("controls", {})
+                if frame_limits is not None:
+                    # Picamera2 merges its default frame limits into every configuration.
+                    controls["FrameDurationLimits"] = frame_limits["still"]
+                return {"created": kwargs, "controls": controls}
 
             def create_preview_configuration(self, **kwargs):
                 self.preview_config = kwargs
-                return {"preview": kwargs, "controls": kwargs.get("controls", {})}
+                controls = kwargs.get("controls", {})
+                if frame_limits is not None:
+                    controls["FrameDurationLimits"] = frame_limits["preview"]
+                return {"preview": kwargs, "controls": controls}
 
             def configure(self, config):
                 self.configure_count += 1
@@ -279,7 +305,9 @@ def install_picamera(monkeypatch):
 
         monkeypatch.setitem(sys.modules, "picamera2", SimpleNamespace(Picamera2=FakePicamera2))
         libcamera_module = _fake_libcamera_module(
-            with_noise_reduction=with_noise_reduction, with_ae_enums=with_ae_enums
+            with_noise_reduction=with_noise_reduction,
+            with_ae_enums=with_ae_enums,
+            with_exposure_time_mode=with_exposure_time_mode,
         )
         monkeypatch.setitem(sys.modules, "libcamera", libcamera_module)
         return state
@@ -846,7 +874,10 @@ def test_default_ae_settings_warn_nothing_on_older_libcamera(install_picamera, c
     install_picamera(with_ae_enums=False)
     camera = Picamera2Camera()
 
-    assert capsys.readouterr().err == ""
+    # Only the start-up line naming the shutter-priority path; no AE warning.
+    assert capsys.readouterr().err == (
+        "picamera2: shutter priority via ExposureTime (legacy libcamera)\n"
+    )
     camera.close()
 
 
@@ -1340,4 +1371,147 @@ def test_preview_reads_do_not_overwrite_the_measured_still_fps(install_picamera)
     )
     camera.read(full=True)
     assert camera.stream_info.fps == 20.0
+    camera.close()
+
+
+def test_shutter_priority_uses_exposure_time_mode_when_available(install_picamera, capsys):
+    state = install_picamera(with_exposure_time_mode=True)
+    camera = Picamera2Camera(preview=True)
+    assert "ExposureTimeMode" in capsys.readouterr().err
+    camera.set_shutter(4000)
+    live = state.instance.set_controls_calls[-1]
+    assert live["ExposureTimeMode"] == _ExposureTimeModeEnum.Manual
+    assert live["ExposureTime"] == 4000
+    for config in (state.instance.created_config, state.instance.preview_config):
+        assert config["controls"]["ExposureTimeMode"] == _ExposureTimeModeEnum.Manual
+        assert config["controls"]["ExposureTime"] == 4000
+    assert camera.shutter_us == 4000
+    camera.set_shutter(None)
+    assert state.instance.set_controls_calls[-1]["ExposureTimeMode"] == (
+        _ExposureTimeModeEnum.Auto
+    )
+    assert camera.shutter_us is None
+    camera.close()
+
+
+def test_shutter_priority_falls_back_to_exposure_time_on_older_libcamera(
+    install_picamera, capsys,
+):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    assert "legacy" in capsys.readouterr().err
+    camera.set_shutter(250_000)
+    assert state.instance.set_controls_calls[-1]["ExposureTime"] == 250_000
+    assert "ExposureTimeMode" not in state.instance.set_controls_calls[-1]
+    camera.set_shutter(None)
+    assert state.instance.set_controls_calls[-1]["ExposureTime"] == 0
+    assert state.instance.preview_config["controls"]["ExposureTime"] == 0
+    camera.close()
+
+
+def test_returning_to_auto_drops_the_stale_exposure_time_from_both_configurations(
+    install_picamera,
+):
+    """Every configure reapplies a configuration's controls as one unordered set,
+    so an ``ExposureTime`` left beside ``ExposureTimeMode=Auto`` would be sent
+    again on every still; whether the IPA ignores it cannot be checked off the Pi."""
+    state = install_picamera(with_exposure_time_mode=True)
+    camera = Picamera2Camera(preview=True)
+    camera.set_shutter(4000)
+    camera.set_shutter(None)
+    for config in (state.instance.created_config, state.instance.preview_config):
+        assert config["controls"]["ExposureTimeMode"] == _ExposureTimeModeEnum.Auto
+        assert "ExposureTime" not in config["controls"]
+    camera.close()
+
+
+def test_a_long_shutter_widens_frame_limits_in_both_configurations_and_auto_restores(
+    install_picamera,
+):
+    limits = {"still": (100, 1_000_000_000), "preview": (100, 83_333)}
+    state = install_picamera(with_exposure_time_mode=True, frame_limits=limits)
+    camera = Picamera2Camera(preview=True)
+    camera.set_shutter(250_000)
+    inst = state.instance
+    assert inst.preview_config["controls"]["FrameDurationLimits"] == (100, 251_000)
+    assert inst.created_config["controls"]["FrameDurationLimits"] == (100, 1_000_000_000)
+    assert inst.set_controls_calls[-1]["FrameDurationLimits"] == (100, 251_000)
+    camera.set_shutter(None)
+    assert inst.preview_config["controls"]["FrameDurationLimits"] == (100, 83_333)
+    assert inst.set_controls_calls[-1]["FrameDurationLimits"] == (100, 83_333)
+    camera.close()
+
+
+def test_a_short_shutter_keeps_the_frame_limits(install_picamera):
+    limits = {"still": (100, 1_000_000_000), "preview": (100, 83_333)}
+    state = install_picamera(with_exposure_time_mode=True, frame_limits=limits)
+    camera = Picamera2Camera(preview=True)
+    camera.set_shutter(4000)
+    assert state.instance.preview_config["controls"]["FrameDurationLimits"] == (100, 83_333)
+    camera.close()
+
+
+@pytest.mark.parametrize("bad", [99, 1_000_001, -5, "x", 4000.5, True, "4000"])
+def test_shutter_outside_the_range_is_refused(install_picamera, bad):
+    install_picamera()
+    camera = Picamera2Camera()
+    with pytest.raises(CameraError):
+        camera.set_shutter(bad)
+    assert camera.shutter_us is None
+    camera.close()
+
+
+def test_integral_float_shutter_is_accepted_as_whole_microseconds(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    camera.set_shutter(4000.0)
+    assert camera.shutter_us == 4000
+    assert type(state.instance.set_controls_calls[-1]["ExposureTime"]) is int
+    camera.close()
+
+
+def test_a_configuration_without_frame_limits_falls_back_to_the_camera_range(
+    install_picamera,
+):
+    state = install_picamera(
+        with_exposure_time_mode=True, control_frame_limits=(100, 83_333, 33_333),
+    )
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    camera.set_shutter(250_000)
+    assert inst.set_controls_calls[-1]["FrameDurationLimits"] == (100, 251_000)
+    assert inst.preview_config["controls"]["FrameDurationLimits"] == (100, 251_000)
+    assert inst.created_config["controls"]["FrameDurationLimits"] == (100, 251_000)
+    camera.set_shutter(None)
+    assert inst.set_controls_calls[-1]["FrameDurationLimits"] == (100, 83_333)
+    assert inst.preview_config["controls"]["FrameDurationLimits"] == (100, 83_333)
+    camera.close()
+
+
+def test_a_rejected_shutter_changes_nothing(install_picamera):
+    state = install_picamera(with_exposure_time_mode=True)
+    camera = Picamera2Camera(preview=True)
+    before = dict(state.instance.preview_config["controls"])
+    still_before = dict(state.instance.created_config["controls"])
+
+    def boom(controls):
+        raise RuntimeError("control rejected")
+
+    state.instance.set_controls = boom
+    with pytest.raises(CameraError):
+        camera.set_shutter(4000)
+    assert camera.shutter_us is None
+    assert state.instance.preview_config["controls"] == before
+    assert state.instance.created_config["controls"] == still_before
+    camera.close()
+
+
+def test_max_gain_comes_from_the_sensor_controls(install_picamera):
+    install_picamera(analogue_gain=(1.0, 22.26, 1.0))
+    camera = Picamera2Camera()
+    assert camera.max_gain == pytest.approx(22.26)
+    camera.close()
+    install_picamera()
+    camera = Picamera2Camera()
+    assert camera.max_gain is None
     camera.close()

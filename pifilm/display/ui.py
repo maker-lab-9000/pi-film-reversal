@@ -2,7 +2,8 @@
 
 Layout: the preview fills the screen letterboxed; a translucent bar along the
 bottom carries the meter; a round shutter button sits at the right edge; EV
-buttons occupy the bar's ends. ``hit`` mirrors the drawn regions plus a 6 px
+buttons occupy the bar's ends; optional shutter-priority +/- buttons
+sit above and below the shutter button. ``hit`` mirrors the drawn regions plus a 6 px
 margin so the two cannot drift apart: both read the same constants.
 """
 
@@ -53,6 +54,12 @@ FOCUS_LABEL_Y = 196
 # bar's backing (y >= FOCUS_BAR_Y0 - 4) even with its hit margin, and away from the
 # battery badge (top-right) and the shutter (right edge).
 DOUBLE_BOX = (4, 4, 74, 24)
+# Shutter-priority buttons, stacked above and below the shutter button. With
+# HIT_MARGIN the + region ends at y 66 and the - region starts at y 138, both clear
+# of the shutter button's hit circle (y 68-136), and the - region ends at y 184,
+# above the bar's hit zone (BAR_TOP - HIT_MARGIN = 198).
+SHUTTER_PLUS_BOX = (264, 26, 312, 60)
+SHUTTER_MINUS_BOX = (264, 144, 312, 178)
 
 
 class Action(Enum):
@@ -61,6 +68,8 @@ class Action(Enum):
     EV_MINUS = "ev_minus"
     EV_PLUS = "ev_plus"
     DOUBLE_TOGGLE = "double_toggle"
+    SHUTTER_FASTER = "shutter_faster"
+    SHUTTER_SLOWER = "shutter_slower"
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -88,6 +97,7 @@ def iso_label(iso: int | None) -> str:
 
 def render_live(
     frame_rgb: np.ndarray, reading: MeterReading, double: tuple[bool, int] | None = None,
+    shutter_buttons: bool = False,
 ) -> Image.Image:
     base = _letterbox(frame_rgb).convert("RGBA")
     overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
@@ -104,13 +114,28 @@ def render_live(
     # readout
     font = _font(14)
     small = _font(11)
-    line1 = (
-        f"{text_or_dash(reading.shutter)}  {iso_label(reading.iso)}  "
-        f"EV {format_ev(reading.ev_comp)}"
-    )
+    shutter_text = text_or_dash(reading.shutter)
+    if reading.shutter_fixed:
+        shutter_text = f"S {shutter_text}"
+    x = EV_BUTTON_W + 6
+    # "S 1/2000  ISO MAX  EV +1.7" at 14 pt ends near x 218 and would run under the needle
+    # marker (its left edge can reach NEEDLE_X0 - 5). The fixed-shutter and ISO MAX
+    # readouts are the longer ones, so only they drop to 12 pt (worst case ends at x 192,
+    # under NEEDLE_X0 - 6); the ordinary readout keeps 14 pt exactly as before.
+    if reading.shutter_fixed or reading.iso_max:
+        font = _font(12)
+    if reading.iso_max:
+        # Drawn in three runs so only the ISO turns amber.
+        for text, colour in ((f"{shutter_text}  ", (255, 255, 255, 255)),
+                             ("ISO MAX", AMBER + (255,)),
+                             (f"  EV {format_ev(reading.ev_comp)}", (255, 255, 255, 255))):
+            draw.text((x, BAR_TOP + 3), text, fill=colour, font=font)
+            x += draw.textlength(text, font=font)
+    else:
+        line1 = f"{shutter_text}  {iso_label(reading.iso)}  EV {format_ev(reading.ev_comp)}"
+        draw.text((x, BAR_TOP + 3), line1, fill=(255, 255, 255, 255), font=font)
     lux = f"{reading.lux:.0f} lx" if reading.lux is not None else f"{DASH} lx"
     line2 = f"{lux}   clip {reading.clip_pct:.0f}%"
-    draw.text((EV_BUTTON_W + 6, BAR_TOP + 3), line1, fill=(255, 255, 255, 255), font=font)
     draw.text((EV_BUTTON_W + 6, BAR_TOP + 21), line2, fill=(220, 220, 220, 255), font=small)
     # needle: scale -3..+3 stops
     draw.line((NEEDLE_X0, NEEDLE_Y, NEEDLE_X1, NEEDLE_Y), fill=(255, 255, 255, 200), width=1)
@@ -130,6 +155,11 @@ def render_live(
         fill=(255, 255, 255, 60), outline=(255, 255, 255, 255), width=2,
     )
     draw.ellipse((cx - 18, cy - 18, cx + 18, cy + 18), fill=(255, 255, 255, 180))
+    if shutter_buttons:
+        for box, glyph in ((SHUTTER_PLUS_BOX, "+"), (SHUTTER_MINUS_BOX, "-")):
+            draw.rectangle(box, fill=(0, 0, 0, BAR_ALPHA), outline=(255, 255, 255, 200))
+            draw.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), glyph,
+                      fill=(255, 255, 255, 255), font=big, anchor="mm")
     if double is not None:
         _draw_double_badge(draw, double[0], double[1], small)
     # battery badge
@@ -259,6 +289,11 @@ def hit(x: int, y: int) -> Action:
     x0, y0, x1, y1 = DOUBLE_BOX
     if x0 - HIT_MARGIN <= x <= x1 + HIT_MARGIN and y0 - HIT_MARGIN <= y <= y1 + HIT_MARGIN:
         return Action.DOUBLE_TOGGLE
+    for box, action in ((SHUTTER_PLUS_BOX, Action.SHUTTER_FASTER),
+                        (SHUTTER_MINUS_BOX, Action.SHUTTER_SLOWER)):
+        x0, y0, x1, y1 = box
+        if x0 - HIT_MARGIN <= x <= x1 + HIT_MARGIN and y0 - HIT_MARGIN <= y <= y1 + HIT_MARGIN:
+            return action
     if y >= BAR_TOP - HIT_MARGIN:
         if x <= EV_BUTTON_W + HIT_MARGIN:
             return Action.EV_MINUS

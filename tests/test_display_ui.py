@@ -13,9 +13,12 @@ from pifilm.display.ui import (
     FOCUS_BAR_Y1,
     HEIGHT,
     HIT_MARGIN,
+    NEEDLE_X0,
     PROCESSING_BARS,
     PROCESSING_DIM,
     SHUTTER_CENTRE,
+    SHUTTER_MINUS_BOX,
+    SHUTTER_PLUS_BOX,
     SHUTTER_RADIUS,
     WIDTH,
     Action,
@@ -232,3 +235,93 @@ def test_badge_region_overlaps_no_other_control():
     # clear of the focus bar's backing, which starts at FOCUS_BAR_Y0 - 4
     assert y1 + HIT_MARGIN < FOCUS_BAR_Y0 - 4
     assert hit(*SHUTTER_CENTRE) is Action.SHUTTER
+
+
+def _box_centre(box):
+    x0, y0, x1, y1 = box
+    return (x0 + x1) // 2, (y0 + y1) // 2
+
+
+def test_shutter_buttons_hit_inside_their_boxes_and_margins():
+    assert hit(*_box_centre(SHUTTER_PLUS_BOX)) is Action.SHUTTER_FASTER
+    assert hit(*_box_centre(SHUTTER_MINUS_BOX)) is Action.SHUTTER_SLOWER
+    x0, y0, x1, y1 = SHUTTER_PLUS_BOX
+    assert hit(x0 - HIT_MARGIN, y0 - HIT_MARGIN) is Action.SHUTTER_FASTER
+    x0, y0, x1, y1 = SHUTTER_MINUS_BOX
+    assert hit(x1 + HIT_MARGIN, y1 + HIT_MARGIN) is Action.SHUTTER_SLOWER
+
+
+def test_shutter_button_regions_overlap_no_other_control():
+    cx, cy = SHUTTER_CENTRE
+    for box, action in ((SHUTTER_PLUS_BOX, Action.SHUTTER_FASTER),
+                        (SHUTTER_MINUS_BOX, Action.SHUTTER_SLOWER)):
+        x0, y0, x1, y1 = box
+        for x in range(x0 - HIT_MARGIN, min(WIDTH, x1 + HIT_MARGIN + 1)):
+            for y in range(y0 - HIT_MARGIN, y1 + HIT_MARGIN + 1):
+                assert hit(x, y) is action, (x, y)
+    # the shutter button still owns its whole circle
+    assert hit(cx, cy - SHUTTER_RADIUS - HIT_MARGIN) is Action.SHUTTER
+    assert hit(cx, cy + SHUTTER_RADIUS + HIT_MARGIN) is Action.SHUTTER
+    assert SHUTTER_MINUS_BOX[3] + HIT_MARGIN < BAR_TOP - HIT_MARGIN
+
+
+def test_shutter_buttons_are_drawn_only_when_asked():
+    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
+    plain = np.asarray(render_live(frame, _reading()))
+    with_buttons = np.asarray(render_live(frame, _reading(), shutter_buttons=True))
+    x0, y0, x1, y1 = SHUTTER_PLUS_BOX
+    assert np.array_equal(plain[y0:y1 + 1, x0:x1 + 1], np.full_like(
+        plain[y0:y1 + 1, x0:x1 + 1], 200))
+    assert not np.array_equal(plain[y0:y1 + 1, x0:x1 + 1],
+                              with_buttons[y0:y1 + 1, x0:x1 + 1])
+
+
+def test_fixed_shutter_readout_is_prefixed(monkeypatch):
+    drawn = []
+    real = ImageDraw.ImageDraw.text
+
+    def spy(self, xy, text, *a, **k):
+        drawn.append(text)
+        return real(self, xy, text, *a, **k)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
+    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
+    render_live(frame, _reading(shutter="1/250", shutter_fixed=True))
+    assert any(t.startswith("S 1/250") for t in drawn)
+    drawn.clear()
+    render_live(frame, _reading(shutter="1/250"))
+    assert any(t.startswith("1/250") for t in drawn)
+
+
+def test_iso_max_is_amber(monkeypatch):
+    calls = []
+    real = ImageDraw.ImageDraw.text
+
+    def spy(self, xy, text, *a, **k):
+        calls.append((text, k.get("fill")))
+        return real(self, xy, text, *a, **k)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
+    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
+    render_live(frame, _reading(iso_max=True))
+    assert ("ISO MAX", AMBER + (255,)) in calls
+
+
+def test_fixed_or_maxed_readout_clears_the_needle(monkeypatch):
+    runs = []
+    real = ImageDraw.ImageDraw.text
+
+    def spy(self, xy, text, *a, **k):
+        if xy[1] == BAR_TOP + 3:  # line 1 only
+            runs.append((xy[0], text, k["font"]))
+        return real(self, xy, text, *a, **k)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
+    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
+    for over in (dict(iso_max=True, ev_comp=1.7, iso=3200),
+                 dict(iso_max=True, ev_comp=-1.7, iso=3200),
+                 dict(iso_max=False, ev_comp=-1.7, iso=2200)):
+        runs.clear()
+        render_live(frame, _reading(shutter="1/2000", shutter_fixed=True, **over))
+        right = max(x + font.getlength(text) for x, text, font in runs)
+        assert right <= NEEDLE_X0 - 6, (over, right)
