@@ -253,3 +253,43 @@ def test_status_survives_a_power_reader_that_raises():
     assert status_code == 200
     assert status["pi_battery"] is None
     assert status["ready"] is True
+
+
+def test_status_reports_double_exposure(remote):
+    server, _session = remote
+    status, _headers, payload = _json(server, "GET", "/v1/status")
+    assert status == 200
+    assert payload["double_exposure"] == {"enabled": False, "taken": 0}
+
+
+def test_exposure_one_image_is_the_card(tmp_path):
+    from pifilm.artifacts import Artifacts, write_artifact
+    from pifilm.capture.app import CaptureSession
+    from pifilm.capture.camera import FakeCamera, synthetic_frame
+    from pifilm.grain import GrainParams
+    from pifilm.lut import LUT3D
+    from pifilm.normalize import NormalizeParams
+    from pifilm.pipeline import Pipeline
+
+    art = tmp_path / "art"
+    write_artifact(art, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    session = CaptureSession(FakeCamera([synthetic_frame(48, 64)]),
+                             Pipeline(Artifacts.load(art)), tmp_path / "shots")
+    controller = CaptureController(session)
+    server = RemoteCaptureServer(controller, "secret-token", ("127.0.0.1", 0))
+    server.start()
+    try:
+        controller.set_double_exposure(True)
+        request_id = str(uuid.uuid4())
+        _request(server, "POST", "/v1/captures", json.dumps({"request_id": request_id}))
+        for _ in range(200):
+            if controller.status(request_id).state == "complete":
+                break
+            time.sleep(0.01)
+        status, _headers, body = _request(server, "GET", f"/v1/captures/{request_id}/image.jpg")
+        assert status == 200 and body[:2] == b"\xff\xd8"
+        _status, _headers, payload = _json(server, "GET", "/v1/status")
+        assert payload["double_exposure"] == {"enabled": True, "taken": 1}
+    finally:
+        server.close()
+        controller.close()

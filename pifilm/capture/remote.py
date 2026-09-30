@@ -229,6 +229,11 @@ class RemoteCaptureServer:
                 }
                 if battery is not None else None
             ),
+            # Ignored by current Stick firmware; lets any client show the 0/2, 1/2 count.
+            "double_exposure": {
+                "enabled": snapshot.double_exposure,
+                "taken": snapshot.exposures_taken,
+            },
         }
 
     def _job(self, request_id: str) -> JobSnapshot | None:
