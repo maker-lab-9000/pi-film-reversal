@@ -5,6 +5,9 @@ request, so the LCD is one more trigger and one more screen, never a second
 owner of the camera. A finished job is noticed through the controller's
 ``finished_count``, which is how a Stick shot appears here without the
 controller knowing about displays.
+Double exposure adds a third state, NOTICE: after exposure 1 of a pair there is
+nothing developed to review, so a short "Exposure 1/2" message replaces the
+review and the loop returns to LIVE for the second exposure.
 
 Display and touch objects are duck-typed (``show``/``close``, ``read``/``close``)
 and the clock is injectable, so the loop is tested without hardware. The loop
@@ -51,6 +54,11 @@ RATE_LOG_INTERVAL = 10.0
 DIM_AFTER = 60.0
 OFF_AFTER = 300.0
 FULL_BACKLIGHT = 80
+# Double exposure: how long the "Exposure 1/2" notice holds before the live view
+# returns for the second exposure (a tap ends it sooner), and the processing labels.
+NOTICE_SECONDS = 1.2
+PROCESSING_FIRST = "Exposure 1 of 2..."
+PROCESSING_DOUBLE = "Developing double exposure..."
 
 
 class ViewfinderLoop:
@@ -72,6 +80,7 @@ class ViewfinderLoop:
         self.ev_comp = float(getattr(camera, "ev", 0.0))
         self._seen_finished = controller.snapshot().finished_count
         self._review_since = 0.0
+        self._notice_since = 0.0
         self._display_failures = 0
         self._touch_logged_at: float | None = None
         self._touch_suppressed = 0
@@ -193,10 +202,19 @@ class ViewfinderLoop:
                 f"{text_or_dash(reading.shutter)}  {iso_label(reading.iso)}  "
                 f"EV {format_ev(self.ev_comp)}"
             )
+            if getattr(job.result, "exposure", None) == (2, 2):
+                caption = f"2x  {caption}"
             return render_review(rgb, caption)
         except Exception as exc:
             self._log(f"review: {exc}")
             return render_message("Review unavailable", str(exc)[:60])
+
+    @staticmethod
+    def _processing_label(snap: Any) -> str:
+        """Which exposure of a pair is on its way. The count is the one before the job."""
+        if not getattr(snap, "double_exposure", False):
+            return "Processing photo..."
+        return PROCESSING_DOUBLE if snap.exposures_taken == 1 else PROCESSING_FIRST
 
     # -- states -----------------------------------------------------------------
 
@@ -215,10 +233,22 @@ class ViewfinderLoop:
         self._apply_backlight(now)
         if snap.finished_count != self._seen_finished and snap.last_finished_job is not None:
             self._seen_finished = snap.finished_count
-            self.state = "REVIEW"
             self._processing_shown = False
+            job = snap.last_finished_job
+            if job.state == "complete" and getattr(job.result, "exposure", None) == (1, 2):
+                self.state = "NOTICE"
+                self._notice_since = self._clock.monotonic()
+                self._show(render_message("Exposure 1/2", "frame the second exposure"))
+                return
+            self.state = "REVIEW"
             self._review_since = self._clock.monotonic()
-            self._show(self._review_image(snap.last_finished_job))
+            self._show(self._review_image(job))
+            return
+        if self.state == "NOTICE":
+            held = self._clock.monotonic() - self._notice_since
+            if tap is not None or held >= NOTICE_SECONDS:
+                self.state = "LIVE"
+                self._restart_rate_window()
             return
         if self.state == "REVIEW":
             held = self._clock.monotonic() - self._review_since
@@ -235,6 +265,10 @@ class ViewfinderLoop:
                 self._set_ev(self.ev_comp - EV_STEP)
             elif action is Action.EV_PLUS:
                 self._set_ev(self.ev_comp + EV_STEP)
+            elif action is Action.DOUBLE_TOGGLE and snap.active_job is None:
+                # Ignored while a job runs (spec section 5): the badge is hidden behind
+                # the colour bars, so a tap there was not aimed at it.
+                self._controller.set_double_exposure(not snap.double_exposure)
         if snap.active_job is not None:
             # The grade takes about three seconds, and the camera belongs to the
             # capture worker for the still in front of it: show the same colour
@@ -244,7 +278,7 @@ class ViewfinderLoop:
             # above, so a shutter tap still reaches the controller (which
             # answers busy) and EV taps still work.
             if not self._processing_shown:
-                self._show(render_processing())
+                self._show(render_processing(self._processing_label(snap)))
                 self._processing_shown = True
             self._restart_rate_window()
             return
@@ -267,7 +301,7 @@ class ViewfinderLoop:
         reading = compute_reading(
             frame.metadata, frame.rgb, self.ev_comp, power, focus=level, focus_peak=peak,
         )
-        self._show(render_live(frame.rgb, reading))
+        self._show(render_live(frame.rgb, reading, (snap.double_exposure, snap.exposures_taken)))
         self._frames += 1
         now = self._clock.monotonic()
         if now - self._rate_since >= RATE_LOG_INTERVAL:

@@ -13,8 +13,8 @@ from pifilm.capture.controller import CaptureController
 from pifilm.capture.errors import CameraError
 from pifilm.display import DisplayError, viewfinder
 from pifilm.display.cst3530 import TouchPoint
-from pifilm.display.ui import BAR_TOP, SHUTTER_CENTRE
-from pifilm.display.viewfinder import EV_STEP, ViewfinderLoop
+from pifilm.display.ui import BAR_TOP, DOUBLE_BOX, SHUTTER_CENTRE
+from pifilm.display.viewfinder import EV_STEP, NOTICE_SECONDS, ViewfinderLoop
 from pifilm.grain import GrainParams
 from pifilm.lut import LUT3D
 from pifilm.normalize import NormalizeParams
@@ -109,6 +109,11 @@ class GatedSession:
         self.started.set()
         assert self.release.wait(5.0), "capture was never released"
         return self._session.capture()
+
+    def __getattr__(self, name):
+        # Only called for attributes the wrapper lacks: double_state and
+        # set_double_exposure fall through to the real session.
+        return getattr(self._session, name)
 
 
 def _gated_controller(tmp_path):
@@ -476,9 +481,9 @@ def _spy_live(monkeypatch):
     readings = []
     real = viewfinder.render_live
 
-    def spy(frame_rgb, reading):
+    def spy(frame_rgb, reading, double=None):
         readings.append(reading)
-        return real(frame_rgb, reading)
+        return real(frame_rgb, reading, double)
 
     monkeypatch.setattr(viewfinder, "render_live", spy)
     return readings
@@ -682,3 +687,135 @@ def test_a_display_without_a_backlight_is_never_dimmed(controller):
     clock.t = 400.0
     loop.step()   # must not raise; the frame is still drawn
     assert display.images
+
+
+# -- double exposure ------------------------------------------------------------
+
+
+def _badge_centre():
+    x0, y0, x1, y1 = DOUBLE_BOX
+    return (x0 + x1) // 2, (y0 + y1) // 2
+
+
+def _enable_double(loop, touch, clock, ctl):
+    _tap(loop, touch, clock, _badge_centre())
+    _until(lambda: ctl.snapshot().double_exposure)
+
+
+def test_badge_tap_toggles_double_exposure(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl)
+    _enable_double(loop, touch, clock, ctl)
+    _tap(loop, touch, clock, _badge_centre())
+    _until(lambda: not ctl.snapshot().double_exposure)
+
+
+def test_badge_taps_during_processing_are_ignored(tmp_path):
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        loop, touch, display, clock = _loop(camera, ctl)
+        ctl.submit("busy")
+        _until(lambda: session.started.is_set())
+        _tap(loop, touch, clock, _badge_centre())
+        session.release.set()
+        _until(lambda: ctl.snapshot().finished_count == 1)
+        assert ctl.snapshot().double_exposure is False
+    finally:
+        session.release.set()
+        ctl.close()
+
+
+def test_live_view_draws_the_badge_from_the_snapshot(controller, monkeypatch):
+    camera, ctl = controller
+    seen = []
+    real = viewfinder.render_live
+
+    def spy(frame, reading, double=None):
+        seen.append(double)
+        return real(frame, reading, double)
+
+    monkeypatch.setattr(viewfinder, "render_live", spy)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert seen[-1] == (False, 0)
+    _enable_double(loop, touch, clock, ctl)
+    loop.step()
+    assert seen[-1] == (True, 0)
+
+
+def test_exposure_one_shows_a_notice_not_a_review(controller, monkeypatch):
+    camera, ctl = controller
+    calls = _record_renderers(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    _enable_double(loop, touch, clock, ctl)
+    ctl.submit("exp-1")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "NOTICE"
+    assert calls["review"] == []
+    assert calls["message"][-1][0] == "Exposure 1/2"
+    clock.t += NOTICE_SECONDS - 0.1
+    loop.step()
+    assert loop.state == "NOTICE"
+    clock.t += 0.2
+    loop.step()
+    assert loop.state == "LIVE"
+
+
+def test_a_tap_ends_the_notice_early(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl)
+    _enable_double(loop, touch, clock, ctl)
+    ctl.submit("exp-1")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    _tap(loop, touch, clock, (160, 120))
+    assert loop.state == "LIVE"
+    assert ctl.snapshot().finished_count == 1  # the tap did not fire the shutter
+
+
+def test_exposure_two_reviews_the_composite_with_a_2x_caption(controller, monkeypatch):
+    camera, ctl = controller
+    calls = _record_renderers(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    _enable_double(loop, touch, clock, ctl)
+    ctl.submit("exp-1")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    ctl.submit("exp-2")
+    _until(lambda: ctl.snapshot().finished_count == 2)
+    loop.step()
+    assert loop.state == "REVIEW"
+    assert calls["review"][-1].startswith("2x")
+    job = ctl.snapshot().last_finished_job
+    assert job.result.pifilm.name.endswith("_double_graded.jpg")
+
+
+def test_processing_labels_follow_the_pair(tmp_path, monkeypatch):
+    camera, ctl, session = _gated_controller(tmp_path)
+    labels = []
+    real = viewfinder.render_processing
+
+    def spy(label="Processing photo..."):
+        labels.append(label)
+        return real(label)
+
+    monkeypatch.setattr(viewfinder, "render_processing", spy)
+    try:
+        loop, touch, display, clock = _loop(camera, ctl)
+        _enable_double(loop, touch, clock, ctl)
+        for request_id, expected in (("a", "Exposure 1 of 2..."),
+                                     ("b", "Developing double exposure...")):
+            session.started.clear()
+            session.release.clear()
+            ctl.submit(request_id)
+            _until(lambda: session.started.is_set())
+            loop.step()
+            assert labels[-1] == expected
+            session.release.set()
+            _until(lambda rid=request_id: ctl.status(rid).state == "complete")
+            loop.step()   # NOTICE or REVIEW
+            _tap(loop, touch, clock, (160, 120))  # back to LIVE
+    finally:
+        session.release.set()
+        ctl.close()
