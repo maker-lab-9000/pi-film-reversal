@@ -40,6 +40,13 @@ finds any difference, it stops before the old folder is touched.
   means a damaged image cannot stop the Pi booting. `X-fstrim.notrim` keeps the
   weekly `fstrim.timer` off it. Pass `0` skips fsck, which expects a block
   device.
+- `RequiresMountsFor=` drop-ins for `pifilm-capture.service` and
+  `pifilm-nextcloud-sync.service`: neither starts without the volume.
+- The bare folder under the mount is immutable (`chattr +i`). If the image
+  ever fails to mount, a write into the empty folder fails instead of quietly
+  filling root again.
+- `~/Pictures/pifilm.pre-volume`, the old copy. Delete it once a capture has
+  landed on the new volume: `sudo rm -rf ~/Pictures/pifilm.pre-volume`.
 
 The image must stay fully allocated for its size to be reserved. Trimming a
 loop mount punches holes in the backing file and hands that space back to root.
@@ -48,13 +55,6 @@ the first run on 2026-09-30, without the flag, left a 30 GiB image with only
 15 GiB allocated. Check with `du -h /var/lib/pifilm/photos.img`, which should
 show the full size. If it doesn't, `sudo fallocate -l 30G
 /var/lib/pifilm/photos.img` fills the holes without touching the data.
-- `RequiresMountsFor=` drop-ins for `pifilm-capture.service` and
-  `pifilm-nextcloud-sync.service`: neither starts without the volume.
-- The bare folder under the mount is immutable (`chattr +i`). If the image
-  ever fails to mount, a write into the empty folder fails instead of quietly
-  filling root again.
-- `~/Pictures/pifilm.pre-volume`, the old copy. Delete it once a capture has
-  landed on the new volume: `sudo rm -rf ~/Pictures/pifilm.pre-volume`.
 
 rsync keeps modification times and rclone compares size and time, so the sync
 does not re-upload anything after the move.
