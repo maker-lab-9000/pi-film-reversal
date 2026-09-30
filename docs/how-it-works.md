@@ -49,6 +49,11 @@ Every graded frame goes through three steps, in a fixed order, in
    The seed is recorded per capture, so any graded file can be regenerated
    from its original.
 
+Shutter priority (the viewfinder's shutter buttons) fixes the exposure time and
+leaves gain to the Pi's auto-exposure, which meets its brightness target with gain
+alone. EV compensation shifts that target, so it keeps working. The grade does not
+change: a frame that ran out of gain (`ISO MAX`) is normalised like any dark frame.
+
 ### Double exposure
 
 With the viewfinder's `2x` toggle on, two captures make one picture

@@ -149,6 +149,9 @@ restart.
 | Focus bar (vertical gauge, left edge, labelled `F`) | Absolute sharpness of the central quarter of the frame, 0 (far out of focus, or nothing to focus on) to full; amber tick marks the best level of the last few seconds | — |
 | Shutter button (circle, right edge) | White ring, filled centre | Submits a capture through the shared controller; the processing screen holds until it finishes |
 | EV `−` / EV `+` buttons (bar's left/right ends) | `-` / `+` labels | Adjusts exposure compensation by 1/3 stop, clamped to ±2; resets to `0` every time `pifilm-capture` restarts. The graded file keeps it too (normalisation used to cancel it until 2026-09-24), and it is logged as `ev_comp` in `captures.jsonl` |
+| Shutter `+` / `−` buttons (right edge, above and below the shutter button) | `+` and `-` | Shutter priority: `+` one 1/3 stop faster, `−` slower, 1/2000 to 1 s; slower than 1 s returns to auto (`A`). The first tap from auto starts at the speed auto-exposure is using. ISO stays automatic; EV still works. Picamera2 only; resets to auto on restart |
+| Shutter readout `S 1/250` | `S` prefix when the shutter is fixed; otherwise the metered speed | — |
+| `ISO MAX` (amber, in the readout) | Gain is at the sensor's maximum: the fixed shutter is too fast for the light and the photo will be dark | — |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Battery badge (top-right) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | `2x` toggle (pill, top-left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
@@ -198,6 +201,25 @@ offset common to both, so only the difference between the two EVs matters. A tap
 the `Exposure 1/2` notice early. The mode is not remembered across restarts. A camera
 error on exposure 2 keeps `1/2`, so just shoot again. See [how it works](how-it-works.md#double-exposure)
 for why the frames are added before grading.
+
+### Shutter priority
+
+Tap the shutter `+` / `−` buttons to fix the shutter speed; the camera keeps choosing
+the ISO to expose correctly, and EV compensation still shifts the result. Use a fast
+speed (1/500 and up) to freeze motion and a slow one (1/15 and down) to blur it; the
+readout shows `S` in front of a fixed speed. Keep tapping `−` past 1 s to return to
+full auto.
+
+- At long speeds the live view slows to match: at 1/4 s it shows about 4 frames a
+  second. That is the exposure, not a fault.
+- `ISO MAX` in amber means the camera has run out of gain for this speed. The photo
+  will come out dark and grainy (it is graded like any dark frame); pick a slower
+  speed or add light.
+- Each photo's `captures.jsonl` line records `shutter_us` (null on auto); the real
+  exposure time and gain are in `camera_metadata`.
+- At start-up the journal names how the shutter is fixed:
+  `picamera2: shutter priority via ExposureTimeMode` on current libcamera, or
+  `... ExposureTime (legacy libcamera)` on older stacks.
 
 ## 6. Reading the meter
 
@@ -288,6 +310,17 @@ per spec §4:
     `1/2`: the badge goes to the outlined `2x`. `systemctl restart pifilm-capture`:
     the mode comes back off. Exposure 2 on the IMX477 finishes within a few seconds of
     a single shot (colour bars not held noticeably longer).
+
+12. Shutter priority: in a dim room tap `+` up to 1/1000: the readout shows
+    `S 1/1000` and amber `ISO MAX`, and the shot is darker. Tap `−` down to 1/4 and pan
+    across a scene: the live view drops to about 4 fps and a shot shows motion blur.
+    Each shot's `camera_metadata.ExposureTime` is within a few percent of the chosen
+    speed, and its `shutter_us` matches. After taking a shot at a fixed speed, the live
+    view keeps it (the readout still shows `S`, and the slow live view or blur persists).
+    Keep tapping `−` past 1 s: the readout loses the `S` and the live view returns to
+    full rate. After returning to `A`, a shot's `camera_metadata.ExposureTime` changes
+    with the scene again (point at a lamp, then a dark corner). The journal line at
+    start-up names the control path.
 
 ## 8. Troubleshooting
 
