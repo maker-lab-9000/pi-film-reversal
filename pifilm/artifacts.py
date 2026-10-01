@@ -38,7 +38,11 @@ from .grain import GrainParams
 from .lut import LUT3D, CubeError, read_cube, sha1_hex, write_cube
 from .normalize import NormalizeParams
 
-PARAMS_VERSION = 2
+PARAMS_VERSION = 3
+# Version 3 exists only to carry a non-Gaussian grain model: an older build ignores
+# the extra grain fields and would grain at the Gaussian model's settings, so such
+# an artifact must be one it refuses. Gaussian-grain artifacts stay at version 2.
+GRAIN_MODEL_VERSION = 3
 DEFAULT_LUT_FILE = "pifilm.cube"
 
 
@@ -101,6 +105,11 @@ class Artifacts:
             # {"wb_gain_min": "oops"} reaches math.isfinite and raises TypeError,
             # which would otherwise escape unwrapped past this loader.
             raise ArtifactsError(f"{params_path}: {exc}") from exc
+        if grain.model != "gaussian" and version < GRAIN_MODEL_VERSION:
+            raise ArtifactsError(
+                f"{params_path}: grain model {grain.model!r} needs params version "
+                f"{GRAIN_MODEL_VERSION}, file says {version}"
+            )
 
         lut_file = raw.get("lut_file", DEFAULT_LUT_FILE)
         # Validated before use: `path / 5` raises TypeError, which would escape
@@ -193,7 +202,7 @@ def write_artifact(
     # artifact fail its own integrity check on load — and an identity table would
     # not reveal it, because its values are exact at six decimals.
     payload = {
-        "version": PARAMS_VERSION,
+        "version": GRAIN_MODEL_VERSION if grain.model != "gaussian" else 2,
         "lut_file": lut_file,
         "lut_sha1": sha1_hex(read_cube(path / lut_file)),
         "normalize": normalize.to_dict(),
