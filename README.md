@@ -27,7 +27,6 @@ Without `--artifacts`, commands continue to use the untrained starter preset.
 
 Photos captured and graded on the Raspberry Pi with the Camera Module 3 Wide (IMX708):
 <p>
-  <img width="300" alt="Sample photo 1" src="https://github.com/user-attachments/assets/a3b258d9-45e8-40c6-b829-678ed328efec" />
   <img width="300" alt="Sample photo 2" src="https://github.com/user-attachments/assets/a626dde2-58c7-4406-ae52-45b3a5e5780a" />
   <img width="300" alt="Sample photo 3" src="https://github.com/user-attachments/assets/0bc29cdd-6456-48be-8309-467c11d3afa7" />
   <img width="300" alt="Sample photo 4" src="https://github.com/user-attachments/assets/7ea2ab9f-f598-4074-89c9-34527727c80f" />
@@ -52,15 +51,6 @@ Photos captured and graded on the Raspberry Pi with the Camera Module 3 Wide (IM
 ## Getting started
 
 Full walkthrough: **[the setup guide](docs/setup.md)** — ordered by dependency, and it names the machine for every step. In brief:
-
-| # | Machine | Step |
-| --- | --- | --- |
-| 1 | Mac | clone, venv, `pip install -e '.[train,dev,deploy]'`, PlatformIO, tests |
-| 2 | — | fill the one `.env` (all credentials/addresses; used by deploy, hotspot and firmware) |
-| 3 | Pi | OS (Trixie), hostname, Ethernet admin, then the Pi's own Wi-Fi hotspot |
-| 4 | Pi | app + service: venv with system OpenCV, choose a look, token file, systemd unit |
-| 5 | Stick | build + flash with credentials baked in, read the serial log |
-| 6 | Mac (opt) | training — only to replace the bundled starter |
 
 More detail lives in the docs: the [network & deployment guide](docs/sticks3-remote.md)
 (hotspot, Ethernet, service, rollback) and the [firmware README](firmware/sticks3/README.md)
