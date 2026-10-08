@@ -38,7 +38,7 @@ Photos captured and graded on the Raspberry Pi with the Camera Module 3 Wide (IM
 ## Current build
 <img width="350" alt="Current Raspberry Pi camera build" src="https://github.com/user-attachments/assets/0fa1a043-e4fe-44cd-b581-5edf5939938f" />
 
-## 3d Print prototype
+## 3D print prototype
 <img width="450" alt="3D printed camera enclosure prototype" src="https://github.com/user-attachments/assets/df29fb9c-6b82-45ab-9d3a-7b00bcd2097e" />
 
 ## Hardware
