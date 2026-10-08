@@ -44,7 +44,7 @@ Photos captured and graded on the Raspberry Pi with the Camera Module 3 Wide (IM
 ## Hardware
 - Raspberry Pi 4, 4GB RAM
 - M5Stack StickS3 (display, trigger)
-- Waveshare 2.8 inch LCD Display Module and touchscreen (light meter, focus meter, trigger, exposure controls)
+- Waveshare 2.8 inch LCD Display Module and touchscreen (light meter, focus meter, trigger, exposure controls, battery meter)
 - x728 UPS Shield + Geekworm X728-C1 Metal Case
 - 64GB SD Card
 - Arducam 8-50mm C-Mount Zoom Lens for IMX477
@@ -57,7 +57,7 @@ Full walkthrough: **[the setup guide](docs/setup.md)** — ordered by dependency
 More detail lives in the docs: the [network & deployment guide](docs/sticks3-remote.md)
 (hotspot, Ethernet, service, rollback) and the [firmware README](firmware/sticks3/README.md)
 
-| Ready to capture | Last captured photo |
+| Last captured photo | Ready to capture |
 | --- | --- |
 | <img src="docs/images/sticks3-ready.jpg" alt="M5Stack StickS3 showing TV colour bars and the READY prompt" height="280"> | <img src="docs/images/sticks3-captured-photo.jpg" alt="M5Stack StickS3 displaying a captured room photo" height="280"> |
 
