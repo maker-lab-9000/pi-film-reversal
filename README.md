@@ -31,6 +31,8 @@ Photos captured and graded on the Raspberry Pi with the Camera Module 3 Wide (IM
   <img width="300" alt="Sample photo 3" src="https://github.com/user-attachments/assets/0bc29cdd-6456-48be-8309-467c11d3afa7" />
   <img width="300" alt="Sample photo 4" src="https://github.com/user-attachments/assets/7ea2ab9f-f598-4074-89c9-34527727c80f" />
   <img width="300" alt="Sample photo 5" src="https://github.com/user-attachments/assets/e923aaf4-8214-4a79-a673-c2b23f084b38" />
+  <img width="300" alt="Sample photo 6" src="https://github.com/user-attachments/assets/6f165bc7-04f7-4809-89df-dad4568b2e50" />
+  <img width="300" alt="Sample photo 7" src="https://github.com/user-attachments/assets/4815dfc8-fd7f-4b68-8855-3100038680f7" />
 </p>
 
 ## Current build
