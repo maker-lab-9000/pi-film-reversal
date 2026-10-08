@@ -48,6 +48,7 @@ I will commit the STL files once final design is approved and tested.
 - M5Stack StickS3 (display, trigger)
 - Waveshare 2.8 inch LCD Display Module and touchscreen (light meter, focus meter, trigger, exposure controls, battery meter)
 - x728 UPS Shield + Geekworm X728-C1 Metal Case
+- 4x 18650 Li-ion cells, estimated capacity around 10000mAh
 - 64GB SD Card
 - Arducam 8-50mm C-Mount Zoom Lens for IMX477
 - Raspberry Pi Camera Module 3, Wide, IMX708 sensor
