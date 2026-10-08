@@ -44,7 +44,7 @@ Photos captured and graded on the Raspberry Pi with the Camera Module 3 Wide (IM
 ## Hardware
 - Raspberry Pi 4, 4GB RAM
 - M5Stack StickS3 (display, trigger)
-- Waveshare 2.8 inch LCD Display Module and touchscreen
+- Waveshare 2.8 inch LCD Display Module and touchscreen (light meter, focus meter, trigger, exposure controls)
 - x728 UPS Shield + Geekworm X728-C1 Metal Case
 - 64GB SD Card
 - Arducam 8-50mm C-Mount Zoom Lens for IMX477
