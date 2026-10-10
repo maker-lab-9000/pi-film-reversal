@@ -231,8 +231,8 @@ curl -s -o /dev/null -w '%{http_code}\n' http://10.42.0.1:8765/v1/status   # 401
 ```
 
 The unit runs `pifilm-capture --no-preview --remote-listen 0.0.0.0:8765
---artifacts <dir> --ups x728 --display waveshare28`. It runs the LCD viewfinder
-when the [Waveshare panel](lcd-viewfinder.md) is fitted and falls back to
+--artifacts <dir> --ups x728 --display waveshare35dsi`. It runs the LCD viewfinder
+when the [Waveshare DSI panel](lcd-viewfinder.md#9-the-35-dsi-panel) is fitted and falls back to
 headless Stick-only service when it is not, or when the camera is USB;
 `--no-preview` because it suppresses the OpenCV window, which needs a desktop
 session the service does not have (it does not disable the LCD);
@@ -304,12 +304,15 @@ as `Pi 77%`, `Pi 77%+` on external power, and `Pi --%` when unknown.
 
 ### 4.8 Optional: LCD viewfinder
 
-For a live viewfinder with a light-meter readout and an on-screen shutter,
-wire up the Waveshare 2.8" Capacitive Touch LCD and add `--display waveshare28`
-to the service (already in the example unit). It needs `sudo usermod -aG
-spi,i2c,gpio george` and `sudo apt install python3-spidev python3-smbus2
-python3-gpiozero python3-lgpio`; full wiring, `config.txt` requirements and the
-hardware acceptance checklist are in [docs/lcd-viewfinder.md](lcd-viewfinder.md).
+For a live viewfinder with a light-meter readout and an on-screen shutter, fit
+the Waveshare 3.5" DSI LCD (E) and run the service with `--display
+waveshare35dsi`, which the example unit already does. It needs Waveshare's
+overlay file, one `config.txt` line, the Pi booting to the console, and the
+service user in `video`, `render` and `input`; the steps, the screen layout and
+the hardware acceptance checklist are in
+[docs/lcd-viewfinder.md](lcd-viewfinder.md#9-the-35-dsi-panel). The older
+Waveshare 2.8" SPI panel is still supported with `--display waveshare28`
+(sections 2 and 3 of the same guide).
 
 ### 4.9 Nextcloud photo sync (optional)
 

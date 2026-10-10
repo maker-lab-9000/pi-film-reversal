@@ -1,9 +1,20 @@
 # LCD viewfinder
 
-A Waveshare 2.8" Capacitive Touch LCD (V2, ST7789 + CST3530) wired to the Pi's
-GPIO header, run by `pifilm-capture --display waveshare28` as a live viewfinder
-with a light-meter readout and an on-screen shutter. Hardware acceptance on the
-real panel has not been run yet; see the [checklist](#7-hardware-acceptance-checklist).
+A touch LCD on the Pi, run by `pifilm-capture --display ...` as a live viewfinder
+with a light-meter readout and an on-screen shutter. Two panels are supported:
+
+| Panel | Flag | Connection | Status |
+| --- | --- | --- | --- |
+| Waveshare 3.5" DSI LCD (E), 640×480, Goodix touch | `--display waveshare35dsi` | DSI ribbon cable only | The default. Setup in [section 9](#9-the-35-dsi-panel) |
+| Waveshare 2.8" Capacitive Touch LCD (V2), 320×240, ST7789 + CST3530 | `--display waveshare28` | SPI, I2C and four GPIO pins on the header | Fallback. Sections 2, 3 and 8 describe it |
+
+Sections 5 and 6 (the screen, the meter) apply to both: the DSI panel shows the
+same layout at twice the size. Where the two differ, section 9 says how. The one
+exception inside section 5 is [Idle dimming](#idle-dimming): the DSI panel has no
+brightness control, so it has no one-minute dim step, only the five-minute off
+step (see [9.3](#93-what-differs-from-the-28-panel)).
+The commands in section 4 and the checklist in section 7 are written for the
+2.8" panel; sections 9.2 and 9.6 are their equivalents for the DSI panel.
 
 ## 1. What it is
 
@@ -132,10 +143,10 @@ warning: display unavailable (the V4L2 backend has no preview mode); continuing 
 and runs exactly as it would without the flag.
 
 `deploy/pifilm-capture.service.example`'s `ExecStart` already includes
-`--display waveshare28`; it is harmless on a Pi without the panel and on a Pi
+`--display waveshare35dsi`; it is harmless on a Pi without the panel and on a Pi
 with a USB camera — the service logs one `warning: display unavailable (...)`
 line and keeps serving the Stick instead of crash-looping. The same is true
-once the viewfinder is running: five consecutive SPI failures close the panel
+once the viewfinder is running: five consecutive display failures close the panel
 and leave the remote API serving the Stick, rather than exiting for systemd to
 restart.
 
@@ -166,6 +177,10 @@ Left untouched, the panel saves itself and the battery:
 | under 1 minute | full brightness (backlight 80 %) | acts normally |
 | 1 minute (`--display-dim-after`) | half brightness, live view still running | restores full brightness **and** acts (the buttons are visible) |
 | 5 minutes (`--display-off-after`) | backlight off; the camera preview is neither read nor drawn | **only wakes** the screen; it never fires the shutter, since you cannot see what you touch |
+
+The 3.5" DSI panel has no dim step: it stays at full brightness until the
+five-minute row, where its output is powered down (see
+[9.3](#93-what-differs-from-the-28-panel)).
 
 Any capture counts as activity: while one is being graded the screen stays
 lit, and a finished shot, from the LCD or the Stick, wakes it into the review.
@@ -346,3 +361,169 @@ process falls back to the mode it would have run in without `--display`.
 | `cannot reset the touch controller on GPIO 17` | GPIO 17 busy, or a wiring fault on `TP_RST` | Check the `TP_RST` connection; confirm nothing else claims GPIO 17 |
 | `touch controller at 0x58 not answering on /dev/i2c-1` | Nothing responded to the probe read at open — usually the ribbon cable | Check the ribbon cable and `TP_RST` wiring, and that the panel has power; confirm with `sudo i2cdetect -y 1` showing `58` |
 | `the V4L2 backend has no preview mode` | The camera is a USB/UVC one; the viewfinder needs Picamera2's preview-mode split and libcamera metadata | Nothing to fix unless a Pi camera is intended: check `--camera`/`--device` and that `python3-picamera2` is installed |
+
+## 9. The 3.5" DSI panel
+
+The Waveshare 3.5" DSI LCD (E) is a kernel display, not an SPI device: an overlay
+registers it with the Pi's display system and `pifilm-capture` hands it finished
+frames. It uses no pins on the GPIO header, and its touch controller is on the DSI
+cable's own I2C bus, not the one shared with the X728.
+
+### 9.1 Pi setup
+
+1. **Cable.** Connect the panel to the Pi 4's 15-pin display (DSI) port with the
+   supplied ribbon cable. Nothing else is wired.
+
+2. **Overlay file.** The overlay is Waveshare's, not part of Raspberry Pi OS
+   (installed 2026-10-10 from the address below; a kernel upgrade may need a
+   newer file from the same wiki page):
+
+   ```sh
+   wget -O /tmp/Waveshare_35DSI.dtbo https://files.waveshare.com/wiki/common/Waveshare_35DSI.dtbo
+   sudo cp /tmp/Waveshare_35DSI.dtbo /boot/firmware/overlays/
+   ```
+
+3. **`config.txt`** (`/boot/firmware/config.txt`). Keep the existing
+   `dtoverlay=vc4-kms-v3d` line and add:
+
+   ```text
+   dtoverlay=waveshare_35DSI,35E,dsi1
+   ```
+
+4. **Boot to the console.** The service must own the screen; under a desktop
+   session the compositor owns it and the viewfinder cannot open it. On the
+   Desktop image:
+
+   ```sh
+   sudo raspi-config nonint do_boot_behaviour B1
+   ```
+
+   (`B4` restores the desktop with autologin, which two-screen mode,
+   `--show-captures`, needs.)
+
+5. **Package and groups.** `python3-kms++` comes with `python3-picamera2`; install
+   it if `python3 -c "import pykms"` fails. The service user needs `video`,
+   `render` and `input`:
+
+   ```sh
+   sudo apt install python3-kms++
+   sudo usermod -aG video,render,input george
+   ```
+
+   Reboot.
+
+6. **Verify.** After the reboot the panel shows boot text and a login prompt, and:
+
+   ```sh
+   cat /sys/class/drm/card*-DSI-1/status          # connected
+   cat /sys/class/drm/card*-DSI-1/modes           # 640x480
+   grep -i goodix /proc/bus/input/devices         # Goodix Capacitive TouchScreen
+   ```
+
+### 9.2 Running
+
+```sh
+# Terminal test: live view on the panel, Ctrl-C to stop
+.venv/bin/pifilm-capture --camera picamera2 --display waveshare35dsi --no-preview --out ~/Pictures/pifilm-lcd
+
+# Upside down for how the panel is mounted
+.venv/bin/pifilm-capture --camera picamera2 --display waveshare35dsi --display-rotate 180 --no-preview --out ~/Pictures/pifilm-lcd
+
+# Print mapped touch coordinates while a finger is on the panel
+.venv/bin/pifilm-capture --camera picamera2 --display waveshare35dsi --touch-debug --no-preview --out ~/Pictures/pifilm-lcd
+```
+
+`deploy/pifilm-capture.service.example` passes `--display waveshare35dsi`, so with
+the unit installed the viewfinder appears at boot without logging in. While the
+service runs it replaces the console on the panel; `sudo systemctl stop
+pifilm-capture` brings the login prompt back.
+
+### 9.3 What differs from the 2.8" panel
+
+| | 2.8" SPI | 3.5" DSI |
+| --- | --- | --- |
+| Resolution | 320×240 | 640×480 (same layout, drawn at 2×) |
+| Idle | Dims at 1 minute, backlight off at 5 | No brightness control, so no dim step and `--display-dim-after` has no effect. At 5 minutes (`--display-off-after`) the display output is powered down and a tap powers it back up (measured on the panel 2026-10-10: the screen goes fully dark and comes back) |
+| Touch | Polled over I2C1, shared with the X728 | Kernel input events; nothing on I2C1 |
+| GPIO header | SPI0 and BCM 17, 18, 25, 27 | None |
+| Needs | `dtparam=spi=on`, `dtparam=i2c_arm=on` | The overlay, console boot |
+
+### 9.4 Measured on the Pi 4 (2026-10-10)
+
+| Item | Value |
+| --- | --- |
+| DRM connector | `DSI-1`, one mode, 640×480 |
+| Framebuffer | `/dev/fb0`, `vc4drmfb`, 16 bpp (not used; the driver uses DRM buffers) |
+| Backlight | none under `/sys/class/backlight/` |
+| Touch | `Goodix Capacitive TouchScreen`, I2C bus 10 address `0x5d`; the `/dev/input/eventN` number varies, so it is found by name |
+
+### 9.5 Troubleshooting
+
+Each message below is printed by `pifilm-capture` as
+`warning: display unavailable (<message>); continuing without it`, and the
+service carries on without the screen, still serving the Stick.
+
+| Message contains | Cause | Fix |
+| --- | --- | --- |
+| `install python3-kms++` | `pykms` is not importable | `sudo apt install python3-kms++`; the venv must see system packages, as for Picamera2 |
+| `cannot open the DSI display on DSI-1` | No such connector, the cable is out, or a desktop session owns the screen | Check the `dtoverlay=waveshare_35DSI,35E,dsi1` line and the overlay file, reseat the cable, boot to the console (9.1 step 4) |
+| `cannot open the DSI display on DSI-1`, ending `set_mode returned ...`, on a Pi that does boot to the console | Something else already holds the display: usually a second copy of `pifilm-capture` (the service is running and you started another from a terminal) | Stop the other one first: `sudo systemctl stop pifilm-capture` before a terminal test, and `sudo systemctl start pifilm-capture` afterwards |
+| `no permission for the DSI display` | Service user not in `video`/`render` | `sudo usermod -aG video,render george`; log out and in, or reboot |
+| `touch device 'Goodix Capacitive TouchScreen' not found` | The touch driver did not load | Same overlay and cable checks; `grep -i goodix /proc/bus/input/devices` |
+| `no permission for /dev/input/event*` | Service user not in `input` | `sudo usermod -aG input george`; log out and in, or reboot |
+| Panel blank after boot, no boot text | Overlay not applied | `dmesg \| grep -i "dsi\|panel\|goodix"`; check steps 2 and 3 |
+
+### 9.6 Hardware acceptance checklist
+
+Run on 2026-10-10 on the Pi 4 with the IMX477, Raspberry Pi OS Trixie booted to the
+console, branch `feat/dsi-viewfinder` at `2d2b6fc`. Idle was checked with
+`--display-off-after 20` rather than the five-minute default.
+
+| Item | Result |
+| --- | --- |
+| 1 Cold boot | Pass. Live view about 28 s after power-on, without logging in |
+| 2 Frame rate and tearing | Pass. 9.1 and 10.0 fps in the journal lines; no tearing when panning |
+| 3 Touch accuracy | Pass. Every control responds where it is drawn, corners included |
+| 4 Controls | Pass. Shutter, review, EV, shutter priority and `2x` behave as on the 2.8" panel |
+| 5 Stick shot | Pass. Appears on the panel |
+| 6 Idle | Pass. No dimming; dark at the off time; a tap wakes it without taking a photo |
+| 7 Stick shot while dark | Pass. Wakes into the review, no `display:` error lines |
+| 8 Service stop | Pass. The login prompt returns to the panel |
+| 9 Cable unplugged | Pass. One warning line; the Stick still captures |
+| 10 Rotation 180 | Not run. The panel is upright at 0 in the current mounting |
+| 11 2.8" fallback | Not run. The panel is no longer wired |
+| 12 Open-time check with the desktop running | Not confirmed. The warning line was not observed; repeat before relying on it |
+
+
+1. Cold boot: the live view appears on the panel without logging in. Note the time
+   from power-on.
+2. The journal's `viewfinder: N fps` line reads 8 or more; panning shows no tearing.
+3. Each control responds where it is drawn, including in the corners;
+   `--touch-debug` prints coordinates within 0..639 × 0..479.
+4. Shutter tap, EV, shutter priority, `2x` and review behave as in items 3, 5, 11
+   and 12 of [section 7](#7-hardware-acceptance-checklist).
+5. A Stick shot appears on the panel, which returns to live after 30 s untouched.
+6. Idle: no dimming at one minute; dark at five; a tap wakes it without taking a
+   photo (no new `captures.jsonl` line).
+7. With the screen dark from idle, take a shot from the Stick: the panel wakes
+   into the review, and the journal (`journalctl -u pifilm-capture`) shows no
+   `display:` error lines. This checks drawing straight after the output is
+   powered back on.
+8. `sudo systemctl stop pifilm-capture`: the login prompt returns to the panel.
+9. Unplug the DSI cable and restart the service: one `warning: display unavailable`
+   line in the journal, and the Stick still captures.
+10. `--display-rotate 180`: the image is inverted and taps still land on the controls.
+11. Optional, only if the 2.8" panel is still wired: `--display waveshare28` works.
+12. The open-time check, with the desktop running. This is the only way to prove on
+    hardware that a refused mode-set is caught at open. Set the boot behaviour to
+    the desktop (`sudo raspi-config nonint do_boot_behaviour B4`) and reboot. Over
+    SSH, run:
+
+    ```sh
+    .venv/bin/pifilm-capture --camera picamera2 --display waveshare35dsi --no-preview --out ~/Pictures/pifilm-lcd
+    ```
+
+    Expect exactly one
+    `warning: display unavailable (cannot open the DSI display on DSI-1 ...)` line,
+    naming console boot, and the process to carry on without the screen. Then
+    restore the console (`sudo raspi-config nonint do_boot_behaviour B1`) and reboot.

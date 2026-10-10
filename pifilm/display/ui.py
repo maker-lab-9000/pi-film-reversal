@@ -1,10 +1,13 @@
-"""Pillow rendering for the 320x240 viewfinder and its hit regions. Pure.
+"""Pillow rendering for the viewfinder and its hit regions, in 320x240 base units. Pure.
 
 Layout: the preview fills the screen letterboxed; a translucent bar along the
 bottom carries the meter; a round shutter button sits at the right edge; EV
 buttons occupy the bar's ends; optional shutter-priority +/- buttons
 sit above and below the shutter button. ``hit`` mirrors the drawn regions plus a 6 px
 margin so the two cannot drift apart: both read the same constants.
+
+Every render takes ``scale``: 1 for the 2.8" SPI panel, 2 for the 640x480 DSI panel.
+The constants below never change with it.
 """
 
 from __future__ import annotations
@@ -77,6 +80,67 @@ def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default(size=size)
 
 
+class _ScaledDraw:
+    """An ``ImageDraw`` that takes coordinates in 320x240 base units.
+
+    The layout constants in this module are in base units so the 2.8" panel
+    (scale 1) and the 3.5" DSI panel (scale 2) share one layout and one set of hit
+    regions. Shapes with two corners (rectangles, ellipses) treat each base pixel
+    as a ``scale`` x ``scale`` block, so the far corner maps to that block's last
+    pixel and neighbouring shapes stay flush; at scale 1 that is the identity.
+    Points (lines, polygons, text anchors) map to ``value * scale``. Widths,
+    radii and font sizes are multiplied; ``textlength`` is returned in base units
+    so callers keep doing their arithmetic there.
+    """
+
+    def __init__(self, draw: ImageDraw.ImageDraw, scale: int) -> None:
+        self._draw, self._s = draw, scale
+
+    def font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        return _font(size * self._s)
+
+    def _box(self, box: Any) -> tuple[float, float, float, float]:
+        x0, y0, x1, y1 = box
+        s = self._s
+        return (x0 * s, y0 * s, (x1 + 1) * s - 1, (y1 + 1) * s - 1)
+
+    def _points(self, points: Any) -> list[tuple[float, float]]:
+        flat = list(points)
+        if flat and not isinstance(flat[0], (tuple, list)):
+            flat = list(zip(flat[0::2], flat[1::2], strict=True))
+        return [(x * self._s, y * self._s) for x, y in flat]
+
+    def _kw(self, kw: dict[str, Any]) -> dict[str, Any]:
+        # Pillow's outline width defaults to 1 for these shapes; scale that default
+        # too, so an outline stays one base pixel thick.
+        kw["width"] = kw.get("width", 1) * self._s
+        return kw
+
+    def rectangle(self, box: Any, **kw: Any) -> None:
+        self._draw.rectangle(self._box(box), **self._kw(kw))
+
+    def rounded_rectangle(self, box: Any, radius: int = 0, **kw: Any) -> None:
+        self._draw.rounded_rectangle(self._box(box), radius=radius * self._s, **self._kw(kw))
+
+    def ellipse(self, box: Any, **kw: Any) -> None:
+        self._draw.ellipse(self._box(box), **self._kw(kw))
+
+    def line(self, points: Any, **kw: Any) -> None:
+        # An unspecified width is one base pixel. Always pass it: Pillow's own
+        # default changed from 0 to 1, and from that release a width of 0 draws
+        # nothing, while 1 is the same hairline on every version.
+        self._draw.line(self._points(points), width=kw.pop("width", 1) * self._s, **kw)
+
+    def polygon(self, points: Any, **kw: Any) -> None:
+        self._draw.polygon(self._points(points), **kw)
+
+    def text(self, xy: Any, text: str, **kw: Any) -> None:
+        self._draw.text((xy[0] * self._s, xy[1] * self._s), text, **kw)
+
+    def textlength(self, text: str, font: Any) -> float:
+        return self._draw.textlength(text, font=font) / self._s
+
+
 def _letterbox(rgb: np.ndarray, size: tuple[int, int] = (WIDTH, HEIGHT)) -> Image.Image:
     src = Image.fromarray(np.ascontiguousarray(rgb))
     scale = min(size[0] / src.width, size[1] / src.height)
@@ -97,23 +161,24 @@ def iso_label(iso: int | None) -> str:
 
 def render_live(
     frame_rgb: np.ndarray, reading: MeterReading, double: tuple[bool, int] | None = None,
-    shutter_buttons: bool = False,
+    shutter_buttons: bool = False, *, scale: int = 1,
 ) -> Image.Image:
-    base = _letterbox(frame_rgb).convert("RGBA")
-    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    size = (WIDTH * scale, HEIGHT * scale)
+    base = _letterbox(frame_rgb, size).convert("RGBA")
+    overlay = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = _ScaledDraw(ImageDraw.Draw(overlay), scale)
     draw.rectangle((0, BAR_TOP, WIDTH, HEIGHT), fill=(0, 0, 0, BAR_ALPHA))
     # EV buttons
     draw.rectangle((0, BAR_TOP, EV_BUTTON_W, HEIGHT), outline=(255, 255, 255, 200))
     draw.rectangle((WIDTH - EV_BUTTON_W, BAR_TOP, WIDTH, HEIGHT), outline=(255, 255, 255, 200))
-    big = _font(18)
+    big = draw.font(18)
     draw.text((EV_BUTTON_W // 2, BAR_TOP + 18), "-",
               fill=(255, 255, 255, 255), font=big, anchor="mm")
     draw.text((WIDTH - EV_BUTTON_W // 2, BAR_TOP + 18), "+",
               fill=(255, 255, 255, 255), font=big, anchor="mm")
     # readout
-    font = _font(14)
-    small = _font(11)
+    font = draw.font(14)
+    small = draw.font(11)
     shutter_text = text_or_dash(reading.shutter)
     if reading.shutter_fixed:
         shutter_text = f"S {shutter_text}"
@@ -123,7 +188,7 @@ def render_live(
     # readouts are the longer ones, so only they drop to 12 pt (worst case ends at x 192,
     # under NEEDLE_X0 - 6); the ordinary readout keeps 14 pt exactly as before.
     if reading.shutter_fixed or reading.iso_max:
-        font = _font(12)
+        font = draw.font(12)
     if reading.iso_max:
         # Drawn in three runs so only the ISO turns amber.
         for text, colour in ((f"{shutter_text}  ", (255, 255, 255, 255)),
@@ -174,7 +239,7 @@ def render_live(
 
 
 def _draw_focus_bar(
-    draw: ImageDraw.ImageDraw, focus: float, peak: float | None, font: Any,
+    draw: _ScaledDraw, focus: float, peak: float | None, font: Any,
 ) -> None:
     """The manual-focus gauge: fill height is the centre's absolute sharpness.
 
@@ -216,7 +281,7 @@ def _draw_focus_bar(
               fill=(255, 255, 255, 255), font=font, anchor="ms")
 
 
-def _draw_double_badge(draw: ImageDraw.ImageDraw, enabled: bool, taken: int, font: Any) -> None:
+def _draw_double_badge(draw: _ScaledDraw, enabled: bool, taken: int, font: Any) -> None:
     """The double-exposure toggle. Off: an outlined ``2x``. On: amber, with progress.
 
     ASCII only: the default font has no multiplication sign.
@@ -232,7 +297,7 @@ def _draw_double_badge(draw: ImageDraw.ImageDraw, enabled: bool, taken: int, fon
     draw.text(((x0 + x1) // 2, (y0 + y1) // 2), label, fill=colour, font=font, anchor="mm")
 
 
-def render_processing(label: str = "Processing photo...") -> Image.Image:
+def render_processing(label: str = "Processing photo...", *, scale: int = 1) -> Image.Image:
     """TV colour bars while a shot is graded: the Stick's screen, on the LCD.
 
     A grade takes about three seconds on the Pi 4, and during it the camera is
@@ -244,14 +309,14 @@ def render_processing(label: str = "Processing photo...") -> Image.Image:
     label stays full white and is ASCII because the default font has no glyphs
     beyond it.
     """
-    img = Image.new("RGB", (WIDTH, HEIGHT), (0, 0, 0))
-    draw = ImageDraw.Draw(img)
+    img = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), (0, 0, 0))
+    draw = _ScaledDraw(ImageDraw.Draw(img), scale)
     for index, colour in enumerate(PROCESSING_BARS):
         left, right = index * WIDTH // 7, (index + 1) * WIDTH // 7
         dimmed = tuple(round(c * PROCESSING_DIM) for c in colour)
         draw.rectangle((left, 0, right - 1, HEIGHT * 3 // 4 - 1), fill=dimmed)
     draw.text((WIDTH // 2, HEIGHT * 7 // 8), label,
-              fill=(255, 255, 255), font=_font(14), anchor="mm")
+              fill=(255, 255, 255), font=draw.font(14), anchor="mm")
     return img
 
 
@@ -260,29 +325,31 @@ def _needle_x(deviation: float) -> int:
     return int(round(NEEDLE_X0 + t * (NEEDLE_X1 - NEEDLE_X0)))
 
 
-def render_review(graded_rgb: np.ndarray, caption: str) -> Image.Image:
-    base = _letterbox(graded_rgb).convert("RGBA")
-    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+def render_review(graded_rgb: np.ndarray, caption: str, *, scale: int = 1) -> Image.Image:
+    size = (WIDTH * scale, HEIGHT * scale)
+    base = _letterbox(graded_rgb, size).convert("RGBA")
+    overlay = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = _ScaledDraw(ImageDraw.Draw(overlay), scale)
     draw.rectangle((0, HEIGHT - 22, WIDTH, HEIGHT), fill=(0, 0, 0, BAR_ALPHA))
-    draw.text((6, HEIGHT - 19), caption, fill=(255, 255, 255, 255), font=_font(12))
+    draw.text((6, HEIGHT - 19), caption, fill=(255, 255, 255, 255), font=draw.font(12))
     hint = "tap to continue"
-    w = draw.textlength(hint, font=_font(11))
-    draw.text((WIDTH - w - 6, HEIGHT - 18), hint, fill=(200, 200, 200, 255), font=_font(11))
+    w = draw.textlength(hint, font=draw.font(11))
+    draw.text((WIDTH - w - 6, HEIGHT - 18), hint, fill=(200, 200, 200, 255), font=draw.font(11))
     return Image.alpha_composite(base, overlay).convert("RGB")
 
 
-def render_message(title: str, detail: str) -> Image.Image:
-    img = Image.new("RGB", (WIDTH, HEIGHT), (20, 20, 20))
-    draw = ImageDraw.Draw(img)
+def render_message(title: str, detail: str, *, scale: int = 1) -> Image.Image:
+    img = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), (20, 20, 20))
+    draw = _ScaledDraw(ImageDraw.Draw(img), scale)
     draw.text((WIDTH // 2, HEIGHT // 2 - 16), title,
-              fill=(255, 255, 255), font=_font(18), anchor="mm")
+              fill=(255, 255, 255), font=draw.font(18), anchor="mm")
     draw.text((WIDTH // 2, HEIGHT // 2 + 14), detail[:60],
-              fill=(200, 200, 200), font=_font(12), anchor="mm")
+              fill=(200, 200, 200), font=draw.font(12), anchor="mm")
     return img
 
 
-def hit(x: int, y: int) -> Action:
+def hit(x: int, y: int, scale: int = 1) -> Action:
+    x, y = x // scale, y // scale
     cx, cy = SHUTTER_CENTRE
     if math.hypot(x - cx, y - cy) <= SHUTTER_RADIUS + HIT_MARGIN:
         return Action.SHUTTER

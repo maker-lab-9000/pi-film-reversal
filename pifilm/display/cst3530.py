@@ -26,12 +26,15 @@ report rather than holding it, and a 10 Hz poll could miss the pulse.
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from . import DisplayError
+from .touch import Tap, TapDetector, TouchPoint
+
+__all__ = ["CST3530Touch", "RawPoint", "Tap", "TapDetector", "TouchPoint",
+           "decode_points", "open_waveshare28_touch", "to_display"]
 
 ADDRESS = 0x58
 REG_DATA = 0xD0070000
@@ -47,19 +50,6 @@ class RawPoint:
     x: int
     y: int
     strength: int
-
-
-@dataclass(frozen=True)
-class TouchPoint:
-    x: int
-    y: int
-    strength: int
-
-
-@dataclass(frozen=True)
-class Tap:
-    x: int
-    y: int
 
 
 def decode_points(buf: bytes, count: int) -> list[RawPoint]:
@@ -132,32 +122,6 @@ class CST3530Touch:
             close = getattr(device, "close", None)
             if callable(close):
                 close()
-
-
-class TapDetector:
-    """Turn per-step point lists into taps: down then up within ``max_hold`` s,
-    moving less than ``max_move`` px. Holds and drags produce nothing."""
-
-    def __init__(self, max_hold: float = 0.6, max_move: float = 20.0) -> None:
-        self._max_hold, self._max_move = max_hold, max_move
-        self._down: tuple[TouchPoint, float] | None = None
-        self._last: TouchPoint | None = None
-
-    def feed(self, points: list[TouchPoint], now: float) -> Tap | None:
-        if points:
-            if self._down is None:
-                self._down = (points[0], now)
-            self._last = points[0]
-            return None
-        if self._down is None:
-            return None
-        first, t0 = self._down
-        last = self._last or first
-        self._down, self._last = None, None
-        moved = math.hypot(last.x - first.x, last.y - first.y)
-        if now - t0 <= self._max_hold and moved < self._max_move:
-            return Tap(first.x, first.y)
-        return None
 
 
 def open_waveshare28_touch(rotate: int = 0, sleep=time.sleep) -> CST3530Touch:

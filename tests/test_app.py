@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1601,3 +1602,53 @@ def test_record_carries_the_shutter_setting(tmp_path, pipeline):
     second = session.capture()
     assert first.record["shutter_us"] is None
     assert second.record["shutter_us"] == 4000
+
+
+# -- the DSI panel ----------------------------------------------------------------
+
+
+def test_open_display_opens_the_dsi_panel_and_its_touch(monkeypatch):
+    from pifilm.capture import app
+    from pifilm.display import evtouch, kms
+
+    calls = {}
+    display = SimpleNamespace(width=640, height=480, close=lambda: None)
+
+    def open_display(rotate):
+        calls["display"] = rotate
+        return display
+
+    def open_touch(size, rotate):
+        calls["touch"] = (size, rotate)
+        return "touch"
+
+    monkeypatch.setattr(kms, "open_waveshare35dsi", open_display)
+    monkeypatch.setattr(evtouch, "open_goodix_touch", open_touch)
+    args = argparse.Namespace(display="waveshare35dsi", display_rotate=180)
+    assert app._open_display(args, Path("/unused")) == (display, "touch")
+    assert calls == {"display": 180, "touch": ((640, 480), 180)}
+
+
+def test_open_display_closes_the_dsi_panel_when_touch_fails(monkeypatch):
+    from pifilm.capture import app
+    from pifilm.display import DisplayError, evtouch, kms
+
+    closed = []
+    display = SimpleNamespace(width=640, height=480, close=lambda: closed.append(1))
+
+    def no_touch(size, rotate):
+        raise DisplayError("touch device not found")
+
+    monkeypatch.setattr(kms, "open_waveshare35dsi", lambda rotate: display)
+    monkeypatch.setattr(evtouch, "open_goodix_touch", no_touch)
+    args = argparse.Namespace(display="waveshare35dsi", display_rotate=0)
+    with pytest.raises(DisplayError, match="touch device not found"):
+        app._open_display(args, Path("/unused"))
+    assert closed == [1]
+
+
+def test_dsi_display_warns_and_continues_on_v4l2(camera_cli, monkeypatch, capsys):
+    monkeypatch.setattr(camera_cli, "V4L2Camera", lambda device: _CameraDouble())
+    assert camera_cli.main(
+        ["--camera", "v4l2", "--display", "waveshare35dsi", "--no-preview"]) == 0
+    assert "warning: display unavailable" in capsys.readouterr().err

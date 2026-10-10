@@ -14,6 +14,7 @@ from pifilm.display.ui import (
     HEIGHT,
     HIT_MARGIN,
     NEEDLE_X0,
+    NEEDLE_Y,
     PROCESSING_BARS,
     PROCESSING_DIM,
     SHUTTER_CENTRE,
@@ -325,3 +326,74 @@ def test_fixed_or_maxed_readout_clears_the_needle(monkeypatch):
         render_live(frame, _reading(shutter="1/2000", shutter_fixed=True, **over))
         right = max(x + font.getlength(text) for x, text, font in runs)
         assert right <= NEEDLE_X0 - 6, (over, right)
+
+
+# -- scale ----------------------------------------------------------------------
+
+
+def test_every_screen_renders_at_640x480_at_scale_2():
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    images = [
+        render_live(frame, _reading(focus=0.5, focus_peak=0.7), (True, 1),
+                    shutter_buttons=True, scale=2),
+        render_review(frame, "1/250  ISO 100  EV 0", scale=2),
+        render_processing(scale=2),
+        render_message("Capture failed", "camera busy", scale=2),
+    ]
+    for img in images:
+        assert img.size == (640, 480) and img.mode == "RGB"
+
+
+def test_scale_1_is_the_default_and_unchanged():
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    assert render_live(frame, _reading(), scale=1).tobytes() == render_live(
+        frame, _reading()).tobytes()
+
+
+def test_render_live_letterboxes_a_16_9_frame_at_scale_2():
+    frame = np.full((360, 640, 3), 200, dtype=np.uint8)
+    img = render_live(frame, _reading(battery_percent=None), scale=2)
+    assert img.getpixel((320, 30)) == (0, 0, 0)          # band above the picture
+    assert img.getpixel((320, 240)) == (200, 200, 200)   # picture, not stretched
+
+
+def test_the_bar_is_in_the_same_place_at_scale_2():
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    img = render_live(frame, _reading(), scale=2)
+    above = img.getpixel((320, 2 * (BAR_TOP - 10)))
+    inside = img.getpixel((320, 2 * (BAR_TOP + 4)))
+    assert sum(inside) < sum(above)
+
+
+def test_processing_bars_leave_no_gaps_at_scale_2():
+    img = render_processing(scale=2)
+    boundary = 2 * (WIDTH // 7)          # first column of the second bar
+    for x in (boundary - 1, boundary):
+        assert img.getpixel((x, 100)) != (0, 0, 0)
+    assert img.getpixel((639, 100)) != (0, 0, 0)
+
+
+def test_hit_regions_scale_with_the_screen():
+    cx, cy = SHUTTER_CENTRE
+    points = [
+        (cx, cy), (10, BAR_TOP + 10), (310, BAR_TOP + 10), (160, 100),
+        ((DOUBLE_BOX[0] + DOUBLE_BOX[2]) // 2, (DOUBLE_BOX[1] + DOUBLE_BOX[3]) // 2),
+        ((SHUTTER_PLUS_BOX[0] + SHUTTER_PLUS_BOX[2]) // 2, SHUTTER_PLUS_BOX[1] + 5),
+        ((SHUTTER_MINUS_BOX[0] + SHUTTER_MINUS_BOX[2]) // 2, SHUTTER_MINUS_BOX[1] + 5),
+    ]
+    for x, y in points:
+        assert hit(2 * x, 2 * y, scale=2) == hit(x, y)
+        assert hit(2 * x + 1, 2 * y + 1, scale=2) == hit(x, y)
+    assert hit(639, 479, scale=2) == Action.EV_PLUS
+
+
+def test_needle_scale_ticks_are_drawn_at_every_scale():
+    """The ticks pass no line width. Pillow 12 draws nothing for a width of 0, so
+    the wrapper must not turn "unspecified" into 0 (it did, and the ticks vanished
+    from the 2.8" panel with no other test noticing)."""
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    for scale in (1, 2):
+        img = render_live(frame, _reading(), scale=scale)
+        tick = img.getpixel((scale * NEEDLE_X0, scale * (NEEDLE_Y - 2)))   # end of the -3 tick
+        bar = img.getpixel((scale * (NEEDLE_X0 + 6), scale * (NEEDLE_Y - 2)))
+        assert sum(tick) > sum(bar) + 150, scale

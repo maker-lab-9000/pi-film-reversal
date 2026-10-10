@@ -652,7 +652,7 @@ def _picamera2_available() -> bool:
 def _drop_display_on_v4l2(args: argparse.Namespace) -> None:
     """Downgrade ``--display`` to a warning when the backend is V4L2.
 
-    The shipped service unit passes ``--display waveshare28``; on a deployment
+    The shipped service unit passes ``--display waveshare35dsi``; on a deployment
     whose camera is USB, refusing the flag would exit 2 and systemd would
     restart the service forever. The viewfinder genuinely cannot run there (the
     V4L2 backend has no preview-mode split and the meter needs libcamera
@@ -710,6 +710,17 @@ def _open_display(args: argparse.Namespace, out_root: Path):
     if args.display == "fake":
         from ..display.fake import FileDisplay, NoTouch
         return FileDisplay(Path(out_root).expanduser() / "viewfinder-last.png"), NoTouch()
+    if args.display == "waveshare35dsi":
+        from ..display import evtouch, kms
+        display = kms.open_waveshare35dsi(args.display_rotate)
+        try:
+            touch = evtouch.open_goodix_touch(
+                (display.width, display.height), args.display_rotate,
+            )
+        except DisplayError:
+            display.close()
+            raise
+        return display, touch
     from ..display.cst3530 import open_waveshare28_touch
     from ..display.st7789 import open_waveshare28
     display = open_waveshare28(args.display_rotate)
@@ -859,9 +870,10 @@ def main(argv: list[str] | None = None) -> int:
         help="UPS to read the Pi's battery from and publish in /v1/status (default: none)",
     )
     parser.add_argument(
-        "--display", choices=("none", "waveshare28", "fake"), default="none",
-        help="LCD viewfinder with exposure meter (Picamera2 or --fake only); "
-             "'fake' writes OUT/viewfinder-last.png instead of driving SPI",
+        "--display", choices=("none", "waveshare35dsi", "waveshare28", "fake"), default="none",
+        help="LCD viewfinder with exposure meter (Picamera2 or --fake only): "
+             "'waveshare35dsi' is the 3.5 inch DSI panel, 'waveshare28' the 2.8 inch SPI "
+             "panel, 'fake' writes OUT/viewfinder-last.png instead of driving a panel",
     )
     parser.add_argument("--display-rotate", type=int, choices=(0, 180), default=0,
                         help="rotate the LCD image and touch mapping by 180 degrees")
@@ -869,10 +881,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="print raw and mapped touch coordinates (orientation check)")
     parser.add_argument("--display-dim-after", type=_idle_seconds, default=60.0,
                         metavar="SECONDS",
-                        help="halve the LCD backlight after this long untouched; 0 disables")
+                        help="halve the LCD backlight after this long untouched; 0 disables "
+                             "(no effect on the DSI panel, which has no brightness control)")
     parser.add_argument("--display-off-after", type=_idle_seconds, default=300.0,
                         metavar="SECONDS",
-                        help="turn the LCD backlight off after this long untouched "
+                        help="turn the LCD screen off after this long untouched "
                              "(a tap wakes it); 0 disables")
     args = parser.parse_args(argv)
 
@@ -918,7 +931,7 @@ def main(argv: list[str] | None = None) -> int:
             _drop_display_on_v4l2(args)
     if args.fake:
         # Argument errors must precede any hardware side effect: the panel below
-        # claims SPI, GPIO and I2C and pulses the touch reset line.
+        # claims the panel (SPI, GPIO and I2C, or the DRM output) and may pulse a reset line.
         _reject_picamera2_only_flags(parser, args, reason="cannot be used with --fake")
     display_pair = None
     if args.display != "none":
