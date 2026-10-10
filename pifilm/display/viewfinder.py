@@ -47,9 +47,9 @@ from PIL import Image
 from ..capture.errors import CameraError
 from ..imageio import load_rgb
 from . import DisplayError, shutter
-from .cst3530 import Tap, TapDetector
 from .idle import IdleDimmer, Screen
 from .meter import FocusTracker, compute_reading, focus_score, format_ev
+from .touch import Tap, TapDetector
 from .ui import (
     Action,
     hit,
