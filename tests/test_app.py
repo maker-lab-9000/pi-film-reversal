@@ -1652,3 +1652,116 @@ def test_dsi_display_warns_and_continues_on_v4l2(camera_cli, monkeypatch, capsys
     assert camera_cli.main(
         ["--camera", "v4l2", "--display", "waveshare35dsi", "--no-preview"]) == 0
     assert "warning: display unavailable" in capsys.readouterr().err
+
+
+# -- the GPIO shutter button --------------------------------------------------------
+
+
+class _ButtonDouble:
+    def __init__(self):
+        self.callback = None
+        self.closed = False
+
+    def on_press(self, callback):
+        self.callback = callback
+
+    def close(self):
+        self.closed = True
+
+
+class _ControllerDouble:
+    def __init__(self, answer):
+        self.answer = answer
+        self.requests = []
+
+    def submit(self, request_id):
+        self.requests.append(request_id)
+        return self.answer
+
+
+def test_a_press_submits_one_new_request(capsys):
+    from pifilm.capture import app
+
+    controller = _ControllerDouble(SimpleNamespace(state="queued", error_code=None))
+    app._button_capture(controller)
+    app._button_capture(controller)
+    assert len(controller.requests) == 2
+    assert controller.requests[0] != controller.requests[1]
+    assert "button: capture requested" in capsys.readouterr().out
+
+
+def test_a_press_while_busy_is_ignored_and_logged(capsys):
+    from pifilm.capture import app
+
+    controller = _ControllerDouble(SimpleNamespace(state="failed", error_code="busy"))
+    app._button_capture(controller)
+    assert "button: press ignored (busy)" in capsys.readouterr().out
+
+
+def test_a_press_after_close_is_ignored(capsys):
+    from pifilm.capture import app
+
+    controller = _ControllerDouble(SimpleNamespace(state="failed", error_code="closed"))
+    app._button_capture(controller)   # must not raise
+    assert "button: press ignored (closed)" in capsys.readouterr().out
+
+
+def test_main_opens_the_button_attaches_it_and_closes_it(camera_cli, monkeypatch, capsys):
+    button = _ButtonDouble()
+    opened = []
+
+    def open_button(pin):
+        opened.append(pin)
+        return button
+
+    monkeypatch.setattr(camera_cli, "open_shutter_button", open_button)
+    assert camera_cli.main(["--fake", "--no-preview", "--shutter-gpio", "21"]) == 0
+    assert opened == [21]
+    assert callable(button.callback)
+    assert button.closed
+    assert "Shutter button on BCM 21." in capsys.readouterr().out
+
+
+def test_main_warns_and_continues_when_the_button_cannot_open(camera_cli, monkeypatch, capsys):
+    from pifilm.capture.button import ButtonError
+
+    def open_button(pin):
+        raise ButtonError("cannot claim BCM 21: GPIO busy")
+
+    monkeypatch.setattr(camera_cli, "open_shutter_button", open_button)
+    assert camera_cli.main(["--fake", "--no-preview", "--shutter-gpio", "21"]) == 0
+    assert (
+        "warning: shutter button unavailable (cannot claim BCM 21: GPIO busy); "
+        "continuing without it"
+    ) in capsys.readouterr().err
+
+
+def test_main_without_the_flag_never_opens_a_button(camera_cli, monkeypatch):
+    def open_button(pin):
+        raise AssertionError("the button must not be opened without --shutter-gpio")
+
+    monkeypatch.setattr(camera_cli, "open_shutter_button", open_button)
+    assert camera_cli.main(["--fake", "--no-preview"]) == 0
+
+
+@pytest.mark.parametrize("argv", [
+    ["--fake", "--no-preview", "--shutter-gpio", "6", "--ups", "x728"],
+    ["--fake", "--no-preview", "--shutter-gpio", "17", "--display", "waveshare28"],
+    ["--fake", "--no-preview", "--shutter-gpio", "3"],
+    ["--fake", "--no-preview", "--shutter-gpio", "28"],
+    ["--fake", "--no-preview", "--shutter-gpio", "twenty"],
+])
+def test_shutter_gpio_refuses_reserved_pins(camera_cli, monkeypatch, argv):
+    def open_button(pin):
+        raise AssertionError("an argument error must come before any hardware is touched")
+
+    monkeypatch.setattr(camera_cli, "open_shutter_button", open_button)
+    monkeypatch.setattr(camera_cli, "build_ups", lambda name: None)
+    with pytest.raises(SystemExit) as excinfo:
+        camera_cli.main(argv)
+    assert excinfo.value.code == 2
+
+
+def test_a_reserved_pin_is_allowed_when_its_hardware_is_not_selected(camera_cli, monkeypatch):
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: _ButtonDouble())
+    assert camera_cli.main(["--fake", "--no-preview", "--shutter-gpio", "17"]) == 0
