@@ -813,11 +813,10 @@ class _ScaledDraw:
         self._draw.ellipse(self._box(box), **self._kw(kw))
 
     def line(self, points: Any, **kw: Any) -> None:
-        # Pillow's line width defaults to 0 (a hairline); keep that at scale 1 so
-        # the 2.8" panel's output does not change by a pixel.
-        width = kw.pop("width", 0)
-        scaled = width * self._s if width else (self._s if self._s > 1 else 0)
-        self._draw.line(self._points(points), width=scaled, **kw)
+        # An unspecified width is one base pixel. Always pass it: Pillow's own
+        # default changed from 0 to 1, and from that release a width of 0 draws
+        # nothing, while 1 is the same hairline on every version.
+        self._draw.line(self._points(points), width=kw.pop("width", 1) * self._s, **kw)
 
     def polygon(self, points: Any, **kw: Any) -> None:
         self._draw.polygon(self._points(points), **kw)

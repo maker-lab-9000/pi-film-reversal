@@ -19,7 +19,8 @@ Pi network, Pi service, Stick, optional training) and says which machine each st
 `docs/how-it-works.md` explains the colour model (capture pipeline, training steps, libraries, dependency-by-role table);
 `docs/nextcloud-sync.md` the optional Pi→Nextcloud photo archive; `docs/photo-volume.md` the fixed-size photo
 volume that keeps captures from filling the Pi's root filesystem; `docs/lcd-viewfinder.md` the optional
-Waveshare LCD viewfinder (wiring, setup, screen layout, meter, hardware acceptance); and
+Waveshare LCD viewfinder (the 3.5" DSI panel and the fallback 2.8" SPI panel: setup, screen layout,
+meter, hardware acceptance); and
 `docs/known-issues.md` tracks understood-but-unfixed defects. The bundled LUT in `pifilm/data/` is a handcrafted,
 untrained starter preset (`trained: false`). Trained artifacts, training data, `data/`, `artifacts/`,
 `ektar100/`, `velvia/` are all gitignored and not in a clone.
@@ -113,7 +114,8 @@ fitted on normalized input; grain runs last because it models developed film.
   otherwise), written into both configurations like `set_ev`.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
   captures-only display (`--show-captures`, shows TV colour bars while processing), and headless
-  terminal. `--display waveshare28` runs the LCD viewfinder instead of any OpenCV window. Output:
+  terminal. `--display waveshare35dsi` (or `waveshare28`) runs the LCD viewfinder instead of any
+  OpenCV window. Output:
   `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,graded|double_graded}.jpg` plus an audit
   line in `captures.jsonl` (LUT hash, normalisation hash and grain seed allow regenerating the
   graded file).
@@ -135,14 +137,21 @@ fitted on normalized input; grain runs last because it models developed film.
 
 ### Display (`pifilm/display/`)
 
-Optional SPI/I2C LCD viewfinder, wired up by `--display waveshare28`: `st7789.py` and `cst3530.py`
-drive the panel and its touch controller; `meter.py` computes the light-meter readout (pure, from
-preview metadata + pixels); `shutter.py` is the shutter-priority step scale (pure); `ui.py` renders
-the live/review/message screens and hit-tests taps (pure); `viewfinder.py`'s `ViewfinderLoop` is the
-LIVE/REVIEW state machine. All hardware imports (`spidev`, `gpiozero`, `smbus2`) are lazy, inside
-the `open_*` factories, so the package imports on a Mac and in tests. `fake.py` (`--display fake`)
-writes frames to a PNG instead of SPI. The loop shares the `CaptureController` with the Stick's
-remote server, so an LCD tap and a Stick request are the same kind of job.
+Optional LCD viewfinder, wired up by `--display waveshare35dsi` (Waveshare 3.5" DSI LCD (E),
+640×480) or `--display waveshare28` (the fallback 2.8" SPI panel, 320×240). `kms.py` drives the
+DSI panel through DRM/KMS (`pykms`, two swapped buffers; the Pi must boot to the console so the
+service owns the screen) and `evtouch.py` reads its Goodix touch from kernel input events, found
+by device name; `st7789.py` and `cst3530.py` drive the SPI panel and its touch controller.
+`touch.py` holds the shared `TouchPoint`/`Tap`/`TapDetector`. `meter.py` computes the light-meter
+readout (pure, from preview metadata + pixels); `shutter.py` is the shutter-priority step scale
+(pure); `ui.py` renders the live/review/message screens and hit-tests taps in 320×240 base units
+at an integer `scale` (pure); `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine
+and takes the scale from the display's width. The DSI panel has no brightness control, so it
+skips the idle dim step and only turns off. All hardware imports (`pykms`, `spidev`, `gpiozero`,
+`smbus2`) are lazy, inside the `open_*` factories, so the package imports on a Mac and in tests.
+`fake.py` (`--display fake`) writes frames to a PNG instead. The loop shares the
+`CaptureController` with the Stick's remote server, so an LCD tap and a Stick request are the
+same kind of job.
 
 ### Trainer (`pifilm/train/`, Mac only; needs `[train]` extra: SciPy, requests)
 

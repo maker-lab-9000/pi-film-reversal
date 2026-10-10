@@ -46,7 +46,7 @@ I will commit the STL files once final design is approved and tested.
 ## Hardware
 - Raspberry Pi 4, 4GB RAM
 - M5Stack StickS3 (display, trigger)
-- Waveshare 2.8 inch LCD Display Module and touchscreen (light meter, focus meter, trigger, exposure controls, battery meter)
+- Waveshare 3.5 inch DSI LCD (E) touchscreen (light meter, focus meter, trigger, exposure controls, battery meter)
 - x728 UPS Shield + Geekworm X728-C1 Metal Case
 - 4x 18650 Li-ion cells, estimated capacity around 10000mAh
 - 64GB SD Card
@@ -88,7 +88,7 @@ Pi saves original + graded JPEG + captures.jsonl → job complete
 - **Save** — to `~/Pictures/pifilm/YYYY-MM-DD/`: `*_original.jpg` (or `*_ungraded.jpg`), the full-res `*_graded.jpg`, and a `captures.jsonl` line (LUT hash, gains, grain seed, timings). The job completes only after these writes.
 - **Preview to Stick** — the Stick fetches `GET /v1/captures/{id}/image.jpg`; the Pi returns a 240×135, ≤64 KiB letterboxed JPEG of the graded file. No re-grading on the Stick.
 - **Display** — shown until the next capture. Full-res stays on the Pi (the Stick isn't the archive); failures show an error, not a fake success.
-- **LCD too** — an optional Waveshare panel on the Pi (`--display waveshare28`) shows the same live view and shutter; a Stick shot appears on the LCD and an LCD shot appears on the Stick, since both go through the same controller.
+- **LCD too** — an optional Waveshare panel on the Pi (`--display waveshare35dsi`) shows the same live view and shutter; a Stick shot appears on the LCD and an LCD shot appears on the Stick, since both go through the same controller.
 
 **Running modes:**
 
@@ -114,7 +114,7 @@ Capture modes:
 | `--no-preview` | terminal controls, no window |
 | `--fake` | synthetic frames, no camera (for testing) |
 | `--device /dev/videoN` | select a specific USB camera |
-| `--display waveshare28` | LCD viewfinder with exposure meter and touch shutter ([guide](docs/lcd-viewfinder.md)) |
+| `--display waveshare35dsi` | LCD viewfinder with exposure meter and touch shutter; `waveshare28` for the older 2.8" SPI panel ([guide](docs/lcd-viewfinder.md)) |
 
 With the default artifact, `pifilm-process` now grades any folder — including old USB captures — without white balance and with the damped highlight lift (see [Camera backends](#camera-backends)).
 
