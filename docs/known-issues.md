@@ -85,6 +85,81 @@ resolution only for the saved original and DNG. Grading 2–3 MP is several time
 faster, which closes the camera-servicing gap that trips the watchdog. Raising
 `buffer_count` and/or CMA is a secondary lever where there is room.
 
+## Picamera2 stops handing over preview frames on the Raspberry Pi 4 (viewfinder freezes)
+
+**Status:** **cause unknown; contained 2026-10-10.** The freeze no longer hangs
+the process: it is logged with Picamera2's state and the service restarts
+itself. Seen once.
+
+**First seen:** 2026-10-10, Raspberry Pi 4 + IMX477, `python3-picamera2`
+0.3.37-1, `python3-libcamera` 0.7.2+rpt20260817-1, the DSI viewfinder with the
+GPIO shutter button, about an hour after boot and twenty to thirty seconds
+after a double exposure had saved normally. Nothing on the screen had been
+tapped.
+
+### Symptom
+
+The live image froze. A shutter press logged `button: capture requested` and
+nothing followed. The process stayed up (SSH worked, systemd reported
+`active (running)`), so nothing restarted it.
+
+### What was measured on the frozen process
+
+- `py-spy dump`: the viewfinder thread was inside Picamera2's
+  `capture_request()`, waiting for the next preview frame while holding the
+  camera lock; the capture worker was waiting for that lock.
+- The sensor was still streaming: `unicam_capture0` in `/proc/interrupts`
+  counted 594 interrupts in 3 seconds.
+- Every thread in the process was at 0.0% CPU, libcamera's `CameraManager`
+  threads included.
+- No libcamera error in the journal, no kernel message, `throttled=0x0`,
+  1.8 GB of memory free.
+
+So frames were arriving at the Pi and nothing was consuming them, which is how
+the camera looks when libcamera has no buffers queued. Why the preview buffers
+stopped being recycled is not known.
+
+### Ruled out
+
+- The sensor, its ribbon cable and the power supply (interrupts still counting,
+  no undervoltage).
+- The display, the touch panel and the button: their threads were idle and
+  healthy.
+- A lost photo: the last capture's files were complete.
+
+### Containment
+
+`Picamera2Camera.read` now waits a bounded time for its frame (5 s for a
+preview frame, 30 s for a still, plus four times a fixed shutter) and raises
+`CameraStalled`. The log line carries Picamera2's state:
+
+```
+camera: no preview frame within 5.0 s (started=True completed=0 frames=41234)
+```
+
+After three stalled preview reads in a row the viewfinder ends and
+`pifilm-capture` exits 1 with
+`error: camera stopped delivering frames: ...; exiting for a restart`, so
+systemd (`Restart=on-failure`) reopens the camera. If closing the stalled
+camera itself hangs, the process is ended after 10 seconds regardless. A shot
+requested during the stall is lost. By the timeouts the camera should be back
+about 20 seconds after the freeze; that has not been timed on the Pi, because
+the stall cannot be produced on demand.
+
+Only the LCD viewfinder has this exit. In the headless Stick-only mode a
+stalled still fails that one capture with the same message and the process
+keeps running.
+
+### If it happens again
+
+The restart destroys the evidence, so the log line is the record: note
+`started`, `completed` and `frames` from it, and what the camera had done in
+the minute before.
+
+```bash
+journalctl -u pifilm-capture.service --since "-10 min" --no-pager | grep -B 30 "no preview frame"
+```
+
 ## A libcamera update could silently retune a deployed trained LUT
 
 **Status:** understood, mitigated by a documented deployment step, not enforced

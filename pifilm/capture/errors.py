@@ -13,3 +13,12 @@ from __future__ import annotations
 
 class CameraError(Exception):
     """Camera could not be opened or read."""
+
+
+class CameraStalled(CameraError):
+    """The camera is open but delivered no frame within the time allowed.
+
+    Separate from an ordinary read failure because it does not clear by itself:
+    a caller that sees it repeatedly should give the camera up and let the
+    process be restarted.
+    """
