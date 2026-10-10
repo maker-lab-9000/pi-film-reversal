@@ -378,6 +378,16 @@ indicate a wiring fault. Once the service
 has been given `--shutter-gpio 21` it holds the pin, so stop it first
 (`sudo systemctl stop pifilm-capture`) and start it again afterwards.
 
+**Verified on the Pi 4 on 2026-10-10** (button on physical pins 39 and 40, X728
+fitted, DSI viewfinder running): the start-up line appears; one press takes one
+photo; presses during processing are dropped as `busy`; ten deliberate presses
+in five seconds produced no false triggers and no double fires; with `2x` on,
+two presses with a wait between them make one composite; a few idle minutes
+produced no photo; and stopping the service while the button was being tapped
+left no "Fatal Python error" in the journal. Not checked separately: a press
+with the screen dark from idle, and a run of ten spaced presses counted against
+ten files.
+
 ### 4.10 Nextcloud photo sync (optional)
 
 To keep an off-device archive of every capture, push `~/Pictures/pifilm` to a
