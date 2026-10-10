@@ -10,7 +10,7 @@ from pifilm.artifacts import Artifacts, write_artifact
 from pifilm.capture.app import CaptureSession
 from pifilm.capture.camera import FakeCamera, synthetic_frame
 from pifilm.capture.controller import CaptureController
-from pifilm.capture.errors import CameraError
+from pifilm.capture.errors import CameraError, CameraStalled
 from pifilm.display import DisplayError, viewfinder
 from pifilm.display.cst3530 import TouchPoint
 from pifilm.display.meter import format_ev
@@ -21,7 +21,12 @@ from pifilm.display.ui import (
     SHUTTER_MINUS_BOX,
     SHUTTER_PLUS_BOX,
 )
-from pifilm.display.viewfinder import EV_STEP, NOTICE_SECONDS, ViewfinderLoop
+from pifilm.display.viewfinder import (
+    CAMERA_STALL_LIMIT,
+    EV_STEP,
+    NOTICE_SECONDS,
+    ViewfinderLoop,
+)
 from pifilm.grain import GrainParams
 from pifilm.lut import LUT3D
 from pifilm.normalize import NormalizeParams
@@ -1121,3 +1126,35 @@ def test_a_display_without_a_width_is_drawn_at_320x240(controller):
     loop, touch, display, clock = _loop(camera, ctl)
     loop.step()
     assert display.images[-1].size == (320, 240)
+
+
+def test_a_camera_that_keeps_stalling_ends_the_loop(controller):
+    """One late frame is survivable; a camera that has stopped delivering them
+    is not, and only a restart of the process brings it back."""
+    camera, ctl = controller
+    logged = []
+    loop, touch, display, clock = _loop(camera, ctl, log=logged.append)
+    camera.read = lambda *, full=True: (_ for _ in ()).throw(CameraStalled("no frame"))
+    for _ in range(CAMERA_STALL_LIMIT - 1):
+        loop.step()
+    assert loop.state == "LIVE"
+    with pytest.raises(CameraStalled):
+        loop.step()
+    assert sum("camera: no frame" in line for line in logged) == CAMERA_STALL_LIMIT
+
+
+def test_a_frame_between_stalls_resets_the_count(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl)
+    original = camera.read
+
+    def stall(*, full=True):
+        raise CameraStalled("no frame")
+
+    for _ in range(3):
+        camera.read = stall
+        for _ in range(CAMERA_STALL_LIMIT - 1):
+            loop.step()
+        camera.read = original
+        loop.step()
+    assert len(display.images) == 3

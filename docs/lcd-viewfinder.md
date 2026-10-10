@@ -472,6 +472,7 @@ service carries on without the screen, still serving the Stick.
 | `touch device 'Goodix Capacitive TouchScreen' not found` | The touch driver did not load | Same overlay and cable checks; `grep -i goodix /proc/bus/input/devices` |
 | `no permission for /dev/input/event*` | Service user not in `input` | `sudo usermod -aG input george`; log out and in, or reboot |
 | Panel blank after boot, no boot text | Overlay not applied | `dmesg \| grep -i "dsi\|panel\|goodix"`; check steps 2 and 3 |
+| Live image freezes for about 20 seconds, then the service restarts by itself; the journal has `camera: no preview frame within` | Picamera2 stopped handing over frames | Nothing to do: the restart reopens the camera. See [known issues](known-issues.md#picamera2-stops-handing-over-preview-frames-on-the-raspberry-pi-4-viewfinder-freezes) |
 
 ### 9.6 Hardware acceptance checklist
 

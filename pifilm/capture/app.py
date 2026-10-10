@@ -99,6 +99,7 @@ from .button import (
 )
 from .camera import Camera, CameraError, FakeCamera, Frame, V4L2Camera
 from .controller import CaptureController, JobSnapshot
+from .errors import CameraStalled
 from .picamera import Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
 from .remote import RemoteCaptureServer
@@ -764,6 +765,18 @@ def _serve_until_interrupt() -> int:
         return 0
 
 
+# How long the clean-up may take after the camera stalls before the process is
+# ended regardless. Closing a camera that has stopped answering can itself wait
+# for ever, and a process that never exits is never restarted.
+STALL_EXIT_DEADLINE = 10.0
+
+
+def _arm_exit_deadline(seconds: float, code: int) -> None:
+    timer = threading.Timer(seconds, os._exit, (code,))
+    timer.daemon = True
+    timer.start()
+
+
 def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     display, touch = display_pair
     stop = threading.Event()
@@ -777,16 +790,27 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     )
     print("LCD viewfinder running. Tap the shutter to capture; Ctrl-C to stop.")
     failure: DisplayError | None = None
+    stalled: CameraStalled | None = None
     try:
         loop.run(stop)
     except KeyboardInterrupt:
         pass
     except DisplayError as exc:
         failure = exc
+    except CameraStalled as exc:
+        stalled = exc
+        _arm_exit_deadline(STALL_EXIT_DEADLINE, 1)
     finally:
         signal.signal(signal.SIGTERM, previous)
         touch.close()
         display.close()
+    if stalled is not None:
+        # Unlike a dead screen, this leaves nothing worth serving: the Stick and
+        # the button would only queue shots behind the same camera. Exit 1 so
+        # systemd restarts the service, which reopens the camera.
+        print(f"error: camera stopped delivering frames: {stalled}; exiting for a restart",
+              file=sys.stderr)
+        return 1
     if failure is None:
         return 0
     print(f"error: display failed repeatedly: {failure}", file=sys.stderr)

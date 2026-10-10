@@ -70,6 +70,7 @@ from typing import Any
 import numpy as np
 
 from .camera import CameraError, Frame, StreamInfo
+from .errors import CameraStalled
 
 DEFAULT_TUNING_FILE: str | None = None  # None: libcamera picks <sensor>.json itself
 _MAIN_FORMAT = "RGB888"
@@ -82,6 +83,16 @@ _SHUTTER_RANGE_US = (100, 1_000_000)
 # A fixed exposure longer than a frame period is clipped by the sensor unless the
 # frame is allowed to last at least that long, plus readout headroom.
 _FRAME_MARGIN_US = 1000
+# How long a read waits for its frame before the camera counts as stalled. The
+# preview runs at tens of frames a second, so five seconds without one is not
+# slowness; a still also pays for a mode switch in each direction. A fixed
+# shutter stretches every frame, so its length is added several times over.
+# Without a limit a read waits for ever while holding the request lock: seen on
+# the Pi 4 on 2026-10-10, when the sensor kept streaming but Picamera2 stopped
+# handing frames over, and the viewfinder froze with the shutter queued behind it.
+_PREVIEW_TIMEOUT_S = 5.0
+_STILL_TIMEOUT_S = 30.0
+_TIMEOUT_SHUTTERS = 4
 
 METADATA_KEYS = (
     "ExposureTime",
@@ -290,13 +301,19 @@ class Picamera2Camera:
                 except Exception as exc:
                     raise CameraError(f"Autofocus cycle failed: {exc}") from exc
 
+            still = full or self._preview is None
+            timeout = self._frame_timeout(still)
             try:
                 if full and self._preview is not None:
                     # Switches to the still configuration, captures, and restores
                     # the preview configuration itself.
-                    request = camera.switch_mode_and_capture_request(self._still_config)
+                    request = camera.switch_mode_and_capture_request(
+                        self._still_config, wait=timeout,
+                    )
                 else:
-                    request = camera.capture_request()
+                    request = camera.capture_request(wait=timeout)
+            except TimeoutError:
+                raise self._stalled(camera, still, timeout) from None
             except Exception as exc:
                 raise CameraError(f"Picamera2 failed to capture a request: {exc}") from exc
 
@@ -352,6 +369,35 @@ class Picamera2Camera:
                         raise CameraError(
                             f"Picamera2 failed to release a capture request: {exc}"
                         ) from exc
+
+    def _frame_timeout(self, still: bool) -> float:
+        base = _STILL_TIMEOUT_S if still else _PREVIEW_TIMEOUT_S
+        return base + _TIMEOUT_SHUTTERS * (self.shutter_us or 0) / 1_000_000
+
+    @staticmethod
+    def _stalled(camera: Any, still: bool, timeout: float) -> CameraStalled:
+        """Build the error for a read that timed out, and clear Picamera2's queue.
+
+        The timed-out job stays queued inside Picamera2; left there it would take
+        the next frame and nobody would release it. The state goes into the
+        message because the log is all there is to diagnose a stall from.
+        """
+        def state(name: str, convert: Any = lambda value: value) -> Any:
+            try:
+                return convert(getattr(camera, name))
+            except Exception:
+                return "?"
+
+        detail = (
+            f"started={state('started')} completed={state('completed_requests', len)} "
+            f"frames={state('frames')}"
+        )
+        try:
+            camera.cancel_all_and_flush()
+        except Exception:
+            pass
+        kind = "still" if still else "preview"
+        return CameraStalled(f"no {kind} frame within {timeout:.1f} s ({detail})")
 
     def _update_fps(self, metadata: Any) -> None:
         try:

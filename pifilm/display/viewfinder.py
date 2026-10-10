@@ -44,7 +44,7 @@ from typing import Any
 
 from PIL import Image
 
-from ..capture.errors import CameraError
+from ..capture.errors import CameraError, CameraStalled
 from ..imageio import load_rgb
 from . import DisplayError, shutter
 from .idle import IdleDimmer, Screen
@@ -64,6 +64,8 @@ from .ui import (
 EV_STEP = 1.0 / 3.0
 EV_LIMIT = 2.0
 RATE_LOG_INTERVAL = 10.0
+# Consecutive preview reads that may time out before the loop gives the camera up.
+CAMERA_STALL_LIMIT = 3
 # Idle dimming: half brightness after a minute untouched, off after five. The
 # normal level is the panel driver's own default (st7789.BACKLIGHT_DEFAULT).
 DIM_AFTER = 60.0
@@ -110,6 +112,7 @@ class ViewfinderLoop:
         self._review_since = 0.0
         self._notice_since = 0.0
         self._display_failures = 0
+        self._camera_stalls = 0
         self._touch_logged_at: float | None = None
         self._touch_suppressed = 0
         self._frames = 0
@@ -380,7 +383,15 @@ class ViewfinderLoop:
         except CameraError as exc:
             self._log(f"camera: {exc}")
             self._restart_rate_window()
+            if isinstance(exc, CameraStalled):
+                # One late frame is survivable. A camera that has stopped
+                # delivering them does not recover inside this process, so the
+                # loop ends and the caller exits for a restart.
+                self._camera_stalls += 1
+                if self._camera_stalls >= CAMERA_STALL_LIMIT:
+                    raise
             return
+        self._camera_stalls = 0
         exposure = (frame.metadata or {}).get("ExposureTime")
         if isinstance(exposure, (int, float)) and exposure > 0:
             self._metered_us = float(exposure)
