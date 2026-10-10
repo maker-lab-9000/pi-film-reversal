@@ -124,7 +124,13 @@ fitted on normalized input; grain runs last because it models developed film.
   graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card in a temp dir
   (never under the synced output folder); toggled via `CaptureController.set_double_exposure`.
 - `controller.py`: `CaptureController` serializes captures on one worker thread, one active job at
-  a time, idempotent by `request_id`. Shared by the local SPACE key and the remote API.
+  a time, idempotent by `request_id`. Shared by the local SPACE key, the LCD, the GPIO shutter
+  button and the remote API.
+- `button.py`: optional physical shutter button (`--shutter-gpio BCM`, documented on BCM 21 with
+  ground on physical pin 39). gpiozero `Button` with the internal pull-up, lazy import; a press
+  calls `CaptureController.submit` like an LCD tap, so a press during a capture is dropped as
+  `busy`. Pins of the X728 and of the 2.8" LCD are refused when that hardware is selected; a pin
+  that cannot be claimed is one warning line, not a failure to start.
 - `remote.py`: `RemoteCaptureServer`, a stdlib `http.server` with bearer-token auth
   (`PIFILM_REMOTE_TOKEN`). Endpoints: `GET /v1/status`, `POST /v1/captures` (`{"request_id": uuid}`,
   409 when busy), `GET /v1/captures/{id}`, `GET /v1/captures/{id}/image.jpg`. Only jobs submitted

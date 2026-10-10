@@ -17,6 +17,9 @@ with ``FakeCamera``:
   Pi's SPI panel instead of any OpenCV window. It shares one
   ``CaptureController`` with the remote API, so a tap on the panel and a Stick
   request are the same kind of job and never two owners of the camera.
+* ``--shutter-gpio`` adds a GPIO push button (``pifilm/capture/button.py``) as one
+  more trigger through that shared ``CaptureController``; the remote API or the
+  button each select the shared-controller loops.
 
 A dropped frame prints and continues in both loops. The spec promises the
 session survives frame read failures, and that promise is only worth
@@ -58,6 +61,7 @@ when present; and ``dng`` (the sidecar filename) when a DNG was written.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import select
@@ -84,6 +88,15 @@ from ..display.viewfinder import ViewfinderLoop
 from ..double import COMPOSITE_METHOD, composite
 from ..imageio import load_rgb, save_jpeg
 from ..pipeline import Pipeline
+from .button import (
+    MAX_PIN,
+    MIN_PIN,
+    WAVESHARE28_PINS,
+    X728_PINS,
+    ButtonError,
+    ShutterButton,
+    open_shutter_button,
+)
 from .camera import Camera, CameraError, FakeCamera, Frame, V4L2Camera
 from .controller import CaptureController, JobSnapshot
 from .picamera import Picamera2Camera
@@ -779,10 +792,40 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     print(f"error: display failed repeatedly: {failure}", file=sys.stderr)
     # A dead screen must cost the screen only. Exiting here would be a restart
     # loop under systemd, and the Stick would get a few seconds of service per
-    # cycle; without a remote API there is nothing left to serve, so 1 stands.
+    # cycle. Without a remote API the process exits 1 and systemd restarts it.
+    # That restart is also what brings a GPIO button back: the button has no
+    # loop of its own to keep the process alive.
     if not args.remote_listen:
         return 1
     return _serve_until_interrupt()
+
+
+def _gpio_pin(text: str) -> int:
+    """An argparse type: a BCM pin number the shutter button may use."""
+    try:
+        pin = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a BCM pin number") from None
+    if not MIN_PIN <= pin <= MAX_PIN:
+        raise argparse.ArgumentTypeError(
+            f"BCM {pin} is not usable; choose a pin between {MIN_PIN} and {MAX_PIN}"
+        )
+    return pin
+
+
+def _button_capture(controller: CaptureController) -> None:
+    """One press of the GPIO shutter button: the same request an LCD tap makes.
+
+    Runs on gpiozero's callback thread. ``submit`` only takes the controller's
+    lock and queues the job, so the press returns at once; a capture already in
+    progress (or a controller that is shutting down) answers with a failed
+    snapshot, and the press is dropped, never queued.
+    """
+    job = controller.submit(str(uuid.uuid4()))
+    if job.state == "failed":
+        print(f"button: press ignored ({job.error_code})")
+    else:
+        print("button: capture requested")
 
 
 def _idle_seconds(text: str) -> float:
@@ -887,7 +930,18 @@ def main(argv: list[str] | None = None) -> int:
                         metavar="SECONDS",
                         help="turn the LCD screen off after this long untouched "
                              "(a tap wakes it); 0 disables")
+    parser.add_argument(
+        "--shutter-gpio", type=_gpio_pin, default=None, metavar="BCM",
+        help="take a photo when a push button wired between this BCM pin and ground is "
+             "pressed (for example 21: physical pin 40, with ground on pin 39)",
+    )
     args = parser.parse_args(argv)
+
+    if args.shutter_gpio is not None:
+        if args.ups == "x728" and args.shutter_gpio in X728_PINS:
+            parser.error(f"--shutter-gpio {args.shutter_gpio} is used by the X728 UPS")
+        if args.display == "waveshare28" and args.shutter_gpio in WAVESHARE28_PINS:
+            parser.error(f"--shutter-gpio {args.shutter_gpio} is used by the 2.8 inch LCD")
 
     if args.camera == "picamera2" and args.device is not None:
         parser.error("--device cannot be used with --camera picamera2")
@@ -976,14 +1030,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     controller: CaptureController | None = None
     remote: RemoteCaptureServer | None = None
+    button: ShutterButton | None = None
     if display_pair is not None:
         controller = CaptureController(session)
     try:
         if power is not None:
             power.start()
             print(f"Reading the {args.ups} UPS every 10 s.")
-        if args.remote_listen:
+        if args.shutter_gpio is not None:
+            try:
+                button = open_shutter_button(args.shutter_gpio)
+            except ButtonError as exc:
+                print(
+                    f"warning: shutter button unavailable ({exc}); continuing without it",
+                    file=sys.stderr,
+                )
+        # The remote API and the button are both triggers that arrive on another
+        # thread, so either one needs the shared controller and the loops that
+        # tolerate it. A button that failed to open leaves the mode as it was.
+        shared = bool(args.remote_listen) or button is not None
+        if shared:
             controller = controller or CaptureController(session)
+        if button is not None:
+            assert controller is not None
+            button.on_press(functools.partial(_button_capture, controller))
+            print(f"Shutter button on BCM {args.shutter_gpio}.")
+        if args.remote_listen:
+            assert controller is not None
             try:
                 remote = RemoteCaptureServer(
                     controller, remote_token, args.remote_listen,
@@ -995,6 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             host, port = args.remote_listen
             print(f"Remote capture API listening on {host}:{port}.")
+        if shared:
             try:
                 if display_pair is not None:
                     assert controller is not None
@@ -1052,6 +1126,17 @@ def main(argv: list[str] | None = None) -> int:
             run_headless_loop(session, keys.read)
         return 0
     finally:
+        if button is not None:
+            # The GPIO library can raise while joining its thread or releasing
+            # the line; that must not skip the closes below, which release the
+            # camera and let a capture in flight finish.
+            try:
+                button.close()
+            except Exception as exc:
+                print(
+                    f"warning: shutter button did not close cleanly ({exc})",
+                    file=sys.stderr,
+                )
         if power is not None:
             power.close()
         if remote is not None:

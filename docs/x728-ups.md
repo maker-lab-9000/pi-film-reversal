@@ -65,6 +65,10 @@ board can otherwise touch the Pi's USB shells and short.
 | 20 | Pi output | Buzzer (v2.1 and later) | optional |
 | 16 | Pi output | Battery charge enable (v2.5 and later, "advanced users only") | leave alone |
 
+The optional shutter button uses BCM 21 (physical pin 40), which is not in this
+table; `pifilm-capture` refuses `--shutter-gpio` on any pin that is, when
+`--ups x728` is given. See [setup](setup.md), "Optional: shutter button".
+
 GPIO chip is `gpiochip0` on the Pi 3. Any future GPIO use in this project, such
 as a flash LED, must avoid pins 5, 6, 12, 16, 20 and 26.
 

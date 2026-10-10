@@ -33,7 +33,11 @@ EnvironmentFile=/etc/pifilm-capture.env
 # service owns the screen. On a Pi without the panel, or on one whose camera is USB
 # (the V4L2 backend has no preview mode), the service logs one warning line and
 # continues headless for the Stick rather than failing to start.
-ExecStart=/home/george/repos/pi-film-reversal/.venv/bin/pifilm-capture --no-preview --remote-listen 0.0.0.0:8765 --artifacts /home/george/repos/pi-film-reversal/pifilm/data --ups x728 --ae-constraint highlight --display waveshare35dsi
+# --shutter-gpio 21 takes a photo when a push button wired between BCM 21 (physical
+# pin 40) and ground (pin 39) is pressed. With no button wired the pin just idles
+# high, so the flag is harmless; if the pin cannot be claimed the service logs one
+# warning line and carries on.
+ExecStart=/home/george/repos/pi-film-reversal/.venv/bin/pifilm-capture --no-preview --remote-listen 0.0.0.0:8765 --artifacts /home/george/repos/pi-film-reversal/pifilm/data --ups x728 --ae-constraint highlight --display waveshare35dsi --shutter-gpio 21
 Restart=on-failure
 RestartSec=3
 StandardInput=null

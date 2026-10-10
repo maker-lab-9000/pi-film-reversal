@@ -47,6 +47,7 @@ I will commit the STL files once final design is approved and tested.
 - Raspberry Pi 4, 4GB RAM
 - M5Stack StickS3 (display, trigger)
 - Waveshare 3.5 inch DSI LCD (E) touchscreen (light meter, focus meter, trigger, exposure controls, battery meter)
+- A momentary push button on two jumper wires (physical shutter button, GPIO 21)
 - x728 UPS Shield + Geekworm X728-C1 Metal Case
 - 4x 18650 Li-ion cells, estimated capacity around 10000mAh
 - 64GB SD Card
@@ -115,6 +116,7 @@ Capture modes:
 | `--fake` | synthetic frames, no camera (for testing) |
 | `--device /dev/videoN` | select a specific USB camera |
 | `--display waveshare35dsi` | LCD viewfinder with exposure meter and touch shutter; `waveshare28` for the older 2.8" SPI panel ([guide](docs/lcd-viewfinder.md)) |
+| `--shutter-gpio 21` | Physical shutter button between BCM 21 and ground ([setup](docs/setup.md)) |
 
 With the default artifact, `pifilm-process` now grades any folder — including old USB captures — without white balance and with the damped highlight lift (see [Camera backends](#camera-backends)).
 
