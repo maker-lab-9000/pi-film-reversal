@@ -475,7 +475,25 @@ service carries on without the screen, still serving the Stick.
 
 ### 9.6 Hardware acceptance checklist
 
-Not yet run. Record results here.
+Run on 2026-10-10 on the Pi 4 with the IMX477, Raspberry Pi OS Trixie booted to the
+console, branch `feat/dsi-viewfinder` at `2d2b6fc`. Idle was checked with
+`--display-off-after 20` rather than the five-minute default.
+
+| Item | Result |
+| --- | --- |
+| 1 Cold boot | Pass. Live view about 28 s after power-on, without logging in |
+| 2 Frame rate and tearing | Pass. 9.1 and 10.0 fps in the journal lines; no tearing when panning |
+| 3 Touch accuracy | Pass. Every control responds where it is drawn, corners included |
+| 4 Controls | Pass. Shutter, review, EV, shutter priority and `2x` behave as on the 2.8" panel |
+| 5 Stick shot | Pass. Appears on the panel |
+| 6 Idle | Pass. No dimming; dark at the off time; a tap wakes it without taking a photo |
+| 7 Stick shot while dark | Pass. Wakes into the review, no `display:` error lines |
+| 8 Service stop | Pass. The login prompt returns to the panel |
+| 9 Cable unplugged | Pass. One warning line; the Stick still captures |
+| 10 Rotation 180 | Not run. The panel is upright at 0 in the current mounting |
+| 11 2.8" fallback | Not run. The panel is no longer wired |
+| 12 Open-time check with the desktop running | Not confirmed. The warning line was not observed; repeat before relying on it |
+
 
 1. Cold boot: the live view appears on the panel without logging in. Note the time
    from power-on.
