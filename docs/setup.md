@@ -314,7 +314,61 @@ the hardware acceptance checklist are in
 Waveshare 2.8" SPI panel is still supported with `--display waveshare28`
 (sections 2 and 3 of the same guide).
 
-### 4.9 Nextcloud photo sync (optional)
+### 4.9 Optional: shutter button
+
+A push button on the GPIO header takes a photo, like the on-screen shutter or
+the Stick. Any momentary (normally open) button works; it needs two wires and no
+resistor, because the Pi's internal pull-up holds the pin high until the button
+connects it to ground.
+
+**Wiring**, with the Pi powered off:
+
+| Button lead | Header pin | |
+| --- | --- | --- |
+| One lead | Physical pin 40 (BCM 21) | The last pin of the outer row |
+| The other lead | Physical pin 39 (ground) | The last pin of the inner row, directly opposite |
+
+Which lead goes where does not matter. These two pins are free on this build:
+the X728 UPS uses BCM 5, 6, 12, 16, 20 and 26, and the DSI panel uses no header
+pins. Do not connect the button to a 3.3 V or 5 V pin.
+
+**Service.** The example unit already passes `--shutter-gpio 21`. On an existing
+install, add it to the `ExecStart=` line of
+`/etc/systemd/system/pifilm-capture.service`, then
+`sudo systemctl daemon-reload && sudo systemctl restart pifilm-capture`. The
+journal shows `Shutter button on BCM 21.` at start-up, and `button: capture
+requested` for each press.
+
+**Behaviour.** One press takes one photo. A press while a photo is still being
+processed is ignored (`button: press ignored (busy)`), never queued. A press
+with the screen dark from idle takes the photo and wakes the screen to show it.
+To use another pin, change the number (BCM 4 to 27); pins that belong to the
+X728 are refused with `--ups x728`, and pins that belong to the 2.8" LCD with
+`--display waveshare28`. The button also works with neither `--remote-listen`
+nor an LCD, but it then puts the app in the same capture-only modes the remote
+API uses: run from the Pi's desktop session, the live preview window is replaced
+by a window that shows only each captured photo. The journal messages that mention the "remote
+API" in those modes (`Remote capture API active without terminal controls.`,
+`Capture display unavailable; remote API remains active.`) are shared with the
+remote API and appear even when only the button is in use.
+
+**If it does not work.** `warning: shutter button unavailable (...); continuing
+without it` in the journal names the cause, and the service carries on without
+the button. There are two: `python3-gpiozero is not installed` (install it with
+`sudo apt install python3-gpiozero python3-lgpio`), or `cannot claim BCM 21:`
+followed by the underlying error, which covers a pin held by another process or
+a `dtoverlay`, a service user who is not in the `gpio` group, and a missing GPIO
+backend (`python3-lgpio`). To test the wiring without the app, run
+
+```sh
+python3 -c "from gpiozero import Button; b = Button(21); print('waiting'); b.wait_for_press(); print('pressed'); b.close()"
+```
+
+It prints `waiting`, then `pressed` when the button is pressed. Once the service
+has been given `--shutter-gpio 21` it holds the pin, so stop it first
+(`sudo systemctl stop pifilm-capture`) and start it again afterwards.
+
+### 4.10 Nextcloud photo sync (optional)
 
 To keep an off-device archive of every capture, push `~/Pictures/pifilm` to a
 Nextcloud folder over WebDAV. It runs from the Pi only when the wired LAN is

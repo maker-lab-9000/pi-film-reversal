@@ -17,6 +17,9 @@ with ``FakeCamera``:
   Pi's SPI panel instead of any OpenCV window. It shares one
   ``CaptureController`` with the remote API, so a tap on the panel and a Stick
   request are the same kind of job and never two owners of the camera.
+* ``--shutter-gpio`` adds a GPIO push button (``pifilm/capture/button.py``) as one
+  more trigger through that shared ``CaptureController``; the remote API or the
+  button each select the shared-controller loops.
 
 A dropped frame prints and continues in both loops. The spec promises the
 session survives frame read failures, and that promise is only worth
