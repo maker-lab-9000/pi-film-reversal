@@ -412,6 +412,15 @@ class ViewfinderLoop:
             name="pifilm-touch", daemon=True,
         )
         self._tap_queue = taps
+        # The touch device was opened seconds before this loop polls it, and the
+        # kernel queued whatever touched the panel meanwhile. Read once and throw
+        # the result away, past the tap detector: otherwise the first poll reports
+        # that stale press, the second its release, and a finger on the panel
+        # during start-up takes a photo.
+        try:
+            self._touch.read()
+        except DisplayError:
+            pass
         worker.start()
         try:
             while not stop.is_set():

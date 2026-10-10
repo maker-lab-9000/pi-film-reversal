@@ -14,17 +14,25 @@ this process holds the display the kernel console is kept off the panel, and it
 returns when the card is closed.
 
 The service must own the screen, so the Pi boots to the console: under a desktop
-session the compositor is the DRM master and opening the output here fails. That
-failure, like every other at open, is a ``DisplayError`` and costs the screen
-only; ``pifilm-capture`` carries on headless for the Stick.
+session the compositor is the DRM master and opening the output here fails. So
+does a second copy of this program. Neither raises in ``pykms``: the card opens
+and the mode-set returns the kernel's error code, so ``_PykmsBackend`` checks that
+return value, or every later swap would fail instead. That failure, like every
+other at open, is a ``DisplayError`` and costs the screen only; ``pifilm-capture``
+carries on headless for the Stick. The same holds while running: whatever type of
+exception the binding raises leaves ``KmsDisplay`` as a ``DisplayError``, the only
+one the viewfinder loop contains.
 
 The panel has no brightness control (``/sys/class/backlight`` is empty), so
 ``backlight`` is on/off: 0 powers the output down and anything else powers it up.
 ``dimmable = False`` tells the viewfinder loop to skip its half-brightness step.
+The loop sets a level once and does not retry it, so ``show`` powers a dark output
+up itself: a power-on that failed once must not leave taps acting on a black screen.
 
 ``KmsDisplay`` holds the logic and is tested against a fake backend;
-``_PykmsBackend`` is the only code that touches ``pykms`` and is proven on the Pi
-(see the acceptance checklist in docs/lcd-viewfinder.md).
+``_PykmsBackend`` is the only code that touches ``pykms``. Its start-up sequence is
+tested against a fake module; the rest is proven on the Pi (see the acceptance
+checklist in docs/lcd-viewfinder.md).
 """
 
 from __future__ import annotations
@@ -62,6 +70,7 @@ class KmsDisplay:
         self.width, self.height = int(backend.width), int(backend.height)
         self._front = 0
         self._on = True
+        self._closed = False
 
     def show(self, image: Image.Image) -> None:
         if image.size != (self.width, self.height):
@@ -71,11 +80,18 @@ class KmsDisplay:
             )
         if image.mode != "RGB":
             image = image.convert("RGB")
+        # The loop never draws while the screen is meant to be off, so a frame
+        # arriving on a dark output means an earlier power-on failed: try again.
+        if not self._on:
+            self.backlight(100)
         back = 1 - self._front
         try:
             self._backend.write(back, pack_xrgb8888(np.asarray(image), self._rotate))
             self._backend.flip(back)
-        except (OSError, RuntimeError) as exc:
+        except Exception as exc:
+            # Any type: the binding maps C++ errors to ValueError and others, and the
+            # viewfinder loop contains only DisplayError. A dead screen costs the
+            # screen, never the process.
             raise DisplayError(f"display swap failed: {exc}") from exc
         self._front = back
 
@@ -85,17 +101,22 @@ class KmsDisplay:
             return
         try:
             self._backend.power(on)
-        except (OSError, RuntimeError) as exc:
+        except Exception as exc:  # any type, as in show()
             raise DisplayError(f"display power {'on' if on else 'off'} failed: {exc}") from exc
         self._on = on
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         try:
             if not self._on:
                 self._backend.power(True)
-        except (OSError, RuntimeError):
+        except Exception:  # any type, as in show(); the backend is closed regardless
             pass
         finally:
+            # Lit or not, nothing may ask a closed backend for power again.
+            self._on = True
             self._backend.close()
 
 
@@ -124,7 +145,14 @@ class _PykmsBackend:
             self._maps.append(
                 flat[: self.height * self.width * 4].reshape(self.height, self.width, 4)
             )
-        self._crtc.set_mode(self._conn, self._fbs[0], self._mode)
+        # set_mode does not raise: it returns the kernel's result, and Card() opens
+        # even when this process cannot become DRM master (a desktop session, or a
+        # second copy of the program, holds the display). Unchecked, the open would
+        # "succeed" and every swap after it fail. RuntimeError, not an OSError with
+        # an errno, so the caller reports console boot rather than group membership.
+        result = self._crtc.set_mode(self._conn, self._fbs[0], self._mode)
+        if result:
+            raise RuntimeError(f"set_mode returned {result}")
         self._plane = self._crtc.primary_plane
 
     def write(self, index: int, pixels: np.ndarray) -> None:

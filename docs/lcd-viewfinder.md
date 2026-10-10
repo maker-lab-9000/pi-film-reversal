@@ -9,7 +9,10 @@ with a light-meter readout and an on-screen shutter. Two panels are supported:
 | Waveshare 2.8" Capacitive Touch LCD (V2), 320×240, ST7789 + CST3530 | `--display waveshare28` | SPI, I2C and four GPIO pins on the header | Fallback. Sections 2, 3 and 8 describe it |
 
 Sections 5 and 6 (the screen, the meter) apply to both: the DSI panel shows the
-same layout at twice the size. Where the two differ, section 9 says how.
+same layout at twice the size. Where the two differ, section 9 says how. The one
+exception inside section 5 is [Idle dimming](#idle-dimming): the DSI panel has no
+brightness control, so it has no one-minute dim step, only the five-minute off
+step (see [9.3](#93-what-differs-from-the-28-panel)).
 The commands in section 4 and the checklist in section 7 are written for the
 2.8" panel; sections 9.2 and 9.6 are their equivalents for the DSI panel.
 
@@ -174,6 +177,10 @@ Left untouched, the panel saves itself and the battery:
 | under 1 minute | full brightness (backlight 80 %) | acts normally |
 | 1 minute (`--display-dim-after`) | half brightness, live view still running | restores full brightness **and** acts (the buttons are visible) |
 | 5 minutes (`--display-off-after`) | backlight off; the camera preview is neither read nor drawn | **only wakes** the screen; it never fires the shutter, since you cannot see what you touch |
+
+The 3.5" DSI panel has no dim step: it stays at full brightness until the
+five-minute row, where its output is powered down (see
+[9.3](#93-what-differs-from-the-28-panel)).
 
 Any capture counts as activity: while one is being graded the screen stays
 lit, and a finished shot, from the LCD or the Stick, wakes it into the review.
@@ -460,9 +467,10 @@ service carries on without the screen, still serving the Stick.
 | --- | --- | --- |
 | `install python3-kms++` | `pykms` is not importable | `sudo apt install python3-kms++`; the venv must see system packages, as for Picamera2 |
 | `cannot open the DSI display on DSI-1` | No such connector, the cable is out, or a desktop session owns the screen | Check the `dtoverlay=waveshare_35DSI,35E,dsi1` line and the overlay file, reseat the cable, boot to the console (9.1 step 4) |
-| `no permission for the DSI display` | Service user not in `video`/`render` | `sudo usermod -aG video,render george`; reboot |
+| `cannot open the DSI display on DSI-1`, ending `set_mode returned ...`, on a Pi that does boot to the console | Something else already holds the display: usually a second copy of `pifilm-capture` (the service is running and you started another from a terminal) | Stop the other one first: `sudo systemctl stop pifilm-capture` before a terminal test, and `sudo systemctl start pifilm-capture` afterwards |
+| `no permission for the DSI display` | Service user not in `video`/`render` | `sudo usermod -aG video,render george`; log out and in, or reboot |
 | `touch device 'Goodix Capacitive TouchScreen' not found` | The touch driver did not load | Same overlay and cable checks; `grep -i goodix /proc/bus/input/devices` |
-| `no permission for /dev/input/event*` | Service user not in `input` | `sudo usermod -aG input george`; reboot |
+| `no permission for /dev/input/event*` | Service user not in `input` | `sudo usermod -aG input george`; log out and in, or reboot |
 | Panel blank after boot, no boot text | Overlay not applied | `dmesg \| grep -i "dsi\|panel\|goodix"`; check steps 2 and 3 |
 
 ### 9.6 Hardware acceptance checklist
@@ -488,3 +496,16 @@ Not yet run. Record results here.
    line in the journal, and the Stick still captures.
 10. `--display-rotate 180`: the image is inverted and taps still land on the controls.
 11. Optional, only if the 2.8" panel is still wired: `--display waveshare28` works.
+12. The open-time check, with the desktop running. This is the only way to prove on
+    hardware that a refused mode-set is caught at open. Set the boot behaviour to
+    the desktop (`sudo raspi-config nonint do_boot_behaviour B4`) and reboot. Over
+    SSH, run:
+
+    ```sh
+    .venv/bin/pifilm-capture --camera picamera2 --display waveshare35dsi --no-preview --out ~/Pictures/pifilm-lcd
+    ```
+
+    Expect exactly one
+    `warning: display unavailable (cannot open the DSI display on DSI-1 ...)` line,
+    naming console boot, and the process to carry on without the screen. Then
+    restore the console (`sudo raspi-config nonint do_boot_behaviour B1`) and reboot.

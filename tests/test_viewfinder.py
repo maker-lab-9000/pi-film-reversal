@@ -1021,6 +1021,52 @@ def test_the_touch_thread_stops_when_the_loop_raises(controller):
     assert not _touch_thread_alive()
 
 
+class QueuedAtStartTouch:
+    """A device that was opened before the loop ran: the first read hands back a
+    touch the kernel queued meanwhile, every later read finds no finger."""
+
+    def __init__(self, xy):
+        self._xy = xy
+        self.reads = 0
+
+    def read(self):
+        n, self.reads = self.reads, self.reads + 1
+        return [TouchPoint(*self._xy, 10)] if n == 0 else []
+
+    def close(self):
+        pass
+
+
+def test_a_touch_queued_before_the_loop_started_takes_no_photo(controller):
+    camera, ctl = controller
+    submitted = []
+    ctl.submit = submitted.append
+    touch = QueuedAtStartTouch(SHUTTER_CENTRE)
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=time, frame_period=0.01)
+    steps = {"n": 0}
+    real_step = loop.step
+
+    def counting_step():
+        real_step()
+        steps["n"] += 1
+
+    loop.step = counting_step
+    stop = threading.Event()
+    runner = threading.Thread(target=loop.run, args=(stop,), daemon=True)
+    runner.start()
+    try:
+        # Long enough for the touch thread to see the point and its release, and
+        # then for the loop to take whatever tap that made off the queue.
+        _until(lambda: touch.reads >= 4)
+        seen = steps["n"]
+        _until(lambda: steps["n"] >= seen + 3)
+    finally:
+        stop.set()
+        runner.join(5.0)
+    assert not runner.is_alive()
+    assert submitted == []
+
+
 # -- the 640x480 DSI panel --------------------------------------------------------
 
 

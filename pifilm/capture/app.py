@@ -885,7 +885,7 @@ def main(argv: list[str] | None = None) -> int:
                              "(no effect on the DSI panel, which has no brightness control)")
     parser.add_argument("--display-off-after", type=_idle_seconds, default=300.0,
                         metavar="SECONDS",
-                        help="turn the LCD backlight off after this long untouched "
+                        help="turn the LCD screen off after this long untouched "
                              "(a tap wakes it); 0 disables")
     args = parser.parse_args(argv)
 
