@@ -128,3 +128,29 @@ def test_the_reserved_pin_sets_match_the_documented_wiring():
 
 def test_shutter_button_is_constructible_from_a_device():
     assert isinstance(ShutterButton(FakeDevice()), ShutterButton)
+
+
+def test_a_failing_callback_with_a_broken_stderr_still_does_not_escape(monkeypatch):
+    """lgpio delivers presses on one thread with no exception handling: anything
+    that escapes the callback, the fallback print included, ends press delivery."""
+
+    class BrokenStream:
+        def write(self, text):
+            raise OSError(32, "Broken pipe")
+
+        def flush(self):
+            raise OSError(32, "Broken pipe")
+
+    device = FakeDevice()
+    button = open_shutter_button(21, open_device=lambda pin: device)
+    calls = []
+
+    def callback():
+        calls.append(1)
+        raise RuntimeError("controller exploded")
+
+    button.on_press(callback)
+    monkeypatch.setattr(sys, "stderr", BrokenStream())
+    device.press()   # must not raise
+    device.press()
+    assert calls == [1, 1]

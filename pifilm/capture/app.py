@@ -792,7 +792,9 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     print(f"error: display failed repeatedly: {failure}", file=sys.stderr)
     # A dead screen must cost the screen only. Exiting here would be a restart
     # loop under systemd, and the Stick would get a few seconds of service per
-    # cycle; without a remote API there is nothing left to serve, so 1 stands.
+    # cycle. Without a remote API the process exits 1 and systemd restarts it.
+    # That restart is also what brings a GPIO button back: the button has no
+    # loop of its own to keep the process alive.
     if not args.remote_listen:
         return 1
     return _serve_until_interrupt()
@@ -1125,7 +1127,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         if button is not None:
-            button.close()
+            # The GPIO library can raise while joining its thread or releasing
+            # the line; that must not skip the closes below, which release the
+            # camera and let a capture in flight finish.
+            try:
+                button.close()
+            except Exception as exc:
+                print(
+                    f"warning: shutter button did not close cleanly ({exc})",
+                    file=sys.stderr,
+                )
         if power is not None:
             power.close()
         if remote is not None:

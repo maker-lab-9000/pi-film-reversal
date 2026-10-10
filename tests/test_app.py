@@ -1765,3 +1765,24 @@ def test_shutter_gpio_refuses_reserved_pins(camera_cli, monkeypatch, argv):
 def test_a_reserved_pin_is_allowed_when_its_hardware_is_not_selected(camera_cli, monkeypatch):
     monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: _ButtonDouble())
     assert camera_cli.main(["--fake", "--no-preview", "--shutter-gpio", "17"]) == 0
+
+
+def test_main_still_shuts_down_when_the_button_does_not_close(camera_cli, monkeypatch, capsys):
+    class StuckButton(_ButtonDouble):
+        def close(self):
+            raise RuntimeError("line busy")
+
+    closed = []
+    real_close = camera_cli.CaptureController.close
+
+    def recording_close(self):
+        closed.append(self)
+        return real_close(self)
+
+    monkeypatch.setattr(camera_cli.CaptureController, "close", recording_close)
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: StuckButton())
+    assert camera_cli.main(["--fake", "--no-preview", "--shutter-gpio", "21"]) == 0
+    assert len(closed) == 1
+    assert (
+        "warning: shutter button did not close cleanly (line busy)"
+    ) in capsys.readouterr().err

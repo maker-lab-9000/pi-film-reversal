@@ -11,10 +11,13 @@ A press is delivered to one callback. ``pifilm-capture`` makes that callback a
 one more trigger and never a second owner of the camera; a press while a capture
 is running is answered ``busy`` by the controller and dropped.
 
-gpiozero calls ``when_pressed`` on its own thread. An exception raised there
-would be printed by gpiozero and, depending on its version, can stop further
-callbacks, so the callback is wrapped: a failure is logged as ``button: ...`` and
-the next press still works.
+gpiozero calls ``when_pressed`` on its backend's thread. With the lgpio backend
+that is one thread for every edge, and it has no exception handling of its own:
+an exception that escapes the callback ends the thread, and with it all further
+callbacks for the life of the process. So nothing may escape. The callback is
+wrapped: a failure is logged as ``button: ...`` and the next press still works,
+and the logging is itself guarded, because a broken stderr (EPIPE after the
+journal restarts) would otherwise raise from inside the handler.
 
 gpiozero is imported only inside ``_open_device`` so this module imports on a Mac
 and in the tests, which pass ``open_device`` instead.
@@ -52,8 +55,11 @@ class ShutterButton:
         def guarded() -> None:
             try:
                 callback()
-            except Exception as exc:  # must not escape into gpiozero's thread
-                print(f"button: {exc}", file=sys.stderr)
+            except Exception as exc:  # must not escape into the GPIO library's thread
+                try:
+                    print(f"button: {exc}", file=sys.stderr)
+                except Exception:  # nor may the report of it: stderr can be broken
+                    pass
 
         self._device.when_pressed = guarded
 
