@@ -42,6 +42,8 @@ class ButtonError(Exception):
 
 
 class ShutterButton:
+    """Wraps a device; ``on_press`` replaces any earlier callback."""
+
     def __init__(self, device: Any) -> None:
         self._device = device
         self._closed = False
@@ -64,8 +66,12 @@ class ShutterButton:
 
 
 def _open_device(pin: int) -> Any:
-    from gpiozero import Button  # lazy: only present on the Pi
-
+    try:
+        from gpiozero import Button  # lazy: only present on the Pi
+    except ImportError as exc:
+        raise ButtonError("python3-gpiozero is not installed; install it from apt") from exc
+    # Constructing the Button can raise gpiozero's BadPinFactory, an ImportError
+    # subclass; that is a pin-backend failure and is reported by the caller as such.
     return Button(pin, pull_up=True, bounce_time=BOUNCE_SECONDS)
 
 
@@ -77,10 +83,8 @@ def open_shutter_button(
         raise ButtonError(f"BCM {pin} is not usable; choose a pin between {MIN_PIN} and {MAX_PIN}")
     try:
         device = (open_device or _open_device)(pin)
-    except ImportError as exc:
-        raise ButtonError(
-            "python3-gpiozero is not installed; install it from apt"
-        ) from exc
+    except ButtonError:
+        raise
     except Exception as exc:  # gpiozero raises library-specific errors for a busy pin
         raise ButtonError(
             f"cannot claim BCM {pin}: {exc}; is another process or a dtoverlay using it, "

@@ -100,6 +100,19 @@ def test_a_pin_that_cannot_be_claimed_is_a_button_error(error):
         open_shutter_button(21, open_device=factory)
 
 
+def test_a_missing_pin_backend_is_a_pin_failure_not_a_missing_library():
+    class BadPinFactory(ImportError):
+        pass
+
+    def factory(pin):
+        raise BadPinFactory("Unable to load any default pin factory!")
+
+    with pytest.raises(ButtonError, match="cannot claim BCM 21") as info:
+        open_shutter_button(21, open_device=factory)
+    assert "Unable to load any default pin factory!" in str(info.value)
+    assert "not installed" not in str(info.value)
+
+
 @pytest.mark.parametrize("pin", [-1, 0, 3, 28, 40])
 def test_a_pin_outside_the_usable_range_is_refused(pin):
     with pytest.raises(ButtonError, match="between 4 and 27"):
