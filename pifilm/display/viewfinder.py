@@ -14,7 +14,7 @@ job is processing.
 Under ``run()`` touch is polled on its own thread ("pifilm-touch"), not inside
 the frame loop. At the long shutter speeds (up to 1 s) the preview read blocks
 for a whole frame, so a frame loop that polled touch would look at the panel
-about once a second. The CST3530 is polled, not latched, and ``TapDetector``
+about once a second. Touch is polled, not latched, on either panel, and ``TapDetector``
 needs to see the finger down and then up within its 0.6 s hold limit, so a
 quick tap would fall between two polls and never register. The thread polls
 every ``touch_period`` of real time and queues finished taps; ``step()`` takes
@@ -91,7 +91,11 @@ class ViewfinderLoop:
         self._clock, self._power = clock, power_snapshot
         self._frame_period, self._review_timeout = frame_period, review_timeout
         self._max_failures, self._log, self._touch_debug = max_display_failures, log, touch_debug
-        self._taps = TapDetector()
+        # The layout is in 320x240 base units; a 640-wide panel draws it at 2x and
+        # reports taps in its own pixels. The tap detector's drag limit is in panel
+        # pixels too, so it grows with the scale.
+        self._scale = max(1, int(getattr(display, "width", 320)) // 320)
+        self._taps = TapDetector(max_move=20.0 * self._scale)
         self._touch_period = touch_period
         # Set only while run()'s touch thread is alive; step() then reads taps
         # from it instead of polling the panel itself.
@@ -122,6 +126,10 @@ class ViewfinderLoop:
         # off would freeze a screen that is still lit.
         if not callable(getattr(display, "backlight", None)):
             dim_after = off_after = 0.0
+        # A panel that can only be on or off (the DSI one has no brightness control)
+        # skips the dim step and keeps the off step.
+        if getattr(display, "dimmable", True) is False:
+            dim_after = 0.0
         self._idle = IdleDimmer(
             full=full_backlight, dim_after=dim_after, off_after=off_after,
             now=clock.monotonic(),
@@ -263,7 +271,9 @@ class ViewfinderLoop:
         Stick server.
         """
         if job.state != "complete" or job.result is None:
-            return render_message("Capture failed", job.error_message or job.error_code or "")
+            return render_message(
+                "Capture failed", job.error_message or job.error_code or "", scale=self._scale,
+            )
         try:
             rgb, _ = load_rgb(job.result.pifilm)
             meta = job.result.record.get("camera_metadata") or {}
@@ -277,10 +287,10 @@ class ViewfinderLoop:
             caption = f"{text_or_dash(reading.shutter)}  {iso_label(reading.iso)}  EV {ev_text}"
             if double:
                 caption = f"2x  {caption}"
-            return render_review(rgb, caption)
+            return render_review(rgb, caption, scale=self._scale)
         except Exception as exc:
             self._log(f"review: {exc}")
-            return render_message("Review unavailable", str(exc)[:60])
+            return render_message("Review unavailable", str(exc)[:60], scale=self._scale)
 
     @staticmethod
     def _processing_label(snap: Any) -> str:
@@ -311,7 +321,9 @@ class ViewfinderLoop:
             if job.state == "complete" and getattr(job.result, "exposure", None) == (1, 2):
                 self.state = "NOTICE"
                 self._notice_since = self._clock.monotonic()
-                self._show(render_message("Exposure 1/2", "frame the second exposure"))
+                self._show(render_message(
+                    "Exposure 1/2", "frame the second exposure", scale=self._scale,
+                ))
                 return
             self.state = "REVIEW"
             self._review_since = self._clock.monotonic()
@@ -331,7 +343,7 @@ class ViewfinderLoop:
                 self._restart_rate_window()
             return
         if tap is not None:
-            action = hit(tap.x, tap.y)
+            action = hit(tap.x, tap.y, self._scale)
             if action is Action.SHUTTER:
                 self._controller.submit(str(uuid.uuid4()))
             elif action is Action.EV_MINUS:
@@ -354,7 +366,7 @@ class ViewfinderLoop:
             # above, so a shutter tap still reaches the controller (which
             # answers busy) and EV taps still work.
             if not self._processing_shown:
-                self._show(render_processing(self._processing_label(snap)))
+                self._show(render_processing(self._processing_label(snap), scale=self._scale))
                 self._processing_shown = True
             self._restart_rate_window()
             return
@@ -384,7 +396,7 @@ class ViewfinderLoop:
         )
         self._show(render_live(
             frame.rgb, reading, (snap.double_exposure, snap.exposures_taken),
-            shutter_buttons=self._shutter_ok,
+            shutter_buttons=self._shutter_ok, scale=self._scale,
         ))
         self._frames += 1
         now = self._clock.monotonic()

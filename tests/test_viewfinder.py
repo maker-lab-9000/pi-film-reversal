@@ -180,13 +180,13 @@ def _record_renderers(monkeypatch):
     calls = {"review": [], "message": []}
     real_review, real_message = viewfinder.render_review, viewfinder.render_message
 
-    def review(rgb, caption):
+    def review(rgb, caption, **kwargs):
         calls["review"].append(caption)
-        return real_review(rgb, caption)
+        return real_review(rgb, caption, **kwargs)
 
-    def message(title, detail):
+    def message(title, detail, **kwargs):
         calls["message"].append((title, detail))
-        return real_message(title, detail)
+        return real_message(title, detail, **kwargs)
 
     monkeypatch.setattr(viewfinder, "render_review", review)
     monkeypatch.setattr(viewfinder, "render_message", message)
@@ -488,9 +488,9 @@ def _spy_live(monkeypatch):
     readings = []
     real = viewfinder.render_live
 
-    def spy(frame_rgb, reading, double=None, shutter_buttons=False):
+    def spy(frame_rgb, reading, double=None, shutter_buttons=False, **kwargs):
         readings.append(reading)
-        return real(frame_rgb, reading, double, shutter_buttons)
+        return real(frame_rgb, reading, double, shutter_buttons, **kwargs)
 
     monkeypatch.setattr(viewfinder, "render_live", spy)
     return readings
@@ -741,9 +741,9 @@ def test_live_view_draws_the_badge_from_the_snapshot(controller, monkeypatch):
     seen = []
     real = viewfinder.render_live
 
-    def spy(frame, reading, double=None, shutter_buttons=False):
+    def spy(frame, reading, double=None, shutter_buttons=False, **kwargs):
         seen.append(double)
-        return real(frame, reading, double, shutter_buttons)
+        return real(frame, reading, double, shutter_buttons, **kwargs)
 
     monkeypatch.setattr(viewfinder, "render_live", spy)
     loop, touch, display, clock = _loop(camera, ctl)
@@ -811,9 +811,9 @@ def test_processing_labels_follow_the_pair(tmp_path, monkeypatch):
     labels = []
     real = viewfinder.render_processing
 
-    def spy(label="Processing photo..."):
+    def spy(label="Processing photo...", **kwargs):
         labels.append(label)
-        return real(label)
+        return real(label, **kwargs)
 
     monkeypatch.setattr(viewfinder, "render_processing", spy)
     try:
@@ -873,9 +873,9 @@ def test_live_view_passes_shutter_state_to_meter_and_renderer(controller, monkey
     seen = {}
     real_render, real_compute = viewfinder.render_live, viewfinder.compute_reading
 
-    def render(frame, reading, double=None, shutter_buttons=False):
+    def render(frame, reading, double=None, shutter_buttons=False, **kwargs):
         seen["buttons"], seen["fixed"] = shutter_buttons, reading.shutter_fixed
-        return real_render(frame, reading, double, shutter_buttons)
+        return real_render(frame, reading, double, shutter_buttons, **kwargs)
 
     def compute(*a, **k):
         seen["max_gain"] = k.get("max_gain")
@@ -897,9 +897,9 @@ def test_a_camera_without_set_shutter_draws_no_buttons_and_ignores_taps(
     seen = []
     real_render = viewfinder.render_live
 
-    def render(frame, reading, double=None, shutter_buttons=False):
+    def render(frame, reading, double=None, shutter_buttons=False, **kwargs):
         seen.append(shutter_buttons)
-        return real_render(frame, reading, double, shutter_buttons)
+        return real_render(frame, reading, double, shutter_buttons, **kwargs)
 
     monkeypatch.setattr(viewfinder, "render_live", render)
     monkeypatch.setattr(type(camera), "set_shutter", None, raising=False)
@@ -1019,3 +1019,59 @@ def test_the_touch_thread_stops_when_the_loop_raises(controller):
         loop.run(stop)
     assert not stop.is_set()
     assert not _touch_thread_alive()
+
+
+# -- the 640x480 DSI panel --------------------------------------------------------
+
+
+class BigDisplay(FakeDisplay):
+    width, height = 640, 480
+    dimmable = False
+
+
+def test_a_640_wide_display_is_drawn_at_640x480(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl, display=BigDisplay())
+    loop.step()
+    assert display.images[-1].size == (640, 480)
+
+
+def test_taps_are_hit_tested_at_the_display_scale(controller, monkeypatch):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl, display=BigDisplay())
+    submitted = []
+    monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
+    cx, cy = SHUTTER_CENTRE
+    _tap(loop, touch, clock, (2 * cx, 2 * cy))
+    assert len(submitted) == 1
+    _tap(loop, touch, clock, (cx, cy))        # the 320x240 position is not the button here
+    assert len(submitted) == 1
+
+
+def test_review_and_processing_screens_use_the_display_scale(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl, display=BigDisplay())
+    ctl.submit("one")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "REVIEW"
+    assert display.images[-1].size == (640, 480)
+
+
+def test_a_non_dimmable_display_skips_dimming_but_still_turns_off(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _idle_loop(camera, ctl, display=BigDisplay())
+    loop.step()
+    clock.t = 60.0
+    loop.step()
+    assert display.levels == [80]
+    clock.t = 300.0
+    loop.step()
+    assert display.levels[-1] == 0
+
+
+def test_a_display_without_a_width_is_drawn_at_320x240(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert display.images[-1].size == (320, 240)
