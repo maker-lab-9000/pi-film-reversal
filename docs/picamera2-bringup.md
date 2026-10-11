@@ -136,16 +136,15 @@ disables AWB) rather than relying on whatever AWB happened to land on.
 `--autofocus {continuous,auto,manual}` and `--af-range {normal,macro,full}`
 control the lens; the default is continuous AF at normal range.
 
-Three more controls, all Picamera2-only (rejected on V4L2, `--device` and
+Two more controls, both Picamera2-only (rejected on V4L2, `--device` and
 `--fake`, and their defaults reproduce today's behaviour exactly):
 `--ae-constraint {normal,highlight,shadows}` (default `normal`) sets
 libcamera's `AeConstraintMode`; `highlight` protects bright regions from
 clipping instead of exposing for the average scene. `--ae-metering
-{centre,spot,matrix}` (default `centre`) sets `AeMeteringMode`. `--ev STOPS`
-(default `0`, range -8 to 8) sets `ExposureValue`, always applied so 0 is an
-explicit, deterministic neutral rather than an unset control. The effect of a
-non-default value shows up in the already-recorded `ExposureTime` and `Lux`
-in `camera_metadata`.
+{centre,spot,matrix}` (default `centre`) sets `AeMeteringMode`. There is no
+`--ev` flag (removed 2026-10-11 with the viewfinder's EV buttons): `ExposureValue`
+is still sent, always `0.0`, so 0 is an explicit, deterministic neutral rather than
+an unset control and `ev_comp` stays in every record.
 
 Confirm on real hardware:
 

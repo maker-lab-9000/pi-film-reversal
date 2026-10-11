@@ -159,7 +159,6 @@ Capture flags:
 | `--ae-lock` / `--awb-lock` / `--colour-gains R,B` | lock exposure / white balance for controlled reference shoots |
 | `--ae-constraint {normal,highlight,shadows}` | AE constraint mode (default `normal`); `highlight` protects bright regions from clipping |
 | `--ae-metering {centre,spot,matrix}` | AE metering mode (default `centre`) |
-| `--ev STOPS` | exposure compensation, -8 to 8 (default `0`) |
 
 
 The preset increases midtone color and contrast with a smooth tone curve,

@@ -19,7 +19,8 @@ The commands in section 4 and the checklist in section 7 are written for the
 ## 1. What it is
 
 The LCD shows a live, ungraded feed from the camera with a light-meter-style
-exposure readout, an on-screen shutter button and EV controls, sharing the same
+exposure meter, an on-screen shutter button and three manual controls (shutter,
+ISO, white balance), sharing the same
 `CaptureController` as the Stick — a shot from either trigger shows up on both.
 The SPACE key is not available while the viewfinder runs: the loop owns the
 process's main thread, so there is no terminal key reader.
@@ -152,22 +153,34 @@ restart.
 
 ## 5. The screen
 
+The live screen is drawn in the style of an SLR finder: the image fills the screen,
+and every read-out sits in a solid black strip along the bottom, amber on black.
+There is no screenshot of a real panel in the repo; the approved design mock-up is
+[2026-10-11-manual-controls-ui.png](superpowers/mockups/2026-10-11-manual-controls-ui.png)
+(left: all automatic; right: full manual, `+` pressed). The layout is in 320×240
+base units, drawn at 1× on the 2.8" panel and 2× on the DSI panel. The
+type is Barlow Condensed (SIL Open Font Licence 1.1; the licence text is
+`pifilm/data/fonts/OFL.txt`) on the live screen only; the review, processing and
+message screens keep the default font.
+
 | Region | Shows | Tap does |
 | --- | --- | --- |
 | Live image | Full-screen letterboxed, ungraded ISP preview | — |
-| Meter bar (bottom strip, translucent black) | Shutter, ISO, EV compensation, lux, clip % | — |
-| Needle | Deviation from mid-grey in stops, −3 to +3, amber marker | — |
-| Focus bar (vertical gauge, left edge, labelled `F`) | Absolute sharpness of the central quarter of the frame, 0 (far out of focus, or nothing to focus on) to full; amber tick marks the best level of the last few seconds | — |
-| Shutter button (circle, right edge) | White ring, filled centre | Submits a capture through the shared controller; the processing screen holds until it finishes |
-| EV `−` / EV `+` buttons (bar's left/right ends) | `-` / `+` labels | Adjusts exposure compensation by 1/3 stop, clamped to ±2; resets to `0` every time `pifilm-capture` restarts. The graded file keeps it too (normalisation used to cancel it until 2026-09-24), and it is logged as `ev_comp` in `captures.jsonl` |
-| Shutter `+` / `−` buttons (right edge, above and below the shutter button) | `+` and `-` | Shutter priority: `+` one 1/3 stop faster, `−` slower, 1/2000 to 1 s; slower than 1 s returns to auto (`A`). The first tap from auto starts at the speed auto-exposure is using. ISO stays automatic; EV still works. Picamera2 only; resets to auto on restart |
-| Shutter readout `S 1/250` | `S` prefix when the shutter is fixed; otherwise the metered speed | — |
-| `ISO MAX` (amber, in the readout) | Gain is at or near the sensor's maximum (98 % or more): on a fixed shutter the speed is too fast for the light and the photo will be dark, so pick a slower speed or add light. It can also appear on auto in very dim light | — |
+| Strip cells `SHUTTER`, `ISO`, `WB` (bottom left, three columns) | Label, then the value. The selected cell is amber (label and value, with a white `AUTO` tag if automatic); the others are grey with a dim amber value. An automatic control shows `AUTO` beside its name and the live metered value (`1/125`, `400`, `5200K`); a fixed one shows only the value. A control the camera cannot change is drawn all grey | Selects the cell. `SHUTTER` is selected at start-up and the selection stays until another cell is tapped |
+| `+` and `-` keys (right edge, below the shutter button) | Outlined amber circles; filled amber while a finger is on them | Steps the selected control; see [Manual controls](#manual-controls) |
+| Shutter button (top right, ring with a white disc) | Filled amber while a finger is on it | Submits a capture through the shared controller; the processing screen holds until it finishes. It is at the top and `+`/`-` are low on the same edge, 31 units apart between their hit circles, so a slip while stepping a value does not take a photo |
+| Exposure meter (strip, right) | 13 dots from −3 to +3 stops in half stops; the dot nearest the measured deviation from mid-grey is lit amber. Small grey text above it: `NNN LX   CLIP NN%` | — |
+| Focus gauge (vertical bar, left edge) | Absolute sharpness of the central quarter of the frame, 0 (far out of focus, or nothing to focus on) to full; an amber tick marks the best level of the last few seconds | — |
+| `2x` toggle (outlined tag, top left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
+| Battery tag (outlined, top left, right of `2x`) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
-| Battery badge (top-right) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
-| `2x` toggle (pill, top-left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
-| `WB` pill (top, right of `2x`) | Outlined `WB A` on auto; amber `WB 5600K` when fixed | Manual white balance: each tap moves one step, A → 3200 → 4000 → 5000 → 5600 → 6500 → 7500 K → A. Picamera2 only; back to the start-up value on restart |
-| Review screen | Full-screen graded result, one-line caption (`shutter  ISO NNN  EV ±N.N`), "tap to continue" hint | Any tap, or 30 s untouched, returns to live view |
+| Review screen | Full-screen graded result, one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint | Any tap, or 30 s untouched, returns to live view |
+
+Press feedback: `+`, `-` and the shutter button light while a finger is on them, not
+only on release, and a tap shorter than one frame still lights its key for 0.15 s.
+The action itself fires on release, and a press held longer than 0.6 s lights the
+key but changes nothing, because the tap detector ignores long holds. `+` and `-`
+light even when they will do nothing (the top of a scale).
 
 ### Idle dimming
 
@@ -203,75 +216,109 @@ or both mixed.
    about a second, then the live view with the badge at `1/2`. Only the original is
    saved; the Stick shows an "Exposure 1/2" card.
 2. **Exposure 2:** colour bars labelled `Developing double exposure...`, then the
-   review screen with the composite (caption starts `2x` and ends with both
-   exposures' EVs, `EV e1/e2`). The badge returns to `0/2` and the mode stays on.
+   review screen with the composite (caption `2x  shutter  ISO NNN`, from the second
+   exposure's metadata). The badge returns to `0/2` and the mode stays on.
 
 Files: each exposure keeps its own `HHMMSS_original.jpg` (and `.dng`). The composite
 is `HHMMSS_double_graded.jpg`, named after exposure 2. Its `captures.jsonl` line has a
 `double` block naming both originals (as paths relative to the output folder, such as
-`2026-09-30/120000_original.jpg`, since a pair can straddle midnight), their EVs and the
-method (`linear_mean`). Exposure compensation per frame is the film shooter's control:
-shoot the frame you want to recede at −1 EV. Do not under-expose both frames as you
-would on film: the one-stop reduction is already applied, and normalisation cancels an
-offset common to both, so only the difference between the two EVs matters. A tap ends
+`2026-09-30/120000_original.jpg`, since a pair can straddle midnight), their `ev_comp`
+values (always 0 since the EV buttons were removed on 2026-10-11) and the method
+(`linear_mean`). Do not under-expose both frames as you would on film: the one-stop
+reduction is already applied, and normalisation cancels an offset common to both. To
+make one frame recede, fix a faster shutter or a lower ISO for it. A tap ends
 the `Exposure 1/2` notice early. The mode is not remembered across restarts. A camera
 error on exposure 2 keeps `1/2`, so just shoot again. See [how it works](how-it-works.md#double-exposure)
 for why the frames are added before grading.
 
-### Shutter priority
+### Manual controls
 
-Tap the shutter `+` / `−` buttons to fix the shutter speed; the camera keeps choosing
-the ISO to expose correctly, and EV compensation still shifts the result. Use a fast
-speed (1/500 and up) to freeze motion and a slow one (1/15 and down) to blur it; the
-readout shows `S` in front of a fixed speed. Keep tapping `−` past 1 s to return to
-full auto.
+Three controls, each of which can be automatic or fixed: shutter speed, ISO and white
+balance. Tap a strip cell to select it; one `+`/`-` pair then changes whichever cell
+is selected, and only that one.
+
+| Control | Steps | `+` | `-` |
+| --- | --- | --- | --- |
+| `SHUTTER` | 1/3-stop steps, 1/2000 s to 1 s (`pifilm/display/shutter.py`) | Faster | Slower; slower than 1 s returns to auto |
+| `ISO` | 100, 200, 400, 800, 1600 (`iso.py`) | Higher; stays on 1600 | Lower; below 100 returns to auto |
+| `WB` | 3200, 4000, 5000, 5600, 6500, 7500 K (`whitebalance.py`) | Warmer (a higher number); stays on 7500 | Cooler; below 3200 returns to auto |
+
+- **Auto and the first step.** Every control starts automatic and resets to automatic
+  on restart (white balance to `--white-balance` if given). The first step out of auto,
+  in either direction, lands on the step nearest, measured in stops (log2), to what the
+  camera is using now, so the picture does not jump. Without a metered value yet the
+  start is 1/125, ISO 400 or 5600 K. The scales are in `stepscale.py`.
+- **Full manual.** With shutter and ISO both fixed there is no auto-exposure left: the
+  picture follows the settings, and the exposure meter is the only guide. Stepping
+  either one darkens or lightens the picture, and the meter dot follows.
+- **`MAX`.** On automatic ISO, when the gain is at or near the sensor's maximum (98 %
+  or more), the `ISO` cell reads `MAX`. On a fixed shutter that means the speed is too
+  fast for the light and the photo will be dark: pick a slower speed or add light. It
+  can also appear on pure auto in very dim light.
+- **Unavailable controls.** A cell is drawn grey and cannot be selected when the camera
+  has no setter for it, when white balance was already fixed with `--awb-lock` or
+  `--colour-gains`, or on a libcamera without a settable `ColourTemperature`. At
+  start-up the selection is `SHUTTER`, or the first cell that can be changed. If no
+  cell is selectable, `+` and `-` do nothing. This is decided once, at start-up.
+- **`--white-balance K`** (2360 to 9000) starts the camera at a fixed value, for
+  instance while a lens that fools auto is mounted. A restart returns to the flag's
+  value, or to auto without the flag. It cannot be combined with `--awb-lock` or
+  `--colour-gains`. There is no `--iso` or shutter flag.
+- **Records.** Each photo's `captures.jsonl` line has `shutter_us`, `iso` and
+  `colour_temperature_k`, each null on auto. The values the camera actually used are in
+  `camera_metadata` (`ExposureTime`, `AnalogueGain`, `ColourGains`).
+- **No exposure compensation.** The EV buttons, the `--ev` flag and the camera `set_ev`
+  were removed on 2026-10-11. `ev_comp` stays in every record as `0` (the camera still
+  sends `ExposureValue: 0.0`), so old records regrade exactly as before;
+  `pifilm-process` and `Pipeline.process(ev=...)` are unchanged.
+- The deployed look does not correct white balance itself (`white_balance: false` in its
+  `params.json`), so a fixed white balance goes straight through to the graded file. A
+  higher number renders warmer: 5600 K is daylight, 3200 K is tungsten lamps, and 6500
+  or 7500 K corrects a picture that auto leaves cold.
+
+Shutter notes:
 
 - At long speeds the live view slows to match: at 1/4 s it shows about 4 frames a
   second. That is the exposure, not a fault.
 - At long speeds the screen also responds to taps only once per frame (about once
   a second at 1 s), so hold a tap briefly rather than flicking it.
-- `ISO MAX` in amber means the gain is at or near the sensor's maximum (98 % or
-  more), so the camera has run out of gain for this speed. The photo will come out
-  dark and grainy (it is graded like any dark frame); pick a slower speed or add
-  light. It can also appear on auto in very dim light.
-- Each photo's `captures.jsonl` line records `shutter_us` (null on auto); the real
-  exposure time and gain are in `camera_metadata`.
-- At start-up the journal names how the shutter is fixed:
+- At start-up the journal names how each control is fixed:
   `picamera2: shutter priority via ExposureTimeMode` on current libcamera, or
-  `... ExposureTime (legacy libcamera)` on older stacks.
-- Do not combine shutter priority with `--ae-lock`: it is not meaningful there. On
+  `... ExposureTime (legacy libcamera)` on older stacks; and on the next line
+  `picamera2: ISO via AnalogueGainMode`, or `... AnalogueGain (legacy libcamera)`.
+- Do not combine a fixed shutter with `--ae-lock`: it is not meaningful there. On
   legacy libcamera the lock freezes the gain too, and on libcamera 0.5 returning to
-  `A` re-enables auto exposure time.
+  auto re-enables auto exposure time.
 
-### Manual white balance
+Measured on the Pi 4 with the IMX477 (libcamera 0.7.2, Picamera2 0.3.37) on 2026-10-11,
+preview configuration, dim room:
 
-Tap the `WB` pill to fix the white balance at a colour temperature instead of letting
-the camera choose. Each tap moves one step up, and the tap after 7500 K returns to
-auto (`WB A`); there is one button, so going back a step means tapping round. The
-live view shows the result at once, and the photo gets the same setting.
+| Set | ExposureTime | AnalogueGain | DigitalGain |
+| --- | --- | --- | --- |
+| auto | 66656 | 16.0 | 1.0 |
+| AnalogueGain 1.0 | 66656 | 1.0 | 1.17 |
+| AnalogueGain 4.0 | 65443 | 4.0 | 1.0 |
+| AnalogueGain 16.0 | 65434 | 16.0 | 1.0 |
+| AnalogueGain 4.0 + ExposureTime 8000 | 7996 | 4.0 | 1.0 |
+| AnalogueGain 0 + ExposureTime 0 | 66656 | 15.75 | 1.0 |
 
-- A higher number renders warmer. The number is the light you are telling the camera
-  it is under: 5600 K is daylight, 3200 K is tungsten lamps, and 6500 or 7500 K
-  corrects a picture that auto leaves cold.
-- The deployed look does not correct white balance itself (`white_balance: false`
-  in its `params.json`), so the setting goes straight through to the graded file.
-- `--white-balance K` (2360 to 9000) starts the camera at a fixed value, for
-  instance while a lens that fools auto is mounted. The pill still changes it, and
-  a restart returns to the flag's value, or to auto without the flag.
-- The pill is not drawn when white balance was already fixed with `--awb-lock` or
-  `--colour-gains`, or on a libcamera without a settable `ColourTemperature`.
-- Each photo's `captures.jsonl` line records `colour_temperature_k` (null on auto);
-  the gains actually applied are in `camera_metadata.ColourGains`.
-- Measured on the IMX477 on 2026-10-11 (libcamera 0.7.2): the red and blue gains
-  were (2.155, 2.052) at 3200 K, (3.102, 1.428) at 5600 K and (3.355, 1.360) at
-  7500 K. A request below 2360 K is clamped to 2360 K.
+`camera_controls["AnalogueGain"]` is `(1.0, 22.26, 1.0)` and `AnalogueGainMode` exists. A
+fixed gain holds while the exposure time stays automatic, both can be fixed, and zero
+returns both to auto. ISO 100 is gain 1.0, the convention the meter already uses. The
+room was too dark to show the exposure time compensating for a fixed gain (it was
+already at the frame limit); that is step 3 of the acceptance list in section 7.
+
+White balance, measured on the IMX477 on 2026-10-11 (libcamera 0.7.2): the red and
+blue gains were (2.155, 2.052) at 3200 K, (3.102, 1.428) at 5600 K and (3.355, 1.360)
+at 7500 K. A request below 2360 K is clamped to 2360 K and 9000 K is accepted as asked.
 
 ## 6. Reading the meter
 
-- **Needle near the centre mark** — auto-exposure has converged on this scene.
-- **Needle hard left or hard right** — auto-exposure has run out of range (more
-  than 3 stops from mid-grey); dial in EV compensation or expect the shot to be
-  under/overexposed.
+- **Lit dot near the middle** — the exposure is near mid-grey: auto-exposure has
+  converged on this scene, or your fixed settings suit it.
+- **Dot at either end** — the exposure is 3 stops or more from mid-grey. On auto the
+  camera has run out of range; in manual, change the shutter or ISO or expect the
+  shot to be under/overexposed.
 - **`clip %`** — the fraction of pixels with any channel at or above 254; this
   is the same clipped-highlight number Phase 6's normalisation cares about
   ([docs/superpowers/plans/2026-09-13-rpi4-imx708-progress.md](superpowers/plans/2026-09-13-rpi4-imx708-progress.md)).
@@ -320,8 +367,7 @@ per spec §4:
    `autofocus none`.
 4. Stick shot while the LCD is live: appears on both; the LCD returns to live
    after 30 s untouched.
-5. EV `+` three times: readout shows `+1.0`, the live view brightens, and a
-   shot's `camera_metadata.ExposureTime` is longer than at `0`.
+5. (Removed 2026-10-11 with EV compensation.)
 6. Meter sanity: cover the lens → needle hard left, lux near 0; point at a
    lamp → `clip %` rises.
 7. Service: `systemctl restart pifilm-capture` with the LCD → live view at
@@ -356,29 +402,29 @@ per spec §4:
     the mode comes back off. Exposure 2 on the IMX477 finishes within a few seconds of
     a single shot (colour bars not held noticeably longer).
 
-12. Shutter priority: in a dim room tap `+` up to 1/1000: the readout shows
-    `S 1/1000` and amber `ISO MAX`, and the shot is darker. Tap `−` down to 1/4 and pan
-    across a scene: the live view drops to about 4 fps and a shot shows motion blur.
-    Each shot's `camera_metadata.ExposureTime` is within a few percent of the chosen
-    speed, and its `shutter_us` matches. After taking a shot at a fixed speed, the live
-    view keeps it (the readout still shows `S`, and the slow live view or blur persists).
-    Keep tapping `−` past 1 s: the readout loses the `S` and the live view returns to
-    full rate. After returning to `A`, a shot's `camera_metadata.ExposureTime` changes
-    with the scene again (point at a lamp, then a dark corner). The journal line at
-    start-up names the control path.
+12. (Replaced 2026-10-11: shutter priority is now part of the manual controls; see
+    "Manual controls and the SLR finder" below.)
 
-13. Manual white balance: tap `WB` through every step; the pill turns amber with the
-    value, and the live view goes from blue (3200 K) to orange (7500 K). Take a shot
-    at 6500 K: its record has `colour_temperature_k: 6500` and
-    `camera_metadata.ColourGains` near (3.24, 1.40), and the live view is still at
-    6500 K afterwards. Tap past 7500 K: the pill returns to `WB A`, and within a few
-    seconds the colour follows the scene again (point at a lamp, then at a window).
-    A shot on auto records `colour_temperature_k: null`. Start with
-    `--white-balance 6500`: the pill is amber at 6500 K from the first frame.
+13. (Replaced 2026-10-11 likewise. Recorded before the replacement, on the Pi 4 with
+    the DSI panel on 2026-10-11: the old `WB` pill's steps, a shot at a fixed value,
+    the return to auto, the record field and a tele lens all passed. The
+    `--white-balance` start-up flag was not run on hardware.)
 
-    Run on the Pi 4 with the DSI panel on 2026-10-11: the steps, a shot at a fixed
-    value, the return to auto, the record field and a tele lens all passed. The
-    `--white-balance` start-up flag was not run on hardware.
+#### Manual controls and the SLR finder
+
+Not yet run on hardware. The branch is `feat/manual-controls-ui`.
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | Start-up: full-screen image, strip with three cells all `AUTO`, `SHUTTER` selected. The journal names the shutter and ISO control paths | Not yet run |
+| 2 | Select each cell; `+`/`-` change only the selected one; `-` below the bottom returns it to `AUTO`; the first step from auto does not jump the picture | Not yet run |
+| 3 | ISO fixed, shutter auto, in good light: the shutter read-out changes to compensate as ISO is stepped, and the meter stays near the centre | Not yet run |
+| 4 | Full manual: fix shutter and ISO; the picture gets darker and lighter with the steps and the meter dot follows | Not yet run |
+| 5 | `+`/`-` light while the finger is down, and on a quick tap | Not yet run |
+| 6 | A shot at fixed shutter + ISO + WB: the record has `shutter_us`, `iso`, `colour_temperature_k`, and `camera_metadata` agrees. Also `--white-balance 6500`: the `WB` cell reads `6500K` from the first frame | Not yet run |
+| 7 | The shutter button is not hit while working `+`/`-` | Not yet run |
+| 8 | `2x`, focus gauge, battery, review, idle screen-off, Stick and GPIO button work as before | Not yet run |
+| 9 | About 10 fps is kept (`viewfinder: N fps` in the journal) | Not yet run |
 
 ## 8. Troubleshooting
 
@@ -522,7 +568,7 @@ console, branch `feat/dsi-viewfinder` at `2d2b6fc`. Idle was checked with
 | 1 Cold boot | Pass. Live view about 28 s after power-on, without logging in |
 | 2 Frame rate and tearing | Pass. 9.1 and 10.0 fps in the journal lines; no tearing when panning |
 | 3 Touch accuracy | Pass. Every control responds where it is drawn, corners included |
-| 4 Controls | Pass. Shutter, review, EV, shutter priority and `2x` behave as on the 2.8" panel |
+| 4 Controls | Pass, for the screen before 2026-10-11 (shutter, review, EV buttons, shutter priority and `2x`). The redesigned screen is checked by the manual-controls table in section 7 |
 | 5 Stick shot | Pass. Appears on the panel |
 | 6 Idle | Pass. No dimming; dark at the off time; a tap wakes it without taking a photo |
 | 7 Stick shot while dark | Pass. Wakes into the review, no `display:` error lines |
@@ -538,8 +584,8 @@ console, branch `feat/dsi-viewfinder` at `2d2b6fc`. Idle was checked with
 2. The journal's `viewfinder: N fps` line reads 8 or more; panning shows no tearing.
 3. Each control responds where it is drawn, including in the corners;
    `--touch-debug` prints coordinates within 0..639 × 0..479.
-4. Shutter tap, EV, shutter priority, `2x` and review behave as in items 3, 5, 11
-   and 12 of [section 7](#7-hardware-acceptance-checklist).
+4. Shutter tap, the manual controls, `2x` and review behave as in items 3 and 11 and
+   the manual-controls table of [section 7](#7-hardware-acceptance-checklist).
 5. A Stick shot appears on the panel, which returns to live after 30 s untouched.
 6. Idle: no dimming at one minute; dark at five; a tap wakes it without taking a
    photo (no new `captures.jsonl` line).
