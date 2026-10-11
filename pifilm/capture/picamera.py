@@ -46,17 +46,22 @@ Every ``configure`` resets Picamera2's controls to the configuration's own
 shot. The neutral ISP set therefore travels inside *both* configurations, not
 only through ``set_controls``; otherwise the still would be taken with the
 ISP's default sharpening and saturation and the viewfinder would come back
-without them. ``set_ev`` updates those dicts as well as the live camera.
-``set_shutter`` does the same for a fixed exposure time (shutter priority), and
-also widens and restores ``FrameDurationLimits``. ``set_iso`` does the same for a
-fixed analogue gain; with both fixed the camera is in full manual.
+without them. A runtime control change has to reach those dicts as well as the
+live camera for the same reason: ``set_shutter`` does so for a fixed exposure time
+(shutter priority), and also widens and restores ``FrameDurationLimits``;
+``set_iso`` does so for a fixed analogue gain (with both fixed the camera is in
+full manual); ``set_colour_temperature`` for a fixed white balance.
+
+There is no exposure compensation. ``ExposureValue`` is still sent, always 0.0, so
+every capture records the same control set as before the viewfinder's EV buttons
+were removed.
 
 Previews and captures arrive on different threads (the viewfinder loop and the
 capture controller), so one lock is held from acquiring a request through
 releasing it: the pixel buffer belongs to the request, and a second thread that
 captured or released in the middle would hand out or free memory the first is
-still copying. ``set_ev`` takes the same lock so a control change never lands
-between a capture and its release.
+still copying. The control setters take the same lock so a control change never
+lands between a capture and its release.
 """
 
 from __future__ import annotations
@@ -79,7 +84,6 @@ _AUTOFOCUS_MODES = ("continuous", "auto", "manual")
 _AF_RANGES = ("normal", "macro", "full")
 _AE_CONSTRAINTS = ("normal", "highlight", "shadows")
 _AE_METERING = ("centre", "spot", "matrix")
-_EV_RANGE = (-8.0, 8.0)
 _SHUTTER_RANGE_US = (100, 1_000_000)
 # A fixed exposure longer than a frame period is clipped by the sensor unless the
 # frame is allowed to last at least that long, plus readout headroom.
@@ -152,7 +156,6 @@ class Picamera2Camera:
         colour_gains: tuple[float, float] | None = None,
         ae_constraint: str = "normal",
         ae_metering: str = "centre",
-        ev: float = 0.0,
         preview: bool | tuple[int, int] | None = None,
         colour_temperature: int | None = None,
     ) -> None:
@@ -170,8 +173,6 @@ class Picamera2Camera:
             raise CameraError(
                 f"Unknown ae_metering {ae_metering!r}; expected one of {_AE_METERING}"
             )
-        if not _EV_RANGE[0] <= float(ev) <= _EV_RANGE[1]:
-            raise CameraError(f"ev must be within {_EV_RANGE}, got {ev}")
 
         if colour_temperature is not None:
             if awb_lock or colour_gains is not None:
@@ -188,7 +189,10 @@ class Picamera2Camera:
         self._wb_refusal = "white balance is fixed by --awb-lock or --colour-gains"
         self._preview: tuple[int, int] | None = None
         self.preview_size: tuple[int, int] | None = None
-        self.ev = float(ev)
+        # Exposure compensation is gone, but the attribute stays: ``CaptureSession``
+        # reads it, so every record still carries ``ev_comp: 0.0`` and old records
+        # (which may hold another value) keep their meaning.
+        self.ev = 0.0
         self.shutter_us: int | None = None
         self.iso: int | None = None
         self.max_gain: float | None = None
@@ -274,7 +278,7 @@ class Picamera2Camera:
             self.preview_size = self._preview
             controls = _camera_controls(
                 autofocus, af_range, ae_lock, awb_lock, colour_gains,
-                ae_constraint, ae_metering, ev, has_autofocus=has_autofocus,
+                ae_constraint, ae_metering, has_autofocus=has_autofocus,
             )
             if "ColourTemperature" not in camera.camera_controls:
                 if colour_temperature is not None:
@@ -452,36 +456,17 @@ class Picamera2Camera:
         if duration > 0 and math.isfinite(duration):
             self._stream_info.fps = 1_000_000.0 / duration
 
-    def set_ev(self, value: float) -> None:
-        """Change exposure compensation on the running camera (viewfinder EV buttons)."""
-        value = float(value)
-        if not _EV_RANGE[0] <= value <= _EV_RANGE[1]:
-            raise CameraError(f"ev must be within {_EV_RANGE}, got {value}")
-        camera = self._camera
-        if camera is None:
-            raise CameraError("Cannot set EV on a closed Picamera2 camera")
-        with self._request_lock:
-            try:
-                camera.set_controls({"ExposureValue": value})
-            except Exception as exc:
-                raise CameraError(f"Picamera2 failed to set ExposureValue: {exc}") from exc
-            # Every configure (including the two inside
-            # switch_mode_and_capture_request) reapplies the configuration's own
-            # controls, so a runtime EV change that only reached the camera
-            # would be undone by the next shot.
-            for config in (self._still_config, self._preview_config):
-                _set_config_control(config, "ExposureValue", value)
-        self.ev = value
-
     def set_shutter(self, us: int | None) -> None:
         """Fix the exposure time (shutter priority), or return to auto with ``None``.
 
-        Gain stays automatic, so EV compensation still works through it. Like
-        ``set_ev``, the controls go to the running camera and into both
-        configurations, because every configure reapplies a configuration's own
-        controls. A long shutter also widens the frame-duration limit, which is why
-        the live view slows at long shutters, and ``None`` restores the limits each
-        configuration was built with. Nothing changes if the camera rejects the
+        Gain stays automatic unless ``set_iso`` has fixed it too. The controls go
+        to the running camera and into both configurations, because every
+        configure (including the two inside ``switch_mode_and_capture_request``)
+        reapplies a configuration's own controls, so a change that only reached
+        the camera would be undone by the next shot. A long shutter also widens
+        the frame-duration limit, which is why the live view slows at long
+        shutters, and ``None`` restores the limits each configuration was built
+        with. Nothing changes if the camera rejects the
         controls. ``us`` must be ``None`` or a whole number of microseconds: an
         integral float such as ``4000.0`` is accepted as ``4000``, while a bool,
         a string or a fractional number is a ``CameraError``.
@@ -798,7 +783,6 @@ def _camera_controls(
     colour_gains: tuple[float, float] | None,
     ae_constraint: str,
     ae_metering: str,
-    ev: float,
     has_autofocus: bool,
 ) -> dict:
     """Neutral ISP rendering plus autofocus and AE shaping, as one control dict.
@@ -854,9 +838,10 @@ def _camera_controls(
         cam_controls["AeMeteringMode"] = metering_modes[ae_metering]
     except AttributeError:
         _warn_missing_ae_enum("AeMeteringMode", "--ae-metering", ae_metering, "centre")
-    # 0.0 is neutral, but it is set unconditionally so every capture records the
-    # same control set regardless of the flags used.
-    cam_controls["ExposureValue"] = float(ev)
+    # 0.0 is neutral and nothing changes it any more (exposure compensation was
+    # removed with the viewfinder's EV buttons), but it is still set so every
+    # capture records the same control set as the ones taken before.
+    cam_controls["ExposureValue"] = 0.0
     if colour_gains is not None:
         cam_controls["AwbEnable"] = False
         cam_controls["ColourGains"] = tuple(colour_gains)

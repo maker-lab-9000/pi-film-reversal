@@ -149,6 +149,7 @@ class FakeCamera:
     ) -> None:
         self._jpegs = jpeg_bytes
         self._metadata = metadata
+        # Constant, as on Picamera2Camera: CaptureSession logs it as ``ev_comp``.
         self.ev = 0.0
         self.shutter_us: int | None = None
         self.colour_temperature_k: int | None = None
@@ -187,13 +188,9 @@ class FakeCamera:
             metadata=self._metadata,
         )
 
-    def set_ev(self, value: float) -> None:
-        # Mirrors Picamera2Camera.set_ev so viewfinder EV buttons can be driven
-        # without hardware; there is no exposure to change, so it only records.
-        self.ev = float(value)
-
     def set_shutter(self, us: int | None) -> None:
-        # Mirrors Picamera2Camera.set_shutter for the viewfinder's shutter buttons.
+        # Mirrors Picamera2Camera.set_shutter for the viewfinder's shutter control;
+        # there is no exposure to change, so it only records.
         self.shutter_us = None if us is None else int(us)
 
     def set_iso(self, iso: int | None) -> None:
@@ -201,7 +198,7 @@ class FakeCamera:
         self.iso = None if iso is None else int(iso)
 
     def set_colour_temperature(self, kelvin: int | None) -> None:
-        # Mirrors Picamera2Camera.set_colour_temperature for the viewfinder's WB pill.
+        # Mirrors Picamera2Camera.set_colour_temperature for the viewfinder's WB control.
         self.colour_temperature_k = None if kelvin is None else int(kelvin)
 
     def close(self) -> None:

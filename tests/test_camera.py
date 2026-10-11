@@ -67,11 +67,11 @@ def test_fake_camera_raw_mode_returns_bytes_that_decode_to_the_frame():
     assert np.array_equal(frame.rgb, decoded), "rgb must be the decode of the same buffer"
 
 
-def test_fake_camera_records_ev_and_returns_metadata():
+def test_fake_camera_has_a_constant_zero_ev_and_returns_metadata():
+    """Exposure compensation is gone; ``ev`` stays so records keep ``ev_comp: 0.0``."""
     camera = FakeCamera([synthetic_frame(8, 8)], metadata={"Lux": 100.0})
     assert camera.ev == 0.0
-    camera.set_ev(-0.5)
-    assert camera.ev == -0.5
+    assert not hasattr(camera, "set_ev")
     assert camera.read(full=False).metadata == {"Lux": 100.0}
 
 

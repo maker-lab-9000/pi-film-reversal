@@ -715,8 +715,8 @@ def _reject_picamera2_only_flags(
     whether that is V4L2 (however it was chosen) or ``--fake``.
 
     Covers ``--tuning-file``, ``--autofocus``, ``--af-range``, ``--ae-lock``,
-    ``--awb-lock``, ``--colour-gains``, ``--ae-constraint``, ``--ae-metering``
-    and ``--ev``. ``--device`` (which itself selects V4L2) and ``--no-dng``
+    ``--awb-lock``, ``--colour-gains``, ``--white-balance``, ``--ae-constraint``
+    and ``--ae-metering``. ``--device`` (which itself selects V4L2) and ``--no-dng``
     (wired independently into ``CaptureSession`` and meaningful on any backend)
     are deliberately excluded, and so is ``--display``: it is a warning rather
     than an error (see ``_drop_display_on_v4l2``), and it runs against
@@ -733,7 +733,6 @@ def _reject_picamera2_only_flags(
         ("--white-balance", args.white_balance is not None),
         ("--ae-constraint", args.ae_constraint is not None),
         ("--ae-metering", args.ae_metering is not None),
-        ("--ev", args.ev is not None),
     ]
     offenders = [name for name, given in picamera_only if given]
     if offenders:
@@ -931,7 +930,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Picamera2: start with the white balance fixed at K kelvin "
             f"({COLOUR_TEMPERATURE_RANGE_K[0]}-{COLOUR_TEMPERATURE_RANGE_K[1]}; higher is "
-            "warmer). The viewfinder's WB pill can change it or return to auto "
+            "warmer). The viewfinder's WB control can change it or return to auto "
             "(default: auto)"
         ),
     )
@@ -945,10 +944,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ae-metering", choices=("centre", "spot", "matrix"), default=None,
         help="Picamera2 AE metering (default: centre-weighted)",
-    )
-    parser.add_argument(
-        "--ev", type=float, default=None, metavar="STOPS",
-        help="Picamera2 exposure compensation in stops, -8 to 8 (default: 0)",
     )
     parser.add_argument(
         "--no-dng", action="store_true", help="disable the Picamera2 DNG sidecar output",
@@ -1072,7 +1067,6 @@ def main(argv: list[str] | None = None) -> int:
                     colour_temperature=args.white_balance,
                     ae_constraint=args.ae_constraint or "normal",
                     ae_metering=args.ae_metering or "centre",
-                    ev=args.ev if args.ev is not None else 0.0,
                     preview=True if display_pair is not None else None,
                 )
             else:

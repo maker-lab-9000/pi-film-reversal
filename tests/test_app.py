@@ -176,11 +176,15 @@ def test_log_line_carries_full_provenance(tmp_path, pipeline):
     }
     assert line["shutter_to_saved_ms"] >= line["pipeline_ms"]
     assert isinstance(line["grain_seed"], int)
+    # Exposure compensation is gone, but the field stays (always zero) so old and
+    # new records read the same way.
+    assert line["ev_comp"] == 0.0
 
 
 def test_capture_grades_with_the_cameras_ev_compensation(tmp_path, pipeline):
-    """The viewfinder's EV buttons set the camera's EV; the grade must honour it
-    too, or normalisation undoes the darker exposure (found on the device)."""
+    """The session grades with whatever ``camera.ev`` says, or normalisation undoes
+    a darker exposure (found on the device with the viewfinder's old EV buttons).
+    The cameras now hold it at 0.0; the attribute is set here by hand."""
     from pifilm.color import luminance, srgb_to_linear
 
     def mean_linear(path):
@@ -195,7 +199,7 @@ def test_capture_grades_with_the_cameras_ev_compensation(tmp_path, pipeline):
     dark = np.clip(dark * 255.0 + 0.5, 0, 255).astype(np.uint8)
     zero = _session(tmp_path / "a", pipeline, FakeCamera([frame])).capture()
     cam = FakeCamera([dark])
-    cam.set_ev(-2.0)
+    cam.ev = -2.0
     minus = _session(tmp_path / "b", pipeline, cam).capture()
     assert minus.record["ev_comp"] == -2.0 and zero.record["ev_comp"] == 0.0
     stops = np.log2(mean_linear(minus.pifilm) / mean_linear(zero.pifilm))
@@ -851,9 +855,6 @@ class _CameraDouble:
         self.closed = False
         self.ev = 0.0
 
-    def set_ev(self, value):
-        self.ev = value
-
     def close(self):
         self.closed = True
 
@@ -1008,7 +1009,6 @@ def test_device_without_camera_choice_selects_v4l2(camera_cli, monkeypatch):
         (["--camera", "v4l2", "--colour-gains", "1.0,1.0"], "--colour-gains"),
         (["--camera", "v4l2", "--ae-constraint", "highlight"], "--ae-constraint"),
         (["--camera", "v4l2", "--ae-metering", "matrix"], "--ae-metering"),
-        (["--camera", "v4l2", "--ev", "-0.5"], "--ev"),
     ],
 )
 def test_camera_specific_options_reject_conflicting_backend(args, message, capsys):
@@ -1040,7 +1040,6 @@ def test_no_dng_is_accepted_with_explicit_v4l2(camera_cli, monkeypatch):
         ["--tuning-file", "sensor.json"],
         ["--ae-constraint", "highlight"],
         ["--ae-metering", "spot"],
-        ["--ev", "0.3"],
     ],
 )
 def test_implicit_v4l2_via_device_rejects_picamera2_only_flags(camera_cli, flag_args):
@@ -1155,12 +1154,12 @@ def test_ae_shaping_flags_reach_the_picamera2_backend(camera_cli, monkeypatch):
 
     assert camera_cli.main([
         "--camera", "picamera2", "--no-preview",
-        "--ae-constraint", "highlight", "--ae-metering", "matrix", "--ev", "-0.5",
+        "--ae-constraint", "highlight", "--ae-metering", "matrix",
     ]) == 0
 
     assert backend_kwargs["ae_constraint"] == "highlight"
     assert backend_kwargs["ae_metering"] == "matrix"
-    assert backend_kwargs["ev"] == -0.5
+    assert "ev" not in backend_kwargs
 
 
 def test_default_flags_leave_ae_shaping_at_libcamera_defaults(camera_cli, monkeypatch):
@@ -1176,7 +1175,25 @@ def test_default_flags_leave_ae_shaping_at_libcamera_defaults(camera_cli, monkey
 
     assert backend_kwargs["ae_constraint"] == "normal"
     assert backend_kwargs["ae_metering"] == "centre"
-    assert backend_kwargs["ev"] == 0.0
+    assert "ev" not in backend_kwargs
+
+
+@pytest.mark.parametrize("argv", [
+    ["--fake", "--no-preview", "--ev", "1"],
+    ["--camera", "picamera2", "--no-preview", "--ev", "1"],
+    ["--camera", "picamera2", "--no-preview", "--ev=-0.5"],
+])
+def test_the_ev_flag_is_gone(camera_cli, monkeypatch, capsys, argv):
+    """Exposure compensation was removed with the viewfinder's EV buttons."""
+    monkeypatch.setattr(
+        camera_cli, "Picamera2Camera",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("opened a camera")),
+        raising=False,
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        camera_cli.main(argv)
+    assert exc_info.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
 
 
 def test_default_flags_leave_ae_and_awb_auto_with_continuous_af(camera_cli, monkeypatch):

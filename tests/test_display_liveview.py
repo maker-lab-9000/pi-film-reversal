@@ -47,7 +47,7 @@ FRAME_GREY = (128, 128, 128)
 
 
 def _reading(**over):
-    base = dict(shutter="1/250", iso=100, ev_comp=0.0, lux=12.0, deviation_ev=0.0,
+    base = dict(shutter="1/250", iso=100, lux=12.0, deviation_ev=0.0,
                 clip_pct=0.0, battery_percent=88, external_power=True)
     base.update(over)
     return MeterReading(**base)

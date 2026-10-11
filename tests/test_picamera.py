@@ -241,7 +241,7 @@ def install_picamera(monkeypatch):
                 self.created_config = kwargs
                 # Picamera2 puts the requested controls into the returned
                 # configuration, and applies them again on every configure();
-                # set_ev mutates that entry, so the fake must expose it.
+                # the control setters mutate that entry, so the fake must expose it.
                 controls = kwargs.get("controls", {})
                 if frame_limits is not None:
                     # Picamera2 merges its default frame limits into every configuration.
@@ -869,14 +869,26 @@ def test_default_leaves_ae_and_awb_auto(install_picamera):
     camera.close()
 
 
-def test_ae_constraint_metering_and_ev_reach_the_controls(install_picamera):
+def test_ae_constraint_and_metering_reach_the_controls_beside_a_zero_ev(install_picamera):
+    """Exposure compensation is gone, but ``ExposureValue: 0.0`` is still sent so
+    every capture records the same control set as before."""
     state = install_picamera()
-    camera = Picamera2Camera(ae_constraint="highlight", ae_metering="matrix", ev=-0.5)
+    camera = Picamera2Camera(ae_constraint="highlight", ae_metering="matrix")
 
     controls = state.instance.set_controls_calls[-1]
     assert controls["AeConstraintMode"] == _AeConstraintModeEnum.Highlight
     assert controls["AeMeteringMode"] == _AeMeteringModeEnum.Matrix
-    assert controls["ExposureValue"] == -0.5
+    assert controls["ExposureValue"] == 0.0
+    assert camera.ev == 0.0
+    camera.close()
+
+
+def test_exposure_compensation_is_gone_from_the_camera(install_picamera):
+    install_picamera()
+    with pytest.raises(TypeError):
+        Picamera2Camera(ev=-0.5)
+    camera = Picamera2Camera()
+    assert not hasattr(camera, "set_ev")
     camera.close()
 
 
@@ -913,8 +925,6 @@ def test_default_ae_settings_warn_nothing_on_older_libcamera(install_picamera, c
     [
         ({"ae_constraint": "bright"}, "ae_constraint"),
         ({"ae_metering": "average"}, "ae_metering"),
-        ({"ev": 9.0}, "ev"),
-        ({"ev": -8.5}, "ev"),
     ],
 )
 def test_invalid_ae_settings_raise_camera_error(install_picamera, kwargs, match):
@@ -1300,16 +1310,6 @@ def test_neutral_controls_travel_with_both_configurations(install_picamera):
     camera.close()
 
 
-def test_set_ev_updates_both_configurations(install_picamera):
-    state = install_picamera()
-    camera = Picamera2Camera(preview=True)
-    camera.set_ev(0.5)
-    inst = state.instance
-    assert inst.created_config["controls"]["ExposureValue"] == pytest.approx(0.5)
-    assert inst.preview_config["controls"]["ExposureValue"] == pytest.approx(0.5)
-    camera.close()
-
-
 def test_without_preview_the_configuration_calls_are_unchanged(install_picamera):
     state = install_picamera()
     camera = Picamera2Camera()
@@ -1335,17 +1335,6 @@ def test_preview_read_uses_the_preview_stream_and_full_read_switches_mode(instal
     full = camera.read(full=True)
     assert full.rgb.shape == (NATIVE_SIZE[1], NATIVE_SIZE[0], 3)
     assert len(inst.switch_calls) == 1 and inst.switch_calls[0]["created"] is inst.created_config
-    camera.close()
-
-
-def test_set_ev_applies_exposure_value_at_runtime(install_picamera):
-    state = install_picamera()
-    camera = Picamera2Camera()
-    camera.set_ev(1.0 / 3)
-    assert state.instance.set_controls_calls[-1] == {"ExposureValue": pytest.approx(1 / 3)}
-    assert camera.ev == pytest.approx(1 / 3)
-    with pytest.raises(CameraError):
-        camera.set_ev(9.0)
     camera.close()
 
 
