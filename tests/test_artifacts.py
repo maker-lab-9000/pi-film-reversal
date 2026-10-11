@@ -27,7 +27,8 @@ def staged(tmp_path):
 
 def test_write_then_load(staged):
     data = json.loads((staged / "params.json").read_text())
-    assert data["version"] == PARAMS_VERSION
+    # Gaussian grain keeps version 2, so a Pi on older code still reads it.
+    assert data["version"] == 2
     assert data["lut_sha1"] == sha1_hex(LUT3D.identity(9))
     art = Artifacts.load(staged)
     assert art.lut.size == 9
@@ -119,7 +120,7 @@ def test_lut_file_is_validated(tmp_path, lut_file, message):
         Artifacts.load(tmp_path)
 
 
-@pytest.mark.parametrize("version", [True, 0, -1, 3])
+@pytest.mark.parametrize("version", [True, 0, -1, PARAMS_VERSION + 1])
 def test_bad_version_values_are_refused(tmp_path, version):
     """`True` is an int subclass, so isinstance would have let it through."""
     (tmp_path / "params.json").write_text(json.dumps({"version": version}))
@@ -264,3 +265,23 @@ def test_committed_default_is_loadable(repo_root):
     art = Artifacts.load(repo_root / "pifilm" / "data")
     assert art.lut.size in (2, 9, 33)
     assert np.isfinite(art.lut.table).all()
+
+
+def test_two_scale_grain_writes_version_3_and_loads(tmp_path):
+    """Older builds read grain they do not know as the Gaussian model, six times too
+    strong; version 3 makes them refuse the artifact instead."""
+    grain = GrainParams(model="two_scale", strength=0.025)
+    write_artifact(tmp_path / "a", LUT3D.identity(9), NormalizeParams(), grain)
+    assert json.loads((tmp_path / "a" / "params.json").read_text())["version"] == 3
+    assert Artifacts.load(tmp_path / "a").grain == grain
+
+
+def test_two_scale_grain_in_a_version_2_file_is_refused(tmp_path):
+    write_artifact(tmp_path / "a", LUT3D.identity(9), NormalizeParams(),
+                   GrainParams(model="two_scale"))
+    p = tmp_path / "a" / "params.json"
+    data = json.loads(p.read_text())
+    data["version"] = 2
+    p.write_text(json.dumps(data))
+    with pytest.raises(ArtifactsError, match="version 3"):
+        Artifacts.load(tmp_path / "a")
