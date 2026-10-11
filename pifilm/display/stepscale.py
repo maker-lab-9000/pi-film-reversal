@@ -14,6 +14,11 @@ From a step, ``up`` moves to the smallest step strictly greater than the current
 value, and stays on the top step when there is none. ``down`` moves to the largest
 step strictly less, and returns ``None`` (back to auto) when there is none. A value
 between steps moves to the next step in that direction, never skipping one.
+
+A current value above the top step is possible (``--white-balance 9000`` starts
+past the white-balance scale). ``up`` then leaves it where it is, as a whole
+number: moving it to the top step would be a step down from a key that means up.
+``down`` brings it onto the top step.
 """
 
 from __future__ import annotations
@@ -51,7 +56,7 @@ def up(steps: Sequence[int], current: float | None, metered: float | None,
     for step in steps:
         if step > current:
             return step
-    return steps[-1]
+    return max(steps[-1], int(current))
 
 
 def down(steps: Sequence[int], current: float | None, metered: float | None,

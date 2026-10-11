@@ -20,9 +20,9 @@ only when the camera advertises them, the recorded ``autofocus`` becomes ``"none
 and asking for a non-default ``autofocus``/``af_range`` on such a sensor is an
 error rather than a silently ignored request.
 
-Auto-exposure shaping (constraint mode, metering mode, exposure compensation) is
-exposed as constructor arguments whose defaults are libcamera's own defaults, so
-an unflagged capture behaves exactly as it did before they existed.
+Auto-exposure shaping (constraint mode, metering mode) is exposed as constructor
+arguments whose defaults are libcamera's own defaults, so an unflagged capture
+behaves exactly as it did before they existed.
 
 ``preview`` adds the LCD viewfinder's second, cheap stream. The still
 configuration is created, applied and validated *first*, before the preview
@@ -187,6 +187,11 @@ class Picamera2Camera:
         # libcamera has no settable ColourTemperature.
         self.wb_adjustable = not awb_lock and colour_gains is None
         self._wb_refusal = "white balance is fixed by --awb-lock or --colour-gains"
+        # False under --ae-lock: with auto-exposure off there is nothing for a
+        # fixed shutter or ISO to work against, and stepping one out and back to
+        # auto would leave ``AeEnable: False`` beside a mode set to Auto in the
+        # configurations. ``set_shutter`` and ``set_iso`` then refuse.
+        self.exposure_adjustable = not ae_lock
         self._preview: tuple[int, int] | None = None
         self.preview_size: tuple[int, int] | None = None
         # Exposure compensation is gone, but the attribute stays: ``CaptureSession``
@@ -466,8 +471,10 @@ class Picamera2Camera:
         the camera would be undone by the next shot. A long shutter also widens
         the frame-duration limit, which is why the live view slows at long
         shutters, and ``None`` restores the limits each configuration was built
-        with. Nothing changes if the camera rejects the
-        controls. ``us`` must be ``None`` or a whole number of microseconds: an
+        with. Nothing changes if the camera rejects the controls or they cannot
+        be built. Under ``--ae-lock`` (``exposure_adjustable`` False) every call
+        is refused, ``None`` included, as ``set_colour_temperature`` refuses
+        under a fixed white balance. ``us`` must be ``None`` or a whole number of microseconds: an
         integral float such as ``4000.0`` is accepted as ``4000``, while a bool,
         a string or a fractional number is a ``CameraError``.
         """
@@ -478,15 +485,24 @@ class Picamera2Camera:
         camera = self._camera
         if camera is None:
             raise CameraError("Cannot set the shutter on a closed Picamera2 camera")
+        if not self.exposure_adjustable:
+            raise CameraError("Cannot set the shutter: auto-exposure is locked by --ae-lock")
         running = "preview" if self._preview_config is not None else "still"
         with self._request_lock:
             try:
-                camera.set_controls(self._shutter_controls(us, self._frame_limits[running]))
+                # Built inside the try, every one of them before anything is
+                # sent: the mode enum is looked up lazily, and a lookup that
+                # fails must be a CameraError with nothing changed.
+                per_config = {
+                    key: self._shutter_controls(us, self._frame_limits[key])
+                    for key in ("still", "preview")
+                }
+                camera.set_controls(per_config[running])
             except Exception as exc:
                 raise CameraError(f"Picamera2 failed to set the shutter: {exc}") from exc
             for key, config in (("still", self._still_config),
                                 ("preview", self._preview_config)):
-                for name, value in self._shutter_controls(us, self._frame_limits[key]).items():
+                for name, value in per_config[key].items():
                     _set_config_control(config, name, value)
                 if us is None and self._shutter_mode == "mode":
                     # Auto sends no ExposureTime, but the one a fixed shutter
@@ -503,7 +519,8 @@ class Picamera2Camera:
         automatic, and both can be fixed at once (full manual). Like
         ``set_shutter``, the controls go to the running camera and into both
         configurations, because every configure reapplies a configuration's own
-        controls. Nothing changes if the camera rejects the controls. ``iso`` must
+        controls. Nothing changes if the camera rejects the controls or they
+        cannot be built, and under ``--ae-lock`` every call is refused. ``iso`` must
         be ``None`` or a whole number inside ``ISO_RANGE`` whose gain the sensor
         can reach: an integral float such as ``400.0`` is accepted as ``400``,
         while a bool, a string or a fractional number is a ``CameraError``.
@@ -518,9 +535,13 @@ class Picamera2Camera:
         camera = self._camera
         if camera is None:
             raise CameraError("Cannot set the ISO on a closed Picamera2 camera")
-        controls = self._iso_controls(iso)
+        if not self.exposure_adjustable:
+            raise CameraError("Cannot set the ISO: auto-exposure is locked by --ae-lock")
         with self._request_lock:
             try:
+                # Built inside the try, like the shutter's: the mode enum is
+                # looked up lazily and a failure there must be a CameraError.
+                controls = self._iso_controls(iso)
                 camera.set_controls(controls)
             except Exception as exc:
                 raise CameraError(f"Picamera2 failed to set the ISO: {exc}") from exc

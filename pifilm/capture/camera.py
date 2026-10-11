@@ -155,6 +155,7 @@ class FakeCamera:
         self.colour_temperature_k: int | None = None
         self.iso: int | None = None
         self.wb_adjustable = True
+        self.exposure_adjustable = True
         self.max_gain: float | None = None
         if jpeg_bytes is not None:
             decoded = [

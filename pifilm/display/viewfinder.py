@@ -61,7 +61,16 @@ from ..capture.errors import CameraError, CameraStalled
 from ..imageio import load_rgb
 from . import DisplayError, iso, shutter, stepscale, whitebalance
 from .idle import IdleDimmer, Screen
-from .liveview import DASH, SELECT_ACTIONS, Action, Cell, LiveState, hit, render_live
+from .liveview import (
+    DASH,
+    PRESS_KEYS,
+    SELECT_ACTIONS,
+    Action,
+    Cell,
+    LiveState,
+    hit,
+    render_live,
+)
 from .meter import FocusTracker, MeterReading, compute_reading, focus_score
 from .touch import Tap, TapDetector
 from .ui import iso_label, render_message, render_processing, render_review, text_or_dash
@@ -69,9 +78,6 @@ from .ui import iso_label, render_message, render_processing, render_review, tex
 RATE_LOG_INTERVAL = 10.0
 # How long a tapped key stays lit after the finger is up.
 PRESS_FLASH_SECONDS = 0.15
-# The keys that light under a finger. The cells and the 2x toggle show a tap by
-# changing state instead.
-PRESS_KEYS = (Action.PLUS, Action.MINUS, Action.SHUTTER)
 # The longest press that still counts as a tap. The detector's own default is
 # 0.6 s, which was right when nothing showed a press; now the keys light under
 # the finger, which invites a longer, more deliberate press, and a key that lit
@@ -122,13 +128,16 @@ class ViewfinderLoop:
         self._tap_queue: queue.Queue[Tap] | None = None
         self.state = "LIVE"
         # Which of the three controls this camera can change, by cell. A fixed
-        # shutter or ISO needs a backend with the setter (Picamera2, the fake).
-        # Manual white balance also needs one that has not had its white balance
-        # fixed from the command line already, and whose libcamera has a settable
-        # ColourTemperature (both reported as ``wb_adjustable``).
+        # shutter or ISO needs a backend with the setter (Picamera2, the fake)
+        # whose auto-exposure was not locked from the command line
+        # (``exposure_adjustable``, False under --ae-lock). Manual white balance
+        # likewise needs one that has not had its white balance fixed already,
+        # and whose libcamera has a settable ColourTemperature (both reported as
+        # ``wb_adjustable``).
+        exposure_ok = getattr(camera, "exposure_adjustable", True) is not False
         self._available = (
-            callable(getattr(camera, "set_shutter", None)),
-            callable(getattr(camera, "set_iso", None)),
+            exposure_ok and callable(getattr(camera, "set_shutter", None)),
+            exposure_ok and callable(getattr(camera, "set_iso", None)),
             callable(getattr(camera, "set_colour_temperature", None))
             and getattr(camera, "wb_adjustable", True) is not False,
         )
@@ -208,6 +217,12 @@ class ViewfinderLoop:
             else:
                 self._touch_suppressed += 1
             points = []
+        except Exception:
+            # Anything else is the caller's to report (the touch thread logs it
+            # and carries on), but the finger last seen is no longer known to
+            # be there: forget it, or its key stays lit while the fault lasts.
+            self._finger = None
+            raise
         # Recorded on every poll, an empty one included, so a key never stays
         # lit after the finger has left or the panel has stopped answering.
         self._finger = (points[0].x, points[0].y) if points else None
@@ -301,8 +316,12 @@ class ViewfinderLoop:
             value = step(getattr(camera, "shutter_us", None), metered)
             setter = camera.set_shutter
         elif cell == ISO_CELL:
+            # Steps the sensor's gain cannot reach are left off the scale, so
+            # the first step from auto never lands on one the camera refuses.
+            max_gain = getattr(camera, "max_gain", None)
+            max_iso = max_gain * 100 if stepscale.is_usable(max_gain) else None
             step = iso.higher if up else iso.lower
-            value = step(getattr(camera, "iso", None), metered)
+            value = step(getattr(camera, "iso", None), metered, max_iso)
             setter = camera.set_iso
         else:
             step = whitebalance.warmer if up else whitebalance.cooler
@@ -318,6 +337,9 @@ class ViewfinderLoop:
 
         A fixed control shows the value the camera holds; an automatic one shows
         what this frame was metered at, or a dash when the frame does not say.
+        A control the camera cannot change shows the metered value too, but
+        without the ``AUTO`` tag: under --ae-lock, --awb-lock or --colour-gains
+        it is fixed, only not by this screen.
         Automatic ISO reads ``MAX`` when the gain has nowhere left to go, which
         is the warning that a fixed shutter this fast will underexpose.
         """
@@ -343,9 +365,9 @@ class ViewfinderLoop:
             wb_text = DASH
         shutter_ok, iso_ok, wb_ok = self._available
         return (
-            Cell("SHUTTER", shutter_text, auto=us is None, enabled=shutter_ok),
-            Cell("ISO", iso_text, auto=fixed_iso is None, enabled=iso_ok),
-            Cell("WB", wb_text, auto=kelvin is None, enabled=wb_ok),
+            Cell("SHUTTER", shutter_text, auto=shutter_ok and us is None, enabled=shutter_ok),
+            Cell("ISO", iso_text, auto=iso_ok and fixed_iso is None, enabled=iso_ok),
+            Cell("WB", wb_text, auto=wb_ok and kelvin is None, enabled=wb_ok),
         )
 
     def _pressed(self, now: float) -> Action | None:
@@ -508,9 +530,10 @@ class ViewfinderLoop:
         # the tracker only remembers the best of the last few seconds for the mark.
         level = focus_score(frame.rgb)
         peak = self._focus.update(level, self._clock.monotonic())
+        max_gain = getattr(self._camera, "max_gain", None)
         reading = compute_reading(
             frame.metadata, frame.rgb, power, focus=level, focus_peak=peak,
-            max_gain=getattr(self._camera, "max_gain", None),
+            max_gain=max_gain if stepscale.is_usable(max_gain) else None,
         )
         metadata = frame.metadata or {}
         metered_k = metadata.get("ColourTemperature")

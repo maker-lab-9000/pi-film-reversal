@@ -1628,6 +1628,66 @@ def test_a_rejected_iso_changes_nothing(install_picamera):
     camera.close()
 
 
+@pytest.mark.parametrize(("setter", "value", "enum", "attr", "kwargs"), [
+    ("set_iso", 400, "AnalogueGainModeEnum", "iso", {"with_analogue_gain_mode": True}),
+    ("set_shutter", 4000, "ExposureTimeModeEnum", "shutter_us",
+     {"with_exposure_time_mode": True}),
+])
+def test_a_failure_building_the_controls_is_a_camera_error_and_changes_nothing(
+    install_picamera, setter, value, enum, attr, kwargs,
+):
+    """The mode enums are looked up lazily on every call. A lookup that fails must
+    not escape as an AttributeError: the viewfinder loop only survives CameraError."""
+    import sys
+
+    state = install_picamera(**kwargs)
+    camera = Picamera2Camera(preview=True)
+    before = dict(state.instance.preview_config["controls"])
+    still_before = dict(state.instance.created_config["controls"])
+    sent = len(state.instance.set_controls_calls)
+    delattr(sys.modules["libcamera"].controls, enum)
+    with pytest.raises(CameraError, match="Picamera2 failed to set the"):
+        getattr(camera, setter)(value)
+    assert getattr(camera, attr) is None
+    assert len(state.instance.set_controls_calls) == sent
+    assert state.instance.preview_config["controls"] == before
+    assert state.instance.created_config["controls"] == still_before
+    camera.close()
+
+
+def test_exposure_is_adjustable_unless_ae_lock_was_given(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera()
+    assert camera.exposure_adjustable is True
+    camera.close()
+    locked = Picamera2Camera(ae_lock=True)
+    assert locked.exposure_adjustable is False
+    locked.close()
+
+
+@pytest.mark.parametrize(("setter", "value"), [
+    ("set_shutter", 4000), ("set_shutter", None), ("set_iso", 400), ("set_iso", None),
+])
+def test_ae_lock_refuses_a_fixed_shutter_or_iso_and_changes_nothing(
+    install_picamera, setter, value,
+):
+    """With auto-exposure off there is nothing for a fixed shutter or ISO to work
+    against, and stepping out and back would leave ``AeEnable: False`` beside a
+    mode set to Auto in the configurations."""
+    state = install_picamera(with_exposure_time_mode=True, with_analogue_gain_mode=True)
+    camera = Picamera2Camera(ae_lock=True, preview=True)
+    before = dict(state.instance.preview_config["controls"])
+    still_before = dict(state.instance.created_config["controls"])
+    sent = len(state.instance.set_controls_calls)
+    with pytest.raises(CameraError, match="--ae-lock"):
+        getattr(camera, setter)(value)
+    assert camera.shutter_us is None and camera.iso is None
+    assert len(state.instance.set_controls_calls) == sent
+    assert state.instance.preview_config["controls"] == before
+    assert state.instance.created_config["controls"] == still_before
+    camera.close()
+
+
 def test_iso_on_a_closed_camera_is_an_error(install_picamera):
     install_picamera()
     camera = Picamera2Camera()

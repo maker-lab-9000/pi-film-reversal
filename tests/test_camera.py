@@ -75,6 +75,10 @@ def test_fake_camera_has_a_constant_zero_ev_and_returns_metadata():
     assert camera.read(full=False).metadata == {"Lux": 100.0}
 
 
+def test_fake_camera_has_adjustable_exposure_like_an_unlocked_picamera():
+    assert FakeCamera([synthetic_frame(8, 8)]).exposure_adjustable is True
+
+
 def test_fake_camera_cycles_and_copies():
     frames = [np.zeros((4, 4, 3), np.uint8), np.ones((4, 4, 3), np.uint8)]
     cam = FakeCamera(frames)

@@ -46,3 +46,9 @@ def test_labels_are_ascii_and_short():
 def test_a_meaningless_current_value_counts_as_auto(bad):
     assert warmer(bad, 4249) == 4000
     assert cooler(bad, None) == DEFAULT_START_K
+
+
+def test_a_start_value_above_the_scale_stays_until_stepped_down():
+    """``--white-balance 9000`` is allowed; + must not cool it to 7500."""
+    assert warmer(9000, 5000) == 9000
+    assert cooler(9000, 5000) == 7500

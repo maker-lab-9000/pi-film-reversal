@@ -910,7 +910,8 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Picamera2: disable auto-exposure at whatever value it holds right "
             "before capture starts (not a converged/settled value); for controlled "
-            "shoots (default: auto)"
+            "shoots. The viewfinder's SHUTTER and ISO controls are then greyed out "
+            "(default: auto)"
         ),
     )
     parser.add_argument(

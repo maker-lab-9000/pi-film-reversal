@@ -134,7 +134,9 @@ class Action(Enum):
 
 
 SELECT_ACTIONS = (Action.SELECT_SHUTTER, Action.SELECT_ISO, Action.SELECT_WB)  # index = cell
-_PRESSABLE = (Action.PLUS, Action.MINUS, Action.SHUTTER)
+# The keys that light under a finger (``LiveState.pressed``). The cells and the 2x
+# toggle show a tap by changing state instead. The viewfinder loop imports this.
+PRESS_KEYS = (Action.PLUS, Action.MINUS, Action.SHUTTER)
 
 
 @dataclass(frozen=True)
@@ -474,7 +476,7 @@ def render_live(
     dot, origin = _lit_dot_tile(_lit_dot(reading.deviation_ev), scale)
     paste(dot, *origin)
 
-    pressed = state.pressed if state.pressed in _PRESSABLE else None
+    pressed = state.pressed if state.pressed in PRESS_KEYS else None
     paste(_controls_tile(pressed, scale), *_CONTROLS_BOX[:2])
     battery = None
     if reading.battery_percent is not None:

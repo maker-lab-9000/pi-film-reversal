@@ -174,7 +174,7 @@ message screens keep the default font.
 | `2x` toggle (outlined tag, top left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
 | Battery tag (outlined, top left, right of `2x`) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
-| Review screen | Full-screen graded result, one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint | Any tap, or 30 s untouched, returns to live view |
+| Review screen | Full-screen graded result, one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
 Press feedback: `+`, `-` and the shutter button light while a finger is on them, not
 only on release, and a tap shorter than one frame still lights its key for 0.15 s.
@@ -205,10 +205,13 @@ Any capture counts as activity: while one is being graded the screen stays
 lit, and a finished shot, from the LCD or the Stick, wakes it into the review.
 `0` disables either step. `--display fake` has no backlight and is never dimmed.
 
-A tap that lands during the roughly one second of still acquisition is
-**dropped, not queued**: the camera lock is held for the whole capture request,
-so the loop is not polling touch at all during it, and the controller is busy
-anyway (it runs one job at a time). Wait for the colour bars to clear.
+Touch is polled on its own thread, about 50 times a second, and finished taps are
+queued, so a tap is never missed because the screen was busy. It is acted on at the
+loop's next frame. During the roughly one second of still acquisition the loop waits
+for the camera, so a tap made then is handled when the colour bars appear: a shutter
+tap is answered busy by the controller (it runs one job at a time) and takes no
+second photo, and taps on the cells, `+`/`-` and `2x` are ignored as described above.
+Wait for the colour bars to clear.
 
 ### Double exposure
 
@@ -231,7 +234,9 @@ is `HHMMSS_double_graded.jpg`, named after exposure 2. Its `captures.jsonl` line
 values (always 0 since the EV buttons were removed on 2026-10-11) and the method
 (`linear_mean`). Do not under-expose both frames as you would on film: the one-stop
 reduction is already applied, and normalisation cancels an offset common to both. To
-make one frame recede, fix a faster shutter or a lower ISO for it. A tap ends
+make one frame recede, fix both the shutter and the ISO (full manual), then step one
+of them down for that frame: a faster shutter or a lower ISO. Fixing only one does
+nothing, because auto-exposure compensates with the other. A tap ends
 the `Exposure 1/2` notice early. The mode is not remembered across restarts. A camera
 error on exposure 2 keeps `1/2`, so just shoot again. See [how it works](how-it-works.md#double-exposure)
 for why the frames are added before grading.
@@ -245,7 +250,7 @@ is selected, and only that one.
 | Control | Steps | `+` | `-` |
 | --- | --- | --- | --- |
 | `SHUTTER` | 1/3-stop steps, 1/2000 s to 1 s (`pifilm/display/shutter.py`) | Faster | Slower; slower than 1 s returns to auto |
-| `ISO` | 100, 200, 400, 800, 1600 (`iso.py`) | Higher; stays on 1600 | Lower; below 100 returns to auto |
+| `ISO` | 100, 200, 400, 800, 1600 (`iso.py`), less any step above the sensor's gain limit | Higher; stays on the top step | Lower; below 100 returns to auto |
 | `WB` | 3200, 4000, 5000, 5600, 6500, 7500 K (`whitebalance.py`) | Warmer (a higher number); stays on 7500 | Cooler; below 3200 returns to auto |
 
 - **Auto and the first step.** Every control starts automatic and resets to automatic
@@ -260,15 +265,24 @@ is selected, and only that one.
   or more), the `ISO` cell reads `MAX`. On a fixed shutter that means the speed is too
   fast for the light and the photo will be dark: pick a slower speed or add light. It
   can also appear on pure auto in very dim light.
+- **The sensor's gain limit.** ISO is analogue gain × 100, and the camera refuses a
+  gain above the sensor's maximum. Steps above that limit are not offered: the scale
+  ends lower, and the first step from auto lands on the nearest step the sensor can
+  reach. The IMX477 (maximum gain 22.26) reaches all five.
 - **Unavailable controls.** A cell is drawn grey and cannot be selected when the camera
-  has no setter for it, when white balance was already fixed with `--awb-lock` or
-  `--colour-gains`, or on a libcamera without a settable `ColourTemperature`. At
-  start-up the selection is `SHUTTER`, or the first cell that can be changed. If no
-  cell is selectable, `+` and `-` do nothing. This is decided once, at start-up.
+  has no setter for it; `SHUTTER` and `ISO` when auto-exposure was locked with
+  `--ae-lock`; `WB` when white balance was already fixed with `--awb-lock` or
+  `--colour-gains`, or on a libcamera without a settable `ColourTemperature`. A grey
+  cell still shows the metered value but no `AUTO` tag, because the control is fixed,
+  only not from this screen. At start-up the selection is `SHUTTER`, or the first cell
+  that can be changed. If no cell is selectable, `+` and `-` do nothing. This is
+  decided once, at start-up.
 - **`--white-balance K`** (2360 to 9000) starts the camera at a fixed value, for
   instance while a lens that fools auto is mounted. A restart returns to the flag's
   value, or to auto without the flag. It cannot be combined with `--awb-lock` or
-  `--colour-gains`. There is no `--iso` or shutter flag.
+  `--colour-gains`. There is no `--iso` or shutter flag. A start value above the top
+  step (8000 or 9000 K) stays where it is when `+` is pressed; `-` brings it onto
+  7500 K and the scale from there.
 - **Records.** Each photo's `captures.jsonl` line has `shutter_us`, `iso` and
   `colour_temperature_k`, each null on auto. The values the camera actually used are in
   `camera_metadata` (`ExposureTime`, `AnalogueGain`, `ColourGains`).
@@ -285,15 +299,16 @@ Shutter notes:
 
 - At long speeds the live view slows to match: at 1/4 s it shows about 4 frames a
   second. That is the exposure, not a fault.
-- At long speeds the screen also responds to taps only once per frame (about once
-  a second at 1 s), so hold a tap briefly rather than flicking it.
+- At long speeds a tap is still caught (touch has its own thread), but it is acted
+  on at the next frame, which at 1 s is up to a second later. There is no need to
+  hold the tap.
 - At start-up the journal names how each control is fixed:
   `picamera2: shutter priority via ExposureTimeMode` on current libcamera, or
   `... ExposureTime (legacy libcamera)` on older stacks; and on the next line
   `picamera2: ISO via AnalogueGainMode`, or `... AnalogueGain (legacy libcamera)`.
-- Do not combine a fixed shutter with `--ae-lock`: it is not meaningful there. On
-  legacy libcamera the lock freezes the gain too, and on libcamera 0.5 returning to
-  auto re-enables auto exposure time.
+- Under `--ae-lock` the `SHUTTER` and `ISO` cells are drawn grey and cannot be
+  selected: auto-exposure is off, so there is nothing for a fixed shutter or ISO to
+  work against. The camera refuses both controls in that mode.
 
 Measured on the Pi 4 with the IMX477 (libcamera 0.7.2, Picamera2 0.3.37) on 2026-10-11,
 preview configuration, dim room:
@@ -324,11 +339,11 @@ at 7500 K. A request below 2360 K is clamped to 2360 K and 9000 K is accepted as
 - **Dot at either end** — the exposure is 3 stops or more from mid-grey. On auto the
   camera has run out of range; in manual, change the shutter or ISO or expect the
   shot to be under/overexposed.
-- **`clip %`** — the fraction of pixels with any channel at or above 254; this
+- **`CLIP NN%`** — the fraction of pixels with any channel at or above 254; this
   is the same clipped-highlight number Phase 6's normalisation cares about
   ([docs/superpowers/plans/2026-09-13-rpi4-imx708-progress.md](superpowers/plans/2026-09-13-rpi4-imx708-progress.md)).
   Aim low outdoors, where clipping is easy to get.
-- **`lux`** — libcamera's own scene-brightness estimate from the sensor, not an
+- **`NNN LX`** — libcamera's own scene-brightness estimate from the sensor, not an
   independently measured value.
 
 ### Focusing by hand
@@ -344,7 +359,7 @@ subject in focus reads about as high as a bright one.
 - **A full bar means sharp; a short bar means soft**, with no need to have seen
   a sharp frame first. Far out of focus reads close to zero.
 - **The amber tick is the best level of the last few seconds.** Rack through
-  focus, then turn back until the green reaches the tick again.
+  focus, then turn back until the white fill reaches the tick again.
 - **The tick fades** (it halves in about three seconds), so it lets go of an
   old subject once the camera points elsewhere.
 - **At high ISO in a dim room the bar tops out lower**, typically two-thirds to
@@ -373,8 +388,8 @@ per spec §4:
 4. Stick shot while the LCD is live: appears on both; the LCD returns to live
    after 30 s untouched.
 5. (Removed 2026-10-11 with EV compensation.)
-6. Meter sanity: cover the lens → needle hard left, lux near 0; point at a
-   lamp → `clip %` rises.
+6. Meter sanity: cover the lens → the leftmost meter dot is lit, `LX` near 0; point
+   at a lamp → `CLIP` rises.
 7. Service: `systemctl restart pifilm-capture` with the LCD → live view at
    boot. Then provoke a fault that the *open* path can actually detect, and
    restart again: the journal must show one `warning: display unavailable (...)`

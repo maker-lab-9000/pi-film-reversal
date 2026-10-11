@@ -56,8 +56,11 @@ def test_from_between_steps_the_next_step_in_that_direction():
     assert down(STEPS, 250, None, 200) == 200
 
 
-def test_above_the_top_up_stays_and_down_lands_on_the_top():
-    assert up(STEPS, 900, None, 200) == 400
+def test_above_the_top_up_leaves_the_value_alone_and_down_lands_on_the_top():
+    """A start value past the scale (``--white-balance 9000``): + must not pull it
+    down to the top step, which would be a move in the wrong direction."""
+    assert up(STEPS, 900, None, 200) == 900
+    assert up(STEPS, 900.0, None, 200) == 900 and isinstance(up(STEPS, 900.0, None, 200), int)
     assert down(STEPS, 900, None, 200) == 400
 
 

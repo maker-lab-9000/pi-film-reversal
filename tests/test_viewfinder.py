@@ -1091,6 +1091,71 @@ def test_a_rejected_control_is_logged_not_fatal(metered, cell, setter):
     assert len(display.images) >= 2
 
 
+@pytest.mark.parametrize("cell", [SHUTTER_CELL, ISO_CELL])
+def test_locked_auto_exposure_greys_the_shutter_and_iso_cells(metered, monkeypatch, cell):
+    """``--ae-lock``: the camera reports ``exposure_adjustable = False``."""
+    camera, ctl = metered
+    states = _spy_states(monkeypatch)
+    camera.exposure_adjustable = False
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert loop.selected == WB_CELL
+    _tap(loop, touch, clock, _cell(cell))
+    assert loop.selected == WB_CELL
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert _values(camera) == (None, None, 4000)
+    assert [c.enabled for c in states[-1].cells] == [False, False, True]
+
+
+def test_a_cell_the_camera_cannot_change_shows_its_value_without_auto(metered, monkeypatch):
+    """Under ``--awb-lock`` the white balance is fixed, not automatic, and under
+    ``--ae-lock`` so is the exposure: the tag would be a lie. The value still reads."""
+    camera, ctl = metered
+    states = _spy_states(monkeypatch)
+    camera.exposure_adjustable = False
+    camera.wb_adjustable = False
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert loop.selected is None
+    assert states[-1].cells == (
+        Cell("SHUTTER", "1/250", auto=False, enabled=False),
+        Cell("ISO", "760", auto=False, enabled=False),
+        Cell("WB", "4200K", auto=False, enabled=False),
+    )
+
+
+def test_iso_steps_above_the_sensors_gain_limit_are_not_offered(tmp_path):
+    """Metered ISO 1250 is nearest 1600, which a sensor with gain 8 cannot reach:
+    the first step from auto must land on a value ``set_iso`` accepts."""
+    camera, ctl = _make_controller(
+        tmp_path, {"ExposureTime": 4000, "AnalogueGain": 12.5, "Lux": 500.0})
+    try:
+        camera.max_gain = 8.0
+        loop, touch, display, clock = _loop(camera, ctl)
+        loop.step()
+        _tap(loop, touch, clock, _cell(ISO_CELL))
+        _tap(loop, touch, clock, PLUS_CENTRE)
+        assert camera.iso == 800
+        _tap(loop, touch, clock, PLUS_CENTRE)
+        assert camera.iso == 800
+        _tap(loop, touch, clock, MINUS_CENTRE)
+        assert camera.iso == 400
+    finally:
+        ctl.close()
+
+
+@pytest.mark.parametrize("bad", [None, 0, float("nan"), "n/a"])
+def test_an_unknown_gain_limit_offers_every_iso_step(metered, bad):
+    camera, ctl = metered
+    camera.max_gain = bad
+    camera.set_iso(800)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _cell(ISO_CELL))
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert camera.iso == 1600
+
+
 def test_automatic_cells_show_the_metered_values(metered, monkeypatch):
     camera, ctl = metered
     states = _spy_states(monkeypatch)
@@ -1272,6 +1337,59 @@ def test_a_touch_error_lights_nothing(controller, monkeypatch):
     clock.t += TAP_MAX_HOLD + 0.5   # too long to be a tap, so no flash either
     loop.step()   # this read fails
     assert states[-1].pressed is None
+
+
+class BrokenTouch(ScriptedTouch):
+    """A touch device whose driver raises something that is not a DisplayError."""
+
+    def __init__(self):
+        super().__init__()
+        self.broken = False
+
+    def read(self):
+        if self.broken:
+            raise OSError("input device went away")
+        return super().read()
+
+
+def test_an_unexpected_touch_error_does_not_leave_a_key_lit(controller):
+    """The touch thread logs such an error and carries on; the finger it last saw
+    must not stay recorded, or the key under it is lit for as long as the fault lasts."""
+    camera, ctl = controller
+    touch = BrokenTouch()
+    touch.script = [[TouchPoint(*PLUS_CENTRE, 10)]]
+    loop, _, display, clock = _loop(camera, ctl, touch=touch)
+    assert loop._poll_tap() is None
+    assert loop._pressed(clock.monotonic()) is Action.PLUS
+    touch.broken = True
+    with pytest.raises(OSError):
+        loop._poll_tap()
+    assert loop._pressed(clock.monotonic()) is None
+
+
+def test_the_touch_thread_clears_a_lit_key_when_the_device_fails(controller, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    lines = []
+    touch = BrokenTouch()
+    touch.script = [[TouchPoint(*PLUS_CENTRE, 10)]] * 100_000
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=time, frame_period=0.02,
+                          log=lines.append)
+    stop = threading.Event()
+    runner = threading.Thread(target=loop.run, args=(stop,), daemon=True)
+    runner.start()
+    try:
+        _until(lambda: any(state.pressed is Action.PLUS for state in list(states)))
+        touch.broken = True
+        _until(lambda: "touch: input device went away" in lines)
+        drawn = len(states)
+        _until(lambda: len(states) >= drawn + 3)
+        assert all(state.pressed is None for state in list(states)[drawn + 1:])
+    finally:
+        stop.set()
+        runner.join(5.0)
+    assert not runner.is_alive()
+    assert camera.shutter_us is None
 
 
 # -- controls while a job is processing ----------------------------------------------
