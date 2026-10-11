@@ -1864,6 +1864,25 @@ def test_double_exposure_records_carry_the_white_balance_setting(tmp_path, pipel
     assert second.record["colour_temperature_k"] == 5600
 
 
+def test_record_carries_the_iso_setting(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    first = session.capture()
+    session.camera.set_iso(400)
+    second = session.capture()
+    assert first.record["iso"] is None
+    assert second.record["iso"] == 400
+
+
+def test_double_exposure_records_carry_the_iso_setting(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    session.set_double_exposure(True)
+    session.camera.set_iso(800)
+    first = session.capture()
+    second = session.capture()
+    assert first.record["iso"] == 800
+    assert second.record["iso"] == 800
+
+
 @pytest.mark.parametrize("argv", [
     ["--white-balance", "1000"], ["--white-balance", "12000"], ["--white-balance", "warm"],
     ["--white-balance", "6500", "--awb-lock"],

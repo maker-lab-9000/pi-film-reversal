@@ -129,8 +129,14 @@ class _ExposureTimeModeEnum:
     Manual = "exposure-time-manual"
 
 
+class _AnalogueGainModeEnum:
+    Auto = "analogue-gain-auto"
+    Manual = "analogue-gain-manual"
+
+
 def _fake_libcamera_module(
-    *, with_noise_reduction=True, with_ae_enums=True, with_exposure_time_mode=False
+    *, with_noise_reduction=True, with_ae_enums=True, with_exposure_time_mode=False,
+    with_analogue_gain_mode=False,
 ):
     controls_ns = SimpleNamespace(AfModeEnum=_AfModeEnum, AfRangeEnum=_AfRangeEnum)
     if with_noise_reduction:
@@ -140,6 +146,8 @@ def _fake_libcamera_module(
         controls_ns.AeMeteringModeEnum = _AeMeteringModeEnum
     if with_exposure_time_mode:
         controls_ns.ExposureTimeModeEnum = _ExposureTimeModeEnum
+    if with_analogue_gain_mode:
+        controls_ns.AnalogueGainModeEnum = _AnalogueGainModeEnum
     return SimpleNamespace(controls=controls_ns)
 
 
@@ -169,6 +177,7 @@ def install_picamera(monkeypatch):
         frame_limits=None,
         control_frame_limits=None,
         with_colour_temperature=True,
+        with_analogue_gain_mode=False,
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
 
@@ -193,6 +202,8 @@ def install_picamera(monkeypatch):
                     self.camera_controls["AfRange"] = (0, 2, 0)
                 if with_exposure_time_mode:
                     self.camera_controls["ExposureTimeMode"] = (0, 1, 0)
+                if with_analogue_gain_mode:
+                    self.camera_controls["AnalogueGainMode"] = (0, 1, 0)
                 if analogue_gain is not None:
                     self.camera_controls["AnalogueGain"] = analogue_gain
                 if with_colour_temperature:
@@ -322,6 +333,7 @@ def install_picamera(monkeypatch):
             with_noise_reduction=with_noise_reduction,
             with_ae_enums=with_ae_enums,
             with_exposure_time_mode=with_exposure_time_mode,
+            with_analogue_gain_mode=with_analogue_gain_mode,
         )
         monkeypatch.setitem(sys.modules, "libcamera", libcamera_module)
         return state
@@ -888,9 +900,10 @@ def test_default_ae_settings_warn_nothing_on_older_libcamera(install_picamera, c
     install_picamera(with_ae_enums=False)
     camera = Picamera2Camera()
 
-    # Only the start-up line naming the shutter-priority path; no AE warning.
+    # Only the start-up lines naming the shutter and ISO control paths; no AE warning.
     assert capsys.readouterr().err == (
         "picamera2: shutter priority via ExposureTime (legacy libcamera)\n"
+        "picamera2: ISO via AnalogueGain (legacy libcamera)\n"
     )
     camera.close()
 
@@ -1414,7 +1427,7 @@ def test_shutter_priority_falls_back_to_exposure_time_on_older_libcamera(
 ):
     state = install_picamera()
     camera = Picamera2Camera(preview=True)
-    assert "legacy" in capsys.readouterr().err
+    assert "shutter priority via ExposureTime (legacy" in capsys.readouterr().err
     camera.set_shutter(250_000)
     assert state.instance.set_controls_calls[-1]["ExposureTime"] == 250_000
     assert "ExposureTimeMode" not in state.instance.set_controls_calls[-1]
@@ -1519,6 +1532,120 @@ def test_a_rejected_shutter_changes_nothing(install_picamera):
     assert state.instance.preview_config["controls"] == before
     assert state.instance.created_config["controls"] == still_before
     camera.close()
+
+
+def test_fixed_iso_uses_analogue_gain_mode_when_available(install_picamera, capsys):
+    state = install_picamera(with_analogue_gain_mode=True)
+    camera = Picamera2Camera(preview=True)
+    assert "AnalogueGainMode" in capsys.readouterr().err
+    assert camera.iso is None
+    camera.set_iso(400)
+    live = state.instance.set_controls_calls[-1]
+    assert live == {"AnalogueGainMode": _AnalogueGainModeEnum.Manual, "AnalogueGain": 4.0}
+    for config in (state.instance.created_config, state.instance.preview_config):
+        assert config["controls"]["AnalogueGainMode"] == _AnalogueGainModeEnum.Manual
+        assert config["controls"]["AnalogueGain"] == 4.0
+    assert camera.iso == 400
+    camera.set_iso(None)
+    assert state.instance.set_controls_calls[-1] == {
+        "AnalogueGainMode": _AnalogueGainModeEnum.Auto
+    }
+    assert camera.iso is None
+    camera.close()
+
+
+def test_returning_to_auto_iso_drops_the_stale_gain_from_both_configurations(
+    install_picamera,
+):
+    """The same hazard as a stale ``ExposureTime``: every configure would send the
+    old ``AnalogueGain`` again beside ``AnalogueGainMode=Auto``."""
+    state = install_picamera(with_analogue_gain_mode=True)
+    camera = Picamera2Camera(preview=True)
+    camera.set_iso(800)
+    camera.set_iso(None)
+    for config in (state.instance.created_config, state.instance.preview_config):
+        assert config["controls"]["AnalogueGainMode"] == _AnalogueGainModeEnum.Auto
+        assert "AnalogueGain" not in config["controls"]
+    camera.close()
+
+
+def test_fixed_iso_falls_back_to_analogue_gain_on_older_libcamera(install_picamera, capsys):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    assert "ISO via AnalogueGain (legacy libcamera)" in capsys.readouterr().err
+    camera.set_iso(1600)
+    assert state.instance.set_controls_calls[-1] == {"AnalogueGain": 16.0}
+    for config in (state.instance.created_config, state.instance.preview_config):
+        assert config["controls"]["AnalogueGain"] == 16.0
+        assert "AnalogueGainMode" not in config["controls"]
+    assert camera.iso == 1600
+    camera.set_iso(None)
+    assert state.instance.set_controls_calls[-1] == {"AnalogueGain": 0.0}
+    for config in (state.instance.created_config, state.instance.preview_config):
+        assert config["controls"]["AnalogueGain"] == 0.0
+    assert camera.iso is None
+    camera.close()
+
+
+@pytest.mark.parametrize("bad", [50, 3200, 99, 1601, -400, 400.5, True, "400", "x"])
+def test_iso_outside_the_range_is_refused(install_picamera, bad):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    sent = len(state.instance.set_controls_calls)
+    with pytest.raises(CameraError):
+        camera.set_iso(bad)
+    assert camera.iso is None
+    assert len(state.instance.set_controls_calls) == sent
+    camera.close()
+
+
+def test_iso_above_the_sensor_gain_limit_is_refused(install_picamera):
+    state = install_picamera(analogue_gain=(1.0, 8.0, 1.0))
+    camera = Picamera2Camera()
+    sent = len(state.instance.set_controls_calls)
+    with pytest.raises(CameraError, match="gain"):
+        camera.set_iso(1600)
+    assert camera.iso is None
+    assert len(state.instance.set_controls_calls) == sent
+    camera.set_iso(800)
+    assert camera.iso == 800
+    camera.close()
+
+
+def test_integral_float_iso_is_accepted_as_a_whole_number(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    camera.set_iso(200.0)
+    assert camera.iso == 200 and type(camera.iso) is int
+    assert state.instance.set_controls_calls[-1] == {"AnalogueGain": 2.0}
+    camera.close()
+
+
+def test_a_rejected_iso_changes_nothing(install_picamera):
+    state = install_picamera(with_analogue_gain_mode=True)
+    camera = Picamera2Camera(preview=True)
+    before = dict(state.instance.preview_config["controls"])
+    still_before = dict(state.instance.created_config["controls"])
+
+    def boom(controls):
+        raise RuntimeError("control rejected")
+
+    state.instance.set_controls = boom
+    with pytest.raises(CameraError, match="failed to set the ISO"):
+        camera.set_iso(400)
+    assert camera.iso is None
+    assert state.instance.preview_config["controls"] == before
+    assert state.instance.created_config["controls"] == still_before
+    camera.close()
+
+
+def test_iso_on_a_closed_camera_is_an_error(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera()
+    camera.close()
+    with pytest.raises(CameraError, match="closed"):
+        camera.set_iso(400)
+    assert camera.iso is None
 
 
 def test_max_gain_comes_from_the_sensor_controls(install_picamera):

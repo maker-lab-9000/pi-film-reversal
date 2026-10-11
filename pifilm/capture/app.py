@@ -54,7 +54,8 @@ unchanged LUT; the negotiated stream format, so a camera that quietly
 dropped to a different mode is visible; two timings, because the pipeline cost
 and the time from shutter to durable file are different numbers and only the
 second is what the user waits for; ``shutter_us`` (the fixed exposure time under
-shutter priority, null on auto); ``camera_metadata`` (per-shot camera metadata)
+shutter priority, null on auto); ``iso`` (the fixed ISO, null on auto);
+``camera_metadata`` (per-shot camera metadata)
 when present; and ``dng`` (the sidecar filename) when a DNG was written.
 """
 
@@ -191,9 +192,13 @@ class CaptureSession:
         shutter_us = getattr(self.camera, "shutter_us", None)
         # And the manual white balance (None = auto).
         wb_k = getattr(self.camera, "colour_temperature_k", None)
+        # And the manual ISO (None = auto).
+        iso = getattr(self.camera, "iso", None)
         frame = self.camera.read()
         if self.double_exposure:
-            return self._capture_double(frame, ev, shutter, shutter_us=shutter_us, wb_k=wb_k)
+            return self._capture_double(
+                frame, ev, shutter, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
+            )
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
         t0 = time.perf_counter()
@@ -213,6 +218,7 @@ class CaptureSession:
             "frame_source": frame.source,
             **info,
             "shutter_us": shutter_us,
+            "iso": iso,
             "colour_temperature_k": wb_k,
             "grain_seed": seed,
             "params_version": PARAMS_VERSION,
@@ -228,7 +234,7 @@ class CaptureSession:
 
     def _capture_double(
         self, frame: Frame, ev: float, shutter: float, *, shutter_us: int | None,
-        wb_k: int | None,
+        wb_k: int | None, iso: int | None,
     ) -> CaptureResult:
         # The pending frame is taken off the session before anything that can fail, so
         # any failure from here on returns the count to 0/2 (spec section 5). A camera
@@ -238,6 +244,7 @@ class CaptureSession:
         camera_fields = {
             "frame_source": frame.source,
             "shutter_us": shutter_us,
+            "iso": iso,
             "colour_temperature_k": wb_k,
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),

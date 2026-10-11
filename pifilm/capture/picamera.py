@@ -48,7 +48,8 @@ only through ``set_controls``; otherwise the still would be taken with the
 ISP's default sharpening and saturation and the viewfinder would come back
 without them. ``set_ev`` updates those dicts as well as the live camera.
 ``set_shutter`` does the same for a fixed exposure time (shutter priority), and
-also widens and restores ``FrameDurationLimits``.
+also widens and restores ``FrameDurationLimits``. ``set_iso`` does the same for a
+fixed analogue gain; with both fixed the camera is in full manual.
 
 Previews and captures arrive on different threads (the viewfinder loop and the
 capture controller), so one lock is held from acquiring a request through
@@ -87,6 +88,10 @@ _FRAME_MARGIN_US = 1000
 # below 2360 K is clamped to 2360 K by the sensor's calibration, and 9000 K is
 # accepted as asked; nothing above it was tried.
 COLOUR_TEMPERATURE_RANGE_K = (2360, 9000)
+# Manual ISO. ISO 100 is analogue gain 1.0, the convention the light meter already
+# uses, so the range is gain 1.0 to 16.0; a sensor whose own gain limit is lower
+# refuses the values above it (see ``set_iso``).
+ISO_RANGE = (100, 1600)
 # How long a read waits for its frame before the camera counts as stalled. The
 # preview runs at tens of frames a second, so five seconds without one is not
 # slowness; a still also pays for a mode switch in each direction. A fixed
@@ -185,8 +190,10 @@ class Picamera2Camera:
         self.preview_size: tuple[int, int] | None = None
         self.ev = float(ev)
         self.shutter_us: int | None = None
+        self.iso: int | None = None
         self.max_gain: float | None = None
         self._shutter_mode = "legacy"
+        self._iso_mode = "legacy"
         self._frame_limits: dict[str, tuple[int, int] | None] = {"still": None, "preview": None}
         self._still_config: Any | None = None
         self._preview_config: Any | None = None
@@ -240,6 +247,17 @@ class Picamera2Camera:
                 "picamera2: shutter priority via "
                 + ("ExposureTimeMode" if self._shutter_mode == "mode"
                    else "ExposureTime (legacy libcamera)"),
+                file=sys.stderr,
+            )
+            # Manual ISO takes the same two paths: AnalogueGainMode where libcamera
+            # has it, else a non-zero AnalogueGain (zero hands the gain back).
+            self._iso_mode = (
+                "mode" if "AnalogueGainMode" in camera.camera_controls else "legacy"
+            )
+            print(
+                "picamera2: ISO via "
+                + ("AnalogueGainMode" if self._iso_mode == "mode"
+                   else "AnalogueGain (legacy libcamera)"),
                 file=sys.stderr,
             )
             gain = camera.camera_controls.get("AnalogueGain")
@@ -492,6 +510,45 @@ class Picamera2Camera:
                     _drop_config_control(config, "ExposureTime")
         self.shutter_us = us
 
+    def set_iso(self, iso: int | None) -> None:
+        """Fix the ISO (analogue gain), or return to auto with ``None``.
+
+        ISO 100 is ``AnalogueGain`` 1.0. Measured on the IMX477 with libcamera
+        0.7.2 on 2026-10-11: a fixed gain holds while the exposure time stays
+        automatic, and both can be fixed at once (full manual). Like
+        ``set_shutter``, the controls go to the running camera and into both
+        configurations, because every configure reapplies a configuration's own
+        controls. Nothing changes if the camera rejects the controls. ``iso`` must
+        be ``None`` or a whole number inside ``ISO_RANGE`` whose gain the sensor
+        can reach: an integral float such as ``400.0`` is accepted as ``400``,
+        while a bool, a string or a fractional number is a ``CameraError``.
+        """
+        if iso is not None:
+            iso = _iso(iso)
+            if self.max_gain is not None and iso / 100 > self.max_gain:
+                raise CameraError(
+                    f"ISO {iso} needs analogue gain {iso / 100:g}, above this sensor's "
+                    f"limit of {self.max_gain:g}"
+                )
+        camera = self._camera
+        if camera is None:
+            raise CameraError("Cannot set the ISO on a closed Picamera2 camera")
+        controls = self._iso_controls(iso)
+        with self._request_lock:
+            try:
+                camera.set_controls(controls)
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to set the ISO: {exc}") from exc
+            for config in (self._still_config, self._preview_config):
+                for name, value in controls.items():
+                    _set_config_control(config, name, value)
+                if iso is None and self._iso_mode == "mode":
+                    # Auto sends no AnalogueGain, but the one a fixed ISO wrote
+                    # would stay in the configuration and be reapplied beside
+                    # AnalogueGainMode=Auto on every configure.
+                    _drop_config_control(config, "AnalogueGain")
+        self.iso = iso
+
     def set_colour_temperature(self, kelvin: int | None) -> None:
         """Fix the white balance at ``kelvin``, or return to auto with ``None``.
 
@@ -545,6 +602,16 @@ class Picamera2Camera:
                 (low, high) if us is None else (low, max(high, us + _FRAME_MARGIN_US))
             )
         return controls
+
+    def _iso_controls(self, iso: int | None) -> dict[str, Any]:
+        if self._iso_mode == "mode":
+            from libcamera import controls as _lc
+
+            mode = _lc.AnalogueGainModeEnum
+            if iso is None:
+                return {"AnalogueGainMode": mode.Auto}
+            return {"AnalogueGainMode": mode.Manual, "AnalogueGain": iso / 100}
+        return {"AnalogueGain": 0.0 if iso is None else iso / 100}
 
     def close(self) -> None:
         camera = self._camera
@@ -631,6 +698,20 @@ def _shutter_us(value: Any) -> int:
     if isinstance(value, float) and math.isfinite(value) and value.is_integer():
         return int(value)
     raise CameraError(f"shutter must be a whole number of microseconds, got {value!r}")
+
+
+def _iso(value: Any) -> int:
+    """A whole-number ISO inside ``ISO_RANGE``, or ``CameraError`` for anything else."""
+    if isinstance(value, numbers.Integral) and not isinstance(value, bool):
+        iso = int(value)
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        iso = int(value)
+    else:
+        raise CameraError(f"ISO must be a whole number, got {value!r}")
+    low, high = ISO_RANGE
+    if not low <= iso <= high:
+        raise CameraError(f"ISO must be within {low}-{high}, got {iso}")
+    return iso
 
 
 def _set_config_control(config: Any, name: str, value: Any) -> None:

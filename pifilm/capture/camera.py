@@ -152,6 +152,7 @@ class FakeCamera:
         self.ev = 0.0
         self.shutter_us: int | None = None
         self.colour_temperature_k: int | None = None
+        self.iso: int | None = None
         self.wb_adjustable = True
         self.max_gain: float | None = None
         if jpeg_bytes is not None:
@@ -194,6 +195,10 @@ class FakeCamera:
     def set_shutter(self, us: int | None) -> None:
         # Mirrors Picamera2Camera.set_shutter for the viewfinder's shutter buttons.
         self.shutter_us = None if us is None else int(us)
+
+    def set_iso(self, iso: int | None) -> None:
+        # Mirrors Picamera2Camera.set_iso for the viewfinder's ISO control.
+        self.iso = None if iso is None else int(iso)
 
     def set_colour_temperature(self, kelvin: int | None) -> None:
         # Mirrors Picamera2Camera.set_colour_temperature for the viewfinder's WB pill.
