@@ -1,5 +1,6 @@
 # pifilm/display/shutter.py
-"""Shutter-priority steps for the viewfinder's shutter buttons. Pure.
+"""Shutter-priority steps for the viewfinder's ``+``/``-`` keys while the SHUTTER
+cell is selected. Pure.
 
 The series is the standard 1/3-stop shutter scale from 1/2000 s to 1 s, as
 (microseconds, label) pairs, with ``None`` meaning ``A``: full auto exposure. ``+``

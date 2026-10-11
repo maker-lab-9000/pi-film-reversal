@@ -44,12 +44,11 @@ class _ScaledDraw:
 
     The layout constants in this module are in base units so the 2.8" panel
     (scale 1) and the 3.5" DSI panel (scale 2) share one layout and one set of hit
-    regions. Shapes with two corners (rectangles, ellipses) treat each base pixel
-    as a ``scale`` x ``scale`` block, so the far corner maps to that block's last
-    pixel and neighbouring shapes stay flush; at scale 1 that is the identity.
-    Points (lines, polygons, text anchors) map to ``value * scale``. Widths,
-    radii and font sizes are multiplied; ``textlength`` is returned in base units
-    so callers keep doing their arithmetic there.
+    regions. A rectangle treats each base pixel as a ``scale`` x ``scale`` block,
+    so its far corner maps to that block's last pixel and neighbouring shapes stay
+    flush; at scale 1 that is the identity. Text anchors map to ``value * scale``.
+    Outline widths and font sizes are multiplied; ``textlength`` is returned in
+    base units so callers keep doing their arithmetic there.
     """
 
     def __init__(self, draw: ImageDraw.ImageDraw, scale: int) -> None:
@@ -63,35 +62,14 @@ class _ScaledDraw:
         s = self._s
         return (x0 * s, y0 * s, (x1 + 1) * s - 1, (y1 + 1) * s - 1)
 
-    def _points(self, points: Any) -> list[tuple[float, float]]:
-        flat = list(points)
-        if flat and not isinstance(flat[0], (tuple, list)):
-            flat = list(zip(flat[0::2], flat[1::2], strict=True))
-        return [(x * self._s, y * self._s) for x, y in flat]
-
     def _kw(self, kw: dict[str, Any]) -> dict[str, Any]:
-        # Pillow's outline width defaults to 1 for these shapes; scale that default
+        # Pillow's outline width defaults to 1; scale that default
         # too, so an outline stays one base pixel thick.
         kw["width"] = kw.get("width", 1) * self._s
         return kw
 
     def rectangle(self, box: Any, **kw: Any) -> None:
         self._draw.rectangle(self._box(box), **self._kw(kw))
-
-    def rounded_rectangle(self, box: Any, radius: int = 0, **kw: Any) -> None:
-        self._draw.rounded_rectangle(self._box(box), radius=radius * self._s, **self._kw(kw))
-
-    def ellipse(self, box: Any, **kw: Any) -> None:
-        self._draw.ellipse(self._box(box), **self._kw(kw))
-
-    def line(self, points: Any, **kw: Any) -> None:
-        # An unspecified width is one base pixel. Always pass it: Pillow's own
-        # default changed from 0 to 1, and from that release a width of 0 draws
-        # nothing, while 1 is the same hairline on every version.
-        self._draw.line(self._points(points), width=kw.pop("width", 1) * self._s, **kw)
-
-    def polygon(self, points: Any, **kw: Any) -> None:
-        self._draw.polygon(self._points(points), **kw)
 
     def text(self, xy: Any, text: str, **kw: Any) -> None:
         self._draw.text((xy[0] * self._s, xy[1] * self._s), text, **kw)

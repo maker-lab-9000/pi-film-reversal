@@ -26,8 +26,12 @@ from pifilm.display.liveview import (
 )
 from pifilm.display.viewfinder import (
     CAMERA_STALL_LIMIT,
+    ISO_CELL,
     NOTICE_SECONDS,
     PRESS_FLASH_SECONDS,
+    SHUTTER_CELL,
+    TAP_MAX_HOLD,
+    WB_CELL,
     ViewfinderLoop,
 )
 from pifilm.grain import GrainParams
@@ -39,7 +43,6 @@ DEFAULT_METADATA = {"ExposureTime": 4000, "AnalogueGain": 1.0, "Lux": 500.0}
 # A frame with all three metered values, none of them on a step: 1/250 s is a
 # shutter step, ISO 760 is nearest 800 and 4249 K is nearest 4000 K.
 METERED = {"ExposureTime": 4000, "AnalogueGain": 7.6, "ColourTemperature": 4249, "Lux": 500.0}
-SHUTTER_CELL, ISO_CELL, WB_CELL = 0, 1, 2
 
 
 class FakeDisplay:
@@ -1183,16 +1186,38 @@ def test_a_finger_held_on_plus_lights_it_every_frame_and_steps_once_on_release(
     assert states[-1].pressed is None
 
 
-def test_a_finger_resting_on_a_key_lights_it_but_never_steps(controller, monkeypatch):
-    """Longer than the tap detector's hold limit is not a tap, as before."""
+def test_a_one_second_press_on_plus_still_steps_exactly_once(controller, monkeypatch):
+    """A lit key invites a longer press than a blind tap; it must still count."""
     camera, ctl = controller
     states = _spy_states(monkeypatch)
     loop, touch, display, clock = _loop(camera, ctl)
-    touch.script = [[TouchPoint(*MINUS_CENTRE, 10)]] * 12
-    for _ in range(12):
+    touch.script = [[TouchPoint(*PLUS_CENTRE, 10)]] * 10
+    for _ in range(10):
+        loop.step()
+        assert states[-1].pressed is Action.PLUS
+        assert camera.shutter_us is None
+        clock.t += 0.1
+    assert clock.t == pytest.approx(1.0)
+    loop.step()   # the finger is up, 1.0 s after it went down
+    assert camera.shutter_us == 4000
+    for _ in range(5):
+        clock.t += 0.1
+        loop.step()
+    assert camera.shutter_us == 4000
+
+
+def test_a_finger_resting_on_a_key_lights_it_but_never_steps(controller, monkeypatch):
+    """Longer than ``TAP_MAX_HOLD`` is not a tap: a resting thumb changes nothing."""
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    polls = int(TAP_MAX_HOLD / 0.1) + 2
+    touch.script = [[TouchPoint(*MINUS_CENTRE, 10)]] * polls
+    for _ in range(polls):
         loop.step()
         assert states[-1].pressed is Action.MINUS
         clock.t += 0.1
+    assert clock.t > TAP_MAX_HOLD
     loop.step()
     clock.t += PRESS_FLASH_SECONDS
     loop.step()
@@ -1244,9 +1269,97 @@ def test_a_touch_error_lights_nothing(controller, monkeypatch):
     loop, _, display, clock = _loop(camera, ctl, touch=touch)
     loop.step()
     assert states[-1].pressed is Action.PLUS
-    clock.t += 1.0
+    clock.t += TAP_MAX_HOLD + 0.5   # too long to be a tap, so no flash either
     loop.step()   # this read fails
     assert states[-1].pressed is None
+
+
+# -- controls while a job is processing ----------------------------------------------
+
+
+@pytest.mark.parametrize(("point", "kind"), [
+    (None, "select"), (PLUS_CENTRE, "plus"), (MINUS_CENTRE, "minus"),
+])
+def test_cell_and_key_taps_during_processing_are_ignored(tmp_path, monkeypatch, point, kind):
+    """The colour bars hide the cells and the keys, as they hide the 2x toggle:
+    no value change, no selection change and no flash."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        states = _spy_states(monkeypatch)
+        camera.set_shutter(4000)
+        loop, touch, display, clock = _loop(camera, ctl)
+        loop.step()
+        ctl.submit("busy")
+        _until(lambda: session.started.is_set())
+        _tap(loop, touch, clock, point or _cell(ISO_CELL))
+        assert loop.selected == SHUTTER_CELL
+        assert _values(camera) == (4000, None, None)
+        session.release.set()
+        _until(lambda: ctl.snapshot().finished_count == 1)
+        loop.step()
+        assert loop.state == "REVIEW"
+        _tap(loop, touch, clock, (160, 100))   # back to LIVE, clock barely moved
+        assert loop.state == "LIVE"
+        loop.step()
+        assert states[-1].pressed is None
+        assert states[-1].selected == SHUTTER_CELL
+        assert _values(camera) == (4000, None, None)
+        # and the same tap acts again once the live view is back
+        _tap(loop, touch, clock, point or _cell(ISO_CELL))
+        assert (loop.selected, camera.shutter_us) == {
+            "select": (ISO_CELL, 4000), "plus": (SHUTTER_CELL, 3125),
+            "minus": (SHUTTER_CELL, 5000),
+        }[kind]
+    finally:
+        session.release.set()
+        ctl.close()
+
+
+def test_a_shutter_tap_during_processing_still_reaches_the_controller(tmp_path, monkeypatch):
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        loop, touch, display, clock = _loop(camera, ctl)
+        ctl.submit("busy")
+        _until(lambda: session.started.is_set())
+        submitted = []
+        monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
+        _tap(loop, touch, clock, SHUTTER_CENTRE)
+        assert len(submitted) == 1
+    finally:
+        session.release.set()
+        ctl.close()
+
+
+def test_the_shutter_key_is_not_lit_when_the_live_view_returns_after_the_shot(
+    tmp_path, monkeypatch,
+):
+    """The tap's flash belongs to the frame it was tapped on. The fake clock does
+    not move here, so only clearing the flash (not its timeout) can pass this."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        states = _spy_states(monkeypatch)
+        loop, touch, display, clock = _loop(camera, ctl)
+        touch.tap(*SHUTTER_CENTRE)
+        loop.step()   # down
+        loop.step()   # up -> tap -> submit; this frame shows the key lit
+        assert states[-1].pressed is Action.SHUTTER
+        _until(lambda: session.started.is_set())
+        loop.step()   # colour bars
+        session.release.set()
+        _until(lambda: ctl.snapshot().finished_count == 1)
+        loop.step()
+        assert loop.state == "REVIEW"
+        touch.tap(160, 100)
+        loop.step()
+        loop.step()
+        assert loop.state == "LIVE"
+        drawn = len(states)
+        loop.step()
+        assert len(states) == drawn + 1
+        assert states[-1].pressed is None
+    finally:
+        session.release.set()
+        ctl.close()
 
 
 # -- touch on its own thread (long exposures) ---------------------------------------
@@ -1309,6 +1422,32 @@ def test_a_quick_tap_registers_while_a_long_exposure_blocks_the_preview(controll
         stop.set()
         runner.join(5.0)
     assert not runner.is_alive()
+
+
+def test_a_finger_held_on_plus_is_drawn_lit_while_the_touch_thread_polls(
+    controller, monkeypatch,
+):
+    """Under run() the finger's position comes from the touch thread, not the loop."""
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    touch = TimedTouch()
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=time, frame_period=0.02)
+    stop = threading.Event()
+    runner = threading.Thread(target=loop.run, args=(stop,), daemon=True)
+    runner.start()
+    try:
+        _until(lambda: len(states) >= 2)
+        assert all(state.pressed is None for state in list(states))
+        touch.press(PLUS_CENTRE, hold=0.5)
+        _until(lambda: any(state.pressed is Action.PLUS for state in list(states)))
+        assert camera.shutter_us is None          # lit while down, nothing fired yet
+        _until(lambda: camera.shutter_us == 4000)  # one step, on release
+        _until(lambda: states[-1].pressed is None)
+    finally:
+        stop.set()
+        runner.join(5.0)
+    assert not runner.is_alive()
+    assert camera.shutter_us == 4000
 
 
 def test_the_touch_thread_stops_with_the_loop(controller):

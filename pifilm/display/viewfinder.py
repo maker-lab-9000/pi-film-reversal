@@ -10,9 +10,10 @@ nothing developed to review, so a short "Exposure 1/2" message replaces the
 review and the loop returns to LIVE for the second exposure.
 The live screen (``liveview.py``) is select-and-adjust: a tap on one of the strip's
 three cells (SHUTTER, ISO, WB) selects it, and one ``+``/``-`` pair steps whichever
-is selected. The steps go straight to the camera, so they also work while a job is
-processing. Which cells the camera can change is decided once, at start-up; a cell
-it cannot change is drawn grey and is never selected. Each control is automatic
+is selected. While a job is processing the colour bars hide the cells and the
+keys, so those taps are ignored then, like the ``2x`` toggle's. Which cells the
+camera can change is decided once, at start-up; a cell it cannot change is drawn
+grey and is never selected. Each control is automatic
 while the camera holds ``None`` for it, and the first step out of auto lands on the
 step nearest what the camera is metering, so the picture does not jump.
 
@@ -27,7 +28,7 @@ Under ``run()`` touch is polled on its own thread ("pifilm-touch"), not inside
 the frame loop. At the long shutter speeds (up to 1 s) the preview read blocks
 for a whole frame, so a frame loop that polled touch would look at the panel
 about once a second. Touch is polled, not latched, on either panel, and ``TapDetector``
-needs to see the finger down and then up within its 0.6 s hold limit, so a
+needs to see the finger down and then up within its hold limit, so a
 quick tap would fall between two polls and never register. The thread polls
 every ``touch_period`` of real time and queues finished taps; ``step()`` takes
 at most one per call and handles it on the loop's clock as before. While the
@@ -71,7 +72,16 @@ PRESS_FLASH_SECONDS = 0.15
 # The keys that light under a finger. The cells and the 2x toggle show a tap by
 # changing state instead.
 PRESS_KEYS = (Action.PLUS, Action.MINUS, Action.SHUTTER)
-SHUTTER_CELL, ISO_CELL, WB_CELL = range(3)  # the order of liveview.SELECT_ACTIONS
+# The longest press that still counts as a tap. The detector's own default is
+# 0.6 s, which was right when nothing showed a press; now the keys light under
+# the finger, which invites a longer, more deliberate press, and a key that lit
+# and then did nothing on release reads as a fault.
+TAP_MAX_HOLD = 1.5
+# Cell indexes, taken from the screen's own order so the two cannot drift.
+SHUTTER_CELL, ISO_CELL, WB_CELL = (
+    SELECT_ACTIONS.index(action)
+    for action in (Action.SELECT_SHUTTER, Action.SELECT_ISO, Action.SELECT_WB)
+)
 # Consecutive preview reads that may time out before the loop gives the camera up.
 CAMERA_STALL_LIMIT = 3
 # Idle dimming: half brightness after a minute untouched, off after five. The
@@ -105,7 +115,7 @@ class ViewfinderLoop:
         # reports taps in its own pixels. The tap detector's drag limit is in panel
         # pixels too, so it grows with the scale.
         self._scale = max(1, int(getattr(display, "width", 320)) // 320)
-        self._taps = TapDetector(max_move=20.0 * self._scale)
+        self._taps = TapDetector(max_hold=TAP_MAX_HOLD, max_move=20.0 * self._scale)
         self._touch_period = touch_period
         # Set only while run()'s touch thread is alive; step() then reads taps
         # from it instead of polling the panel itself.
@@ -411,6 +421,7 @@ class ViewfinderLoop:
         if snap.finished_count != self._seen_finished and snap.last_finished_job is not None:
             self._seen_finished = snap.finished_count
             self._processing_shown = False
+            self._flash = None
             job = snap.last_finished_job
             if job.state == "complete" and getattr(job.result, "exposure", None) == (1, 2):
                 self.state = "NOTICE"
@@ -438,6 +449,12 @@ class ViewfinderLoop:
             return
         if tap is not None:
             action = hit(tap.x, tap.y, self._scale)
+            if snap.active_job is not None and action is not Action.SHUTTER:
+                # While a job runs the colour bars hide the cells, the keys and
+                # the 2x toggle (spec section 5), so a tap there was not aimed at
+                # them: no step, no selection, no toggle and no flash. Only the
+                # shutter tap goes on, to the controller, which answers busy.
+                action = Action.NONE
             if action in PRESS_KEYS:
                 self._flash = (action, now + PRESS_FLASH_SECONDS)
             if action is Action.SHUTTER:
@@ -450,9 +467,7 @@ class ViewfinderLoop:
                     self.selected = cell
             elif action in (Action.PLUS, Action.MINUS):
                 self._step_selected(action is Action.PLUS)
-            elif action is Action.DOUBLE_TOGGLE and snap.active_job is None:
-                # Ignored while a job runs (spec section 5): the badge is hidden behind
-                # the colour bars, so a tap there was not aimed at it.
+            elif action is Action.DOUBLE_TOGGLE:
                 self._controller.set_double_exposure(not snap.double_exposure)
         if snap.active_job is not None:
             # The grade takes about three seconds, and the camera belongs to the
@@ -461,7 +476,9 @@ class ViewfinderLoop:
             # frame. Drawn once per job, because re-blitting identical bars at
             # 10 fps would only occupy the SPI bus. Touch keeps being polled
             # above, so a shutter tap still reaches the controller (which
-            # answers busy) and + and - still step the selected control.
+            # answers busy). A key's flash must not outlive the live view it
+            # was drawn on.
+            self._flash = None
             if not self._processing_shown:
                 self._show(render_processing(self._processing_label(snap), scale=self._scale))
                 self._processing_shown = True

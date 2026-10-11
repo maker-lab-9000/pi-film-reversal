@@ -178,9 +178,14 @@ message screens keep the default font.
 
 Press feedback: `+`, `-` and the shutter button light while a finger is on them, not
 only on release, and a tap shorter than one frame still lights its key for 0.15 s.
-The action itself fires on release, and a press held longer than 0.6 s lights the
-key but changes nothing, because the tap detector ignores long holds. `+` and `-`
-light even when they will do nothing (the top of a scale).
+The action itself fires on release. A press of up to 1.5 s counts (a lit key
+invites a longer press than a blind tap); one held longer than that lights the key
+but changes nothing, so a resting thumb never steps a value. `+` and `-` light even
+when they will do nothing (the top of a scale).
+
+While the processing screen is showing, taps on the cells, on `+`/`-` and on `2x`
+are ignored: the colour bars hide them, so nothing is selected or stepped. A tap on
+the shutter button's place still reaches the controller, which answers busy.
 
 ### Idle dimming
 
