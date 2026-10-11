@@ -376,6 +376,10 @@ per spec §4:
     A shot on auto records `colour_temperature_k: null`. Start with
     `--white-balance 6500`: the pill is amber at 6500 K from the first frame.
 
+    Run on the Pi 4 with the DSI panel on 2026-10-11: the steps, a shot at a fixed
+    value, the return to auto, the record field and a tele lens all passed. The
+    `--white-balance` start-up flag was not run on hardware.
+
 ## 8. Troubleshooting
 
 Every line below is printed by `pifilm-capture` as
