@@ -17,7 +17,28 @@ from __future__ import annotations
 
 import math
 
+from . import stepscale
+
 WB_STEPS_K: tuple[int, ...] = (3200, 4000, 5000, 5600, 6500, 7500)
+
+
+DEFAULT_START_K = 5600
+
+
+def warmer(current_k: int | None, metered_k: float | None) -> int:
+    """Higher kelvin: the camera renders warmer. From auto, the step nearest the
+    metered temperature (log2), else 5600; stays on the top step."""
+    return stepscale.up(WB_STEPS_K, current_k, metered_k, DEFAULT_START_K)
+
+
+def cooler(current_k: int | None, metered_k: float | None) -> int | None:
+    """Lower kelvin; one step below the lowest is back to auto (``None``)."""
+    return stepscale.down(WB_STEPS_K, current_k, metered_k, DEFAULT_START_K)
+
+
+def value_label(kelvin: float) -> str:
+    """``5600K``; a metered value is rounded to the nearest 100 K."""
+    return f"{int(round(kelvin / 100.0)) * 100}K"
 
 
 def next_step(current_k: float | None) -> int | None:
