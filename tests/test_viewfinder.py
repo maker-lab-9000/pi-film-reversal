@@ -20,6 +20,7 @@ from pifilm.display.ui import (
     SHUTTER_CENTRE,
     SHUTTER_MINUS_BOX,
     SHUTTER_PLUS_BOX,
+    WB_BOX,
 )
 from pifilm.display.viewfinder import (
     CAMERA_STALL_LIMIT,
@@ -1158,3 +1159,71 @@ def test_a_frame_between_stalls_resets_the_count(controller):
         camera.read = original
         loop.step()
     assert len(display.images) == 3
+
+
+def test_wb_taps_step_the_colour_temperature_and_wrap_to_auto(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _centre(WB_BOX))
+    assert camera.colour_temperature_k == 3200
+    for _ in range(5):
+        _tap(loop, touch, clock, _centre(WB_BOX))
+    assert camera.colour_temperature_k == 7500
+    _tap(loop, touch, clock, _centre(WB_BOX))
+    assert camera.colour_temperature_k is None
+
+
+def test_live_view_passes_the_white_balance_to_the_renderer(controller, monkeypatch):
+    camera, ctl = controller
+    seen = []
+    real_render = viewfinder.render_live
+
+    def render(*args, **kwargs):
+        seen.append((kwargs.get("wb_button"), kwargs.get("wb_k")))
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(viewfinder, "render_live", render)
+    camera.set_colour_temperature(6500)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert seen == [(True, 6500)]
+
+
+@pytest.mark.parametrize("how", ["no_setter", "not_adjustable"])
+def test_a_camera_that_cannot_change_white_balance_draws_no_pill_and_ignores_taps(
+    controller, monkeypatch, how,
+):
+    camera, ctl = controller
+    seen = []
+    real_render = viewfinder.render_live
+
+    def render(*args, **kwargs):
+        seen.append(kwargs.get("wb_button"))
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(viewfinder, "render_live", render)
+    if how == "no_setter":
+        monkeypatch.setattr(type(camera), "set_colour_temperature", None, raising=False)
+    else:
+        camera.wb_adjustable = False
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _centre(WB_BOX))
+    assert seen and not any(seen)
+    assert camera.colour_temperature_k is None
+
+
+def test_a_rejected_white_balance_is_logged_not_fatal(controller):
+    camera, ctl = controller
+    lines = []
+
+    def reject(k):
+        raise CameraError("control rejected")
+
+    camera.set_colour_temperature = reject
+    loop, touch, display, clock = _loop(camera, ctl, log=lines.append)
+    loop.step()
+    _tap(loop, touch, clock, _centre(WB_BOX))
+    assert any("control rejected" in line for line in lines)
+    assert loop.state == "LIVE"

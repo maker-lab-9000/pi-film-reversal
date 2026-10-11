@@ -114,7 +114,9 @@ fitted on normalized input; grain runs last because it models developed film.
   per model). An optional `preview` mode adds a second, cheap stream for the LCD viewfinder;
   `read(full=True)` switches to the still configuration, captures, and returns to preview.
   `set_shutter` gives shutter priority (`ExposureTimeMode` on libcamera 0.5, legacy `ExposureTime`
-  otherwise), written into both configurations like `set_ev`. Every read waits a bounded time
+  otherwise), written into both configurations like `set_ev`.
+  `set_colour_temperature` fixes the white balance in kelvin the same way (the viewfinder's
+  `WB` pill, `--white-balance K`). Every read waits a bounded time
   for its frame and raises `CameraStalled` (see `docs/known-issues.md`); three stalled preview
   reads end the viewfinder and the process exits 1 for a systemd restart.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
@@ -155,6 +157,7 @@ service owns the screen) and `evtouch.py` reads its Goodix touch from kernel inp
 by device name; `st7789.py` and `cst3530.py` drive the SPI panel and its touch controller.
 `touch.py` holds the shared `TouchPoint`/`Tap`/`TapDetector`. `meter.py` computes the light-meter
 readout (pure, from preview metadata + pixels); `shutter.py` is the shutter-priority step scale
+(pure) and `whitebalance.py` the manual white-balance step scale in kelvin
 (pure); `ui.py` renders the live/review/message screens and hit-tests taps in 320×240 base units
 at an integer `scale` (pure); `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine
 and takes the scale from the display's width. The DSI panel has no brightness control, so it

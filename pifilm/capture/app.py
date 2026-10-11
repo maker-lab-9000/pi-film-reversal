@@ -100,7 +100,7 @@ from .button import (
 from .camera import Camera, CameraError, FakeCamera, Frame, V4L2Camera
 from .controller import CaptureController, JobSnapshot
 from .errors import CameraStalled
-from .picamera import Picamera2Camera
+from .picamera import COLOUR_TEMPERATURE_RANGE_K, Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
 from .remote import RemoteCaptureServer
 from .thumbnail import render_exposure_card
@@ -189,9 +189,11 @@ class CaptureSession:
         ev = float(getattr(self.camera, "ev", 0.0))
         # Also read before the frame: the shutter the exposure was made at (None = auto).
         shutter_us = getattr(self.camera, "shutter_us", None)
+        # And the manual white balance (None = auto).
+        wb_k = getattr(self.camera, "colour_temperature_k", None)
         frame = self.camera.read()
         if self.double_exposure:
-            return self._capture_double(frame, ev, shutter, shutter_us=shutter_us)
+            return self._capture_double(frame, ev, shutter, shutter_us=shutter_us, wb_k=wb_k)
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
         t0 = time.perf_counter()
@@ -211,6 +213,7 @@ class CaptureSession:
             "frame_source": frame.source,
             **info,
             "shutter_us": shutter_us,
+            "colour_temperature_k": wb_k,
             "grain_seed": seed,
             "params_version": PARAMS_VERSION,
             "package_version": self._package_version,
@@ -225,6 +228,7 @@ class CaptureSession:
 
     def _capture_double(
         self, frame: Frame, ev: float, shutter: float, *, shutter_us: int | None,
+        wb_k: int | None,
     ) -> CaptureResult:
         # The pending frame is taken off the session before anything that can fail, so
         # any failure from here on returns the count to 0/2 (spec section 5). A camera
@@ -234,6 +238,7 @@ class CaptureSession:
         camera_fields = {
             "frame_source": frame.source,
             "shutter_us": shutter_us,
+            "colour_temperature_k": wb_k,
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
             **({"camera_metadata": frame.metadata} if frame.metadata else {}),
@@ -640,6 +645,20 @@ def _remote_listen(value: str) -> tuple[str, int]:
     return host, port
 
 
+def _white_balance(value: str) -> int:
+    """Parse the ``--white-balance`` colour temperature in kelvin."""
+    low, high = COLOUR_TEMPERATURE_RANGE_K
+    try:
+        kelvin = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a whole number of kelvin, got {value!r}"
+        ) from None
+    if not low <= kelvin <= high:
+        raise argparse.ArgumentTypeError(f"must be within {low}-{high} K, got {kelvin}")
+    return kelvin
+
+
 def _colour_gains(value: str) -> tuple[float, float]:
     """Parse the ``R,B`` fixed colour-gains CLI value."""
     parts = value.split(",")
@@ -704,6 +723,7 @@ def _reject_picamera2_only_flags(
         ("--ae-lock", args.ae_lock),
         ("--awb-lock", args.awb_lock),
         ("--colour-gains", args.colour_gains is not None),
+        ("--white-balance", args.white_balance is not None),
         ("--ae-constraint", args.ae_constraint is not None),
         ("--ae-metering", args.ae_metering is not None),
         ("--ev", args.ev is not None),
@@ -900,6 +920,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Picamera2: fixed colour gains R,B; implies AWB disabled (controlled shoots)",
     )
     parser.add_argument(
+        "--white-balance", type=_white_balance, default=None, metavar="K",
+        help=(
+            "Picamera2: start with the white balance fixed at K kelvin "
+            f"({COLOUR_TEMPERATURE_RANGE_K[0]}-{COLOUR_TEMPERATURE_RANGE_K[1]}; higher is "
+            "warmer). The viewfinder's WB pill can change it or return to auto "
+            "(default: auto)"
+        ),
+    )
+    parser.add_argument(
         "--ae-constraint", choices=("normal", "highlight", "shadows"), default=None,
         help=(
             "Picamera2 AE constraint: highlight protects bright regions from clipping "
@@ -967,6 +996,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.display == "waveshare28" and args.shutter_gpio in WAVESHARE28_PINS:
             parser.error(f"--shutter-gpio {args.shutter_gpio} is used by the 2.8 inch LCD")
 
+    if args.white_balance is not None and (args.awb_lock or args.colour_gains is not None):
+        parser.error("--white-balance cannot be combined with --awb-lock or --colour-gains")
+
     if args.camera == "picamera2" and args.device is not None:
         parser.error("--device cannot be used with --camera picamera2")
     if args.camera == "v4l2":
@@ -1030,6 +1062,7 @@ def main(argv: list[str] | None = None) -> int:
                     ae_lock=args.ae_lock,
                     awb_lock=args.awb_lock,
                     colour_gains=args.colour_gains,
+                    colour_temperature=args.white_balance,
                     ae_constraint=args.ae_constraint or "normal",
                     ae_metering=args.ae_metering or "centre",
                     ev=args.ev if args.ev is not None else 0.0,

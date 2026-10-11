@@ -46,7 +46,7 @@ from PIL import Image
 
 from ..capture.errors import CameraError, CameraStalled
 from ..imageio import load_rgb
-from . import DisplayError, shutter
+from . import DisplayError, shutter, whitebalance
 from .idle import IdleDimmer, Screen
 from .meter import FocusTracker, compute_reading, focus_score, format_ev
 from .touch import Tap, TapDetector
@@ -107,6 +107,10 @@ class ViewfinderLoop:
         # Shutter priority exists only on backends that can fix the exposure time
         # (Picamera2, the fake); on V4L2 the buttons are neither drawn nor live.
         self._shutter_ok = callable(getattr(camera, "set_shutter", None))
+        # Manual white balance needs a backend that can fix the colour temperature
+        # and has not had its white balance fixed from the command line already.
+        self._wb_ok = (callable(getattr(camera, "set_colour_temperature", None))
+                       and getattr(camera, "wb_adjustable", True) is not False)
         self._metered_us: float | None = None
         self._seen_finished = controller.snapshot().finished_count
         self._review_since = 0.0
@@ -260,6 +264,13 @@ class ViewfinderLoop:
         except CameraError as exc:
             self._log(f"camera: {exc}")
 
+    def _step_wb(self) -> None:
+        value = whitebalance.next_step(getattr(self._camera, "colour_temperature_k", None))
+        try:
+            self._camera.set_colour_temperature(value)
+        except CameraError as exc:
+            self._log(f"camera: {exc}")
+
     def _review_image(self, job: Any) -> Image.Image:
         """Render the review screen for a finished job, whatever state it is in.
 
@@ -356,6 +367,8 @@ class ViewfinderLoop:
             elif (action in (Action.SHUTTER_FASTER, Action.SHUTTER_SLOWER)
                   and self._shutter_ok):
                 self._step_shutter(action)
+            elif action is Action.WB_NEXT and self._wb_ok:
+                self._step_wb()
             elif action is Action.DOUBLE_TOGGLE and snap.active_job is None:
                 # Ignored while a job runs (spec section 5): the badge is hidden behind
                 # the colour bars, so a tap there was not aimed at it.
@@ -407,7 +420,8 @@ class ViewfinderLoop:
         )
         self._show(render_live(
             frame.rgb, reading, (snap.double_exposure, snap.exposures_taken),
-            shutter_buttons=self._shutter_ok, scale=self._scale,
+            shutter_buttons=self._shutter_ok, wb_button=self._wb_ok,
+            wb_k=getattr(self._camera, "colour_temperature_k", None), scale=self._scale,
         ))
         self._frames += 1
         now = self._clock.monotonic()
