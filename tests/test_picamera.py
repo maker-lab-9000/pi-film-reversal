@@ -11,6 +11,7 @@ from PIL import Image
 from pifilm.artifacts import Artifacts, write_artifact
 from pifilm.capture.app import CaptureSession
 from pifilm.capture.camera import CameraError, Frame
+from pifilm.capture.errors import CameraStalled
 from pifilm.capture.picamera import Picamera2Camera
 from pifilm.capture.thumbnail import fitted_jpeg
 from pifilm.grain import GrainParams
@@ -207,6 +208,11 @@ def install_picamera(monkeypatch):
                 self.configure_count = 0
                 self.start_count = 0
                 self.capture_count = 0
+                self.waits = []
+                self.cancel_count = 0
+                self.started = True
+                self.completed_requests = []
+                self.frames = 0
                 self.stop_count = 0
                 self.close_count = 0
                 self.set_controls_calls = []
@@ -275,15 +281,20 @@ def install_picamera(monkeypatch):
                 if start_error is not None:
                     raise start_error
 
-            def capture_request(self):
+            def capture_request(self, wait=None):
                 self.capture_count += 1
+                self.waits.append(wait)
                 if capture_error is not None:
                     raise capture_error
                 return request
 
-            def switch_mode_and_capture_request(self, config):
+            def cancel_all_and_flush(self):
+                self.cancel_count += 1
+
+            def switch_mode_and_capture_request(self, config, wait=None):
                 self.switch_calls.append(config)
                 self.capture_count += 1
+                self.waits.append(wait)
                 if capture_error is not None:
                     raise capture_error
                 return request
@@ -1300,9 +1311,10 @@ def test_preview_read_uses_the_preview_stream_and_full_read_switches_mode(instal
     assert frame.rgb.shape == (480, 640, 3)
     assert frame.metadata == {"ExposureTime": 5000}
     assert state.instance.switch_calls == []
-    state.instance.capture_request = lambda: (_ for _ in ()).throw(AssertionError("no switch"))
+    state.instance.capture_request = lambda **k: (_ for _ in ()).throw(
+        AssertionError("no switch"))
     inst = state.instance
-    inst.switch_mode_and_capture_request = lambda cfg: (inst.switch_calls.append(cfg),
+    inst.switch_mode_and_capture_request = lambda cfg, **k: (inst.switch_calls.append(cfg),
                                                         FakeRequest(big))[1]
     full = camera.read(full=True)
     assert full.rgb.shape == (NATIVE_SIZE[1], NATIVE_SIZE[0], 3)
@@ -1333,7 +1345,7 @@ def test_requests_are_serialised_by_a_lock(install_picamera):
 
     original = state.instance.capture_request
 
-    def slow_capture():
+    def slow_capture(**kwargs):
         if inside.is_set():
             overlaps.append(True)
         inside.set()
@@ -1366,7 +1378,7 @@ def test_preview_reads_do_not_overwrite_the_measured_still_fps(install_picamera)
     camera.read(full=False)
     assert camera.stream_info.fps == 0.0
     inst = state.instance
-    inst.switch_mode_and_capture_request = lambda cfg: FakeRequest(
+    inst.switch_mode_and_capture_request = lambda cfg, **k: FakeRequest(
         big, metadata={"FrameDuration": 50_000}
     )
     camera.read(full=True)
@@ -1514,4 +1526,60 @@ def test_max_gain_comes_from_the_sensor_controls(install_picamera):
     install_picamera()
     camera = Picamera2Camera()
     assert camera.max_gain is None
+    camera.close()
+
+
+def test_preview_read_that_gets_no_frame_is_a_stall_not_a_hang(install_picamera):
+    """Seen on the Pi 4 on 2026-10-10: the sensor kept streaming but Picamera2
+    stopped handing frames over, and a ``capture_request()`` with no timeout
+    held the camera lock for good, so the screen froze and every later shutter
+    press queued behind it."""
+    state = install_picamera(capture_error=TimeoutError())
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    with pytest.raises(CameraStalled) as caught:
+        camera.read(full=False)
+    inst = state.instance
+    assert inst.waits == [pytest.approx(5.0)]
+    # The timed-out job is still queued inside Picamera2; left there, it would
+    # take the next frame and never release it.
+    assert inst.cancel_count == 1
+    message = str(caught.value)
+    assert "no preview frame within 5.0 s" in message
+    assert "started=True" in message and "completed=0" in message and "frames=0" in message
+    # The lock was released: the next read gets as far as the camera again.
+    with pytest.raises(CameraStalled):
+        camera.read(full=False)
+    assert inst.capture_count == 2
+    camera.close()
+
+
+def test_still_that_gets_no_frame_is_a_stall_with_a_longer_limit(install_picamera):
+    state = install_picamera(capture_error=TimeoutError())
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    with pytest.raises(CameraStalled, match="no still frame within 30.0 s"):
+        camera.read(full=True)
+    assert state.instance.waits == [pytest.approx(30.0)]
+    assert state.instance.cancel_count == 1
+    camera.close()
+
+
+def test_a_long_shutter_lengthens_the_frame_timeout(install_picamera):
+    """A one-second shutter makes every frame take a second; that is not a stall."""
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    camera.set_shutter(1_000_000)
+    camera.read(full=False)
+    assert state.instance.waits == [pytest.approx(5.0 + 4 * 1.0)]
+    camera.close()
+
+
+def test_a_stall_is_reported_even_when_the_diagnostics_are_unavailable(install_picamera):
+    state = install_picamera(capture_error=TimeoutError())
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    inst = state.instance
+    del inst.started, inst.completed_requests, inst.frames
+    inst.cancel_all_and_flush = lambda: (_ for _ in ()).throw(RuntimeError("gone"))
+    with pytest.raises(CameraStalled, match="started=\\? completed=\\? frames=\\?"):
+        camera.read(full=False)
     camera.close()

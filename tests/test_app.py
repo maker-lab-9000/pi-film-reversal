@@ -1786,3 +1786,60 @@ def test_main_still_shuts_down_when_the_button_does_not_close(camera_cli, monkey
     assert (
         "warning: shutter button did not close cleanly (line busy)"
     ) in capsys.readouterr().err
+
+
+def test_stalled_camera_exits_nonzero_even_with_the_remote_api(
+    camera_cli, tmp_path, monkeypatch, capsys,
+):
+    """A dead screen costs the screen only, but a camera that stopped delivering
+    frames leaves nothing to serve: the process must exit so systemd restarts it,
+    and a clean-up that hangs on the same camera must not keep it alive."""
+    from pifilm.capture.errors import CameraStalled
+
+    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
+    armed = []
+
+    class ServerDouble:
+        def __init__(self, controller, token, listen, power=None):
+            pass
+
+        def start(self):
+            return None
+
+        def close(self):
+            return None
+
+    class Panel:
+        closed = False
+
+        def show(self, image):
+            return None
+
+        def read(self):
+            return []
+
+        def close(self):
+            self.closed = True
+
+    class StalledLoop:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, stop):
+            raise CameraStalled("no preview frame within 5.0 s")
+
+    display, touch = Panel(), Panel()
+    monkeypatch.setattr(camera_cli, "RemoteCaptureServer", ServerDouble)
+    monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: (display, touch))
+    monkeypatch.setattr(camera_cli, "ViewfinderLoop", StalledLoop)
+    monkeypatch.setattr(
+        camera_cli, "_arm_exit_deadline", lambda seconds, code: armed.append((seconds, code)),
+    )
+
+    assert camera_cli.main([
+        "--fake", "--display", "waveshare28", "--no-preview",
+        "--remote-listen", "127.0.0.1:8765", "--out", str(tmp_path / "shots"),
+    ]) == 1
+    assert armed == [(camera_cli.STALL_EXIT_DEADLINE, 1)]
+    assert display.closed and touch.closed
+    assert "camera stopped delivering frames" in capsys.readouterr().err

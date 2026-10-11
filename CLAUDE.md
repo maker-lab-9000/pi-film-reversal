@@ -111,7 +111,9 @@ fitted on normalized input; grain runs last because it models developed film.
   per model). An optional `preview` mode adds a second, cheap stream for the LCD viewfinder;
   `read(full=True)` switches to the still configuration, captures, and returns to preview.
   `set_shutter` gives shutter priority (`ExposureTimeMode` on libcamera 0.5, legacy `ExposureTime`
-  otherwise), written into both configurations like `set_ev`.
+  otherwise), written into both configurations like `set_ev`. Every read waits a bounded time
+  for its frame and raises `CameraStalled` (see `docs/known-issues.md`); three stalled preview
+  reads end the viewfinder and the process exits 1 for a systemd restart.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
   captures-only display (`--show-captures`, shows TV colour bars while processing), and headless
   terminal. `--display waveshare35dsi` (or `waveshare28`) runs the LCD viewfinder instead of any
