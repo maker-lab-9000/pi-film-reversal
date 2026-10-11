@@ -168,6 +168,7 @@ def install_picamera(monkeypatch):
         analogue_gain=None,
         frame_limits=None,
         control_frame_limits=None,
+        with_colour_temperature=True,
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
 
@@ -194,6 +195,8 @@ def install_picamera(monkeypatch):
                     self.camera_controls["ExposureTimeMode"] = (0, 1, 0)
                 if analogue_gain is not None:
                     self.camera_controls["AnalogueGain"] = analogue_gain
+                if with_colour_temperature:
+                    self.camera_controls["ColourTemperature"] = (100, 100000, None)
                 if control_frame_limits is not None:
                     self.camera_controls["FrameDurationLimits"] = control_frame_limits
                 self.sensor_modes = sensor_modes if sensor_modes is not None else [
@@ -1583,3 +1586,92 @@ def test_a_stall_is_reported_even_when_the_diagnostics_are_unavailable(install_p
     with pytest.raises(CameraStalled, match="started=\\? completed=\\? frames=\\?"):
         camera.read(full=False)
     camera.close()
+
+
+def test_colour_temperature_reaches_the_camera_and_both_configurations(install_picamera):
+    """Measured on the IMX477 on 2026-10-11: ``ColourTemperature`` alone fixes the
+    gains, and ``AwbEnable`` returns to auto. Each configure reapplies its own
+    controls, so the value has to be in both or the next photo undoes it."""
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    assert camera.wb_adjustable and camera.colour_temperature_k is None
+    camera.set_colour_temperature(6500)
+    inst = state.instance
+    assert inst.set_controls_calls[-1] == {"ColourTemperature": 6500}
+    for config in (inst.created_config, inst.preview_config):
+        assert config["controls"]["ColourTemperature"] == 6500
+        assert "AwbEnable" not in config["controls"]
+    assert camera.colour_temperature_k == 6500
+    camera.set_colour_temperature(None)
+    assert inst.set_controls_calls[-1] == {"AwbEnable": True}
+    for config in (inst.created_config, inst.preview_config):
+        assert config["controls"]["AwbEnable"] is True
+        assert "ColourTemperature" not in config["controls"]
+    assert camera.colour_temperature_k is None
+    camera.close()
+
+
+def test_a_starting_colour_temperature_is_in_the_first_controls(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True, colour_temperature=5600)
+    inst = state.instance
+    assert camera.colour_temperature_k == 5600
+    assert inst.created_config["controls"]["ColourTemperature"] == 5600
+    assert inst.preview_config["controls"]["ColourTemperature"] == 5600
+    assert inst.set_controls_calls[0]["ColourTemperature"] == 5600
+    camera.close()
+
+
+@pytest.mark.parametrize("bad", [2000, 9001, 5600.5, True, "5600"])
+def test_colour_temperature_outside_the_range_is_refused(install_picamera, bad):
+    install_picamera()
+    camera = Picamera2Camera(preview=True)
+    with pytest.raises(CameraError):
+        camera.set_colour_temperature(bad)
+    assert camera.colour_temperature_k is None
+    camera.close()
+
+
+def test_a_rejected_colour_temperature_changes_nothing(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    before = dict(state.instance.preview_config["controls"])
+
+    def boom(controls):
+        raise RuntimeError("control rejected")
+
+    state.instance.set_controls = boom
+    with pytest.raises(CameraError):
+        camera.set_colour_temperature(6500)
+    assert camera.colour_temperature_k is None
+    assert state.instance.preview_config["controls"] == before
+    camera.close()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"awb_lock": True}, {"colour_gains": (2.0, 1.5)},
+])
+def test_a_fixed_white_balance_from_start_up_is_not_adjustable(install_picamera, kwargs):
+    install_picamera()
+    camera = Picamera2Camera(preview=True, **kwargs)
+    assert camera.wb_adjustable is False
+    with pytest.raises(CameraError, match="white balance is fixed"):
+        camera.set_colour_temperature(6500)
+    camera.close()
+
+
+def test_a_camera_without_the_control_is_not_adjustable(install_picamera):
+    install_picamera(with_colour_temperature=False)
+    camera = Picamera2Camera(preview=True)
+    assert camera.wb_adjustable is False
+    with pytest.raises(CameraError, match="ColourTemperature"):
+        camera.set_colour_temperature(6500)
+    camera.close()
+
+
+def test_start_up_colour_temperature_conflicts_are_refused(install_picamera):
+    install_picamera()
+    with pytest.raises(CameraError):
+        Picamera2Camera(colour_temperature=6500, awb_lock=True)
+    with pytest.raises(CameraError):
+        Picamera2Camera(colour_temperature=1000)

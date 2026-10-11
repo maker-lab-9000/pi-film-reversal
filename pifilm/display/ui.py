@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from . import whitebalance
 from .meter import MeterReading, format_ev
 
 WIDTH, HEIGHT = 320, 240
@@ -63,6 +64,10 @@ DOUBLE_BOX = (4, 4, 74, 24)
 # above the bar's hit zone (BAR_TOP - HIT_MARGIN = 198).
 SHUTTER_PLUS_BOX = (264, 26, 312, 60)
 SHUTTER_MINUS_BOX = (264, 144, 312, 178)
+# White-balance pill, right of the double-exposure toggle. With HIT_MARGIN its
+# region starts at x 82, past the toggle's (which ends at x 80), and ends at x 174,
+# well short of the battery badge.
+WB_BOX = (88, 4, 168, 24)
 
 
 class Action(Enum):
@@ -73,6 +78,7 @@ class Action(Enum):
     DOUBLE_TOGGLE = "double_toggle"
     SHUTTER_FASTER = "shutter_faster"
     SHUTTER_SLOWER = "shutter_slower"
+    WB_NEXT = "wb_next"
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -161,7 +167,8 @@ def iso_label(iso: int | None) -> str:
 
 def render_live(
     frame_rgb: np.ndarray, reading: MeterReading, double: tuple[bool, int] | None = None,
-    shutter_buttons: bool = False, *, scale: int = 1,
+    shutter_buttons: bool = False, *, wb_button: bool = False, wb_k: int | None = None,
+    scale: int = 1,
 ) -> Image.Image:
     size = (WIDTH * scale, HEIGHT * scale)
     base = _letterbox(frame_rgb, size).convert("RGBA")
@@ -227,6 +234,8 @@ def render_live(
                       fill=(255, 255, 255, 255), font=big, anchor="mm")
     if double is not None:
         _draw_double_badge(draw, double[0], double[1], small)
+    if wb_button:
+        _draw_wb_badge(draw, wb_k, small)
     # battery badge
     if reading.battery_percent is not None:
         label = f"{'AC ' if reading.external_power else ''}{reading.battery_percent}%"
@@ -297,6 +306,20 @@ def _draw_double_badge(draw: _ScaledDraw, enabled: bool, taken: int, font: Any) 
     draw.text(((x0 + x1) // 2, (y0 + y1) // 2), label, fill=colour, font=font, anchor="mm")
 
 
+def _draw_wb_badge(draw: _ScaledDraw, kelvin: int | None, font: Any) -> None:
+    """The white-balance pill. Auto: an outlined ``WB A``. Fixed: amber, with the value."""
+    x0, y0, x1, y1 = WB_BOX
+    if kelvin is None:
+        draw.rounded_rectangle(WB_BOX, radius=8, fill=(0, 0, 0, BAR_ALPHA),
+                               outline=(255, 255, 255, 255), width=1)
+        colour = (255, 255, 255, 255)
+    else:
+        draw.rounded_rectangle(WB_BOX, radius=8, fill=AMBER + (255,))
+        colour = (0, 0, 0, 255)
+    draw.text(((x0 + x1) // 2, (y0 + y1) // 2), whitebalance.label(kelvin),
+              fill=colour, font=font, anchor="mm")
+
+
 def render_processing(label: str = "Processing photo...", *, scale: int = 1) -> Image.Image:
     """TV colour bars while a shot is graded: the Stick's screen, on the LCD.
 
@@ -357,7 +380,8 @@ def hit(x: int, y: int, scale: int = 1) -> Action:
     if x0 - HIT_MARGIN <= x <= x1 + HIT_MARGIN and y0 - HIT_MARGIN <= y <= y1 + HIT_MARGIN:
         return Action.DOUBLE_TOGGLE
     for box, action in ((SHUTTER_PLUS_BOX, Action.SHUTTER_FASTER),
-                        (SHUTTER_MINUS_BOX, Action.SHUTTER_SLOWER)):
+                        (SHUTTER_MINUS_BOX, Action.SHUTTER_SLOWER),
+                        (WB_BOX, Action.WB_NEXT)):
         x0, y0, x1, y1 = box
         if x0 - HIT_MARGIN <= x <= x1 + HIT_MARGIN and y0 - HIT_MARGIN <= y <= y1 + HIT_MARGIN:
             return action

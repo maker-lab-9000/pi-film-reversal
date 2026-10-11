@@ -21,6 +21,7 @@ from pifilm.display.ui import (
     SHUTTER_MINUS_BOX,
     SHUTTER_PLUS_BOX,
     SHUTTER_RADIUS,
+    WB_BOX,
     WIDTH,
     Action,
     hit,
@@ -397,3 +398,30 @@ def test_needle_scale_ticks_are_drawn_at_every_scale():
         tick = img.getpixel((scale * NEEDLE_X0, scale * (NEEDLE_Y - 2)))   # end of the -3 tick
         bar = img.getpixel((scale * (NEEDLE_X0 + 6), scale * (NEEDLE_Y - 2)))
         assert sum(tick) > sum(bar) + 150, scale
+
+
+def test_wb_pill_hits_inside_its_box_and_overlaps_no_other_control():
+    x0, y0, x1, y1 = WB_BOX
+    for x in range(x0 - HIT_MARGIN, x1 + HIT_MARGIN + 1):
+        for y in range(max(0, y0 - HIT_MARGIN), y1 + HIT_MARGIN + 1):
+            assert hit(x, y) is Action.WB_NEXT, (x, y)
+    # one unclaimed column separates it from the double-exposure toggle
+    assert hit(x0 - HIT_MARGIN - 1, (y0 + y1) // 2) is Action.NONE
+    assert hit(x0 - HIT_MARGIN - 2, (y0 + y1) // 2) is Action.DOUBLE_TOGGLE
+    assert hit(x1 + HIT_MARGIN + 1, (y0 + y1) // 2) is Action.NONE
+    assert hit(*_box_centre(WB_BOX), scale=1) is Action.WB_NEXT
+    assert hit(2 * (x0 + 10), 2 * (y0 + 5), scale=2) is Action.WB_NEXT
+
+
+def test_wb_pill_is_drawn_only_when_asked_and_turns_amber_when_fixed():
+    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
+    x0, y0, x1, y1 = WB_BOX
+    region = lambda image: np.asarray(image)[y0:y1 + 1, x0:x1 + 1]  # noqa: E731
+    plain = region(render_live(frame, _reading()))
+    auto = region(render_live(frame, _reading(), wb_button=True))
+    fixed = region(render_live(frame, _reading(), wb_button=True, wb_k=5600))
+    assert np.array_equal(plain, np.full_like(plain, 200))
+    assert not np.array_equal(plain, auto)
+    amber = np.array(AMBER, dtype=np.uint8)
+    assert not (auto == amber).all(axis=-1).any()
+    assert (fixed == amber).all(axis=-1).mean() > 0.4

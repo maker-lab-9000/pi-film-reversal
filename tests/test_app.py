@@ -1843,3 +1843,34 @@ def test_stalled_camera_exits_nonzero_even_with_the_remote_api(
     assert armed == [(camera_cli.STALL_EXIT_DEADLINE, 1)]
     assert display.closed and touch.closed
     assert "camera stopped delivering frames" in capsys.readouterr().err
+
+
+def test_record_carries_the_white_balance_setting(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    first = session.capture()
+    session.camera.set_colour_temperature(6500)
+    second = session.capture()
+    assert first.record["colour_temperature_k"] is None
+    assert second.record["colour_temperature_k"] == 6500
+
+
+def test_double_exposure_records_carry_the_white_balance_setting(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    session.set_double_exposure(True)
+    session.camera.set_colour_temperature(5600)
+    first = session.capture()
+    second = session.capture()
+    assert first.record["colour_temperature_k"] == 5600
+    assert second.record["colour_temperature_k"] == 5600
+
+
+@pytest.mark.parametrize("argv", [
+    ["--white-balance", "1000"], ["--white-balance", "12000"], ["--white-balance", "warm"],
+    ["--white-balance", "6500", "--awb-lock"],
+    ["--white-balance", "6500", "--colour-gains", "2.0,1.5"],
+    ["--white-balance", "6500", "--camera", "v4l2"],
+])
+def test_bad_white_balance_arguments_are_refused(camera_cli, tmp_path, argv):
+    with pytest.raises(SystemExit) as caught:
+        camera_cli.main([*argv, "--no-preview", "--out", str(tmp_path / "shots")])
+    assert caught.value.code == 2

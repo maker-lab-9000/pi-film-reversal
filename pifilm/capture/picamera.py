@@ -83,6 +83,10 @@ _SHUTTER_RANGE_US = (100, 1_000_000)
 # A fixed exposure longer than a frame period is clipped by the sensor unless the
 # frame is allowed to last at least that long, plus readout headroom.
 _FRAME_MARGIN_US = 1000
+# Manual white balance, in kelvin. Measured on the IMX477 on 2026-10-11: a request
+# below 2360 K is clamped to 2360 K by the sensor's calibration, and 9000 K is
+# accepted as asked; nothing above it was tried.
+COLOUR_TEMPERATURE_RANGE_K = (2360, 9000)
 # How long a read waits for its frame before the camera counts as stalled. The
 # preview runs at tens of frames a second, so five seconds without one is not
 # slowness; a still also pays for a mode switch in each direction. A fixed
@@ -145,6 +149,7 @@ class Picamera2Camera:
         ae_metering: str = "centre",
         ev: float = 0.0,
         preview: bool | tuple[int, int] | None = None,
+        colour_temperature: int | None = None,
     ) -> None:
         if autofocus not in _AUTOFOCUS_MODES:
             raise CameraError(
@@ -163,7 +168,19 @@ class Picamera2Camera:
         if not _EV_RANGE[0] <= float(ev) <= _EV_RANGE[1]:
             raise CameraError(f"ev must be within {_EV_RANGE}, got {ev}")
 
+        if colour_temperature is not None:
+            if awb_lock or colour_gains is not None:
+                raise CameraError(
+                    "colour_temperature cannot be combined with awb_lock or colour_gains"
+                )
+            colour_temperature = _colour_temperature_k(colour_temperature)
+
         self._request_lock = threading.Lock()
+        self.colour_temperature_k: int | None = colour_temperature
+        # False when white balance was fixed at start-up, or (set below) when this
+        # libcamera has no settable ColourTemperature.
+        self.wb_adjustable = not awb_lock and colour_gains is None
+        self._wb_refusal = "white balance is fixed by --awb-lock or --colour-gains"
         self._preview: tuple[int, int] | None = None
         self.preview_size: tuple[int, int] | None = None
         self.ev = float(ev)
@@ -241,6 +258,16 @@ class Picamera2Camera:
                 autofocus, af_range, ae_lock, awb_lock, colour_gains,
                 ae_constraint, ae_metering, ev, has_autofocus=has_autofocus,
             )
+            if "ColourTemperature" not in camera.camera_controls:
+                if colour_temperature is not None:
+                    raise CameraError(
+                        "this libcamera has no settable ColourTemperature control"
+                    )
+                if self.wb_adjustable:
+                    self.wb_adjustable = False
+                    self._wb_refusal = "this libcamera has no settable ColourTemperature control"
+            if colour_temperature is not None:
+                controls["ColourTemperature"] = colour_temperature
             config = camera.create_still_configuration(
                 main={"size": self._native_size, "format": _MAIN_FORMAT},
                 raw={"size": self._native_size},
@@ -465,6 +492,38 @@ class Picamera2Camera:
                     _drop_config_control(config, "ExposureTime")
         self.shutter_us = us
 
+    def set_colour_temperature(self, kelvin: int | None) -> None:
+        """Fix the white balance at ``kelvin``, or return to auto with ``None``.
+
+        Measured on the IMX477 with libcamera 0.7.2 on 2026-10-11:
+        ``ColourTemperature`` by itself fixes the colour gains, and ``AwbEnable``
+        hands them back to the algorithm. Like ``set_shutter``, the control goes to
+        the running camera and into both configurations, because every configure
+        reapplies a configuration's own controls. The two controls are never left
+        in a configuration together, so which one wins never depends on the order
+        libcamera applies them in. Nothing changes if the camera rejects the control.
+        """
+        if kelvin is not None:
+            kelvin = _colour_temperature_k(kelvin)
+        camera = self._camera
+        if camera is None:
+            raise CameraError("Cannot set the white balance on a closed Picamera2 camera")
+        if not self.wb_adjustable:
+            raise CameraError(f"Cannot set the white balance: {self._wb_refusal}")
+        if kelvin is None:
+            name, value, stale = "AwbEnable", True, "ColourTemperature"
+        else:
+            name, value, stale = "ColourTemperature", kelvin, "AwbEnable"
+        with self._request_lock:
+            try:
+                camera.set_controls({name: value})
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to set the white balance: {exc}") from exc
+            for config in (self._still_config, self._preview_config):
+                _set_config_control(config, name, value)
+                _drop_config_control(config, stale)
+        self.colour_temperature_k = kelvin
+
     def _shutter_controls(
         self, us: int | None, limits: tuple[int, int] | None,
     ) -> dict[str, Any]:
@@ -553,6 +612,16 @@ def _control_frame_limits(camera_controls: Any) -> tuple[int, int] | None:
         return int(entry[0]), int(entry[1])
     except (TypeError, KeyError, IndexError, ValueError):
         return None
+
+
+def _colour_temperature_k(value: Any) -> int:
+    """A whole number of kelvin inside the supported range, or ``CameraError``."""
+    if not isinstance(value, numbers.Integral) or isinstance(value, bool):
+        raise CameraError(f"colour temperature must be a whole number of kelvin, got {value!r}")
+    low, high = COLOUR_TEMPERATURE_RANGE_K
+    if not low <= value <= high:
+        raise CameraError(f"colour temperature must be within {low}-{high} K, got {value}")
+    return int(value)
 
 
 def _shutter_us(value: Any) -> int:

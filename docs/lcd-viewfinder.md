@@ -166,6 +166,7 @@ restart.
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Battery badge (top-right) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | `2x` toggle (pill, top-left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
+| `WB` pill (top, right of `2x`) | Outlined `WB A` on auto; amber `WB 5600K` when fixed | Manual white balance: each tap moves one step, A → 3200 → 4000 → 5000 → 5600 → 6500 → 7500 K → A. Picamera2 only; back to the start-up value on restart |
 | Review screen | Full-screen graded result, one-line caption (`shutter  ISO NNN  EV ±N.N`), "tap to continue" hint | Any tap, or 30 s untouched, returns to live view |
 
 ### Idle dimming
@@ -241,6 +242,29 @@ full auto.
 - Do not combine shutter priority with `--ae-lock`: it is not meaningful there. On
   legacy libcamera the lock freezes the gain too, and on libcamera 0.5 returning to
   `A` re-enables auto exposure time.
+
+### Manual white balance
+
+Tap the `WB` pill to fix the white balance at a colour temperature instead of letting
+the camera choose. Each tap moves one step up, and the tap after 7500 K returns to
+auto (`WB A`); there is one button, so going back a step means tapping round. The
+live view shows the result at once, and the photo gets the same setting.
+
+- A higher number renders warmer. The number is the light you are telling the camera
+  it is under: 5600 K is daylight, 3200 K is tungsten lamps, and 6500 or 7500 K
+  corrects a picture that auto leaves cold.
+- The deployed look does not correct white balance itself (`white_balance: false`
+  in its `params.json`), so the setting goes straight through to the graded file.
+- `--white-balance K` (2360 to 9000) starts the camera at a fixed value, for
+  instance while a lens that fools auto is mounted. The pill still changes it, and
+  a restart returns to the flag's value, or to auto without the flag.
+- The pill is not drawn when white balance was already fixed with `--awb-lock` or
+  `--colour-gains`, or on a libcamera without a settable `ColourTemperature`.
+- Each photo's `captures.jsonl` line records `colour_temperature_k` (null on auto);
+  the gains actually applied are in `camera_metadata.ColourGains`.
+- Measured on the IMX477 on 2026-10-11 (libcamera 0.7.2): the red and blue gains
+  were (2.155, 2.052) at 3200 K, (3.102, 1.428) at 5600 K and (3.355, 1.360) at
+  7500 K. A request below 2360 K is clamped to 2360 K.
 
 ## 6. Reading the meter
 
@@ -342,6 +366,15 @@ per spec §4:
     full rate. After returning to `A`, a shot's `camera_metadata.ExposureTime` changes
     with the scene again (point at a lamp, then a dark corner). The journal line at
     start-up names the control path.
+
+13. Manual white balance: tap `WB` through every step; the pill turns amber with the
+    value, and the live view goes from blue (3200 K) to orange (7500 K). Take a shot
+    at 6500 K: its record has `colour_temperature_k: 6500` and
+    `camera_metadata.ColourGains` near (3.24, 1.40), and the live view is still at
+    6500 K afterwards. Tap past 7500 K: the pill returns to `WB A`, and within a few
+    seconds the colour follows the scene again (point at a lamp, then at a window).
+    A shot on auto records `colour_temperature_k: null`. Start with
+    `--white-balance 6500`: the pill is amber at 6500 K from the first frame.
 
 ## 8. Troubleshooting
 
