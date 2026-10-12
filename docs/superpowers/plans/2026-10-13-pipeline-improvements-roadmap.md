@@ -9,8 +9,8 @@ review of the capture and grading pipeline.
 - Each step is its own branch off `pipeline-improvements`, merged back by a pull
   request whose base is `pipeline-improvements`. `main` gets one merge when the
   owner decides the set is ready (or at agreed points along the way).
-- Steps 1 to 3 do not change how photographs look. Steps 4 and 5 do, and stay
-  experiments until the owner has judged a gallery (looks are decided from many
+- Steps 1, 3 and 4 do not change how photographs look. Step 5 does, and stays
+  an experiment until the owner has judged a gallery (looks are decided from many
   rendered examples, not from metrics).
 - Every step that changes pixels gets a new version marker, so photographs taken
   before it still regrade exactly as they were (`pifilm-process` reproduces the
@@ -43,12 +43,38 @@ exposure), normalise, LUT, grain, each file write. `pipeline_ms` and
 `shutter_to_saved_ms` stay. No change to pixels.
 
 Done when: a capture on the Pi shows `stage_ms`, and its parts add up to
-`shutter_to_saved_ms` within a few percent. The Pi numbers then set the order of
-step 2.
+`shutter_to_saved_ms` within a few percent. The Pi numbers then say how much of
+a shot the GPU can touch.
 
-### 2. Speed without changing the look
+### 2. GPU spike (hardware, throwaway)
 
-Branch per change, each judged against step 1's numbers.
+Moved up on 2026-10-13: the owner wants GPU grading for the speed. Before any
+design, a script on the Pi uploads a 12 MP frame, applies a 33-point LUT in a
+shader, reads the result back, and reports:
+
+- time for upload, lookup and read-back, against step 1's CPU numbers;
+- graphics memory used, and whether a full-resolution still capture still works
+  while the textures are loaded (the GPU, the display and the camera share one
+  reserved memory pool on the Pi 4);
+- the largest texture the GPU accepts (4096 is expected: the IMX477 at 4056 fits,
+  the IMX708 at 4608 does not);
+- whether a windowless graphics context runs beside the display the app owns;
+- how far the result is from the CPU reference, pixel by pixel.
+
+Nothing from the spike is kept as product code. Its numbers decide whether step 3
+speeds grain up on the CPU or goes straight to the GPU, and feed step 7's design.
+
+Known costs of GPU grading, accepted by the owner as the price of the speed, to
+be designed around: it speeds up only the grading part of a shot; the Pi and
+`pifilm-process` on a Mac stop agreeing pixel for pixel (the CPU path stays as the
+reference and the tests become "within one level"); two grading paths to keep in
+step; the GPU path can only be tested on the Pi; a new dependency on the Pi's
+graphics driver.
+
+### 3. Speed without changing the look
+
+Branch per change, each judged against step 1's numbers and step 2's verdict on
+where grain should run.
 
 - **Grain.** The largest stage. Candidates: a pre-generated grain tile placed with
   seeded offsets, cheaper random generation, float32 throughout. Any change in
@@ -59,14 +85,14 @@ Branch per change, each judged against step 1's numbers.
   lever is settings (quality 95, 4:4:4), which is a quality decision for the owner.
 - **DNG extraction** and the second JPEG, if step 1 shows they matter.
 
-### 3. Integrity: tuning-file identity
+### 4. Integrity: tuning-file identity
 
 Branch `feat/tuning-hash`. Record a hash of the libcamera tuning in use in each
 capture record and in the artifact a look was trained against; warn (or refuse,
 owner's choice) when they differ. This turns the known issue "a libcamera update
 could silently retune a deployed trained LUT" into a check.
 
-### 4. Look experiments (offline, gallery-judged)
+### 5. Look experiments (offline, gallery-judged)
 
 No change to defaults until the owner has chosen from a gallery.
 
@@ -81,7 +107,7 @@ No change to defaults until the owner has chosen from a gallery.
   with it on and off, grade both, compare. It changes what the LUT is fed, so a
   retrain may follow.
 
-### 5. Background grading
+### 6. Background grading
 
 Branch `feat/background-grade`. Save the original and the DNG, show a fast
 low-resolution grade for review and for the Stick, and grade the full frame on a
@@ -90,12 +116,13 @@ decisions on queue depth and memory, what a power loss leaves behind (a journal 
 pending grades), double exposure, and what the Stick is told. Gets its own design
 document before any code.
 
-### 6. GPU grading (only if steps 2 and 5 are not enough)
+### 7. GPU grading
 
-The Pi 4's GPU can do the LUT lookup in hardware. It needs a graphics context
-beside the display driver and ends pixel-exact agreement between the Pi and
-`pifilm-process` on a Mac, so it waits until the cheaper steps have been measured.
-Gets its own design document and a hardware spike first.
+Wanted by the owner (2026-10-13). Built from step 2's measurements, with its own
+design document: where the context lives, what is done on the GPU (normalise,
+LUT, grain), the fallback to the CPU path, how memory is kept clear of the
+camera's still capture, the IMX708's oversize frame, and the tolerance the tests
+hold it to. A graded live view becomes possible once it exists.
 
 ## Considered and not planned
 
