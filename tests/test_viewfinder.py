@@ -583,7 +583,9 @@ def test_the_focus_peak_decays_by_wall_time_across_a_review(controller, monkeypa
     assert loop.state == "LIVE"
     loop.step()                                  # the blurred frame, a minute later
     assert readings[-1].focus <= 0.2
-    assert readings[-1].focus_peak == pytest.approx(readings[-1].focus)
+    # An absolute tolerance: the blurred frame now scores exactly 0.0, and a mark
+    # that halves every few seconds only approaches zero.
+    assert readings[-1].focus_peak == pytest.approx(readings[-1].focus, abs=1e-3)
 
 
 # -- idle dimming ---------------------------------------------------------------
