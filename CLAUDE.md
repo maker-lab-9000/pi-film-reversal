@@ -168,7 +168,16 @@ bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its tap
 holds only the review, processing and message screens. Both work in 320×240 base units at an
 integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine
 (it also lights `+`/`-`/shutter while a finger is on them) and takes the scale from the display's
-width. The DSI panel has no brightness control, so it
+width. Under `run()` it reads preview frames on a `pifilm-frames` thread (touch is on `pifilm-touch`)
+and redraws the latest frame every step, so the controls stay responsive at a 1 s shutter;
+`Picamera2Camera` backs this with two locks: a preview read holds only the request lock, the
+control setters only the configuration lock, and a still holds both (request first). Each new
+frame's metadata is checked against the fixed shutter/ISO/white balance, because the Pi 4 ignores
+live white-balance changes after a photo (`docs/known-issues.md`): a white-balance mismatch lasting
+1.5 s and 6 frames restarts the live view at once (`restart_preview`), a shutter/ISO one lasting 3 s
+is resent (`reassert_controls`) and restarted after two resends, one restart per selection; each
+successful step also logs one `control: ...` trace line about 2 s later (selection, what the camera
+reports, the picture's R/G and B/G). The DSI panel has no brightness control, so it
 skips the idle dim step and only turns off. All hardware imports (`pykms`, `spidev`, `gpiozero`,
 `smbus2`) are lazy, inside the `open_*` factories, so the package imports on a Mac and in tests.
 `fake.py` (`--display fake`) writes frames to a PNG instead. The loop shares the

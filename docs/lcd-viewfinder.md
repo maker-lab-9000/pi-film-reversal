@@ -206,12 +206,14 @@ lit, and a finished shot, from the LCD or the Stick, wakes it into the review.
 `0` disables either step. `--display fake` has no backlight and is never dimmed.
 
 Touch is polled on its own thread, about 50 times a second, and finished taps are
-queued, so a tap is never missed because the screen was busy. It is acted on at the
-loop's next frame. During the roughly one second of still acquisition the loop waits
-for the camera, so a tap made then is handled when the colour bars appear: a shutter
-tap is answered busy by the controller (it runs one job at a time) and takes no
-second photo, and taps on the cells, `+`/`-` and `2x` are ignored as described above.
-Wait for the colour bars to clear.
+queued, so a tap is never missed because the screen was busy. The camera's preview
+frames are read on a second thread, so the loop never waits for the camera: about ten
+times a second it takes one tap off the queue, acts on it and redraws the screen with
+the most recent frame, whatever the shutter speed. The colour bars therefore appear on
+the loop's next turn after a shutter tap, without waiting for the still. While they
+are up a shutter tap is answered busy by the controller (it runs one job at a time)
+and takes no second photo, and taps on the cells, `+`/`-` and `2x` are ignored as
+described above. Wait for the colour bars to clear.
 
 ### Double exposure
 
@@ -294,14 +296,75 @@ is selected, and only that one.
   `params.json`), so a fixed white balance goes straight through to the graded file. A
   higher number renders warmer: 5600 K is daylight, 3200 K is tungsten lamps, and 6500
   or 7500 K corrects a picture that auto leaves cold.
+- Returning `WB` to `AUTO` is slow, and that is libcamera's auto white balance, not
+  the viewfinder: it eases from the old value toward its own answer in small steps so
+  the colour does not flicker. Measured on the Pi 4 + IMX477 on 2026-10-12 in dim room
+  light: a fixed value was reported by the camera 0.6 s after it was set (1.7 s after
+  a photo), while a return from 7500 K to auto did nothing for 2 s and was still
+  drifting after 8 s; by eye it settles in about 12 s. A photo taken meanwhile uses
+  whatever auto has reached. Nothing was changed for this: the damping is part of the
+  sensor tuning.
+- **The controls are checked against the camera.** On the Pi 4 a control sent to the
+  running camera does not always take effect, and the cause is not known (see
+  [known issues](known-issues.md#live-white-balance-changes-are-ignored-after-a-photo-pi-4-imx477)).
+  What you see: before the first photo after start-up a white-balance change shows
+  within about 2 s, with no blink. After a photo it shows in the old colour for about
+  a second and a half, then the live view blinks once and shows the new one. Shutter
+  and ISO change live either way.
+  How: every new camera frame's metadata is compared with what is fixed:
+  `ColourTemperature` within 100 K of a fixed white balance, `ExposureTime` within 5 %
+  of a fixed shutter, `AnalogueGain` within 5 % of a fixed ISO, and, after `WB` has
+  been returned to `AUTO`, a `ColourTemperature` that has left the old fixed value. A
+  frame without the value cannot tell and is never a fault.
+  - *White balance* that disagrees for 1.5 s and 6 camera frames (4 s for a return to
+    auto, because libcamera's own damping holds the old value for about 2 s) restarts
+    the live view at once, which reconfigures the camera as a photo does:
+    `camera: white balance 6500K not in the live view after 1.6 s (camera reports 5600K); restarting the live view; picture R/G 1.03 B/G 0.96`,
+    or `camera: auto white balance has not moved from 7500K after 4.1 s; restarting the live view; picture ...`.
+    It is never resent: on the Pi that cured 2 cases of about 7, and a restart cured
+    3 of 3.
+  - *Shutter and ISO* that disagree for 3 s and 6 camera frames are sent again:
+    `camera: shutter 1/250 not in the live view after 3.2 s (camera reports 1/30); resending; picture ...`
+    (likewise `ISO 800`). If two resends change nothing the live view is restarted:
+    `camera: shutter 1/250 still not in the live view after 2 resends; restarting the live view; picture ...`.
+  The first frame that agrees again logs `camera: ... applied after resend` or
+  `... applied after restarting the live view`. There is one restart per selection: if
+  the disagreement outlives it, `camera: ... not applied even after restarting the live view`
+  is logged once and the live view is not restarted again for that value (shutter and
+  ISO go on being resent every 3 s, with the `resending` line written at most once in
+  30 s and a count of the ones held back; white balance is left alone). A step, a
+  photo, a review or a dark screen starts afresh and may restart again, but two
+  restarts are never less than 5 s apart. The lines end with the picture's colour,
+  the means of the preview frame's red and blue channels over its green one. They are
+  the evidence of the camera not taking a live control:
+  `journalctl -u pifilm-capture | grep -E 'camera:|control:'`.
+- **Every step leaves a trace.** A `+`/`-` step that changes a control is followed,
+  on the first new camera frame at least 2 s later, by one journal line with what was
+  selected, what the camera reports and what the picture looks like:
+  `control: WB 7500K selected; camera reports 7500K gains (3.35, 1.36), exposure 1/60, ISO 400; picture R/G 2.42 B/G 0.00`
+  (`WB AUTO selected` for a return to auto; `-` for a value the frame does not carry).
+  All three reported values are written whichever control was stepped. A second step
+  before the line is written replaces it, and a photo, a review or a dark screen
+  cancels it. The camera alone applies a live white balance correctly, even after a
+  photo (tried on the Pi), so the fault above is somewhere in how the app runs it;
+  this line is how a case would be caught where the camera reports the selected value
+  and the picture does not show it, which the check above cannot see. A step the camera
+  rejects, or `+` on a top step, changes nothing and is not traced.
 
 Shutter notes:
 
 - At long speeds the live view slows to match: at 1/4 s it shows about 4 frames a
   second. That is the exposure, not a fault.
-- At long speeds a tap is still caught (touch has its own thread), but it is acted
-  on at the next frame, which at 1 s is up to a second later. There is no need to
-  hold the tap.
+- At long speeds the controls stay quick although the picture is slow: a tap on a
+  cell, `+` or `-` changes the value on screen and lights the key on the loop's next
+  redraw, about a tenth of a second later, not on the next camera frame. The picture
+  itself changes when the camera delivers the next frame, so at 1 s the new exposure
+  shows up to a second or two after the tap. There is no need to hold the tap.
+- The photo waits for the preview exposure in progress: the camera takes one frame
+  at a time, so at 1 s the still can start up to a second after the shutter tap.
+  The colour bars appear at once all the same.
+- The `viewfinder: N fps` line in the journal counts camera frames, not redraws, so
+  at 1 s it reads about 1 while the screen is redrawn ten times a second.
 - At start-up the journal names how each control is fixed:
   `picamera2: shutter priority via ExposureTimeMode` on current libcamera, or
   `... ExposureTime (legacy libcamera)` on older stacks; and on the next line
@@ -441,7 +504,7 @@ Not yet run on hardware. The branch is `feat/manual-controls-ui`.
 | 3 | ISO fixed, shutter auto, in good light: the shutter read-out changes to compensate as ISO is stepped, and the meter stays near the centre | Not yet run |
 | 4 | Full manual: fix shutter and ISO; the picture gets darker and lighter with the steps and the meter dot follows | Not yet run |
 | 5 | `+`/`-` light while the finger is down, and on a quick tap | Not yet run |
-| 6 | A shot at fixed shutter + ISO + WB: the record has `shutter_us`, `iso`, `colour_temperature_k`, and `camera_metadata` agrees. Also `--white-balance 6500`: the `WB` cell reads `6500K` from the first frame | Not yet run |
+| 6 | A shot at fixed shutter + ISO + WB: the record has `shutter_us`, `iso`, `colour_temperature_k`, and `camera_metadata` agrees. Also `--white-balance 6500`: the `WB` cell reads `6500K` from the first frame | Record part passed 2026-10-12: a shot with shutter 1/125, ISO 1600 and 7500 K fixed logged `shutter_us` 8000, `iso` 1600, `colour_temperature_k` 7500, and `camera_metadata` reported 7986 us, gain 16.0 and 7500 K; ten shots at a fixed white balance all matched their metadata. The `--white-balance` start-up flag: not yet run |
 | 7 | The shutter button is not hit while working `+`/`-` | Not yet run |
 | 8 | `2x`, focus gauge, battery, review, idle screen-off, Stick and GPIO button work as before | Not yet run |
 | 9 | About 10 fps is kept (`viewfinder: N fps` in the journal) | Not yet run |
@@ -463,6 +526,7 @@ process falls back to the mode it would have run in without `--display`.
 | `cannot claim display GPIO 25/27/18` | GPIO already held — usually a leftover `dtoverlay=fbtft`, or another process | Remove any `dtoverlay=fbtft` line from `config.txt`; check the `gpio` group |
 | `cannot reset the touch controller on GPIO 17` | GPIO 17 busy, or a wiring fault on `TP_RST` | Check the `TP_RST` connection; confirm nothing else claims GPIO 17 |
 | `touch controller at 0x58 not answering on /dev/i2c-1` | Nothing responded to the probe read at open — usually the ribbon cable | Check the ribbon cable and `TP_RST` wiring, and that the panel has power; confirm with `sudo i2cdetect -y 1` showing `58` |
+| `not in the live view after ... resending`, `restarting the live view`, `applied after resend` | The camera did not take a control sent to it while running (seen on the Pi 4, cause not yet known). For white balance the viewfinder restarted the live view; for shutter and ISO it sent the control again and restarted the live view after two resends | Nothing to do when an `applied after ...` line follows. `not applied even after restarting the live view` means that did not help: step the control again or take a photo (both allow another restart or reconfigure the camera) and keep the journal lines, see [Manual controls](#manual-controls) and [known issues](known-issues.md#live-white-balance-changes-are-ignored-after-a-photo-pi-4-imx477) |
 | `the V4L2 backend has no preview mode` | The camera is a USB/UVC one; the viewfinder needs Picamera2's preview-mode split and libcamera metadata | Nothing to fix unless a Pi camera is intended: check `--camera`/`--device` and that `python3-picamera2` is installed |
 
 ## 9. The 3.5" DSI panel

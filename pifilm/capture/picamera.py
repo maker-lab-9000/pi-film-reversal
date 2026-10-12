@@ -56,16 +56,31 @@ There is no exposure compensation. ``ExposureValue`` is still sent, always 0.0, 
 every capture records the same control set as before the viewfinder's EV buttons
 were removed.
 
-Previews and captures arrive on different threads (the viewfinder loop and the
-capture controller), so one lock is held from acquiring a request through
-releasing it: the pixel buffer belongs to the request, and a second thread that
-captured or released in the middle would hand out or free memory the first is
-still copying. The control setters take the same lock so a control change never
-lands between a capture and its release.
+Previews and captures arrive on different threads (the viewfinder's frame
+thread and the capture controller), so the request lock is held from acquiring
+a request through releasing it: the pixel buffer belongs to the request, and a
+second thread that captured or released in the middle would hand out or free
+memory the first is still copying.
+
+The control setters are called from a third thread (the viewfinder loop) and
+take a second lock, the configuration lock, not the request lock. A preview
+read holds the request lock for a whole exposure, a second at the slowest
+shutter, and a setter that queued behind it would make a tap on ``+`` as slow
+as the picture. A setter does not need that exclusion: it touches no request,
+and Picamera2's ``set_controls`` is safe beside a capture in flight. What a
+setter must not overlap is a still, which configures the camera twice from the
+configuration dicts the setters write and whose controls are what the capture
+record describes. So a still (``read(full=True)``) holds both locks, always
+the request lock first and the configuration lock second, a preview read holds
+only the request lock, and a setter holds only the configuration lock. No
+thread ever waits for the request lock while holding the configuration lock,
+so the two cannot deadlock. ``reassert_controls`` is a setter in this respect,
+and ``restart_preview``, which stops and reconfigures the camera, is a still.
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
 import numbers
 import sys
@@ -182,6 +197,9 @@ class Picamera2Camera:
             colour_temperature = _colour_temperature_k(colour_temperature)
 
         self._request_lock = threading.Lock()
+        # Held by the control setters and by a still; see the module docstring.
+        # Order, where both are taken: request lock, then this one.
+        self._config_lock = threading.Lock()
         self.colour_temperature_k: int | None = colour_temperature
         # False when white balance was fixed at start-up, or (set below) when this
         # libcamera has no settable ColourTemperature.
@@ -343,12 +361,18 @@ class Picamera2Camera:
         """Acquire one frame. ``full=False`` (preview) skips the autofocus cycle
         and DNG extraction, which otherwise make each read too slow for a live
         preview; the request is still captured, converted and released, and
-        metadata is still read, so ``preview_frame`` keeps working."""
+        metadata is still read, so ``preview_frame`` keeps working.
+
+        Every read holds the request lock. A still also holds the configuration
+        lock, so no control setter changes the camera or the configurations
+        under it; a preview read does not, so a setter never waits out a long
+        preview exposure."""
         camera = self._camera
         if camera is None:
             raise CameraError("Cannot read from a closed Picamera2 camera")
 
-        with self._request_lock:
+        config_lock = self._config_lock if full else contextlib.nullcontext()
+        with self._request_lock, config_lock:
             if full and self._autofocus == "auto" and self._stream_info.autofocus != "none":
                 try:
                     camera.autofocus_cycle()
@@ -429,8 +453,13 @@ class Picamera2Camera:
         return base + _TIMEOUT_SHUTTERS * (self.shutter_us or 0) / 1_000_000
 
     @staticmethod
-    def _stalled(camera: Any, still: bool, timeout: float) -> CameraStalled:
+    def _stalled(
+        camera: Any, still: bool, timeout: float, what: str | None = None,
+    ) -> CameraStalled:
         """Build the error for a read that timed out, and clear Picamera2's queue.
+
+        ``what`` names the thing that did not arrive when it was not a frame
+        (the live view restart).
 
         The timed-out job stays queued inside Picamera2; left there it would take
         the next frame and nobody would release it. The state goes into the
@@ -450,8 +479,8 @@ class Picamera2Camera:
             camera.cancel_all_and_flush()
         except Exception:
             pass
-        kind = "still" if still else "preview"
-        return CameraStalled(f"no {kind} frame within {timeout:.1f} s ({detail})")
+        what = what or ("still frame" if still else "preview frame")
+        return CameraStalled(f"no {what} within {timeout:.1f} s ({detail})")
 
     def _update_fps(self, metadata: Any) -> None:
         try:
@@ -488,7 +517,7 @@ class Picamera2Camera:
         if not self.exposure_adjustable:
             raise CameraError("Cannot set the shutter: auto-exposure is locked by --ae-lock")
         running = "preview" if self._preview_config is not None else "still"
-        with self._request_lock:
+        with self._config_lock:
             try:
                 # Built inside the try, every one of them before anything is
                 # sent: the mode enum is looked up lazily, and a lookup that
@@ -537,7 +566,7 @@ class Picamera2Camera:
             raise CameraError("Cannot set the ISO on a closed Picamera2 camera")
         if not self.exposure_adjustable:
             raise CameraError("Cannot set the ISO: auto-exposure is locked by --ae-lock")
-        with self._request_lock:
+        with self._config_lock:
             try:
                 # Built inside the try, like the shutter's: the mode enum is
                 # looked up lazily and a failure there must be a CameraError.
@@ -577,7 +606,7 @@ class Picamera2Camera:
             name, value, stale = "AwbEnable", True, "ColourTemperature"
         else:
             name, value, stale = "ColourTemperature", kelvin, "AwbEnable"
-        with self._request_lock:
+        with self._config_lock:
             try:
                 camera.set_controls({name: value})
             except Exception as exc:
@@ -586,6 +615,79 @@ class Picamera2Camera:
                 _set_config_control(config, name, value)
                 _drop_config_control(config, stale)
         self.colour_temperature_k = kelvin
+
+    def reassert_controls(self) -> None:
+        """Send the current selection to the running camera again, in one call.
+
+        On the Pi 4 a control sent to the running camera has been seen not to
+        take effect: a white balance was selected and the live view kept the
+        old colour until a photo was taken (a still re-applies the whole
+        configuration, which is why the photo was right). The cause is not
+        known, so the viewfinder checks each frame's metadata against the
+        selection and calls this when they keep disagreeing.
+
+        What is sent is what the setters sent live: the shutter and ISO controls
+        for ``shutter_us`` and ``iso`` (auto included), unless ``--ae-lock``
+        fixed the exposure, and ``ColourTemperature`` or ``AwbEnable``, unless
+        the white balance is not adjustable. The configurations already hold
+        the selection and are not touched, nor is any attribute. With nothing
+        adjustable nothing is sent.
+        """
+        camera = self._camera
+        if camera is None:
+            raise CameraError("Cannot resend the controls on a closed Picamera2 camera")
+        running = "preview" if self._preview_config is not None else "still"
+        with self._config_lock:
+            try:
+                controls: dict[str, Any] = {}
+                if self.exposure_adjustable:
+                    controls.update(
+                        self._shutter_controls(self.shutter_us, self._frame_limits[running])
+                    )
+                    controls.update(self._iso_controls(self.iso))
+                if self.wb_adjustable:
+                    if self.colour_temperature_k is None:
+                        controls["AwbEnable"] = True
+                    else:
+                        controls["ColourTemperature"] = self.colour_temperature_k
+                if controls:
+                    camera.set_controls(controls)
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to resend the controls: {exc}") from exc
+
+    def restart_preview(self) -> None:
+        """Stop the camera, apply the preview configuration again and restart it.
+
+        The remedy for a live control the camera ignores that a resend (see
+        ``reassert_controls``) does not cure: on the Pi 4 a white balance sent
+        after a photo is usually ignored, a fixed value and a return to auto
+        alike, until the next photo. What the photo does that a resend does not
+        is reconfigure the camera, and this is that reconfiguration without
+        the photo; on 2026-10-12 it cured the fault 3 times out of 3. The
+        viewfinder uses it at once for white balance and after two resends for
+        shutter and ISO. The preview
+        configuration's controls already hold the selection, because the
+        setters write them there, so nothing else is sent.
+
+        It stops the camera, so like a still it holds both locks, the request
+        lock first: no read is in flight and no setter runs meanwhile. It
+        therefore waits for a preview read in progress, up to one exposure.
+        It waits as long as a still does; no answer in that time is a stalled
+        camera. Only a camera with a preview stream has a live view to restart.
+        """
+        camera = self._camera
+        if camera is None:
+            raise CameraError("Cannot restart the live view on a closed Picamera2 camera")
+        if self._preview_config is None:
+            raise CameraError("Cannot restart the live view: this camera has no preview stream")
+        timeout = self._frame_timeout(True)
+        with self._request_lock, self._config_lock:
+            try:
+                camera.switch_mode(self._preview_config, wait=timeout)
+            except TimeoutError:
+                raise self._stalled(camera, True, timeout, "live view restart") from None
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to restart the live view: {exc}") from exc
 
     def _shutter_controls(
         self, us: int | None, limits: tuple[int, int] | None,

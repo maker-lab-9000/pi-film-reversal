@@ -1748,3 +1748,1090 @@ def test_a_frame_between_stalls_resets_the_count(controller):
         camera.read = original
         loop.step()
     assert len(display.images) == 3
+
+
+# -- frames on their own thread (long exposures) ------------------------------------
+
+
+class HeldClock(FakeClock):
+    """Loop time moves only when the test moves it; a sleep just yields the CPU.
+
+    Under ``run()`` the loop then turns over hundreds of times a second of real
+    time while its own clock stands still, so what is drawn and counted depends
+    on what the test releases, not on how fast the machine is.
+    """
+
+    def sleep(self, s):
+        time.sleep(0.002)
+
+
+class ReadGate:
+    """Makes every preview read wait for a permit, as a long exposure does.
+
+    A full read (the capture worker's still) passes straight through, uncounted.
+    """
+
+    def __init__(self, camera):
+        self._real = camera.read
+        self._permits = threading.Semaphore(0)
+        self.reads = 0                      # preview reads begun
+        self.returned = 0                   # ... and finished
+        camera.read = self._read
+
+    def _read(self, *, full=True):
+        if full:
+            return self._real(full=full)
+        self.reads += 1
+        if not self._permits.acquire(timeout=10.0):
+            raise CameraError("the test never released this read")
+        try:
+            return self._real(full=False)
+        finally:
+            self.returned += 1
+
+    def release(self, n=1):
+        for _ in range(n):
+            self._permits.release()
+
+
+class ScriptedReads:
+    """Preview reads that raise the scripted errors in order, then deliver frames."""
+
+    def __init__(self, camera, script):
+        self._real = camera.read
+        self._script = list(script)
+        self.reads = 0
+        camera.read = self._read
+
+    def _read(self, *, full=True):
+        self.reads += 1
+        outcome = self._script.pop(0) if self._script else None
+        if outcome is not None:
+            raise outcome
+        return self._real(full=full)
+
+
+class Running:
+    """``loop.run`` on a thread, with whatever it raised and a count of its steps."""
+
+    def __init__(self, loop):
+        self.stop = threading.Event()
+        self.raised = None
+        self.steps = 0
+        real_step = loop.step
+
+        def counting_step():
+            real_step()
+            self.steps += 1
+
+        loop.step = counting_step
+        self._loop = loop
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            self._loop.run(self.stop)
+        except BaseException as exc:  # handed to the test, which asserts on it
+            self.raised = exc
+
+    def more_steps(self, n=5):
+        """Wait until the loop has been round ``n`` more times."""
+        target = self.steps + n
+        _until(lambda: self.steps >= target or not self.thread.is_alive())
+        assert self.steps >= target, f"the loop ended early: {self.raised!r}"
+
+    def finish(self, timeout=5.0):
+        self.stop.set()
+        self.thread.join(timeout)
+        assert not self.thread.is_alive(), "run() did not return"
+
+
+def _frames_thread_alive():
+    return any(t.name == "pifilm-frames" and t.is_alive() for t in threading.enumerate())
+
+
+def _spy_frames(monkeypatch):
+    """Record the picture and ``LiveState`` of every live redraw, still drawing it."""
+    drawn = []
+    real = viewfinder.render_live
+
+    def spy(frame_rgb, reading, state, **kwargs):
+        drawn.append((frame_rgb, state))
+        return real(frame_rgb, reading, state, **kwargs)
+
+    monkeypatch.setattr(viewfinder, "render_live", spy)
+    return drawn
+
+
+def _pictures(drawn):
+    """How many different camera frames the redraws showed, in order."""
+    count, last = 0, None
+    for rgb, _ in list(drawn):
+        if rgb is not last:
+            count, last = count + 1, rgb
+    return count
+
+
+def test_a_step_without_run_still_reads_its_frame_inline(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl)
+    reads = _count_reads(camera)
+    for _ in range(3):
+        loop.step()
+    assert reads["n"] == 3 and len(display.images) == 3
+    assert not _frames_thread_alive()
+
+
+def test_a_plus_tap_changes_the_value_and_lights_the_key_while_a_read_is_blocked(
+    controller, monkeypatch,
+):
+    """At a 1 s shutter the camera read blocks for a second. The controls must
+    not wait for it: the screen is redrawn, and a tap acted on, at the loop's
+    own rate."""
+    camera, ctl = controller
+    gate = ReadGate(camera)
+    drawn = _spy_frames(monkeypatch)
+    touch = TimedTouch()
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=time, frame_period=0.02)
+    running = Running(loop)
+    try:
+        gate.release()                            # the first frame, so there is a picture
+        _until(lambda: len(drawn) >= 1 and gate.reads == 2)
+        # From here to the end the second read never returns.
+        before = len(drawn)
+        _until(lambda: len(drawn) >= before + 3)  # still redrawn with the read blocked
+        assert drawn[-1][1].cells[SHUTTER_CELL].auto is True
+        touch.press(PLUS_CENTRE, hold=0.1)
+        _until(lambda: camera.shutter_us == 4000)
+        _until(lambda: any(
+            state.pressed is Action.PLUS and state.cells[SHUTTER_CELL] == Cell(
+                "SHUTTER", "1/250", auto=False)
+            for _, state in list(drawn)[before:]
+        ))
+        assert gate.reads == 2 and _pictures(drawn) == 1
+    finally:
+        gate.release(10)
+        running.finish()
+    assert running.raised is None
+
+
+def test_a_new_frame_is_drawn_when_it_arrives_and_the_rate_counts_camera_frames(
+    tmp_path, monkeypatch,
+):
+    """The fps line is read on hardware as the camera's rate, so the redraws
+    between two camera frames must not be counted in it."""
+    art = tmp_path / "art"
+    write_artifact(art, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    camera = FakeCamera([synthetic_frame(48, 64) for _ in range(3)], metadata=DEFAULT_METADATA)
+    ctl = CaptureController(CaptureSession(
+        camera, Pipeline(Artifacts.load(art)), tmp_path / "shots",
+        seed_rng=np.random.default_rng(0)))
+    gate = ReadGate(camera)
+    drawn = _spy_frames(monkeypatch)
+    logs = []
+    loop, _, _, clock = _loop(camera, ctl, clock=HeldClock(), log=logs.append)
+    running = Running(loop)
+    try:
+        assert not drawn                          # nothing to show before the first frame
+        for expected in (1, 2):
+            gate.release()
+            _until(lambda n=expected: _pictures(drawn) == n)
+            shown = len(drawn)
+            _until(lambda n=shown: len(drawn) >= n + 10)   # many redraws of one frame
+            assert _pictures(drawn) == expected
+        clock.t = 10.0
+        gate.release()
+        _until(lambda: _pictures(drawn) == 3)
+        _until(lambda: any(line.startswith("viewfinder:") for line in logs))
+    finally:
+        gate.release(10)
+        running.finish()
+        ctl.close()
+    assert running.raised is None
+    assert [line for line in logs if line.startswith("viewfinder:")][0] == "viewfinder: 0.3 fps"
+
+
+def test_the_frame_thread_does_not_read_while_the_screen_is_off(controller):
+    camera, ctl = controller
+    gate = ReadGate(camera)
+    touch = TimedTouch()
+    loop, _, display, clock = _idle_loop(camera, ctl, touch=touch, clock=HeldClock())
+    running = Running(loop)
+    try:
+        gate.release()
+        _until(lambda: gate.reads == 2)           # the second read is in flight
+        clock.t = 300.0
+        _until(lambda: display.levels[-1:] == [0])
+        running.more_steps()
+        gate.release(5)                           # that read returns; no other may start
+        running.more_steps(20)
+        time.sleep(0.05)
+        assert gate.reads == 2
+        touch.press((5, 5), hold=0.1)             # a tap wakes the screen
+        _until(lambda: gate.reads >= 3)
+    finally:
+        gate.release(50)
+        running.finish()
+    assert running.raised is None
+
+
+def test_the_frame_thread_does_not_read_during_processing_or_review(tmp_path):
+    camera, ctl, session = _gated_controller(tmp_path)
+    gate = ReadGate(camera)
+    touch = TimedTouch()
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=HeldClock())
+    running = Running(loop)
+    try:
+        gate.release()
+        _until(lambda: gate.reads == 2)           # the second read is in flight
+        ctl.submit("one")
+        assert session.started.wait(2.0)
+        running.more_steps()                      # the loop has seen the active job
+        gate.release(5)                           # that read returns; no other may start
+        running.more_steps(20)
+        time.sleep(0.05)
+        assert gate.reads == 2
+        session.release.set()
+        _until(lambda: loop.state == "REVIEW")
+        running.more_steps(20)
+        time.sleep(0.05)
+        assert gate.reads == 2
+        touch.press((5, 5), hold=0.1)             # a tap ends the review
+        _until(lambda: loop.state == "LIVE" and gate.reads >= 3)
+    finally:
+        session.release.set()
+        gate.release(50)
+        running.finish()
+        ctl.close()
+    assert running.raised is None
+
+
+def test_the_step_that_takes_the_photo_asks_for_no_preview_frame(tmp_path):
+    """The still waits for the camera behind any preview read. A read asked for
+    by the very step that pressed the shutter would be a second of shutter lag
+    at a 1 s shutter, for a frame the colour bars are about to cover."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    gate = ReadGate(camera)
+    touch = TimedTouch()
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=HeldClock())
+    real_submit = ctl.submit
+
+    def submit(request_id):
+        # The read in flight returns while this step is still running, so the
+        # frame thread is idle and would take a request made later in the step.
+        gate.release()
+        _until(lambda: gate.returned == 2)
+        return real_submit(request_id)
+
+    ctl.submit = submit
+    running = Running(loop)
+    try:
+        gate.release()
+        _until(lambda: gate.reads == 2)
+        touch.press(SHUTTER_CENTRE, hold=0.1)
+        assert session.started.wait(3.0)
+        gate.release(5)
+        running.more_steps(20)
+        time.sleep(0.05)
+        assert gate.reads == 2
+    finally:
+        session.release.set()
+        gate.release(50)
+        running.finish()
+        ctl.close()
+    assert running.raised is None
+
+
+def test_a_frame_that_arrived_during_a_pause_is_shown_but_not_counted(tmp_path, monkeypatch):
+    """A read in flight when the colour bars went up delivers its frame during
+    the pause. Back in the live view it is better than a blank screen, but it
+    is not a frame of this rate window."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    gate = ReadGate(camera)
+    drawn = _spy_frames(monkeypatch)
+    touch = TimedTouch()
+    logs = []
+    loop, _, _, clock = _loop(camera, ctl, touch=touch, clock=HeldClock(), log=logs.append)
+    running = Running(loop)
+    try:
+        gate.release()
+        _until(lambda: _pictures(drawn) == 1 and gate.reads == 2)
+        ctl.submit("one")
+        assert session.started.wait(2.0)
+        running.more_steps()
+        gate.release()                            # read 2 delivers during processing
+        session.release.set()
+        _until(lambda: loop.state == "REVIEW")
+        running.more_steps()
+        touch.press((5, 5), hold=0.1)
+        _until(lambda: _pictures(drawn) == 2)     # the paused frame is shown...
+        _until(lambda: gate.reads == 3)           # ...and a fresh one is asked for
+        clock.t = 10.0
+        gate.release()
+        _until(lambda: any(line.startswith("viewfinder:") for line in logs))
+    finally:
+        session.release.set()
+        gate.release(50)
+        running.finish()
+        ctl.close()
+    assert running.raised is None
+    # One frame in the ten seconds since the live view came back, not two.
+    assert [line for line in logs if line.startswith("viewfinder:")][0] == "viewfinder: 0.1 fps"
+
+
+def test_a_camera_that_keeps_stalling_ends_run(controller):
+    camera, ctl = controller
+    logged = []
+    reads = ScriptedReads(camera, [CameraStalled("no frame")] * 50)
+    loop, _, display, _ = _loop(
+        camera, ctl, clock=HeldClock(), log=logged.append, frame_period=0.01)
+    running = Running(loop)
+    running.thread.join(5.0)
+    assert not running.thread.is_alive()
+    assert isinstance(running.raised, CameraStalled)
+    assert sum("camera: no frame" in line for line in logged) == CAMERA_STALL_LIMIT
+    assert reads.reads >= CAMERA_STALL_LIMIT and display.images == []
+    _until(lambda: not _frames_thread_alive())
+
+
+def test_a_frame_between_stalls_resets_the_count_under_run(controller):
+    camera, ctl = controller
+    logged = []
+    round_ = [CameraStalled("no frame")] * (CAMERA_STALL_LIMIT - 1) + [None]
+    reads = ScriptedReads(camera, round_ * 3)
+    loop, _, display, _ = _loop(
+        camera, ctl, clock=HeldClock(), log=logged.append, frame_period=0.01)
+    running = Running(loop)
+    try:
+        _until(lambda: reads.reads >= len(round_) * 3 + 2)
+        running.more_steps()
+    finally:
+        running.finish()
+    assert running.raised is None
+    assert sum("camera: no frame" in line for line in logged) == 3 * (CAMERA_STALL_LIMIT - 1)
+    assert display.images
+
+
+def test_an_ordinary_camera_error_under_run_is_logged_and_survived(controller, monkeypatch):
+    camera, ctl = controller
+    logged = []
+    reads = ScriptedReads(camera, [CameraError("busy"), CameraError("busy")])
+    drawn = _spy_frames(monkeypatch)
+    loop, _, _, _ = _loop(camera, ctl, clock=HeldClock(), log=logged.append, frame_period=0.01)
+    running = Running(loop)
+    try:
+        _until(lambda: reads.reads >= 4 and _pictures(drawn) >= 2)
+    finally:
+        running.finish()
+    assert running.raised is None
+    assert logged.count("camera: busy") == 2
+
+
+def test_an_unexpected_error_does_not_kill_the_frame_thread(controller, monkeypatch):
+    """A thread that died would leave a frozen picture and no line in the log."""
+    camera, ctl = controller
+    logged = []
+    reads = ScriptedReads(camera, [ValueError("boom")])
+    drawn = _spy_frames(monkeypatch)
+    loop, _, _, _ = _loop(camera, ctl, clock=HeldClock(), log=logged.append, frame_period=0.01)
+    running = Running(loop)
+    try:
+        _until(lambda: reads.reads >= 3 and _pictures(drawn) >= 2)
+        assert _frames_thread_alive()
+    finally:
+        running.finish()
+    assert running.raised is None
+    assert logged.count("frames: boom") == 1
+
+
+def test_the_frame_thread_stops_with_the_loop(controller):
+    camera, ctl = controller
+    loop, _, display, _ = _loop(camera, ctl, clock=time, frame_period=0.02)
+    running = Running(loop)
+    try:
+        _until(lambda: len(display.images) >= 3)
+        assert _frames_thread_alive()
+    finally:
+        running.finish()
+    assert not _frames_thread_alive()
+
+
+def test_run_returns_when_stopped_with_a_read_still_blocked(controller, monkeypatch):
+    """A read can outlast the wait for it (a stall takes five seconds to be
+    called one). run() must come back anyway, and say what it left behind."""
+    camera, ctl = controller
+    monkeypatch.setattr(viewfinder, "FRAME_THREAD_JOIN_SECONDS", 0.1)
+    gate = ReadGate(camera)
+    logged = []
+    loop, _, _, _ = _loop(camera, ctl, clock=HeldClock(), log=logged.append)
+    running = Running(loop)
+    try:
+        _until(lambda: gate.reads == 1)           # blocked: no permit was ever given
+        running.finish(timeout=3.0)
+        assert any(line.startswith("frames:") and "did not stop" in line for line in logged)
+    finally:
+        gate.release(10)
+    _until(lambda: not _frames_thread_alive())
+    assert running.raised is None
+
+
+# -- verifying fixed controls against the camera's metadata -------------------------
+
+AGREEING = {"ExposureTime": 4000, "AnalogueGain": 8.0, "ColourTemperature": 7500, "Lux": 500.0}
+RESEND_STEP = 0.64   # six frames this far apart: the sixth is 3.2 s after the first
+
+
+def _picture(rgb):
+    """The picture's colour as the journal lines give it: channel means, R/G and B/G."""
+    r, g, b = (float(rgb[..., channel].mean()) for channel in range(3))
+    return f"picture R/G {r / g:.2f} B/G {b / g:.2f}"
+
+
+# Every frame of the fixture camera is this one, so every line ends the same way.
+PICTURE = "; " + _picture(synthetic_frame(48, 64))
+
+
+def _check_loop(camera, ctl, prefix="camera:", **kw):
+    """A loop that never dims, and the ``camera:`` lines it logs (not the fps ones)."""
+    logs = []
+
+    def log(line):
+        if line.startswith(prefix):
+            logs.append(line)
+
+    loop, touch, display, clock = _loop(camera, ctl, log=log, dim_after=0, off_after=0, **kw)
+    return loop, touch, clock, logs
+
+
+def _live_frames(loop, clock, n, dt=RESEND_STEP):
+    """``n`` live steps, each a new camera frame, ``dt`` apart on the loop's clock."""
+    for _ in range(n):
+        loop.step()
+        clock.t += dt
+
+
+def _fix_wb(camera):
+    camera.set_colour_temperature(7500)
+    camera._metadata = {**AGREEING, "ColourTemperature": 4250}
+
+
+def _fix_shutter(camera):
+    camera.set_shutter(4000)
+    camera._metadata = {**AGREEING, "ExposureTime": 33333}
+
+
+def _fix_iso(camera):
+    camera.set_iso(800)
+    camera._metadata = {**AGREEING, "AnalogueGain": 1.0}
+
+
+@pytest.mark.parametrize("fix, line", [
+    (_fix_shutter, "camera: shutter 1/250 not in the live view after 3.2 s "
+                   "(camera reports 1/30); resending" + PICTURE),
+    (_fix_iso, "camera: ISO 800 not in the live view after 3.2 s "
+               "(camera reports ISO 100); resending" + PICTURE),
+])
+def test_a_fixed_control_the_camera_does_not_report_is_resent(controller, fix, line):
+    """A shutter or ISO the camera does not report is sent again first: on the
+    Pi a live shutter change was seen applied even where a white balance was not."""
+    camera, ctl = controller
+    fix(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 5)
+    assert camera.reassert_count == 0 and logs == []
+    _live_frames(loop, clock, 1)
+    assert camera.reassert_count == 1
+    assert logs == [line]
+
+
+def test_auto_white_balance_that_was_never_fixed_is_not_checked(controller):
+    camera, ctl = controller
+    camera._metadata = dict(AGREEING)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 20)
+    assert camera.reassert_count == 0 and logs == []
+
+
+def test_controls_that_agree_with_the_camera_are_never_resent(controller):
+    camera, ctl = controller
+    camera.set_shutter(4000)
+    camera.set_iso(800)
+    camera.set_colour_temperature(7500)
+    # Inside the tolerances: 5 % on time and gain, 100 K on white balance.
+    camera._metadata = {"ExposureTime": 3990, "AnalogueGain": 8.2, "ColourTemperature": 7440}
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 20)
+    assert camera.reassert_count == 0 and logs == []
+
+
+def test_no_resend_before_three_seconds_however_many_frames(controller):
+    camera, ctl = controller
+    _fix_shutter(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 4, dt=0.5)       # frames at 0, 0.5, 1.0, 1.5
+    _live_frames(loop, clock, 20, dt=0.05)     # ... and twenty more up to 2.95 s
+    assert camera.reassert_count == 0
+    clock.t = 3.0
+    _live_frames(loop, clock, 1)
+    assert camera.reassert_count == 1
+
+
+def test_no_resend_before_six_frames_however_long_they_take(controller):
+    """At a 1 s shutter three seconds is three frames, and the new value needs
+    a frame or two to arrive in the first place."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 5, dt=1.0)
+    assert camera.reassert_count == 0
+    _live_frames(loop, clock, 1, dt=1.0)
+    assert camera.reassert_count == 1
+    assert "after 5.0 s" in logs[0]
+
+
+def test_a_frame_that_agrees_starts_the_wait_again(controller):
+    camera, ctl = controller
+    _fix_shutter(camera)
+    wrong = camera._metadata
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 5)
+    camera._metadata = dict(AGREEING)
+    _live_frames(loop, clock, 1)
+    camera._metadata = wrong
+    _live_frames(loop, clock, 5)
+    assert camera.reassert_count == 0 and logs == []
+    _live_frames(loop, clock, 1)
+    assert camera.reassert_count == 1
+
+
+def test_a_step_starts_the_wait_again(controller):
+    """A new value has been sent: the camera gets the full wait to show it."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 4)
+    _tap(loop, touch, clock, PLUS_CENTRE)       # two more frames; the second one steps
+    assert camera.shutter_us != 4000
+    # Without the step the eighth frame, 3.3 s in, would be resent to.
+    _live_frames(loop, clock, 4)
+    assert camera.reassert_count == 0 and logs == []
+    _live_frames(loop, clock, 2)
+    assert camera.reassert_count == 1
+
+
+def test_leaving_the_live_view_starts_the_wait_again(controller):
+    """A still re-applies the whole configuration, so what the frames before it
+    showed says nothing about the ones after."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 5)
+    ctl.submit("one")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "REVIEW"
+    _tap(loop, touch, clock, (5, 5))
+    assert loop.state == "LIVE"
+    _live_frames(loop, clock, 5)
+    assert camera.reassert_count == 0 and logs == []
+    _live_frames(loop, clock, 1)
+    assert camera.reassert_count == 1
+
+
+@pytest.mark.parametrize("metadata", [
+    None, {}, {"ExposureTime": "4000", "AnalogueGain": None, "ColourTemperature": True},
+    {"ExposureTime": float("nan"), "AnalogueGain": float("inf"), "ColourTemperature": [7500]},
+])
+def test_metadata_that_cannot_tell_is_never_a_mismatch(controller, metadata):
+    camera, ctl = controller
+    camera.set_shutter(4000)
+    camera.set_iso(800)
+    camera.set_colour_temperature(7500)
+    camera._metadata = metadata
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 20)
+    camera.set_colour_temperature(None)
+    _live_frames(loop, clock, 20)
+    assert camera.reassert_count == 0 and logs == []
+
+
+def test_a_control_the_camera_cannot_change_is_never_checked(controller, monkeypatch):
+    camera, ctl = controller
+    _fix_wb(camera)
+    monkeypatch.setattr(camera, "wb_adjustable", False)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 20)
+    assert (camera.reassert_count, camera.restart_count) == (0, 0) and logs == []
+
+
+def test_the_first_agreeing_frame_after_a_resend_is_logged_once(controller):
+    camera, ctl = controller
+    _fix_shutter(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 6)
+    assert camera.reassert_count == 1
+    camera._metadata = None                     # a frame that cannot tell proves nothing
+    _live_frames(loop, clock, 1)
+    assert len(logs) == 1
+    camera._metadata = dict(AGREEING)
+    _live_frames(loop, clock, 5)
+    assert logs[1:] == ["camera: shutter 1/250 applied after resend"]
+
+
+def test_resends_continue_but_the_line_is_logged_once_in_thirty_seconds(controller):
+    """A camera that never takes the control is resent to every few seconds for
+    as long as it lasts, without a journal line for each."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+    camera.restart_preview = None               # a camera that can only be resent to
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 60)               # resends at frames 6, 12, ... 60
+    assert camera.reassert_count == 10
+    assert logs == [
+        "camera: shutter 1/250 not in the live view after 3.2 s "
+        "(camera reports 1/30); resending" + PICTURE,
+        "camera: shutter 1/250 not in the live view after 33.9 s "
+        "(camera reports 1/30); resending (7 more)" + PICTURE,
+    ]
+
+
+def test_a_resend_the_camera_refuses_is_logged_and_survived(controller):
+    camera, ctl = controller
+    _fix_shutter(camera)
+    attempts = []
+
+    def refuse():
+        attempts.append(1)
+        raise CameraError("Picamera2 failed to resend the controls: busy")
+
+    camera.reassert_controls = refuse
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 12)
+    assert len(attempts) == 2 and loop.state == "LIVE"
+    assert logs.count("camera: Picamera2 failed to resend the controls: busy") == 2
+
+
+def test_a_camera_that_cannot_resend_still_gets_the_journal_line(controller):
+    camera, ctl = controller
+    _fix_shutter(camera)
+    camera.reassert_controls = None
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 6)
+    assert len(logs) == 1 and "not in the live view" in logs[0]
+
+
+def test_redraws_of_one_frame_do_not_count_as_frames_that_disagree(controller):
+    """Under run() the loop redraws ten times a second whatever the camera
+    does; only a new camera frame is new evidence."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    # As under run(), without the thread: the test publishes the frames itself.
+    loop._want_frames = threading.Event()
+    for seq in range(1, 6):
+        loop._grab = viewfinder._Grab(seq, frame=camera.read(full=False))
+        for _ in range(10):                     # one new frame, nine redraws of it
+            loop.step()
+            clock.t += 0.1
+    assert camera.reassert_count == 0 and logs == []
+    loop._grab = viewfinder._Grab(6, frame=camera.read(full=False))
+    loop.step()
+    assert camera.reassert_count == 1
+
+
+# -- restarting the live view when resending does not help --------------------------
+
+STILL_WRONG = ("camera: shutter 1/250 still not in the live view after 2 resends; "
+               "restarting the live view" + PICTURE)
+
+
+def test_two_resends_that_do_not_help_are_followed_by_a_restart_of_the_live_view(controller):
+    """Seen on the Pi 4: a live control ignored for good, fixed value or return
+    to auto alike, until a photo reconfigured the camera. The restart is that
+    reconfiguration without the photo."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 17)
+    assert (camera.reassert_count, camera.restart_count) == (2, 0)
+    _live_frames(loop, clock, 1)                # the eighteenth frame, 10.9 s in
+    assert (camera.reassert_count, camera.restart_count) == (2, 1)
+    assert logs[-1] == STILL_WRONG
+    camera._metadata = dict(AGREEING)
+    _live_frames(loop, clock, 3)
+    assert logs[-1] == "camera: shutter 1/250 applied after restarting the live view"
+    assert logs.count(logs[-1]) == 1 and not any("after resend" in line for line in logs)
+    _live_frames(loop, clock, 30)
+    assert (camera.reassert_count, camera.restart_count) == (2, 1)
+
+
+@pytest.mark.parametrize("frames", [6, 12])
+def test_a_resend_that_cures_it_is_not_followed_by_a_restart(controller, frames):
+    camera, ctl = controller
+    _fix_shutter(camera)
+    wrong = camera._metadata
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, frames)           # one resend, or two
+    assert camera.reassert_count == frames // 6
+    camera._metadata = dict(AGREEING)
+    _live_frames(loop, clock, 30)
+    assert camera.restart_count == 0
+    assert logs[-1] == "camera: shutter 1/250 applied after resend"
+    # A new disagreement later starts from the beginning: two resends first.
+    camera._metadata = wrong
+    _live_frames(loop, clock, 17)
+    assert camera.restart_count == 0
+    _live_frames(loop, clock, 1)
+    assert camera.restart_count == 1
+
+
+def test_a_restart_the_camera_refuses_is_logged_and_survived(controller):
+    camera, ctl = controller
+    _fix_shutter(camera)
+
+    def refuse():
+        raise CameraError("Picamera2 failed to restart the live view: busy")
+
+    camera.restart_preview = refuse
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 30)
+    assert loop.state == "LIVE"
+    assert logs.count("camera: Picamera2 failed to restart the live view: busy") == 1
+
+
+def test_a_restart_that_stalls_counts_like_a_stalled_frame(controller):
+    """A camera that cannot be restarted and then delivers no frames is the
+    stalled camera the loop already gives up on."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+
+    def stall(*args, **kwargs):
+        raise CameraStalled("no frame")
+
+    camera.restart_preview = stall
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 18)               # the restart stalls: one
+    assert logs[-1] == "camera: no frame" and loop.state == "LIVE"
+    camera.read = stall
+    for _ in range(CAMERA_STALL_LIMIT - 2):
+        loop.step()
+    with pytest.raises(CameraStalled):
+        loop.step()
+
+
+def test_a_camera_without_a_restart_keeps_being_resent_to(controller):
+    camera, ctl = controller
+    _fix_shutter(camera)
+    camera.restart_preview = None
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 30)
+    assert camera.reassert_count == 5
+    assert not any("restarting" in line for line in logs)
+
+
+def test_a_mismatch_that_survives_its_restart_is_not_restarted_again(controller):
+    """One restart for one selection: a restart blanks the picture, and one
+    that did not help will not help the second time either."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 18)               # two resends, then the restart
+    assert (camera.reassert_count, camera.restart_count) == (2, 1)
+    _live_frames(loop, clock, 6)                # the next wait ends: said once, resent
+    gave_up = "camera: shutter 1/250 not applied even after restarting the live view"
+    assert logs[-1] == gave_up and camera.reassert_count == 3
+    _live_frames(loop, clock, 120)              # well over a minute more
+    assert camera.restart_count == 1 and camera.reassert_count == 23
+    assert logs.count(gave_up) == 1 and logs.count(STILL_WRONG) == 1
+    # A step is a new selection, and that may have its own restart.
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _live_frames(loop, clock, 18)
+    assert camera.restart_count == 2
+
+
+# -- white balance: restarted at once, never resent ---------------------------------
+
+WB_STEP = 0.32   # six frames this far apart: the sixth is 1.6 s after the first
+WB_RESTART = ("camera: white balance 7500K not in the live view after 1.6 s "
+              "(camera reports 4250K); restarting the live view" + PICTURE)
+
+
+def test_a_white_balance_the_camera_does_not_report_restarts_the_live_view(controller):
+    """Measured on the Pi 4 on 2026-10-12: after a photo a live white-balance
+    change was ignored 11 times out of 11, a resend cured 2 of about 7, and a
+    restart of the live view cured it every time. So no resend is tried."""
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 5, dt=WB_STEP)
+    assert camera.restart_count == 0 and logs == []
+    _live_frames(loop, clock, 1, dt=WB_STEP)
+    assert (camera.reassert_count, camera.restart_count) == (0, 1)
+    assert logs == [WB_RESTART]
+    camera._metadata = dict(AGREEING)
+    _live_frames(loop, clock, 3, dt=WB_STEP)
+    assert logs[1:] == ["camera: white balance 7500K applied after restarting the live view"]
+    _live_frames(loop, clock, 40, dt=WB_STEP)
+    assert (camera.reassert_count, camera.restart_count) == (0, 1) and len(logs) == 2
+
+
+def test_no_white_balance_restart_before_a_second_and_a_half(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 14, dt=0.1)       # frames up to 1.3 s
+    assert camera.restart_count == 0
+    clock.t = 1.5
+    _live_frames(loop, clock, 1)
+    assert camera.restart_count == 1
+
+
+def test_no_white_balance_restart_before_six_frames(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 5, dt=1.0)
+    assert camera.restart_count == 0
+    _live_frames(loop, clock, 1, dt=1.0)
+    assert camera.restart_count == 1 and "after 5.0 s" in logs[0]
+
+
+def test_an_auto_white_balance_that_has_not_moved_is_given_four_seconds(controller):
+    """libcamera's own damping holds the old value for about two seconds before
+    it drifts: a restart then would be a false alarm."""
+    camera, ctl = controller
+    camera.set_colour_temperature(7500)
+    camera._metadata = dict(AGREEING)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 2, dt=0.5)
+    camera.set_colour_temperature(None)
+    _live_frames(loop, clock, 8, dt=0.5)        # 0 to 3.5 s on auto
+    assert camera.restart_count == 0 and logs == []
+    _live_frames(loop, clock, 1, dt=0.5)
+    assert (camera.reassert_count, camera.restart_count) == (0, 1)
+    assert logs == ["camera: auto white balance has not moved from 7500K after 4.0 s; "
+                    "restarting the live view" + PICTURE]
+    camera._metadata = {**AGREEING, "ColourTemperature": 7400}
+    _live_frames(loop, clock, 1, dt=0.5)
+    assert logs[-1] == "camera: auto white balance applied after restarting the live view"
+    # Auto has taken over: landing on the old value later is not a fault.
+    camera._metadata = dict(AGREEING)
+    _live_frames(loop, clock, 40, dt=0.5)
+    assert camera.restart_count == 1
+
+
+def test_an_auto_white_balance_that_moves_in_time_is_left_alone(controller):
+    camera, ctl = controller
+    camera.set_colour_temperature(7500)
+    camera._metadata = dict(AGREEING)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 2, dt=0.5)
+    camera.set_colour_temperature(None)
+    _live_frames(loop, clock, 6, dt=0.5)        # held for 2.5 s, as measured
+    camera._metadata = {**AGREEING, "ColourTemperature": 7380}
+    _live_frames(loop, clock, 40, dt=0.5)
+    assert (camera.reassert_count, camera.restart_count) == (0, 0) and logs == []
+
+
+def test_a_white_balance_that_survives_its_restart_is_left_alone(controller):
+    """White balance does nothing further: no resend, no second restart, one line."""
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 1
+    _live_frames(loop, clock, 300, dt=WB_STEP)  # a minute and a half
+    assert (camera.reassert_count, camera.restart_count) == (0, 1)
+    assert logs == [
+        WB_RESTART, "camera: white balance 7500K not applied even after restarting the live view"]
+
+
+def _wb_selected_then_ignored(camera, ctl):
+    """A loop with the WB cell selected at 5600 K, which the camera then stops reporting."""
+    camera.set_colour_temperature(5600)
+    camera._metadata = {**AGREEING, "ColourTemperature": 5600}
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _tap(loop, touch, clock, _cell(WB_CELL))
+    camera._metadata = {**AGREEING, "ColourTemperature": 4250}
+    return loop, touch, clock, logs
+
+
+def test_a_new_selection_may_restart_the_live_view_again_at_once(controller):
+    camera, ctl = controller
+    loop, touch, clock, logs = _wb_selected_then_ignored(camera, ctl)
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 1
+    _live_frames(loop, clock, 30, dt=WB_STEP)   # nearly ten seconds; the same selection
+    assert camera.restart_count == 1
+    _tap(loop, touch, clock, PLUS_CENTRE)       # 6500 K: one frame of the new wait
+    assert camera.colour_temperature_k == 6500
+    _live_frames(loop, clock, 5, dt=WB_STEP)    # ... and five more, 1.28 s in
+    assert camera.restart_count == 1
+    _live_frames(loop, clock, 1, dt=WB_STEP)
+    assert camera.restart_count == 2
+    assert logs[-1].startswith("camera: white balance 6500K not in the live view after 1.6 s")
+
+
+def test_two_restarts_are_never_closer_than_five_seconds(controller):
+    """The backstop against a picture that blinks with every tap."""
+    camera, ctl = controller
+    loop, touch, clock, logs = _wb_selected_then_ignored(camera, ctl)
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 1
+    restarted_at = clock.t - WB_STEP
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _live_frames(loop, clock, 12, dt=WB_STEP)   # past both limits, 4 s after the restart
+    assert clock.t - restarted_at < 5.0 and camera.restart_count == 1
+    clock.t = restarted_at + 5.0
+    _live_frames(loop, clock, 1)
+    assert camera.restart_count == 2
+
+
+def test_leaving_the_live_view_allows_a_white_balance_restart_again(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 40, dt=WB_STEP)
+    assert camera.restart_count == 1
+    ctl.submit("one")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "REVIEW"
+    _tap(loop, touch, clock, (5, 5))
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 2
+
+
+def test_a_white_balance_restart_the_camera_refuses_is_tried_once(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    attempts = []
+
+    def refuse():
+        attempts.append(1)
+        raise CameraError("Picamera2 failed to restart the live view: busy")
+
+    camera.restart_preview = refuse
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 60, dt=WB_STEP)
+    assert len(attempts) == 1 and loop.state == "LIVE"
+    assert logs[1:] == ["camera: Picamera2 failed to restart the live view: busy"]
+
+
+def test_a_camera_that_cannot_restart_still_gets_the_white_balance_line(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    camera.restart_preview = None
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 60, dt=WB_STEP)
+    assert camera.reassert_count == 0
+    assert logs == ["camera: white balance 7500K not in the live view after 1.6 s "
+                    "(camera reports 4250K); cannot restart the live view" + PICTURE]
+
+
+# -- a trace line after every control step ------------------------------------------
+
+TRACED = {"ExposureTime": 16667, "AnalogueGain": 4.0, "ColourTemperature": 7500,
+          "ColourGains": [3.35, 1.36], "Lux": 500.0}
+REPORTS = "camera reports 7500K gains (3.35, 1.36), exposure 1/60, ISO 400"
+
+
+def _trace_loop(camera, ctl, metadata=TRACED):
+    camera._metadata = metadata
+    loop, touch, clock, logs = _check_loop(camera, ctl, prefix="control:")
+    loop.step()                                 # one frame, so the first step has a metered value
+    return loop, touch, clock, logs
+
+
+@pytest.mark.parametrize("cell, selected", [
+    (SHUTTER_CELL, "SHUTTER 1/60"), (ISO_CELL, "ISO 400"), (WB_CELL, "WB 7500K"),
+])
+def test_a_step_is_traced_once_two_seconds_later(controller, cell, selected):
+    """The camera alone applies a live control correctly, so the fault seen on
+    the Pi is in how the app runs: each step leaves what was selected, what the
+    camera reported and what the picture looked like in the journal."""
+    camera, ctl = controller
+    loop, touch, clock, logs = _trace_loop(camera, ctl)
+    _tap(loop, touch, clock, _cell(cell))
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _live_frames(loop, clock, 4, dt=0.5)        # frames 0 to 1.5 s after the step
+    assert logs == []
+    _live_frames(loop, clock, 1, dt=0.5)
+    assert logs == [f"control: {selected} selected; {REPORTS}{PICTURE}"]
+    _live_frames(loop, clock, 20, dt=0.5)
+    assert len(logs) == 1
+
+
+def test_the_trace_of_a_return_to_auto_says_auto(controller):
+    camera, ctl = controller
+    camera.set_colour_temperature(3200)
+    loop, touch, clock, logs = _trace_loop(camera, ctl)
+    _tap(loop, touch, clock, _cell(WB_CELL))
+    _tap(loop, touch, clock, MINUS_CENTRE)
+    assert camera.colour_temperature_k is None
+    _live_frames(loop, clock, 5, dt=0.5)
+    assert logs == [f"control: WB AUTO selected; {REPORTS}{PICTURE}"]
+
+
+def test_the_trace_writes_a_dash_for_what_the_camera_does_not_report(controller):
+    camera, ctl = controller
+    camera._frames = [np.zeros((48, 64, 3), dtype=np.uint8)]
+    loop, touch, clock, logs = _trace_loop(camera, ctl, metadata=None)
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert camera.shutter_us is not None
+    _live_frames(loop, clock, 5, dt=0.5)
+    assert logs == [
+        f"control: SHUTTER {viewfinder.shutter.label(camera.shutter_us)} selected; "
+        "camera reports - gains -, exposure -, ISO -; picture R/G - B/G -"]
+
+
+def test_a_second_step_replaces_the_pending_trace(controller):
+    camera, ctl = controller
+    loop, touch, clock, logs = _trace_loop(camera, ctl)
+    _tap(loop, touch, clock, _cell(ISO_CELL))
+    _tap(loop, touch, clock, PLUS_CENTRE)       # ISO 400
+    _live_frames(loop, clock, 3, dt=0.5)
+    _tap(loop, touch, clock, PLUS_CENTRE)       # ISO 800, 1.6 s after the first step
+    _live_frames(loop, clock, 4, dt=0.5)        # up to 1.5 s after the second
+    assert logs == []
+    _live_frames(loop, clock, 2, dt=0.5)        # 2.0 s is a rounding error either way
+    assert logs == [f"control: ISO 800 selected; {REPORTS}{PICTURE}"]
+
+
+def test_leaving_the_live_view_cancels_the_trace(controller):
+    """The photo reconfigures the camera: what follows says nothing of the step."""
+    camera, ctl = controller
+    loop, touch, clock, logs = _trace_loop(camera, ctl)
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    ctl.submit("one")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "REVIEW"
+    _tap(loop, touch, clock, (5, 5))
+    assert loop.state == "LIVE"
+    _live_frames(loop, clock, 20, dt=0.5)
+    assert logs == []
+
+
+def test_a_step_the_camera_rejects_is_not_traced(controller):
+    camera, ctl = controller
+
+    def refuse(us):
+        raise CameraError("rejected")
+
+    camera.set_shutter = refuse
+    loop, touch, clock, logs = _trace_loop(camera, ctl)
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _live_frames(loop, clock, 20, dt=0.5)
+    assert logs == []
+
+
+def test_a_step_that_changes_nothing_is_not_traced(controller):
+    camera, ctl = controller
+    camera.set_colour_temperature(7500)         # the top step: + stays there
+    loop, touch, clock, logs = _trace_loop(camera, ctl)
+    _tap(loop, touch, clock, _cell(WB_CELL))
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _live_frames(loop, clock, 20, dt=0.5)
+    assert logs == []

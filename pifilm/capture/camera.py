@@ -157,6 +157,8 @@ class FakeCamera:
         self.wb_adjustable = True
         self.exposure_adjustable = True
         self.max_gain: float | None = None
+        self.reassert_count = 0
+        self.restart_count = 0
         if jpeg_bytes is not None:
             decoded = [
                 cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR) for b in jpeg_bytes
@@ -201,6 +203,15 @@ class FakeCamera:
     def set_colour_temperature(self, kelvin: int | None) -> None:
         # Mirrors Picamera2Camera.set_colour_temperature for the viewfinder's WB control.
         self.colour_temperature_k = None if kelvin is None else int(kelvin)
+
+    def reassert_controls(self) -> None:
+        # Mirrors Picamera2Camera.reassert_controls; there is no camera to
+        # resend to, so it only counts the calls.
+        self.reassert_count += 1
+
+    def restart_preview(self) -> None:
+        # Mirrors Picamera2Camera.restart_preview; nothing to restart, so it counts.
+        self.restart_count += 1
 
     def close(self) -> None:
         return None
