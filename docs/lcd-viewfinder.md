@@ -441,6 +441,9 @@ subject in focus reads about as high as a bright one.
   | Room scene, slightly soft | 0.28 | 0.11 to 0.18 |
   | Room scene, completely out | 0.43 to 0.45 | 0.00 |
   | Plain surface, any focus | 0.50 to 0.67 | 0.00 to 0.06 |
+
+  Run live on the Pi 4 on 2026-10-13: the bar was near empty fully defocused,
+  climbed toward focus and peaked where the picture looked sharpest.
 - **The amber tick is the best level of the last few seconds.** Rack through
   focus, then turn back until the white fill reaches the tick again.
 - **The tick fades** (it halves in about three seconds), so it lets go of an
