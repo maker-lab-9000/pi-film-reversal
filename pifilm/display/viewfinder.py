@@ -61,8 +61,9 @@ driven directly has no thread and reads its frame inline, exactly as before.
 Each new frame is also the check that the camera took the controls it was sent.
 On the Pi 4 a fixed white balance has been seen not to reach the live view until
 a photo re-applied the configuration, so a frame whose metadata disagrees with
-the fixed shutter, ISO or white balance for long enough is logged, the controls
-are sent again, and if that changes nothing the live view is restarted (see
+the fixed shutter, ISO or white balance for long enough is logged and acted on:
+shutter and ISO are sent again and, if that changes nothing, the live view is
+restarted; white balance restarts the live view at once (see
 ``CONTROL_RESEND_SECONDS`` and ``_verify_controls``). Each successful step is
 also traced in the journal about two seconds later (``CONTROL_TRACE_SECONDS``).
 
@@ -125,25 +126,50 @@ CAMERA_STALL_LIMIT = 3
 # the slowest shutter takes a second, so this covers any healthy one; a read
 # that is waiting out a stall (five seconds and more) is left behind instead.
 FRAME_THREAD_JOIN_SECONDS = 2.0
-# Verifying the fixed controls. On the Pi 4 a control sent to the running camera
-# has been seen not to take effect: a white balance was selected and the live
-# view kept the old colour, once for over a minute, until a photo re-applied the
-# configuration. The cause is not known (300 control changes against Picamera2
-# alone lost none), so each new frame's metadata is compared with the selection,
-# and a disagreement that lasts this long, over at least this many frames, is
-# written to the journal and the controls are sent again. The journal line is
-# the evidence. Both limits must pass: a new value takes a few frames to show
-# at any shutter speed, and at 1 s three seconds is only three frames.
+# Verifying the fixed controls. Each new frame's metadata is compared with the
+# selection, because on the Pi 4 a control sent to the running camera does not
+# always take effect, and a disagreement that lasts is written to the journal
+# and acted on. The journal line is the evidence; the cause is not known.
+#
+# Measured on the Pi 4 + IMX477 (libcamera 0.7.2, Picamera2 0.3.37) on
+# 2026-10-12, from these journal lines:
+# - before the first photo after start-up a live white-balance change is
+#   applied within 2 s;
+# - after a photo or a restart of the live view (after any mode switch) a live
+#   white-balance change, to a fixed value or back to auto, is usually not
+#   applied: 11 of 11 first sends were ignored, sending again cured 2 of about
+#   7, and restarting the live view cured it every time (3 of 3);
+# - a live shutter change after a photo was applied within 2 s (one case).
+# The same camera class driven from a stand-alone script took live changes
+# after a photo, and 300 control changes against Picamera2 alone lost none.
+#
+# So the remedy depends on the control. Shutter and ISO are sent again when the
+# disagreement has lasted this long over at least this many new frames (both: a
+# new value takes a few frames to show at any shutter speed, and at 1 s three
+# seconds is only three frames), and after this many resends that changed
+# nothing the live view is restarted, which reconfigures the camera as a photo
+# does.
 CONTROL_RESEND_SECONDS = 3.0
 CONTROL_RESEND_FRAMES = 6
-# A control has also been seen ignored for good, a fixed value and a return to
-# auto alike, until a photo was taken. What the photo adds is a reconfiguration
-# of the camera, so after this many resends that changed nothing the live view
-# is restarted, which is that reconfiguration without the photo. A restart
-# blanks the picture for a moment, so one that did not help is not repeated
-# for a minute; the resends go on meanwhile.
 CONTROL_RESENDS_BEFORE_RESTART = 2
-CONTROL_RESTART_HOLDOFF = 60.0
+# White balance is never resent, since that so rarely helped: the live view is
+# restarted as soon as the disagreement has lasted this long over this many new
+# frames. After a photo a new white balance therefore shows in the old colour
+# for about a second and a half, then the picture blinks once and is right.
+WB_RESTART_SECONDS = 1.5
+WB_RESTART_FRAMES = 6
+# A return to auto gets longer: libcamera's own damping was measured holding
+# the old value for about 2 s before it starts to drift, and a restart inside
+# that would be a false alarm.
+WB_AUTO_RESTART_SECONDS = 4.0
+# One restart per episode, an episode being one unbroken disagreement of one
+# control with one selected value. A restart that did not help is not repeated
+# (a 60 s hold-off was tried first and left the user stuck in the wrong colour
+# after the first restart, 2026-10-12); a step, agreement, or leaving the live
+# view begins a new episode that may restart again. Whatever the episodes, two
+# restarts are never closer than this, so no run of taps can make the picture
+# blink continuously.
+CONTROL_RESTART_MIN_INTERVAL = 5.0
 # The camera by itself applies a live control correctly, even after a photo
 # (tried on the Pi: the reported value and the picture both change), so the
 # fault is somewhere in how this app runs it, and the evidence has to come from
@@ -176,6 +202,26 @@ FULL_BACKLIGHT = 80
 NOTICE_SECONDS = 1.2
 PROCESSING_FIRST = "Exposure 1 of 2..."
 PROCESSING_DOUBLE = "Developing double exposure..."
+
+
+@dataclass
+class _Episode:
+    """One unbroken disagreement of one control with one selected value.
+
+    ``began`` is when it was first seen and ``since`` when its current wait
+    started, both on the loop's clock; ``frames`` counts the new camera frames
+    of that wait. ``restarted`` says the one restart this episode may have has
+    been used, ``told`` that its failure has been reported, and ``awaiting``
+    names the remedy ("resend" or "restart") whose effect has yet to be seen.
+    """
+
+    began: float
+    since: float
+    frames: int = 0
+    resends: int = 0
+    restarted: bool = False
+    told: bool = False
+    awaiting: str | None = None
 
 
 @dataclass(frozen=True)
@@ -230,24 +276,15 @@ class ViewfinderLoop:
         self._grab_seq = 0
         self._view: tuple[Any, MeterReading, Any] | None = None
         self._was_live = False
-        # Verifying the fixed controls (see CONTROL_RESEND_SECONDS). When the
-        # current disagreement was first seen and when its wait began, both on
-        # the loop's clock, and the new frames that have shown it since; the
-        # controls a resend is waiting to see applied; when each control's line
-        # was last written and how many have been held back since; and the last
-        # white balance that was fixed, until auto is seen to have left it.
-        self._mismatch_began: float | None = None
-        self._mismatch_since = 0.0
-        self._mismatch_frames = 0
-        self._resent: set[str] = set()
-        # The second stage: resends made in this wait without effect, the
-        # controls a restart of the live view is waiting to see applied, the
-        # ones already reported as surviving a restart, and when the live view
-        # was last restarted.
-        self._resends = 0
-        self._restarted: set[str] = set()
-        self._gave_up: set[str] = set()
+        # Verifying the fixed controls (see CONTROL_RESEND_SECONDS): the
+        # disagreement in progress for each control, by its key; when each
+        # control's resend line was last written and how many have been held
+        # back since; when the live view was last restarted; and the last white
+        # balance that was fixed, until auto is seen to have left it.
+        self._episodes: dict[str, _Episode] = {}
+        self._resend_logged: dict[str, tuple[float, int]] = {}
         self._restarted_at: float | None = None
+        self._last_fixed_k: float | None = None
         # The step waiting for its trace line: the cell and when it was stepped.
         self._trace: tuple[int, float] | None = None
         self._resend_logged: dict[str, tuple[float, int]] = {}
@@ -424,21 +461,19 @@ class ViewfinderLoop:
                 halt.wait(self._frame_period)
 
     def _restart_control_check(self, *, new_selection: bool = False) -> None:
-        """Begin the wait for the controls to show in the live view again.
+        """End every episode: the controls get their full wait again.
 
         Called when the live view is left, because a still re-applies the whole
         configuration and what the frames before it showed says nothing about
         the ones after, and when a control is stepped (``new_selection``),
         because a new value has just been sent and is a new question: its line
-        may be written at once. Leaving the live view also drops a pending
-        trace line.
+        may be written at once. Either way the next disagreement is a new
+        episode, with its own restart. Leaving the live view also drops a
+        pending trace line.
         """
-        self._mismatch_began, self._mismatch_frames, self._resends = None, 0, 0
-        self._resent.clear()
-        self._restarted.clear()
+        self._episodes.clear()
         if new_selection:
             self._resend_logged.clear()
-            self._gave_up.clear()
         else:
             # A trace across a photo would describe the photo's reconfiguration,
             # not the step.
@@ -567,92 +602,127 @@ class ViewfinderLoop:
         """Check one new frame against the fixed controls; act when overdue.
 
         Called once per camera frame, never for a redraw: only a new frame is
-        new evidence. The first remedy is to send the controls again; when
-        ``CONTROL_RESENDS_BEFORE_RESTART`` resends have changed nothing, the
-        live view is restarted instead of another resend. A failure of either
-        is logged and survived like any other camera error from a control,
-        except that a restart which times out is a stalled camera and is
-        counted as one (it raises at ``CAMERA_STALL_LIMIT``). The lines that
-        announce a resend or a restart end with the picture's colour, from
-        ``rgb``.
+        new evidence. A control that agrees ends its episode; one the frame
+        cannot tell about is left as it is. For one that disagrees, shutter and
+        ISO are sent again and, after ``CONTROL_RESENDS_BEFORE_RESTART``
+        resends without effect, the live view is restarted; white balance goes
+        straight to the restart (see the constants for why). An episode has one
+        restart: if the disagreement outlives it, that is said once, shutter
+        and ISO go on being resent and white balance is left alone.
+
+        A failed resend is logged and survived like any other camera error from
+        a control; so is a failed restart, except that one which times out is a
+        stalled camera and is counted as one (it raises at
+        ``CAMERA_STALL_LIMIT``). The lines that announce a resend or a restart
+        end with the picture's colour, from ``rgb``.
         """
         self._note_fixed_wb()
-        faults = []
-        for kind, what, fault in self._control_checks(metadata):
-            if fault is not None:
-                faults.append((kind, what, fault))
-                continue
-            self._resend_logged.pop(kind, None)
-            self._gave_up.discard(kind)
-            if kind in self._restarted:
-                self._restarted.discard(kind)
-                self._log(f"camera: {what} applied after restarting the live view")
-            elif kind in self._resent:
-                self._log(f"camera: {what} applied after resend")
-            self._resent.discard(kind)
-        if not faults:
-            self._mismatch_began, self._mismatch_frames, self._resends = None, 0, 0
-            return
-        if self._mismatch_began is None:
-            self._mismatch_began = self._mismatch_since = now
-        self._mismatch_frames += 1
-        if (
-            self._mismatch_frames < CONTROL_RESEND_FRAMES
-            or now - self._mismatch_since < CONTROL_RESEND_SECONDS
-        ):
-            return
-        self._mismatch_since, self._mismatch_frames = now, 0
         restart = getattr(self._camera, "restart_preview", None)
-        if (
-            self._resends >= CONTROL_RESENDS_BEFORE_RESTART
-            and callable(restart)
-            and (
-                self._restarted_at is None
-                or now - self._restarted_at >= CONTROL_RESTART_HOLDOFF
-            )
-        ):
-            for _, what, _ in faults:
-                self._log(
+        may_restart = callable(restart) and (
+            self._restarted_at is None
+            or now - self._restarted_at >= CONTROL_RESTART_MIN_INTERVAL
+        )
+        restart_line: str | None = None
+        resend_due = False
+        for kind, what, fault in self._control_checks(metadata):
+            if fault is None:
+                self._resend_logged.pop(kind, None)
+                episode = self._episodes.pop(kind, None)
+                if episode is not None and episode.awaiting == "restart":
+                    self._log(f"camera: {what} applied after restarting the live view")
+                elif episode is not None and episode.awaiting == "resend":
+                    self._log(f"camera: {what} applied after resend")
+                continue
+            before, after = fault
+            episode = self._episodes.get(kind)
+            if episode is None:
+                episode = self._episodes[kind] = _Episode(began=now, since=now)
+            episode.frames += 1
+            elapsed = f"{now - episode.began:.1f} s"
+            if kind in ("wb", "awb"):
+                seconds = WB_AUTO_RESTART_SECONDS if kind == "awb" else WB_RESTART_SECONDS
+                if episode.frames < WB_RESTART_FRAMES or now - episode.since < seconds:
+                    continue
+                if episode.restarted:
+                    # The restart has had a full wait and the camera still
+                    # disagrees. Said once, and nothing more is tried.
+                    if not episode.told:
+                        episode.told = True
+                        self._log(
+                            f"camera: {what} not applied even after restarting the live view"
+                        )
+                elif not callable(restart):
+                    episode.restarted = episode.told = True
+                    self._log(
+                        f"camera: {before} after {elapsed}{after}; cannot restart the "
+                        f"live view; {self._picture(rgb)}"
+                    )
+                elif may_restart and restart_line is None:
+                    restart_line = (
+                        f"camera: {before} after {elapsed}{after}; restarting the "
+                        f"live view; {self._picture(rgb)}"
+                    )
+                continue
+            if (
+                episode.frames < CONTROL_RESEND_FRAMES
+                or now - episode.since < CONTROL_RESEND_SECONDS
+            ):
+                continue
+            episode.since, episode.frames = now, 0
+            if episode.restarted and not episode.told:
+                episode.told = True
+                self._log(f"camera: {what} not applied even after restarting the live view")
+            if (
+                not episode.restarted
+                and episode.resends >= CONTROL_RESENDS_BEFORE_RESTART
+                and may_restart
+                and restart_line is None
+            ):
+                restart_line = (
                     f"camera: {what} still not in the live view after "
-                    f"{self._resends} resends; restarting the live view; "
+                    f"{episode.resends} resends; restarting the live view; "
                     f"{self._picture(rgb)}"
                 )
-            self._resends, self._restarted_at = 0, now
-            self._resent.clear()
-            try:
-                # On the loop thread, and it waits for the frame thread's read
-                # in flight (one exposure) and then for the camera to restart:
-                # the screen and the keys stand still that long. Acceptable on
-                # a path this rare; the alternative is a third thread.
-                restart()
-            except CameraError as exc:
-                self._camera_failed(exc)
-                return
-            self._restarted = {kind for kind, _, _ in faults}
-            return
-        elapsed = now - self._mismatch_began
-        self._resends += 1
-        for kind, what, (before, after) in faults:
-            if kind in self._restarted:
-                # The restart has had its full wait and the camera still
-                # disagrees. Said once; the resends below go on.
-                self._restarted.discard(kind)
-                if kind not in self._gave_up:
-                    self._gave_up.add(kind)
-                    self._log(
-                        f"camera: {what} not applied even after restarting the live view"
-                    )
-            self._resent.add(kind)
+                continue
+            episode.resends += 1
+            episode.awaiting = "resend"
+            resend_due = True
             logged = self._resend_logged.get(kind)
             if logged is not None and now - logged[0] < CONTROL_LOG_INTERVAL:
                 self._resend_logged[kind] = (logged[0], logged[1] + 1)
                 continue
             more = f" ({logged[1]} more)" if logged is not None and logged[1] else ""
             self._log(
-                f"camera: {before} after {elapsed:.1f} s{after}; resending{more}; "
+                f"camera: {before} after {elapsed}{after}; resending{more}; "
                 f"{self._picture(rgb)}"
             )
             self._resend_logged[kind] = (now, 0)
+        if restart_line is not None:
+            self._log(restart_line)
+            self._restarted_at = now
+            # The restart re-applies every control, so it is the one restart of
+            # every episode open now, and each gets a full wait to show it.
+            for episode in self._episodes.values():
+                episode.restarted, episode.awaiting = True, None
+                episode.since, episode.frames = now, 0
+            try:
+                # On the loop thread, and it waits for the frame thread's read
+                # in flight (one exposure) and then for the camera to restart:
+                # the screen and the keys stand still that long. Accepted for
+                # a restart; the alternative is a third thread.
+                restart()
+            except CameraError as exc:
+                # Not restarted, so there is nothing to report as surviving it;
+                # the episode's one attempt is spent all the same.
+                for episode in self._episodes.values():
+                    episode.told = True
+                self._camera_failed(exc)
+                return
+            for episode in self._episodes.values():
+                episode.awaiting = "restart"
+            return
+        if not resend_due:
+            return
         resend = getattr(self._camera, "reassert_controls", None)
         if callable(resend):
             try:

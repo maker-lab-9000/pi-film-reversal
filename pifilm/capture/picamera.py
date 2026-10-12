@@ -658,11 +658,14 @@ class Picamera2Camera:
     def restart_preview(self) -> None:
         """Stop the camera, apply the preview configuration again and restart it.
 
-        The second remedy for a live control the camera ignores (see
-        ``reassert_controls``): on the Pi 4 one has been seen ignored for good,
-        a fixed value and a return to auto alike, until a photo was taken. What
-        the photo does that a resend does not is reconfigure the camera, and
-        this is that reconfiguration without the photo. The preview
+        The remedy for a live control the camera ignores that a resend (see
+        ``reassert_controls``) does not cure: on the Pi 4 a white balance sent
+        after a photo is usually ignored, a fixed value and a return to auto
+        alike, until the next photo. What the photo does that a resend does not
+        is reconfigure the camera, and this is that reconfiguration without
+        the photo; on 2026-10-12 it cured the fault 3 times out of 3. The
+        viewfinder uses it at once for white balance and after two resends for
+        shutter and ISO. The preview
         configuration's controls already hold the selection, because the
         setters write them there, so nothing else is sent.
 

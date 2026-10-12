@@ -160,6 +160,83 @@ the minute before.
 journalctl -u pifilm-capture.service --since "-10 min" --no-pager | grep -B 30 "no preview frame"
 ```
 
+## Live white-balance changes are ignored after a photo (Pi 4, IMX477)
+
+**Status:** **cause unknown; contained 2026-10-12** by restarting the live view
+when a white-balance change has not taken effect. The wrong colour lasts about a
+second and a half and the picture blinks once; the root cause is not fixed.
+
+**First seen:** 2026-10-12, Raspberry Pi 4 + IMX477, libcamera 0.7.2,
+Picamera2 0.3.37, `pifilm-capture --display waveshare35dsi`.
+
+### Symptom
+
+A white balance is selected on the viewfinder (`WB` cell, `+`/`-`) and the live
+view keeps the old colour, once for over a minute and sometimes until a photo is
+taken. The photo itself is right: each still re-applies the whole configuration.
+Returning `WB` to `AUTO` fails the same way.
+
+### What was measured
+
+From the viewfinder's own journal lines (`control:` after each step, `camera:`
+when a frame's metadata disagrees with the selection), on 2026-10-12:
+
+- Before the first photo after start-up, a live white-balance change is applied
+  within 2 s: the camera reports the new value.
+- After a photo or a restart of the live view, that is after any mode switch, a
+  live white-balance change (to a fixed value or back to auto) is usually not
+  applied: 11 of 11 first sends were ignored.
+- Sending the controls again cured 2 of about 7.
+- Restarting the live view cured it every time (3 of 3).
+- A live shutter change after a photo was applied within 2 s (one observation).
+- In a stand-alone script using the same `Picamera2Camera` class, live changes
+  after a photo were applied and the picture's R/G and B/G followed, so the
+  camera and the ISP work in isolation.
+- A 300-change stress test of Picamera2 alone lost none.
+- A first containment that allowed one restart per 60 s left the user stuck in
+  the wrong colour after the first restart.
+
+### Ruled out
+
+- **The display path.** The picture ratios in the journal (the means of the
+  preview frame's channels, R/G and B/G) agree with the value the camera reports,
+  so the screen shows what the camera delivers.
+- **A lost update in Picamera2 as the sole cause.** Sending the same controls
+  again rarely helps.
+
+### Containment
+
+`ViewfinderLoop._verify_controls` (`pifilm/display/viewfinder.py`) compares each
+new frame's metadata with the fixed controls. A white balance that disagrees for
+1.5 s and 6 camera frames (4 s for a return to auto, which libcamera's own
+damping holds still for about 2 s) restarts the live view through
+`Picamera2Camera.restart_preview`, a `switch_mode` to the preview configuration,
+which already holds the selection. It is not resent first. Shutter and ISO are
+resent after 3 s and 6 frames and the live view is restarted after two resends
+without effect. There is one restart per selection, and never two within 5 s; a
+step, agreement, or leaving the live view allows another. What the user sees and
+the exact lines are in
+[`lcd-viewfinder.md`](lcd-viewfinder.md#manual-controls).
+
+### If someone investigates further
+
+Collect the journal around a failure:
+
+```bash
+journalctl -u pifilm-capture | grep -E 'control:|camera:'
+```
+
+- `control: WB 7500K selected; camera reports ...; picture R/G ... B/G ...` is
+  written about 2 s after every step: what was selected, what the camera
+  reported, and what the picture looked like.
+- `camera: ... not in the live view after ...; restarting the live view` and
+  `... resending` are written when the camera's report disagrees, and
+  `camera: ... applied after ...` or `... not applied even after restarting the
+  live view` say how it ended.
+
+The open question is what differs between the app and the stand-alone script
+that took live changes after a photo.
+
 ## A libcamera update could silently retune a deployed trained LUT
 
 **Status:** understood, mitigated by a documented deployment step, not enforced

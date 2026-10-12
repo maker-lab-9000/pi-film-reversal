@@ -2227,16 +2227,14 @@ def _fix_iso(camera):
 
 
 @pytest.mark.parametrize("fix, line", [
-    (_fix_wb, "camera: white balance 7500K not in the live view after 3.2 s "
-              "(camera reports 4250K); resending" + PICTURE),
     (_fix_shutter, "camera: shutter 1/250 not in the live view after 3.2 s "
                    "(camera reports 1/30); resending" + PICTURE),
     (_fix_iso, "camera: ISO 800 not in the live view after 3.2 s "
                "(camera reports ISO 100); resending" + PICTURE),
 ])
 def test_a_fixed_control_the_camera_does_not_report_is_resent(controller, fix, line):
-    """Seen on the Pi 4: a white balance was selected and the live view kept the
-    old colour for over a minute, until a photo re-applied it."""
+    """A shutter or ISO the camera does not report is sent again first: on the
+    Pi a live shutter change was seen applied even where a white balance was not."""
     camera, ctl = controller
     fix(camera)
     loop, touch, clock, logs = _check_loop(camera, ctl)
@@ -2245,29 +2243,6 @@ def test_a_fixed_control_the_camera_does_not_report_is_resent(controller, fix, l
     _live_frames(loop, clock, 1)
     assert camera.reassert_count == 1
     assert logs == [line]
-
-
-def test_auto_white_balance_that_has_not_moved_from_the_fixed_value_is_resent(controller):
-    camera, ctl = controller
-    camera.set_colour_temperature(7500)
-    camera._metadata = dict(AGREEING)
-    loop, touch, clock, logs = _check_loop(camera, ctl)
-    _live_frames(loop, clock, 3)
-    camera.set_colour_temperature(None)
-    _live_frames(loop, clock, 5)
-    assert camera.reassert_count == 0
-    _live_frames(loop, clock, 1)
-    assert camera.reassert_count == 1
-    assert logs == [
-        "camera: auto white balance has not moved from 7500K after 3.2 s; resending"
-        + PICTURE]
-    camera._metadata = {**AGREEING, "ColourTemperature": 7400}
-    _live_frames(loop, clock, 1)
-    assert logs[-1] == "camera: auto white balance applied after resend"
-    # Auto has taken over: landing on the old value later is not a fault.
-    camera._metadata = dict(AGREEING)
-    _live_frames(loop, clock, 20)
-    assert camera.reassert_count == 1
 
 
 def test_auto_white_balance_that_was_never_fixed_is_not_checked(controller):
@@ -2292,7 +2267,7 @@ def test_controls_that_agree_with_the_camera_are_never_resent(controller):
 
 def test_no_resend_before_three_seconds_however_many_frames(controller):
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 4, dt=0.5)       # frames at 0, 0.5, 1.0, 1.5
     _live_frames(loop, clock, 20, dt=0.05)     # ... and twenty more up to 2.95 s
@@ -2306,7 +2281,7 @@ def test_no_resend_before_six_frames_however_long_they_take(controller):
     """At a 1 s shutter three seconds is three frames, and the new value needs
     a frame or two to arrive in the first place."""
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 5, dt=1.0)
     assert camera.reassert_count == 0
@@ -2317,7 +2292,7 @@ def test_no_resend_before_six_frames_however_long_they_take(controller):
 
 def test_a_frame_that_agrees_starts_the_wait_again(controller):
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     wrong = camera._metadata
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 5)
@@ -2349,7 +2324,7 @@ def test_leaving_the_live_view_starts_the_wait_again(controller):
     """A still re-applies the whole configuration, so what the frames before it
     showed says nothing about the ones after."""
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 5)
     ctl.submit("one")
@@ -2387,12 +2362,12 @@ def test_a_control_the_camera_cannot_change_is_never_checked(controller, monkeyp
     monkeypatch.setattr(camera, "wb_adjustable", False)
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 20)
-    assert camera.reassert_count == 0 and logs == []
+    assert (camera.reassert_count, camera.restart_count) == (0, 0) and logs == []
 
 
 def test_the_first_agreeing_frame_after_a_resend_is_logged_once(controller):
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 6)
     assert camera.reassert_count == 1
@@ -2401,29 +2376,29 @@ def test_the_first_agreeing_frame_after_a_resend_is_logged_once(controller):
     assert len(logs) == 1
     camera._metadata = dict(AGREEING)
     _live_frames(loop, clock, 5)
-    assert logs[1:] == ["camera: white balance 7500K applied after resend"]
+    assert logs[1:] == ["camera: shutter 1/250 applied after resend"]
 
 
 def test_resends_continue_but_the_line_is_logged_once_in_thirty_seconds(controller):
     """A camera that never takes the control is resent to every few seconds for
     as long as it lasts, without a journal line for each."""
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     camera.restart_preview = None               # a camera that can only be resent to
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 60)               # resends at frames 6, 12, ... 60
     assert camera.reassert_count == 10
     assert logs == [
-        "camera: white balance 7500K not in the live view after 3.2 s "
-        "(camera reports 4250K); resending" + PICTURE,
-        "camera: white balance 7500K not in the live view after 33.9 s "
-        "(camera reports 4250K); resending (7 more)" + PICTURE,
+        "camera: shutter 1/250 not in the live view after 3.2 s "
+        "(camera reports 1/30); resending" + PICTURE,
+        "camera: shutter 1/250 not in the live view after 33.9 s "
+        "(camera reports 1/30); resending (7 more)" + PICTURE,
     ]
 
 
 def test_a_resend_the_camera_refuses_is_logged_and_survived(controller):
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     attempts = []
 
     def refuse():
@@ -2439,7 +2414,7 @@ def test_a_resend_the_camera_refuses_is_logged_and_survived(controller):
 
 def test_a_camera_that_cannot_resend_still_gets_the_journal_line(controller):
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     camera.reassert_controls = None
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 6)
@@ -2450,7 +2425,7 @@ def test_redraws_of_one_frame_do_not_count_as_frames_that_disagree(controller):
     """Under run() the loop redraws ten times a second whatever the camera
     does; only a new camera frame is new evidence."""
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     loop, touch, clock, logs = _check_loop(camera, ctl)
     # As under run(), without the thread: the test publishes the frames itself.
     loop._want_frames = threading.Event()
@@ -2467,7 +2442,7 @@ def test_redraws_of_one_frame_do_not_count_as_frames_that_disagree(controller):
 
 # -- restarting the live view when resending does not help --------------------------
 
-STILL_WRONG = ("camera: white balance 7500K still not in the live view after 2 resends; "
+STILL_WRONG = ("camera: shutter 1/250 still not in the live view after 2 resends; "
                "restarting the live view" + PICTURE)
 
 
@@ -2476,7 +2451,7 @@ def test_two_resends_that_do_not_help_are_followed_by_a_restart_of_the_live_view
     to auto alike, until a photo reconfigured the camera. The restart is that
     reconfiguration without the photo."""
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 17)
     assert (camera.reassert_count, camera.restart_count) == (2, 0)
@@ -2485,29 +2460,16 @@ def test_two_resends_that_do_not_help_are_followed_by_a_restart_of_the_live_view
     assert logs[-1] == STILL_WRONG
     camera._metadata = dict(AGREEING)
     _live_frames(loop, clock, 3)
-    assert logs[-1] == "camera: white balance 7500K applied after restarting the live view"
+    assert logs[-1] == "camera: shutter 1/250 applied after restarting the live view"
     assert logs.count(logs[-1]) == 1 and not any("after resend" in line for line in logs)
     _live_frames(loop, clock, 30)
     assert (camera.reassert_count, camera.restart_count) == (2, 1)
 
 
-def test_an_unmoved_auto_white_balance_is_restarted_too(controller):
-    camera, ctl = controller
-    camera.set_colour_temperature(7500)
-    camera._metadata = dict(AGREEING)
-    loop, touch, clock, logs = _check_loop(camera, ctl)
-    _live_frames(loop, clock, 2)
-    camera.set_colour_temperature(None)
-    _live_frames(loop, clock, 18)
-    assert (camera.reassert_count, camera.restart_count) == (2, 1)
-    assert logs[-1] == ("camera: auto white balance still not in the live view after "
-                        "2 resends; restarting the live view" + PICTURE)
-
-
 @pytest.mark.parametrize("frames", [6, 12])
 def test_a_resend_that_cures_it_is_not_followed_by_a_restart(controller, frames):
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     wrong = camera._metadata
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, frames)           # one resend, or two
@@ -2515,7 +2477,7 @@ def test_a_resend_that_cures_it_is_not_followed_by_a_restart(controller, frames)
     camera._metadata = dict(AGREEING)
     _live_frames(loop, clock, 30)
     assert camera.restart_count == 0
-    assert logs[-1] == "camera: white balance 7500K applied after resend"
+    assert logs[-1] == "camera: shutter 1/250 applied after resend"
     # A new disagreement later starts from the beginning: two resends first.
     camera._metadata = wrong
     _live_frames(loop, clock, 17)
@@ -2524,30 +2486,9 @@ def test_a_resend_that_cures_it_is_not_followed_by_a_restart(controller, frames)
     assert camera.restart_count == 1
 
 
-def test_a_mismatch_that_survives_a_restart_is_not_restarted_again_for_a_minute(controller):
-    """A restart blanks the picture for a moment; one that did not help must
-    not be repeated every few seconds."""
-    camera, ctl = controller
-    _fix_wb(camera)
-    loop, touch, clock, logs = _check_loop(camera, ctl)
-    _live_frames(loop, clock, 18)               # restart at 10.88 s
-    assert camera.restart_count == 1
-    _live_frames(loop, clock, 6)                # the next wait ends: said once, resent
-    gave_up = "camera: white balance 7500K not applied even after restarting the live view"
-    assert logs[-1] == gave_up and camera.reassert_count == 3
-    _live_frames(loop, clock, 84)               # frames up to 68.5 s: resends only
-    assert camera.restart_count == 1 and camera.reassert_count == 17
-    assert logs.count(gave_up) == 1 and logs.count(STILL_WRONG) == 1
-    _live_frames(loop, clock, 6)                # the wait that ends 60 s after the restart
-    assert camera.restart_count == 2
-    assert logs[-1] == ("camera: white balance 7500K still not in the live view after "
-                        "15 resends; restarting the live view" + PICTURE)
-    assert logs.count(gave_up) == 1
-
-
 def test_a_restart_the_camera_refuses_is_logged_and_survived(controller):
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
 
     def refuse():
         raise CameraError("Picamera2 failed to restart the live view: busy")
@@ -2563,7 +2504,7 @@ def test_a_restart_that_stalls_counts_like_a_stalled_frame(controller):
     """A camera that cannot be restarted and then delivers no frames is the
     stalled camera the loop already gives up on."""
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
 
     def stall(*args, **kwargs):
         raise CameraStalled("no frame")
@@ -2581,12 +2522,212 @@ def test_a_restart_that_stalls_counts_like_a_stalled_frame(controller):
 
 def test_a_camera_without_a_restart_keeps_being_resent_to(controller):
     camera, ctl = controller
-    _fix_wb(camera)
+    _fix_shutter(camera)
     camera.restart_preview = None
     loop, touch, clock, logs = _check_loop(camera, ctl)
     _live_frames(loop, clock, 30)
     assert camera.reassert_count == 5
     assert not any("restarting" in line for line in logs)
+
+
+def test_a_mismatch_that_survives_its_restart_is_not_restarted_again(controller):
+    """One restart for one selection: a restart blanks the picture, and one
+    that did not help will not help the second time either."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 18)               # two resends, then the restart
+    assert (camera.reassert_count, camera.restart_count) == (2, 1)
+    _live_frames(loop, clock, 6)                # the next wait ends: said once, resent
+    gave_up = "camera: shutter 1/250 not applied even after restarting the live view"
+    assert logs[-1] == gave_up and camera.reassert_count == 3
+    _live_frames(loop, clock, 120)              # well over a minute more
+    assert camera.restart_count == 1 and camera.reassert_count == 23
+    assert logs.count(gave_up) == 1 and logs.count(STILL_WRONG) == 1
+    # A step is a new selection, and that may have its own restart.
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _live_frames(loop, clock, 18)
+    assert camera.restart_count == 2
+
+
+# -- white balance: restarted at once, never resent ---------------------------------
+
+WB_STEP = 0.32   # six frames this far apart: the sixth is 1.6 s after the first
+WB_RESTART = ("camera: white balance 7500K not in the live view after 1.6 s "
+              "(camera reports 4250K); restarting the live view" + PICTURE)
+
+
+def test_a_white_balance_the_camera_does_not_report_restarts_the_live_view(controller):
+    """Measured on the Pi 4 on 2026-10-12: after a photo a live white-balance
+    change was ignored 11 times out of 11, a resend cured 2 of about 7, and a
+    restart of the live view cured it every time. So no resend is tried."""
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 5, dt=WB_STEP)
+    assert camera.restart_count == 0 and logs == []
+    _live_frames(loop, clock, 1, dt=WB_STEP)
+    assert (camera.reassert_count, camera.restart_count) == (0, 1)
+    assert logs == [WB_RESTART]
+    camera._metadata = dict(AGREEING)
+    _live_frames(loop, clock, 3, dt=WB_STEP)
+    assert logs[1:] == ["camera: white balance 7500K applied after restarting the live view"]
+    _live_frames(loop, clock, 40, dt=WB_STEP)
+    assert (camera.reassert_count, camera.restart_count) == (0, 1) and len(logs) == 2
+
+
+def test_no_white_balance_restart_before_a_second_and_a_half(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 14, dt=0.1)       # frames up to 1.3 s
+    assert camera.restart_count == 0
+    clock.t = 1.5
+    _live_frames(loop, clock, 1)
+    assert camera.restart_count == 1
+
+
+def test_no_white_balance_restart_before_six_frames(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 5, dt=1.0)
+    assert camera.restart_count == 0
+    _live_frames(loop, clock, 1, dt=1.0)
+    assert camera.restart_count == 1 and "after 5.0 s" in logs[0]
+
+
+def test_an_auto_white_balance_that_has_not_moved_is_given_four_seconds(controller):
+    """libcamera's own damping holds the old value for about two seconds before
+    it drifts: a restart then would be a false alarm."""
+    camera, ctl = controller
+    camera.set_colour_temperature(7500)
+    camera._metadata = dict(AGREEING)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 2, dt=0.5)
+    camera.set_colour_temperature(None)
+    _live_frames(loop, clock, 8, dt=0.5)        # 0 to 3.5 s on auto
+    assert camera.restart_count == 0 and logs == []
+    _live_frames(loop, clock, 1, dt=0.5)
+    assert (camera.reassert_count, camera.restart_count) == (0, 1)
+    assert logs == ["camera: auto white balance has not moved from 7500K after 4.0 s; "
+                    "restarting the live view" + PICTURE]
+    camera._metadata = {**AGREEING, "ColourTemperature": 7400}
+    _live_frames(loop, clock, 1, dt=0.5)
+    assert logs[-1] == "camera: auto white balance applied after restarting the live view"
+    # Auto has taken over: landing on the old value later is not a fault.
+    camera._metadata = dict(AGREEING)
+    _live_frames(loop, clock, 40, dt=0.5)
+    assert camera.restart_count == 1
+
+
+def test_an_auto_white_balance_that_moves_in_time_is_left_alone(controller):
+    camera, ctl = controller
+    camera.set_colour_temperature(7500)
+    camera._metadata = dict(AGREEING)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 2, dt=0.5)
+    camera.set_colour_temperature(None)
+    _live_frames(loop, clock, 6, dt=0.5)        # held for 2.5 s, as measured
+    camera._metadata = {**AGREEING, "ColourTemperature": 7380}
+    _live_frames(loop, clock, 40, dt=0.5)
+    assert (camera.reassert_count, camera.restart_count) == (0, 0) and logs == []
+
+
+def test_a_white_balance_that_survives_its_restart_is_left_alone(controller):
+    """White balance does nothing further: no resend, no second restart, one line."""
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 1
+    _live_frames(loop, clock, 300, dt=WB_STEP)  # a minute and a half
+    assert (camera.reassert_count, camera.restart_count) == (0, 1)
+    assert logs == [
+        WB_RESTART, "camera: white balance 7500K not applied even after restarting the live view"]
+
+
+def _wb_selected_then_ignored(camera, ctl):
+    """A loop with the WB cell selected at 5600 K, which the camera then stops reporting."""
+    camera.set_colour_temperature(5600)
+    camera._metadata = {**AGREEING, "ColourTemperature": 5600}
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _tap(loop, touch, clock, _cell(WB_CELL))
+    camera._metadata = {**AGREEING, "ColourTemperature": 4250}
+    return loop, touch, clock, logs
+
+
+def test_a_new_selection_may_restart_the_live_view_again_at_once(controller):
+    camera, ctl = controller
+    loop, touch, clock, logs = _wb_selected_then_ignored(camera, ctl)
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 1
+    _live_frames(loop, clock, 30, dt=WB_STEP)   # nearly ten seconds; the same selection
+    assert camera.restart_count == 1
+    _tap(loop, touch, clock, PLUS_CENTRE)       # 6500 K: one frame of the new wait
+    assert camera.colour_temperature_k == 6500
+    _live_frames(loop, clock, 5, dt=WB_STEP)    # ... and five more, 1.28 s in
+    assert camera.restart_count == 1
+    _live_frames(loop, clock, 1, dt=WB_STEP)
+    assert camera.restart_count == 2
+    assert logs[-1].startswith("camera: white balance 6500K not in the live view after 1.6 s")
+
+
+def test_two_restarts_are_never_closer_than_five_seconds(controller):
+    """The backstop against a picture that blinks with every tap."""
+    camera, ctl = controller
+    loop, touch, clock, logs = _wb_selected_then_ignored(camera, ctl)
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 1
+    restarted_at = clock.t - WB_STEP
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _live_frames(loop, clock, 12, dt=WB_STEP)   # past both limits, 4 s after the restart
+    assert clock.t - restarted_at < 5.0 and camera.restart_count == 1
+    clock.t = restarted_at + 5.0
+    _live_frames(loop, clock, 1)
+    assert camera.restart_count == 2
+
+
+def test_leaving_the_live_view_allows_a_white_balance_restart_again(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 40, dt=WB_STEP)
+    assert camera.restart_count == 1
+    ctl.submit("one")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "REVIEW"
+    _tap(loop, touch, clock, (5, 5))
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 2
+
+
+def test_a_white_balance_restart_the_camera_refuses_is_tried_once(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    attempts = []
+
+    def refuse():
+        attempts.append(1)
+        raise CameraError("Picamera2 failed to restart the live view: busy")
+
+    camera.restart_preview = refuse
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 60, dt=WB_STEP)
+    assert len(attempts) == 1 and loop.state == "LIVE"
+    assert logs[1:] == ["camera: Picamera2 failed to restart the live view: busy"]
+
+
+def test_a_camera_that_cannot_restart_still_gets_the_white_balance_line(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    camera.restart_preview = None
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 60, dt=WB_STEP)
+    assert camera.reassert_count == 0
+    assert logs == ["camera: white balance 7500K not in the live view after 1.6 s "
+                    "(camera reports 4250K); cannot restart the live view" + PICTURE]
 
 
 # -- a trace line after every control step ------------------------------------------
