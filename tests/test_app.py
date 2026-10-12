@@ -1460,18 +1460,24 @@ def test_fake_display_writes_a_png_and_exits_on_stop(tmp_path, monkeypatch):
 
     monkeypatch.setattr(app.Artifacts, "resolve", lambda _: Artifacts.default())
 
+    out = tmp_path / "shots"
+
     class StopSoon:
+        """Stops once a frame has been written. The loop's first turn has no
+        frame yet (the frame thread is still reading it), and the touch and
+        frame threads ask this event too, so a fixed number of calls would not
+        say how many turns the loop got. The count only bounds a failure."""
+
         def __init__(self):
             self.n = 0
 
         def is_set(self):
             self.n += 1
-            return self.n > 2
+            return (out / "viewfinder-last.png").exists() or self.n > 500
 
     # Narrow the patch to app's own name: setattr on the real threading module
     # would also replace the Event that Thread.start() uses internally.
     monkeypatch.setattr(app, "threading", SimpleNamespace(Event=StopSoon))
-    out = tmp_path / "shots"
     assert app.main(["--fake", "--display", "fake", "--no-preview", "--out", str(out)]) == 0
     assert (out / "viewfinder-last.png").exists()
 

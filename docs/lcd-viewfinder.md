@@ -206,12 +206,14 @@ lit, and a finished shot, from the LCD or the Stick, wakes it into the review.
 `0` disables either step. `--display fake` has no backlight and is never dimmed.
 
 Touch is polled on its own thread, about 50 times a second, and finished taps are
-queued, so a tap is never missed because the screen was busy. It is acted on at the
-loop's next frame. During the roughly one second of still acquisition the loop waits
-for the camera, so a tap made then is handled when the colour bars appear: a shutter
-tap is answered busy by the controller (it runs one job at a time) and takes no
-second photo, and taps on the cells, `+`/`-` and `2x` are ignored as described above.
-Wait for the colour bars to clear.
+queued, so a tap is never missed because the screen was busy. The camera's preview
+frames are read on a second thread, so the loop never waits for the camera: about ten
+times a second it takes one tap off the queue, acts on it and redraws the screen with
+the most recent frame, whatever the shutter speed. The colour bars therefore appear on
+the loop's next turn after a shutter tap, without waiting for the still. While they
+are up a shutter tap is answered busy by the controller (it runs one job at a time)
+and takes no second photo, and taps on the cells, `+`/`-` and `2x` are ignored as
+described above. Wait for the colour bars to clear.
 
 ### Double exposure
 
@@ -299,9 +301,16 @@ Shutter notes:
 
 - At long speeds the live view slows to match: at 1/4 s it shows about 4 frames a
   second. That is the exposure, not a fault.
-- At long speeds a tap is still caught (touch has its own thread), but it is acted
-  on at the next frame, which at 1 s is up to a second later. There is no need to
-  hold the tap.
+- At long speeds the controls stay quick although the picture is slow: a tap on a
+  cell, `+` or `-` changes the value on screen and lights the key on the loop's next
+  redraw, about a tenth of a second later, not on the next camera frame. The picture
+  itself changes when the camera delivers the next frame, so at 1 s the new exposure
+  shows up to a second or two after the tap. There is no need to hold the tap.
+- The photo waits for the preview exposure in progress: the camera takes one frame
+  at a time, so at 1 s the still can start up to a second after the shutter tap.
+  The colour bars appear at once all the same.
+- The `viewfinder: N fps` line in the journal counts camera frames, not redraws, so
+  at 1 s it reads about 1 while the screen is redrawn ten times a second.
 - At start-up the journal names how each control is fixed:
   `picamera2: shutter priority via ExposureTimeMode` on current libcamera, or
   `... ExposureTime (legacy libcamera)` on older stacks; and on the next line

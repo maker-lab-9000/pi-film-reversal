@@ -56,16 +56,30 @@ There is no exposure compensation. ``ExposureValue`` is still sent, always 0.0, 
 every capture records the same control set as before the viewfinder's EV buttons
 were removed.
 
-Previews and captures arrive on different threads (the viewfinder loop and the
-capture controller), so one lock is held from acquiring a request through
-releasing it: the pixel buffer belongs to the request, and a second thread that
-captured or released in the middle would hand out or free memory the first is
-still copying. The control setters take the same lock so a control change never
-lands between a capture and its release.
+Previews and captures arrive on different threads (the viewfinder's frame
+thread and the capture controller), so the request lock is held from acquiring
+a request through releasing it: the pixel buffer belongs to the request, and a
+second thread that captured or released in the middle would hand out or free
+memory the first is still copying.
+
+The control setters are called from a third thread (the viewfinder loop) and
+take a second lock, the configuration lock, not the request lock. A preview
+read holds the request lock for a whole exposure, a second at the slowest
+shutter, and a setter that queued behind it would make a tap on ``+`` as slow
+as the picture. A setter does not need that exclusion: it touches no request,
+and Picamera2's ``set_controls`` is safe beside a capture in flight. What a
+setter must not overlap is a still, which configures the camera twice from the
+configuration dicts the setters write and whose controls are what the capture
+record describes. So a still (``read(full=True)``) holds both locks, always
+the request lock first and the configuration lock second, a preview read holds
+only the request lock, and a setter holds only the configuration lock. No
+thread ever waits for the request lock while holding the configuration lock,
+so the two cannot deadlock.
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
 import numbers
 import sys
@@ -182,6 +196,9 @@ class Picamera2Camera:
             colour_temperature = _colour_temperature_k(colour_temperature)
 
         self._request_lock = threading.Lock()
+        # Held by the control setters and by a still; see the module docstring.
+        # Order, where both are taken: request lock, then this one.
+        self._config_lock = threading.Lock()
         self.colour_temperature_k: int | None = colour_temperature
         # False when white balance was fixed at start-up, or (set below) when this
         # libcamera has no settable ColourTemperature.
@@ -343,12 +360,18 @@ class Picamera2Camera:
         """Acquire one frame. ``full=False`` (preview) skips the autofocus cycle
         and DNG extraction, which otherwise make each read too slow for a live
         preview; the request is still captured, converted and released, and
-        metadata is still read, so ``preview_frame`` keeps working."""
+        metadata is still read, so ``preview_frame`` keeps working.
+
+        Every read holds the request lock. A still also holds the configuration
+        lock, so no control setter changes the camera or the configurations
+        under it; a preview read does not, so a setter never waits out a long
+        preview exposure."""
         camera = self._camera
         if camera is None:
             raise CameraError("Cannot read from a closed Picamera2 camera")
 
-        with self._request_lock:
+        config_lock = self._config_lock if full else contextlib.nullcontext()
+        with self._request_lock, config_lock:
             if full and self._autofocus == "auto" and self._stream_info.autofocus != "none":
                 try:
                     camera.autofocus_cycle()
@@ -488,7 +511,7 @@ class Picamera2Camera:
         if not self.exposure_adjustable:
             raise CameraError("Cannot set the shutter: auto-exposure is locked by --ae-lock")
         running = "preview" if self._preview_config is not None else "still"
-        with self._request_lock:
+        with self._config_lock:
             try:
                 # Built inside the try, every one of them before anything is
                 # sent: the mode enum is looked up lazily, and a lookup that
@@ -537,7 +560,7 @@ class Picamera2Camera:
             raise CameraError("Cannot set the ISO on a closed Picamera2 camera")
         if not self.exposure_adjustable:
             raise CameraError("Cannot set the ISO: auto-exposure is locked by --ae-lock")
-        with self._request_lock:
+        with self._config_lock:
             try:
                 # Built inside the try, like the shutter's: the mode enum is
                 # looked up lazily and a failure there must be a CameraError.
@@ -577,7 +600,7 @@ class Picamera2Camera:
             name, value, stale = "AwbEnable", True, "ColourTemperature"
         else:
             name, value, stale = "ColourTemperature", kelvin, "AwbEnable"
-        with self._request_lock:
+        with self._config_lock:
             try:
                 camera.set_controls({name: value})
             except Exception as exc:

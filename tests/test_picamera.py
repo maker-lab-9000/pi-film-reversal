@@ -1371,6 +1371,156 @@ def test_requests_are_serialised_by_a_lock(install_picamera):
     camera.close()
 
 
+class _HeldCapture:
+    """Replaces one of the fake camera's capture calls with one that waits.
+
+    ``inside`` is set when the call has been entered (so the camera's lock is
+    held by then) and the call returns once ``release`` is set.
+    """
+
+    def __init__(self, instance, name, request):
+        import threading
+
+        self.inside = threading.Event()
+        self.release = threading.Event()
+        self.order = []
+        self._request = request
+        setattr(instance, name, self._capture)
+
+    def _capture(self, *args, **kwargs):
+        self.order.append("entered")
+        self.inside.set()
+        assert self.release.wait(5.0), "the test never released this capture"
+        self.order.append("returned")
+        return self._request
+
+
+def _in_thread(call):
+    """Run ``call`` on a thread; the returned event is set when it has returned."""
+    import threading
+
+    done = threading.Event()
+    errors = []
+
+    def target():
+        try:
+            call()
+        except Exception as exc:  # reported by the test's own assertions
+            errors.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return done, errors
+
+
+_SETTERS = [
+    ("set_shutter", 4000, "shutter_us"),
+    ("set_iso", 400, "iso"),
+    ("set_colour_temperature", 5600, "colour_temperature_k"),
+]
+
+
+@pytest.mark.parametrize("setter, value, attribute", _SETTERS)
+def test_a_control_setter_does_not_wait_for_a_preview_read(
+    install_picamera, setter, value, attribute,
+):
+    """The viewfinder reads previews on their own thread, and at a 1 s shutter
+    one read holds the request lock for a second. A tap on ``+`` must not wait
+    behind it, or the controls are as slow as the picture."""
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    held = _HeldCapture(state.instance, "capture_request", FakeRequest(small))
+    read_done, read_errors = _in_thread(lambda: camera.read(full=False))
+    try:
+        assert held.inside.wait(2.0)
+        set_done, set_errors = _in_thread(lambda: getattr(camera, setter)(value))
+        assert set_done.wait(2.0), f"{setter} waited for the preview read"
+        assert set_errors == [] and getattr(camera, attribute) == value
+        assert not read_done.is_set()
+    finally:
+        held.release.set()
+    assert read_done.wait(2.0) and read_errors == []
+    camera.close()
+
+
+@pytest.mark.parametrize("setter, value, attribute", _SETTERS)
+def test_a_control_setter_waits_for_a_still_capture(
+    install_picamera, setter, value, attribute,
+):
+    """A still reconfigures the camera twice from the configurations the
+    setters write, so a control change must not land in the middle of one."""
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    inst = state.instance
+    held = _HeldCapture(inst, "switch_mode_and_capture_request", FakeRequest(big))
+    sent_before = len(inst.set_controls_calls)
+    read_done, read_errors = _in_thread(lambda: camera.read(full=True))
+    try:
+        assert held.inside.wait(2.0)
+        set_done, set_errors = _in_thread(lambda: getattr(camera, setter)(value))
+        assert not set_done.wait(0.1), f"{setter} did not wait for the still"
+        assert getattr(camera, attribute) is None
+        assert len(inst.set_controls_calls) == sent_before
+    finally:
+        held.release.set()
+    assert read_done.wait(5.0) and read_errors == []
+    assert set_done.wait(2.0) and set_errors == []
+    assert getattr(camera, attribute) == value
+    assert len(inst.set_controls_calls) == sent_before + 1
+    camera.close()
+
+
+def test_a_still_capture_waits_for_a_preview_read_in_flight(install_picamera):
+    """The pixel buffer belongs to the request: a mode switch while a preview
+    request is still being copied would free memory that copy is reading."""
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    inst = state.instance
+    held = _HeldCapture(inst, "capture_request", FakeRequest(small))
+    switched = []
+    inst.switch_mode_and_capture_request = lambda config, **kwargs: (
+        switched.append(list(held.order)), FakeRequest(big))[1]
+    preview_done, preview_errors = _in_thread(lambda: camera.read(full=False))
+    try:
+        assert held.inside.wait(2.0)
+        still_done, still_errors = _in_thread(lambda: camera.read(full=True))
+        assert not still_done.wait(0.1), "the still did not wait for the preview read"
+        assert switched == []
+    finally:
+        held.release.set()
+    assert preview_done.wait(2.0) and preview_errors == []
+    assert still_done.wait(5.0) and still_errors == []
+    assert switched == [["entered", "returned"]]
+    camera.close()
+
+
+def test_a_still_without_a_preview_stream_also_excludes_the_setters(install_picamera):
+    """Without ``preview`` a still is a plain ``capture_request``, but it is
+    still the shot the record describes: its controls must not change under it."""
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(big))
+    camera = Picamera2Camera(save_dng=False)
+    held = _HeldCapture(state.instance, "capture_request", FakeRequest(big))
+    read_done, read_errors = _in_thread(lambda: camera.read(full=True))
+    try:
+        assert held.inside.wait(2.0)
+        set_done, set_errors = _in_thread(lambda: camera.set_shutter(4000))
+        assert not set_done.wait(0.1)
+        assert camera.shutter_us is None
+    finally:
+        held.release.set()
+    assert read_done.wait(5.0) and read_errors == []
+    assert set_done.wait(2.0) and set_errors == [] and camera.shutter_us == 4000
+    camera.close()
+
+
 def test_preview_reads_do_not_overwrite_the_measured_still_fps(install_picamera):
     """``stream_info`` is the audit of the still, and ``fps`` is part of it: a
     binned viewfinder frame must not be what a capture record claims the still

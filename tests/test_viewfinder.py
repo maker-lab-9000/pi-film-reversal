@@ -1748,3 +1748,429 @@ def test_a_frame_between_stalls_resets_the_count(controller):
         camera.read = original
         loop.step()
     assert len(display.images) == 3
+
+
+# -- frames on their own thread (long exposures) ------------------------------------
+
+
+class HeldClock(FakeClock):
+    """Loop time moves only when the test moves it; a sleep just yields the CPU.
+
+    Under ``run()`` the loop then turns over hundreds of times a second of real
+    time while its own clock stands still, so what is drawn and counted depends
+    on what the test releases, not on how fast the machine is.
+    """
+
+    def sleep(self, s):
+        time.sleep(0.002)
+
+
+class ReadGate:
+    """Makes every preview read wait for a permit, as a long exposure does.
+
+    A full read (the capture worker's still) passes straight through, uncounted.
+    """
+
+    def __init__(self, camera):
+        self._real = camera.read
+        self._permits = threading.Semaphore(0)
+        self.reads = 0                      # preview reads begun
+        self.returned = 0                   # ... and finished
+        camera.read = self._read
+
+    def _read(self, *, full=True):
+        if full:
+            return self._real(full=full)
+        self.reads += 1
+        if not self._permits.acquire(timeout=10.0):
+            raise CameraError("the test never released this read")
+        try:
+            return self._real(full=False)
+        finally:
+            self.returned += 1
+
+    def release(self, n=1):
+        for _ in range(n):
+            self._permits.release()
+
+
+class ScriptedReads:
+    """Preview reads that raise the scripted errors in order, then deliver frames."""
+
+    def __init__(self, camera, script):
+        self._real = camera.read
+        self._script = list(script)
+        self.reads = 0
+        camera.read = self._read
+
+    def _read(self, *, full=True):
+        self.reads += 1
+        outcome = self._script.pop(0) if self._script else None
+        if outcome is not None:
+            raise outcome
+        return self._real(full=full)
+
+
+class Running:
+    """``loop.run`` on a thread, with whatever it raised and a count of its steps."""
+
+    def __init__(self, loop):
+        self.stop = threading.Event()
+        self.raised = None
+        self.steps = 0
+        real_step = loop.step
+
+        def counting_step():
+            real_step()
+            self.steps += 1
+
+        loop.step = counting_step
+        self._loop = loop
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            self._loop.run(self.stop)
+        except BaseException as exc:  # handed to the test, which asserts on it
+            self.raised = exc
+
+    def more_steps(self, n=5):
+        """Wait until the loop has been round ``n`` more times."""
+        target = self.steps + n
+        _until(lambda: self.steps >= target or not self.thread.is_alive())
+        assert self.steps >= target, f"the loop ended early: {self.raised!r}"
+
+    def finish(self, timeout=5.0):
+        self.stop.set()
+        self.thread.join(timeout)
+        assert not self.thread.is_alive(), "run() did not return"
+
+
+def _frames_thread_alive():
+    return any(t.name == "pifilm-frames" and t.is_alive() for t in threading.enumerate())
+
+
+def _spy_frames(monkeypatch):
+    """Record the picture and ``LiveState`` of every live redraw, still drawing it."""
+    drawn = []
+    real = viewfinder.render_live
+
+    def spy(frame_rgb, reading, state, **kwargs):
+        drawn.append((frame_rgb, state))
+        return real(frame_rgb, reading, state, **kwargs)
+
+    monkeypatch.setattr(viewfinder, "render_live", spy)
+    return drawn
+
+
+def _pictures(drawn):
+    """How many different camera frames the redraws showed, in order."""
+    count, last = 0, None
+    for rgb, _ in list(drawn):
+        if rgb is not last:
+            count, last = count + 1, rgb
+    return count
+
+
+def test_a_step_without_run_still_reads_its_frame_inline(controller):
+    camera, ctl = controller
+    loop, touch, display, clock = _loop(camera, ctl)
+    reads = _count_reads(camera)
+    for _ in range(3):
+        loop.step()
+    assert reads["n"] == 3 and len(display.images) == 3
+    assert not _frames_thread_alive()
+
+
+def test_a_plus_tap_changes_the_value_and_lights_the_key_while_a_read_is_blocked(
+    controller, monkeypatch,
+):
+    """At a 1 s shutter the camera read blocks for a second. The controls must
+    not wait for it: the screen is redrawn, and a tap acted on, at the loop's
+    own rate."""
+    camera, ctl = controller
+    gate = ReadGate(camera)
+    drawn = _spy_frames(monkeypatch)
+    touch = TimedTouch()
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=time, frame_period=0.02)
+    running = Running(loop)
+    try:
+        gate.release()                            # the first frame, so there is a picture
+        _until(lambda: len(drawn) >= 1 and gate.reads == 2)
+        # From here to the end the second read never returns.
+        before = len(drawn)
+        _until(lambda: len(drawn) >= before + 3)  # still redrawn with the read blocked
+        assert drawn[-1][1].cells[SHUTTER_CELL].auto is True
+        touch.press(PLUS_CENTRE, hold=0.1)
+        _until(lambda: camera.shutter_us == 4000)
+        _until(lambda: any(
+            state.pressed is Action.PLUS and state.cells[SHUTTER_CELL] == Cell(
+                "SHUTTER", "1/250", auto=False)
+            for _, state in list(drawn)[before:]
+        ))
+        assert gate.reads == 2 and _pictures(drawn) == 1
+    finally:
+        gate.release(10)
+        running.finish()
+    assert running.raised is None
+
+
+def test_a_new_frame_is_drawn_when_it_arrives_and_the_rate_counts_camera_frames(
+    tmp_path, monkeypatch,
+):
+    """The fps line is read on hardware as the camera's rate, so the redraws
+    between two camera frames must not be counted in it."""
+    art = tmp_path / "art"
+    write_artifact(art, LUT3D.identity(9), NormalizeParams(), GrainParams())
+    camera = FakeCamera([synthetic_frame(48, 64) for _ in range(3)], metadata=DEFAULT_METADATA)
+    ctl = CaptureController(CaptureSession(
+        camera, Pipeline(Artifacts.load(art)), tmp_path / "shots",
+        seed_rng=np.random.default_rng(0)))
+    gate = ReadGate(camera)
+    drawn = _spy_frames(monkeypatch)
+    logs = []
+    loop, _, _, clock = _loop(camera, ctl, clock=HeldClock(), log=logs.append)
+    running = Running(loop)
+    try:
+        assert not drawn                          # nothing to show before the first frame
+        for expected in (1, 2):
+            gate.release()
+            _until(lambda n=expected: _pictures(drawn) == n)
+            shown = len(drawn)
+            _until(lambda n=shown: len(drawn) >= n + 10)   # many redraws of one frame
+            assert _pictures(drawn) == expected
+        clock.t = 10.0
+        gate.release()
+        _until(lambda: _pictures(drawn) == 3)
+        _until(lambda: any(line.startswith("viewfinder:") for line in logs))
+    finally:
+        gate.release(10)
+        running.finish()
+        ctl.close()
+    assert running.raised is None
+    assert [line for line in logs if line.startswith("viewfinder:")][0] == "viewfinder: 0.3 fps"
+
+
+def test_the_frame_thread_does_not_read_while_the_screen_is_off(controller):
+    camera, ctl = controller
+    gate = ReadGate(camera)
+    touch = TimedTouch()
+    loop, _, display, clock = _idle_loop(camera, ctl, touch=touch, clock=HeldClock())
+    running = Running(loop)
+    try:
+        gate.release()
+        _until(lambda: gate.reads == 2)           # the second read is in flight
+        clock.t = 300.0
+        _until(lambda: display.levels[-1:] == [0])
+        running.more_steps()
+        gate.release(5)                           # that read returns; no other may start
+        running.more_steps(20)
+        time.sleep(0.05)
+        assert gate.reads == 2
+        touch.press((5, 5), hold=0.1)             # a tap wakes the screen
+        _until(lambda: gate.reads >= 3)
+    finally:
+        gate.release(50)
+        running.finish()
+    assert running.raised is None
+
+
+def test_the_frame_thread_does_not_read_during_processing_or_review(tmp_path):
+    camera, ctl, session = _gated_controller(tmp_path)
+    gate = ReadGate(camera)
+    touch = TimedTouch()
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=HeldClock())
+    running = Running(loop)
+    try:
+        gate.release()
+        _until(lambda: gate.reads == 2)           # the second read is in flight
+        ctl.submit("one")
+        assert session.started.wait(2.0)
+        running.more_steps()                      # the loop has seen the active job
+        gate.release(5)                           # that read returns; no other may start
+        running.more_steps(20)
+        time.sleep(0.05)
+        assert gate.reads == 2
+        session.release.set()
+        _until(lambda: loop.state == "REVIEW")
+        running.more_steps(20)
+        time.sleep(0.05)
+        assert gate.reads == 2
+        touch.press((5, 5), hold=0.1)             # a tap ends the review
+        _until(lambda: loop.state == "LIVE" and gate.reads >= 3)
+    finally:
+        session.release.set()
+        gate.release(50)
+        running.finish()
+        ctl.close()
+    assert running.raised is None
+
+
+def test_the_step_that_takes_the_photo_asks_for_no_preview_frame(tmp_path):
+    """The still waits for the camera behind any preview read. A read asked for
+    by the very step that pressed the shutter would be a second of shutter lag
+    at a 1 s shutter, for a frame the colour bars are about to cover."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    gate = ReadGate(camera)
+    touch = TimedTouch()
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=HeldClock())
+    real_submit = ctl.submit
+
+    def submit(request_id):
+        # The read in flight returns while this step is still running, so the
+        # frame thread is idle and would take a request made later in the step.
+        gate.release()
+        _until(lambda: gate.returned == 2)
+        return real_submit(request_id)
+
+    ctl.submit = submit
+    running = Running(loop)
+    try:
+        gate.release()
+        _until(lambda: gate.reads == 2)
+        touch.press(SHUTTER_CENTRE, hold=0.1)
+        assert session.started.wait(3.0)
+        gate.release(5)
+        running.more_steps(20)
+        time.sleep(0.05)
+        assert gate.reads == 2
+    finally:
+        session.release.set()
+        gate.release(50)
+        running.finish()
+        ctl.close()
+    assert running.raised is None
+
+
+def test_a_frame_that_arrived_during_a_pause_is_shown_but_not_counted(tmp_path, monkeypatch):
+    """A read in flight when the colour bars went up delivers its frame during
+    the pause. Back in the live view it is better than a blank screen, but it
+    is not a frame of this rate window."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    gate = ReadGate(camera)
+    drawn = _spy_frames(monkeypatch)
+    touch = TimedTouch()
+    logs = []
+    loop, _, _, clock = _loop(camera, ctl, touch=touch, clock=HeldClock(), log=logs.append)
+    running = Running(loop)
+    try:
+        gate.release()
+        _until(lambda: _pictures(drawn) == 1 and gate.reads == 2)
+        ctl.submit("one")
+        assert session.started.wait(2.0)
+        running.more_steps()
+        gate.release()                            # read 2 delivers during processing
+        session.release.set()
+        _until(lambda: loop.state == "REVIEW")
+        running.more_steps()
+        touch.press((5, 5), hold=0.1)
+        _until(lambda: _pictures(drawn) == 2)     # the paused frame is shown...
+        _until(lambda: gate.reads == 3)           # ...and a fresh one is asked for
+        clock.t = 10.0
+        gate.release()
+        _until(lambda: any(line.startswith("viewfinder:") for line in logs))
+    finally:
+        session.release.set()
+        gate.release(50)
+        running.finish()
+        ctl.close()
+    assert running.raised is None
+    # One frame in the ten seconds since the live view came back, not two.
+    assert [line for line in logs if line.startswith("viewfinder:")][0] == "viewfinder: 0.1 fps"
+
+
+def test_a_camera_that_keeps_stalling_ends_run(controller):
+    camera, ctl = controller
+    logged = []
+    reads = ScriptedReads(camera, [CameraStalled("no frame")] * 50)
+    loop, _, display, _ = _loop(
+        camera, ctl, clock=HeldClock(), log=logged.append, frame_period=0.01)
+    running = Running(loop)
+    running.thread.join(5.0)
+    assert not running.thread.is_alive()
+    assert isinstance(running.raised, CameraStalled)
+    assert sum("camera: no frame" in line for line in logged) == CAMERA_STALL_LIMIT
+    assert reads.reads >= CAMERA_STALL_LIMIT and display.images == []
+    _until(lambda: not _frames_thread_alive())
+
+
+def test_a_frame_between_stalls_resets_the_count_under_run(controller):
+    camera, ctl = controller
+    logged = []
+    round_ = [CameraStalled("no frame")] * (CAMERA_STALL_LIMIT - 1) + [None]
+    reads = ScriptedReads(camera, round_ * 3)
+    loop, _, display, _ = _loop(
+        camera, ctl, clock=HeldClock(), log=logged.append, frame_period=0.01)
+    running = Running(loop)
+    try:
+        _until(lambda: reads.reads >= len(round_) * 3 + 2)
+        running.more_steps()
+    finally:
+        running.finish()
+    assert running.raised is None
+    assert sum("camera: no frame" in line for line in logged) == 3 * (CAMERA_STALL_LIMIT - 1)
+    assert display.images
+
+
+def test_an_ordinary_camera_error_under_run_is_logged_and_survived(controller, monkeypatch):
+    camera, ctl = controller
+    logged = []
+    reads = ScriptedReads(camera, [CameraError("busy"), CameraError("busy")])
+    drawn = _spy_frames(monkeypatch)
+    loop, _, _, _ = _loop(camera, ctl, clock=HeldClock(), log=logged.append, frame_period=0.01)
+    running = Running(loop)
+    try:
+        _until(lambda: reads.reads >= 4 and _pictures(drawn) >= 2)
+    finally:
+        running.finish()
+    assert running.raised is None
+    assert logged.count("camera: busy") == 2
+
+
+def test_an_unexpected_error_does_not_kill_the_frame_thread(controller, monkeypatch):
+    """A thread that died would leave a frozen picture and no line in the log."""
+    camera, ctl = controller
+    logged = []
+    reads = ScriptedReads(camera, [ValueError("boom")])
+    drawn = _spy_frames(monkeypatch)
+    loop, _, _, _ = _loop(camera, ctl, clock=HeldClock(), log=logged.append, frame_period=0.01)
+    running = Running(loop)
+    try:
+        _until(lambda: reads.reads >= 3 and _pictures(drawn) >= 2)
+        assert _frames_thread_alive()
+    finally:
+        running.finish()
+    assert running.raised is None
+    assert logged.count("frames: boom") == 1
+
+
+def test_the_frame_thread_stops_with_the_loop(controller):
+    camera, ctl = controller
+    loop, _, display, _ = _loop(camera, ctl, clock=time, frame_period=0.02)
+    running = Running(loop)
+    try:
+        _until(lambda: len(display.images) >= 3)
+        assert _frames_thread_alive()
+    finally:
+        running.finish()
+    assert not _frames_thread_alive()
+
+
+def test_run_returns_when_stopped_with_a_read_still_blocked(controller, monkeypatch):
+    """A read can outlast the wait for it (a stall takes five seconds to be
+    called one). run() must come back anyway, and say what it left behind."""
+    camera, ctl = controller
+    monkeypatch.setattr(viewfinder, "FRAME_THREAD_JOIN_SECONDS", 0.1)
+    gate = ReadGate(camera)
+    logged = []
+    loop, _, _, _ = _loop(camera, ctl, clock=HeldClock(), log=logged.append)
+    running = Running(loop)
+    try:
+        _until(lambda: gate.reads == 1)           # blocked: no permit was ever given
+        running.finish(timeout=3.0)
+        assert any(line.startswith("frames:") and "did not stop" in line for line in logged)
+    finally:
+        gate.release(10)
+    _until(lambda: not _frames_thread_alive())
+    assert running.raised is None

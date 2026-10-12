@@ -36,6 +36,28 @@ thread runs it is the only code that touches the touch device, the
 ``TapDetector`` and the touch-error log state. ``step()`` driven directly (the
 tests) has no thread and polls inline, exactly as before.
 
+Under ``run()`` the camera is read on its own thread too ("pifilm-frames"), for
+the other half of the same problem: a loop that waited a second for each frame
+also took a second to act on a queued tap and to redraw the key and the value it
+changed. The loop now turns over at its own rate whatever the shutter speed.
+Each step draws the most recent frame with the controls as they are at that
+moment, and the meter, the focus measure and the metered values are worked out
+once per camera frame, not once per redraw. The slow picture at a slow shutter
+is the exposure and stays; the slow controls are gone.
+The frame thread reads only when asked: every live step sets ``_want_frames``
+and the thread takes that as a request for one frame, so the camera is read no
+more often than the loop turns over (as when the loop read it itself), and not
+at all while the screen is off or showing colour bars, a notice or a review. At
+a slow shutter the request is already waiting when a read returns, so the reads
+run back to back. A read already in flight when the live view is left still
+finishes, and its frame is the one shown when the live view comes back; it is
+shown but not counted, because the ``viewfinder: N fps`` line counts frames the
+camera delivered to the live view and is read as the camera's rate.
+While the thread runs it is the only code that reads preview frames; the
+camera's control setters are still called from the loop, which
+``Picamera2Camera`` allows beside a preview read (see its locks). ``step()``
+driven directly has no thread and reads its frame inline, exactly as before.
+
 Display and touch objects are duck-typed (``show``/``close``, ``read``/``close``)
 and the clock is injectable, so the loop is tested without hardware. The loop
 never closes the camera: the caller stops it through the stop event and only
@@ -53,6 +75,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from PIL import Image
@@ -90,6 +113,10 @@ SHUTTER_CELL, ISO_CELL, WB_CELL = (
 )
 # Consecutive preview reads that may time out before the loop gives the camera up.
 CAMERA_STALL_LIMIT = 3
+# How long run() waits for the frame thread once the loop has ended. A read at
+# the slowest shutter takes a second, so this covers any healthy one; a read
+# that is waiting out a stall (five seconds and more) is left behind instead.
+FRAME_THREAD_JOIN_SECONDS = 2.0
 # Idle dimming: half brightness after a minute untouched, off after five. The
 # normal level is the panel driver's own default (st7789.BACKLIGHT_DEFAULT).
 DIM_AFTER = 60.0
@@ -100,6 +127,19 @@ FULL_BACKLIGHT = 80
 NOTICE_SECONDS = 1.2
 PROCESSING_FIRST = "Exposure 1 of 2..."
 PROCESSING_DOUBLE = "Developing double exposure..."
+
+
+@dataclass(frozen=True)
+class _Grab:
+    """What one preview read produced: a frame, or the error it raised.
+
+    ``seq`` numbers the reads, so the loop can tell a new result from the one
+    it has already handled.
+    """
+
+    seq: int
+    frame: Any = None
+    error: CameraError | None = None
 
 
 class ViewfinderLoop:
@@ -126,6 +166,21 @@ class ViewfinderLoop:
         # Set only while run()'s touch thread is alive; step() then reads taps
         # from it instead of polling the panel itself.
         self._tap_queue: queue.Queue[Tap] | None = None
+        # Set only while run()'s frame thread is alive; step() then asks it for
+        # frames through this event instead of reading the camera itself.
+        self._want_frames: threading.Event | None = None
+        # The frame thread's latest result. It is written by that thread and
+        # read by step(), once per step into a local: one assignment of an
+        # immutable record is the only cross-thread traffic, as with the finger
+        # below, so it needs no lock.
+        self._grab: _Grab | None = None
+        # The rest is the loop's own. The number of the last result handled;
+        # the picture, meter reading and metered white balance of the last good
+        # frame, which every redraw until the next one reuses; and whether the
+        # previous step was a live one.
+        self._grab_seq = 0
+        self._view: tuple[Any, MeterReading, Any] | None = None
+        self._was_live = False
         self.state = "LIVE"
         # Which of the three controls this camera can change, by cell. A fixed
         # shutter or ISO needs a backend with the setter (Picamera2, the fake)
@@ -260,12 +315,50 @@ class ViewfinderLoop:
                 taps.put(tap)
             halt.wait(self._touch_period)
 
+    def _read_grab(self, seq: int) -> _Grab:
+        """One preview read as a record: the frame, or the ``CameraError`` it raised."""
+        try:
+            return _Grab(seq, frame=self._camera.read(full=False))
+        except CameraError as exc:
+            return _Grab(seq, error=exc)
+
+    def _frame_worker(self, stop: threading.Event, halt: threading.Event,
+                      want: threading.Event, seq: int) -> None:
+        """Read one preview frame for each request until the loop stops.
+
+        ``want`` is the loop's request and is taken (cleared) before the read,
+        so a request made during a long read starts the next one at once and a
+        loop that has left the live view starts none. A camera error is the
+        loop's to judge (it logs it and counts stalls), so it is published like
+        a frame. Anything else is logged here and the thread carries on, as the
+        touch thread does: dying would freeze the picture without a word.
+        After either the thread waits a frame period, so a camera that fails
+        at once is not asked again in a tight loop.
+        """
+        while not (stop.is_set() or halt.is_set()):
+            if not want.wait(self._frame_period):
+                continue
+            want.clear()
+            if halt.is_set():
+                break
+            seq += 1
+            try:
+                grab = self._read_grab(seq)
+            except Exception as exc:
+                self._log(f"frames: {exc}")
+                halt.wait(self._frame_period)
+                continue
+            self._grab = grab
+            if grab.error is not None:
+                halt.wait(self._frame_period)
+
     def _restart_rate_window(self) -> None:
         """Begin a fresh frame-rate window after a gap that was not the live view.
 
         The printed rate is what acceptance item 1 is read against, so the up
         to 30 s a review screen is held, or a stretch of camera errors, must
-        not be averaged in as dropped frames.
+        not be averaged in as dropped frames. It counts camera frames, not
+        redraws: under run() the same frame is redrawn until the next arrives.
         """
         self._frames, self._rate_since = 0, self._clock.monotonic()
 
@@ -374,8 +467,9 @@ class ViewfinderLoop:
         """The key to draw lit: the one under the finger, else a tap's flash.
 
         ``now`` is the time this step began, not the time the frame is drawn:
-        at a one-second shutter the preview read between the two outlasts the
-        flash, and a tap handled in this step must still be seen in its frame.
+        when the step reads the camera itself, a one-second preview read
+        between the two outlasts the flash, and a tap handled in this step must
+        still be seen in its frame.
         """
         finger = self._finger
         if finger is not None:
@@ -427,6 +521,14 @@ class ViewfinderLoop:
     # -- states -----------------------------------------------------------------
 
     def step(self) -> None:
+        # No frames are wanted until this step turns out to be a live one, so
+        # the frame thread starts no read behind colour bars, a review, a
+        # notice or a dark screen.
+        want = self._want_frames
+        if want is not None:
+            want.clear()
+        was_live, self._was_live = self._was_live, False
+        ask = True
         tap = self._next_tap()
         now = self._clock.monotonic()
         if tap is not None:
@@ -481,6 +583,10 @@ class ViewfinderLoop:
                 self._flash = (action, now + PRESS_FLASH_SECONDS)
             if action is Action.SHUTTER:
                 self._controller.submit(str(uuid.uuid4()))
+                # The still waits for the camera behind any preview read, so
+                # this step asks the frame thread for none: at a 1 s shutter a
+                # read started now would add a second of shutter lag.
+                ask = False
             elif action in SELECT_ACTIONS:
                 # hit() knows nothing of the camera: a grey cell still reports
                 # its tap, and is ignored here.
@@ -511,37 +617,57 @@ class ViewfinderLoop:
             # loop's CPU. Touch and the controller are still polled above.
             self._restart_rate_window()
             return
-        try:
-            frame = self._camera.read(full=False)
-        except CameraError as exc:
-            self._log(f"camera: {exc}")
-            self._restart_rate_window()
-            if isinstance(exc, CameraStalled):
-                # One late frame is survivable. A camera that has stopped
-                # delivering them does not recover inside this process, so the
-                # loop ends and the caller exits for a restart.
-                self._camera_stalls += 1
-                if self._camera_stalls >= CAMERA_STALL_LIMIT:
-                    raise
+        self._was_live = True
+        if want is None:
+            # No frame thread (step() driven directly): read one frame here.
+            grab = self._read_grab(self._grab_seq + 1)
+        else:
+            grab = self._grab
+            if ask:
+                want.set()
+        fresh = grab is not None and grab.seq != self._grab_seq
+        if fresh:
+            self._grab_seq = grab.seq
+            if grab.error is not None:
+                self._log(f"camera: {grab.error}")
+                self._restart_rate_window()
+                if isinstance(grab.error, CameraStalled):
+                    # One late frame is survivable. A camera that has stopped
+                    # delivering them does not recover inside this process, so the
+                    # loop ends and the caller exits for a restart.
+                    self._camera_stalls += 1
+                    if self._camera_stalls >= CAMERA_STALL_LIMIT:
+                        raise grab.error
+                return
+            self._camera_stalls = 0
+            frame = grab.frame
+            power = self._power() if self._power is not None else None
+            # Manual focus aid: the bar is the absolute sharpness of the frame's
+            # centre, the tracker only remembers the best of the last few seconds
+            # for the mark.
+            level = focus_score(frame.rgb)
+            peak = self._focus.update(level, self._clock.monotonic())
+            max_gain = getattr(self._camera, "max_gain", None)
+            reading = compute_reading(
+                frame.metadata, frame.rgb, power, focus=level, focus_peak=peak,
+                max_gain=max_gain if stepscale.is_usable(max_gain) else None,
+            )
+            metadata = frame.metadata or {}
+            metered_k = metadata.get("ColourTemperature")
+            for cell, value in enumerate(
+                (metadata.get("ExposureTime"), reading.iso, metered_k)
+            ):
+                if stepscale.is_usable(value):
+                    self._metered[cell] = float(value)
+            self._view = (frame.rgb, reading, metered_k)
+        if self._view is None:
+            # Nothing has arrived yet: the first frame of a slow shutter.
             return
-        self._camera_stalls = 0
-        power = self._power() if self._power is not None else None
-        # Manual focus aid: the bar is the absolute sharpness of the frame's centre,
-        # the tracker only remembers the best of the last few seconds for the mark.
-        level = focus_score(frame.rgb)
-        peak = self._focus.update(level, self._clock.monotonic())
-        max_gain = getattr(self._camera, "max_gain", None)
-        reading = compute_reading(
-            frame.metadata, frame.rgb, power, focus=level, focus_peak=peak,
-            max_gain=max_gain if stepscale.is_usable(max_gain) else None,
-        )
-        metadata = frame.metadata or {}
-        metered_k = metadata.get("ColourTemperature")
-        for cell, value in enumerate((metadata.get("ExposureTime"), reading.iso, metered_k)):
-            if stepscale.is_usable(value):
-                self._metered[cell] = float(value)
+        # Drawn every step, new frame or not: the cells, the selection and the
+        # lit key are read now, so a tap shows at the loop's rate, not the camera's.
+        rgb, reading, metered_k = self._view
         self._show(render_live(
-            frame.rgb, reading,
+            rgb, reading,
             LiveState(
                 cells=self._cells(reading, metered_k), selected=self.selected,
                 pressed=self._pressed(now),
@@ -549,6 +675,13 @@ class ViewfinderLoop:
             ),
             scale=self._scale,
         ))
+        if not fresh:
+            return
+        if want is not None and not was_live:
+            # The first result after a pause came from a read that was in flight
+            # when the live view was left: worth showing, but not a frame of the
+            # rate window that has just begun.
+            return
         self._frames += 1
         now = self._clock.monotonic()
         if now - self._rate_since >= RATE_LOG_INTERVAL:
@@ -563,6 +696,13 @@ class ViewfinderLoop:
             name="pifilm-touch", daemon=True,
         )
         self._tap_queue = taps
+        want = threading.Event()
+        grabber = threading.Thread(
+            target=self._frame_worker, args=(stop, halt, want, self._grab_seq),
+            name="pifilm-frames", daemon=True,
+        )
+        self._grab = None
+        self._want_frames = want
         # The touch device was opened seconds before this loop polls it, and the
         # kernel queued whatever touched the panel meanwhile. Read once and throw
         # the result away, past the tap detector: otherwise the first poll reports
@@ -573,6 +713,7 @@ class ViewfinderLoop:
         except DisplayError:
             pass
         worker.start()
+        grabber.start()
         try:
             while not stop.is_set():
                 started = self._clock.monotonic()
@@ -587,3 +728,14 @@ class ViewfinderLoop:
             if worker.is_alive():
                 self._log("touch: poll thread did not stop within 1 s")
             self._tap_queue = None
+            # The frame thread is woken so it sees the halt at once. One that is
+            # inside a read cannot be interrupted; it is given the time a healthy
+            # read takes and otherwise left behind (it is a daemon, publishes to
+            # a loop nobody steps any more, and ends with its read).
+            want.set()
+            grabber.join(FRAME_THREAD_JOIN_SECONDS)
+            if grabber.is_alive():
+                self._log(
+                    f"frames: read thread did not stop within {FRAME_THREAD_JOIN_SECONDS:g} s"
+                )
+            self._want_frames = None
