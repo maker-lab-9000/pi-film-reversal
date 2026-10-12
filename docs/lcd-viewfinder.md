@@ -296,6 +296,14 @@ is selected, and only that one.
   `params.json`), so a fixed white balance goes straight through to the graded file. A
   higher number renders warmer: 5600 K is daylight, 3200 K is tungsten lamps, and 6500
   or 7500 K corrects a picture that auto leaves cold.
+- Returning `WB` to `AUTO` is slow, and that is libcamera's auto white balance, not
+  the viewfinder: it eases from the old value toward its own answer in small steps so
+  the colour does not flicker. Measured on the Pi 4 + IMX477 on 2026-10-12 in dim room
+  light: a fixed value was reported by the camera 0.6 s after it was set (1.7 s after
+  a photo), while a return from 7500 K to auto did nothing for 2 s and was still
+  drifting after 8 s; by eye it settles in about 12 s. A photo taken meanwhile uses
+  whatever auto has reached. Nothing was changed for this: the damping is part of the
+  sensor tuning.
 
 Shutter notes:
 
@@ -450,7 +458,7 @@ Not yet run on hardware. The branch is `feat/manual-controls-ui`.
 | 3 | ISO fixed, shutter auto, in good light: the shutter read-out changes to compensate as ISO is stepped, and the meter stays near the centre | Not yet run |
 | 4 | Full manual: fix shutter and ISO; the picture gets darker and lighter with the steps and the meter dot follows | Not yet run |
 | 5 | `+`/`-` light while the finger is down, and on a quick tap | Not yet run |
-| 6 | A shot at fixed shutter + ISO + WB: the record has `shutter_us`, `iso`, `colour_temperature_k`, and `camera_metadata` agrees. Also `--white-balance 6500`: the `WB` cell reads `6500K` from the first frame | Not yet run |
+| 6 | A shot at fixed shutter + ISO + WB: the record has `shutter_us`, `iso`, `colour_temperature_k`, and `camera_metadata` agrees. Also `--white-balance 6500`: the `WB` cell reads `6500K` from the first frame | Record part passed 2026-10-12: a shot with shutter 1/125, ISO 1600 and 7500 K fixed logged `shutter_us` 8000, `iso` 1600, `colour_temperature_k` 7500, and `camera_metadata` reported 7986 us, gain 16.0 and 7500 K; ten shots at a fixed white balance all matched their metadata. The `--white-balance` start-up flag: not yet run |
 | 7 | The shutter button is not hit while working `+`/`-` | Not yet run |
 | 8 | `2x`, focus gauge, battery, review, idle screen-off, Stick and GPIO button work as before | Not yet run |
 | 9 | About 10 fps is kept (`viewfinder: N fps` in the journal) | Not yet run |
