@@ -1,5 +1,5 @@
 # Introduction
-This entire idea took shape from trying to find a kid friendly camera for my son, which escalated into a full blown project consisting of Raspberry Pi 4 portable camera with IMX708 Sensor and C mount lens, 3D LUT grading via machine learning using some hand selected sources and 3d printed case.
+This entire idea took shape from trying to find a kid friendly camera for my son, which escalated into a full blown project consisting of Raspberry Pi 4 portable camera with IMX477 sensor and C mount lens, 3D LUT grading via machine learning using some hand selected sources and 3d printed case.
 
 The prototype phase is still in progress, the repo is super messy hence I'm experimenting with various hardware, software, and photo grading techniques.
 
@@ -43,15 +43,36 @@ Photos captured and graded on the Raspberry Pi with the Camera Module 3 Wide (IM
 
 I will commit the STL files once final design is approved and tested.
 
+## The display
+
+<img width="640" alt="LCD viewfinder: auto mode and full manual mode" src="docs/images/lcd-viewfinder.png" />
+
+The 3.5 inch touchscreen is the viewfinder. Left: everything on auto. Right: full manual.
+
+- **Live view** — full screen, about 10 frames per second.
+- **Shutter button** — the big ring, top right. Tap it to take a photo.
+- **SHUTTER, ISO, WB** — tap one to select it. Then `+` and `−` change it.
+- **Auto or manual** — each of the three can be on `AUTO` or on a fixed value. Fix all three and the camera is fully manual.
+- **Exposure meter** — the row of dots. The lit dot shows if the photo will be too dark or too bright.
+- **Focus gauge** — the bar on the left. Higher means sharper.
+- **2x** — double exposure. Two shots become one photo.
+- **Battery** — charge level, top left.
+- **Light and clipping** — lux and how much of the picture is blown out.
+- **After a shot** — colour bars while the Pi works, then the graded photo. Tap to go back.
+- **Sleep** — the screen turns off after 5 minutes. A tap wakes it.
+
+More in [the viewfinder guide](docs/lcd-viewfinder.md).
+
 ## Hardware
 - Raspberry Pi 4, 4GB RAM
 - M5Stack StickS3 (display, trigger)
-- Waveshare 3.5 inch DSI LCD (E) touchscreen (light meter, focus meter, trigger, exposure controls, battery meter)
+- Waveshare 3.5 inch DSI LCD (E) touchscreen (viewfinder, shutter, manual shutter / ISO / white balance, light meter, focus gauge, battery)
 - A momentary push button on two jumper wires (physical shutter button, GPIO 21)
 - x728 UPS Shield + Geekworm X728-C1 Metal Case
 - 4x 18650 Li-ion cells, estimated capacity around 10000mAh
 - 64GB SD Card
 - Arducam 8-50mm C-Mount Zoom Lens for IMX477
+- Raspberry Pi HQ Camera, IMX477 sensor
 - Raspberry Pi Camera Module 3, Wide, IMX708 sensor
 
 ## Getting started
@@ -64,6 +85,30 @@ More detail lives in the docs: the [network & deployment guide](docs/sticks3-rem
 | Last captured photo | Ready to capture |
 | --- | --- |
 | <img src="docs/images/sticks3-ready.jpg" alt="M5Stack StickS3 showing TV colour bars and the READY prompt" height="280"> | <img src="docs/images/sticks3-captured-photo.jpg" alt="M5Stack StickS3 displaying a captured room photo" height="280"> |
+
+## From shutter button to saved photo
+
+```text
+Press the button (GPIO 21) — or tap the screen, or press the Stick
+    ↓
+The Pi takes one photo at a time. A press during a photo is ignored.
+    ↓ colour bars on the screen
+Camera switches to full resolution → takes one frame → back to live view
+    ↓
+Grade: normalize → 3D LUT → grain
+    ↓
+Save: original JPEG + raw DNG + graded JPEG + one line in captures.jsonl
+    ↓
+The screen shows the graded photo. The Stick shows a small copy.
+```
+
+The grading has three steps, always in this order:
+
+- **Normalize** — fixes exposure and levels, so every photo starts from the same place.
+- **3D LUT** — the look. A colour table that maps every colour to a new one.
+- **Grain** — film-like noise, added last. Either a simple grain, or one measured from Ilford HP5 scans.
+
+A double exposure adds the two frames first, then grades the result once.
 
 ## From button press to displayed photo
 
@@ -89,13 +134,14 @@ Pi saves original + graded JPEG + captures.jsonl → job complete
 - **Save** — to `~/Pictures/pifilm/YYYY-MM-DD/`: `*_original.jpg` (or `*_ungraded.jpg`), the full-res `*_graded.jpg`, and a `captures.jsonl` line (LUT hash, gains, grain seed, timings). The job completes only after these writes.
 - **Preview to Stick** — the Stick fetches `GET /v1/captures/{id}/image.jpg`; the Pi returns a 240×135, ≤64 KiB letterboxed JPEG of the graded file. No re-grading on the Stick.
 - **Display** — shown until the next capture. Full-res stays on the Pi (the Stick isn't the archive); failures show an error, not a fake success.
-- **LCD too** — an optional Waveshare panel on the Pi (`--display waveshare35dsi`) shows the same live view and shutter; a Stick shot appears on the LCD and an LCD shot appears on the Stick, since both go through the same controller.
+- **LCD too** — the touchscreen on the Pi (`--display waveshare35dsi`, see [the display](#the-display)) has its own shutter; a Stick shot appears on the LCD and an LCD shot appears on the Stick, since both go through the same controller.
 
 **Running modes:**
 
 | Mode | Command | Notes |
 | --- | --- | --- |
 | Headless (field) | `pifilm-capture --no-preview --remote-listen 0.0.0.0:8765` | battery, no monitor; the Stick still gets the preview |
+| Camera with screen and button | `pifilm-capture --no-preview --remote-listen 0.0.0.0:8765 --display waveshare35dsi --shutter-gpio 21` | the touchscreen is the viewfinder; the Stick still works |
 | Two-screen | `pifilm-capture --show-captures` | run in a Pi desktop session; the Pi also shows colour bars + the graded photo |
 
 Full config and rollback: the [deployment guide](docs/sticks3-remote.md).
@@ -115,7 +161,7 @@ Capture modes:
 | `--no-preview` | terminal controls, no window |
 | `--fake` | synthetic frames, no camera (for testing) |
 | `--device /dev/videoN` | select a specific USB camera |
-| `--display waveshare35dsi` | LCD viewfinder with exposure meter and touch shutter; `waveshare28` for the older 2.8" SPI panel ([guide](docs/lcd-viewfinder.md)) |
+| `--display waveshare35dsi` | LCD viewfinder with touch shutter and manual controls; `waveshare28` for the older 2.8" SPI panel ([guide](docs/lcd-viewfinder.md)) |
 | `--shutter-gpio 21` | Physical shutter button between BCM 21 and ground ([setup](docs/setup.md)) |
 
 With the default artifact, `pifilm-process` now grades any folder — including old USB captures — without white balance and with the damped highlight lift (see [Camera backends](#camera-backends)).
@@ -129,7 +175,7 @@ Output lands in `~/Pictures/pifilm/YYYY-MM-DD/`: `*_original.jpg` (or `*_ungrade
 | Command | What it captures |
 | --- | --- |
 | `pifilm-capture --camera v4l2 --device /dev/video0` | USB (UVC) camera at 1920×1080 |
-| `pifilm-capture --camera picamera2` | Pi Camera Module 3 (IMX708) at native 4608×2592 |
+| `pifilm-capture --camera picamera2` | Pi camera at the sensor's full size (IMX477: 4056×3040, IMX708: 4608×2592) |
 
 > The tuning file is libcamera's own automatic choice for the detected sensor;
 > `--tuning-file imx708_wide.json` pins it, for a module variant whose tuning
@@ -159,6 +205,7 @@ Capture flags:
 | `--ae-lock` / `--awb-lock` / `--colour-gains R,B` | lock exposure / white balance for controlled reference shoots |
 | `--ae-constraint {normal,highlight,shadows}` | AE constraint mode (default `normal`); `highlight` protects bright regions from clipping |
 | `--ae-metering {centre,spot,matrix}` | AE metering mode (default `centre`) |
+| `--white-balance K` | start with a fixed white balance in kelvin (default: auto) |
 
 
 The preset increases midtone color and contrast with a smooth tone curve,
@@ -212,7 +259,8 @@ Training is optional — the camera works with the bundled starter. Point `pifil
 
 The "model" is a **33 × 33 × 33 colour lookup table** (a standard `.cube`), not a neural network — fitted with classical colour statistics (distribution matching, regularised least squares, safety gates) and run on the Pi with no ML runtime.
 
-- **At capture:** normalize → 3D LUT (trilinear) → film-like grain — a fixed pipeline in `pifilm/pipeline.py`.
+- **At capture:** normalize → 3D LUT (trilinear) → film-like grain (simple, or measured from HP5 film) — a fixed pipeline in `pifilm/pipeline.py`.
+- An artifact is the look: the trained 3D LUT plus the settings for normalize and grain. Two artifacts can share the same LUT and differ only in grain.
 - Normalisation is defined per artifact, not per camera: the bundled starter now targets the IMX708 (the default mount), with source white balance off and a clipping-aware highlight lift — see [the write-up](docs/experiments/2026-09-19-imx708-normalisation.md).
 - **At training:** `pifilm-train` samples two image corpora in Oklab, reweights hues, matches distributions (Pitié IDT), fits the LUT by regularised least squares, then passes five numerical gates before publishing.
 
