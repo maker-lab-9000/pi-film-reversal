@@ -58,6 +58,14 @@ camera's control setters are still called from the loop, which
 ``Picamera2Camera`` allows beside a preview read (see its locks). ``step()``
 driven directly has no thread and reads its frame inline, exactly as before.
 
+Each new frame is also the check that the camera took the controls it was sent.
+On the Pi 4 a fixed white balance has been seen not to reach the live view until
+a photo re-applied the configuration, so a frame whose metadata disagrees with
+the fixed shutter, ISO or white balance for long enough is logged, the controls
+are sent again, and if that changes nothing the live view is restarted (see
+``CONTROL_RESEND_SECONDS`` and ``_verify_controls``). Each successful step is
+also traced in the journal about two seconds later (``CONTROL_TRACE_SECONDS``).
+
 Display and touch objects are duck-typed (``show``/``close``, ``read``/``close``)
 and the clock is injectable, so the loop is tested without hardware. The loop
 never closes the camera: the caller stops it through the stop event and only
@@ -94,7 +102,7 @@ from .liveview import (
     hit,
     render_live,
 )
-from .meter import FocusTracker, MeterReading, compute_reading, focus_score
+from .meter import FocusTracker, MeterReading, compute_reading, focus_score, format_shutter
 from .touch import Tap, TapDetector
 from .ui import iso_label, render_message, render_processing, render_review, text_or_dash
 
@@ -117,6 +125,47 @@ CAMERA_STALL_LIMIT = 3
 # the slowest shutter takes a second, so this covers any healthy one; a read
 # that is waiting out a stall (five seconds and more) is left behind instead.
 FRAME_THREAD_JOIN_SECONDS = 2.0
+# Verifying the fixed controls. On the Pi 4 a control sent to the running camera
+# has been seen not to take effect: a white balance was selected and the live
+# view kept the old colour, once for over a minute, until a photo re-applied the
+# configuration. The cause is not known (300 control changes against Picamera2
+# alone lost none), so each new frame's metadata is compared with the selection,
+# and a disagreement that lasts this long, over at least this many frames, is
+# written to the journal and the controls are sent again. The journal line is
+# the evidence. Both limits must pass: a new value takes a few frames to show
+# at any shutter speed, and at 1 s three seconds is only three frames.
+CONTROL_RESEND_SECONDS = 3.0
+CONTROL_RESEND_FRAMES = 6
+# A control has also been seen ignored for good, a fixed value and a return to
+# auto alike, until a photo was taken. What the photo adds is a reconfiguration
+# of the camera, so after this many resends that changed nothing the live view
+# is restarted, which is that reconfiguration without the photo. A restart
+# blanks the picture for a moment, so one that did not help is not repeated
+# for a minute; the resends go on meanwhile.
+CONTROL_RESENDS_BEFORE_RESTART = 2
+CONTROL_RESTART_HOLDOFF = 60.0
+# The camera by itself applies a live control correctly, even after a photo
+# (tried on the Pi: the reported value and the picture both change), so the
+# fault is somewhere in how this app runs it, and the evidence has to come from
+# inside the app. Each successful step is therefore followed by one journal
+# line: what was selected, what the camera reports and what the picture looks
+# like, taken from the first new frame at least this long after the step, by
+# when a control that is going to take has taken.
+CONTROL_TRACE_SECONDS = 2.0
+# The cell names as the trace line writes them, in cell order, and the camera
+# attribute that holds each selection.
+_TRACE_NAMES = ("SHUTTER", "ISO", "WB")
+_SELECTION_ATTRIBUTES = ("shutter_us", "iso", "colour_temperature_k")
+# A camera that never takes the control is resent to every few seconds, but
+# the line is written this often at most, per control.
+CONTROL_LOG_INTERVAL = 30.0
+# How far the camera's report may be from the selection and still agree: the
+# sensor rounds an exposure time to whole lines and a gain to its own steps.
+WB_TOLERANCE_K = 100.0
+EXPOSURE_TOLERANCE = 0.05
+# Automatic white balance that reports the last fixed value to within this has
+# not started: once running it drifts by tens of kelvin from frame to frame.
+AWB_UNMOVED_K = 1.0
 # Idle dimming: half brightness after a minute untouched, off after five. The
 # normal level is the panel driver's own default (st7789.BACKLIGHT_DEFAULT).
 DIM_AFTER = 60.0
@@ -181,6 +230,28 @@ class ViewfinderLoop:
         self._grab_seq = 0
         self._view: tuple[Any, MeterReading, Any] | None = None
         self._was_live = False
+        # Verifying the fixed controls (see CONTROL_RESEND_SECONDS). When the
+        # current disagreement was first seen and when its wait began, both on
+        # the loop's clock, and the new frames that have shown it since; the
+        # controls a resend is waiting to see applied; when each control's line
+        # was last written and how many have been held back since; and the last
+        # white balance that was fixed, until auto is seen to have left it.
+        self._mismatch_began: float | None = None
+        self._mismatch_since = 0.0
+        self._mismatch_frames = 0
+        self._resent: set[str] = set()
+        # The second stage: resends made in this wait without effect, the
+        # controls a restart of the live view is waiting to see applied, the
+        # ones already reported as surviving a restart, and when the live view
+        # was last restarted.
+        self._resends = 0
+        self._restarted: set[str] = set()
+        self._gave_up: set[str] = set()
+        self._restarted_at: float | None = None
+        # The step waiting for its trace line: the cell and when it was stepped.
+        self._trace: tuple[int, float] | None = None
+        self._resend_logged: dict[str, tuple[float, int]] = {}
+        self._last_fixed_k: float | None = None
         self.state = "LIVE"
         # Which of the three controls this camera can change, by cell. A fixed
         # shutter or ISO needs a backend with the setter (Picamera2, the fake)
@@ -352,6 +423,258 @@ class ViewfinderLoop:
             if grab.error is not None:
                 halt.wait(self._frame_period)
 
+    def _restart_control_check(self, *, new_selection: bool = False) -> None:
+        """Begin the wait for the controls to show in the live view again.
+
+        Called when the live view is left, because a still re-applies the whole
+        configuration and what the frames before it showed says nothing about
+        the ones after, and when a control is stepped (``new_selection``),
+        because a new value has just been sent and is a new question: its line
+        may be written at once. Leaving the live view also drops a pending
+        trace line.
+        """
+        self._mismatch_began, self._mismatch_frames, self._resends = None, 0, 0
+        self._resent.clear()
+        self._restarted.clear()
+        if new_selection:
+            self._resend_logged.clear()
+            self._gave_up.clear()
+        else:
+            # A trace across a photo would describe the photo's reconfiguration,
+            # not the step.
+            self._trace = None
+
+    def _note_fixed_wb(self) -> None:
+        kelvin = getattr(self._camera, "colour_temperature_k", None)
+        if stepscale.is_usable(kelvin):
+            self._last_fixed_k = float(kelvin)
+
+    def _control_checks(
+        self, metadata: dict,
+    ) -> list[tuple[str, str, tuple[str, str] | None]]:
+        """Compare a frame's metadata with the fixed controls.
+
+        One entry for each control that could be judged: its key, its name for
+        the log, and ``None`` when the camera agrees or the two halves of the
+        complaint when it does not. A control on auto has nothing to agree
+        with, one whose cell the camera cannot change is not this screen's, and
+        a missing or meaningless metadata value cannot tell either way: none of
+        those is listed. The exception on auto is a white balance that was
+        fixed earlier and has not moved at all since it was released.
+        """
+        camera = self._camera
+        checks: list[tuple[str, str, tuple[str, str] | None]] = []
+        us = getattr(camera, "shutter_us", None)
+        exposure = metadata.get("ExposureTime")
+        if self._available[SHUTTER_CELL] and stepscale.is_usable(us) \
+                and stepscale.is_usable(exposure):
+            what = f"shutter {shutter.label(us)}"
+            agrees = abs(exposure - us) <= EXPOSURE_TOLERANCE * us
+            checks.append(("shutter", what, None if agrees else (
+                f"{what} not in the live view",
+                f" (camera reports {format_shutter(exposure)})",
+            )))
+        fixed_iso = getattr(camera, "iso", None)
+        gain = metadata.get("AnalogueGain")
+        if self._available[ISO_CELL] and stepscale.is_usable(fixed_iso) \
+                and stepscale.is_usable(gain):
+            what = f"ISO {iso.label(fixed_iso)}"
+            agrees = abs(gain - fixed_iso / 100) <= EXPOSURE_TOLERANCE * fixed_iso / 100
+            checks.append(("iso", what, None if agrees else (
+                f"{what} not in the live view",
+                f" (camera reports ISO {round(gain * 100)})",
+            )))
+        kelvin = getattr(camera, "colour_temperature_k", None)
+        reported = metadata.get("ColourTemperature")
+        if not self._available[WB_CELL] or not stepscale.is_usable(reported):
+            return checks
+        if stepscale.is_usable(kelvin):
+            what = f"white balance {round(kelvin)}K"
+            agrees = abs(reported - kelvin) <= WB_TOLERANCE_K
+            checks.append(("wb", what, None if agrees else (
+                f"{what} not in the live view", f" (camera reports {round(reported)}K)",
+            )))
+        elif self._last_fixed_k is not None:
+            what = "auto white balance"
+            if abs(reported - self._last_fixed_k) <= AWB_UNMOVED_K:
+                checks.append(("awb", what, (
+                    f"{what} has not moved from {round(self._last_fixed_k)}K", "",
+                )))
+            else:
+                # Auto is running: reaching the old value again later is not a fault.
+                self._last_fixed_k = None
+                checks.append(("awb", what, None))
+        return checks
+
+    @staticmethod
+    def _picture(rgb: Any) -> str:
+        """The frame's colour for a journal line: channel means as R/G and B/G.
+
+        It is what the picture looks like, beside what the camera says it did:
+        a white balance the camera reports but the picture does not show is
+        only visible this way. Worked out when a line is written, never for
+        every frame.
+        """
+        try:
+            red, green, blue = (float(rgb[..., channel].mean()) for channel in range(3))
+        except Exception:
+            red = green = blue = 0.0
+        if not stepscale.is_usable(green):
+            return "picture R/G - B/G -"
+        return f"picture R/G {red / green:.2f} B/G {blue / green:.2f}"
+
+    def _trace_step(self, rgb: Any, metadata: dict, now: float) -> None:
+        """Write the pending step's trace line once its frame has come.
+
+        All three reported values are written whatever was stepped, with a
+        dash for one the frame does not carry: a step of one control that
+        moved another is exactly the kind of thing the line is for.
+        """
+        if self._trace is None or now - self._trace[1] < CONTROL_TRACE_SECONDS:
+            return
+        cell = self._trace[0]
+        self._trace = None
+        selection = getattr(self._camera, _SELECTION_ATTRIBUTES[cell], None)
+        if not stepscale.is_usable(selection):
+            selected = "AUTO"
+        elif cell == SHUTTER_CELL:
+            selected = shutter.label(selection)
+        elif cell == ISO_CELL:
+            selected = iso.label(selection)
+        else:
+            selected = f"{round(selection)}K"
+        kelvin = metadata.get("ColourTemperature")
+        gains = metadata.get("ColourGains")
+        exposure = metadata.get("ExposureTime")
+        gain = metadata.get("AnalogueGain")
+        if (
+            isinstance(gains, (list, tuple)) and len(gains) == 2
+            and all(stepscale.is_usable(value) for value in gains)
+        ):
+            gains_text = f"({gains[0]:.2f}, {gains[1]:.2f})"
+        else:
+            gains_text = DASH
+        self._log(
+            f"control: {_TRACE_NAMES[cell]} {selected} selected; camera reports "
+            f"{f'{round(kelvin)}K' if stepscale.is_usable(kelvin) else DASH} "
+            f"gains {gains_text}, "
+            f"exposure {format_shutter(exposure) if stepscale.is_usable(exposure) else DASH}, "
+            f"ISO {round(gain * 100) if stepscale.is_usable(gain) else DASH}; "
+            f"{self._picture(rgb)}"
+        )
+
+    def _verify_controls(self, metadata: dict, now: float, rgb: Any = None) -> None:
+        """Check one new frame against the fixed controls; act when overdue.
+
+        Called once per camera frame, never for a redraw: only a new frame is
+        new evidence. The first remedy is to send the controls again; when
+        ``CONTROL_RESENDS_BEFORE_RESTART`` resends have changed nothing, the
+        live view is restarted instead of another resend. A failure of either
+        is logged and survived like any other camera error from a control,
+        except that a restart which times out is a stalled camera and is
+        counted as one (it raises at ``CAMERA_STALL_LIMIT``). The lines that
+        announce a resend or a restart end with the picture's colour, from
+        ``rgb``.
+        """
+        self._note_fixed_wb()
+        faults = []
+        for kind, what, fault in self._control_checks(metadata):
+            if fault is not None:
+                faults.append((kind, what, fault))
+                continue
+            self._resend_logged.pop(kind, None)
+            self._gave_up.discard(kind)
+            if kind in self._restarted:
+                self._restarted.discard(kind)
+                self._log(f"camera: {what} applied after restarting the live view")
+            elif kind in self._resent:
+                self._log(f"camera: {what} applied after resend")
+            self._resent.discard(kind)
+        if not faults:
+            self._mismatch_began, self._mismatch_frames, self._resends = None, 0, 0
+            return
+        if self._mismatch_began is None:
+            self._mismatch_began = self._mismatch_since = now
+        self._mismatch_frames += 1
+        if (
+            self._mismatch_frames < CONTROL_RESEND_FRAMES
+            or now - self._mismatch_since < CONTROL_RESEND_SECONDS
+        ):
+            return
+        self._mismatch_since, self._mismatch_frames = now, 0
+        restart = getattr(self._camera, "restart_preview", None)
+        if (
+            self._resends >= CONTROL_RESENDS_BEFORE_RESTART
+            and callable(restart)
+            and (
+                self._restarted_at is None
+                or now - self._restarted_at >= CONTROL_RESTART_HOLDOFF
+            )
+        ):
+            for _, what, _ in faults:
+                self._log(
+                    f"camera: {what} still not in the live view after "
+                    f"{self._resends} resends; restarting the live view; "
+                    f"{self._picture(rgb)}"
+                )
+            self._resends, self._restarted_at = 0, now
+            self._resent.clear()
+            try:
+                # On the loop thread, and it waits for the frame thread's read
+                # in flight (one exposure) and then for the camera to restart:
+                # the screen and the keys stand still that long. Acceptable on
+                # a path this rare; the alternative is a third thread.
+                restart()
+            except CameraError as exc:
+                self._camera_failed(exc)
+                return
+            self._restarted = {kind for kind, _, _ in faults}
+            return
+        elapsed = now - self._mismatch_began
+        self._resends += 1
+        for kind, what, (before, after) in faults:
+            if kind in self._restarted:
+                # The restart has had its full wait and the camera still
+                # disagrees. Said once; the resends below go on.
+                self._restarted.discard(kind)
+                if kind not in self._gave_up:
+                    self._gave_up.add(kind)
+                    self._log(
+                        f"camera: {what} not applied even after restarting the live view"
+                    )
+            self._resent.add(kind)
+            logged = self._resend_logged.get(kind)
+            if logged is not None and now - logged[0] < CONTROL_LOG_INTERVAL:
+                self._resend_logged[kind] = (logged[0], logged[1] + 1)
+                continue
+            more = f" ({logged[1]} more)" if logged is not None and logged[1] else ""
+            self._log(
+                f"camera: {before} after {elapsed:.1f} s{after}; resending{more}; "
+                f"{self._picture(rgb)}"
+            )
+            self._resend_logged[kind] = (now, 0)
+        resend = getattr(self._camera, "reassert_controls", None)
+        if callable(resend):
+            try:
+                resend()
+            except CameraError as exc:
+                self._log(f"camera: {exc}")
+
+    def _camera_failed(self, exc: CameraError) -> None:
+        """Log a camera error from the live view; raise it when the camera has stalled out.
+
+        One late frame is survivable. A camera that has stopped delivering
+        them does not recover inside this process, so at ``CAMERA_STALL_LIMIT``
+        consecutive stalls the error is raised, the loop ends and the caller
+        exits for a restart.
+        """
+        self._log(f"camera: {exc}")
+        self._restart_rate_window()
+        if isinstance(exc, CameraStalled):
+            self._camera_stalls += 1
+            if self._camera_stalls >= CAMERA_STALL_LIMIT:
+                raise exc
+
     def _restart_rate_window(self) -> None:
         """Begin a fresh frame-rate window after a gap that was not the live view.
 
@@ -420,10 +743,19 @@ class ViewfinderLoop:
             step = whitebalance.warmer if up else whitebalance.cooler
             value = step(getattr(camera, "colour_temperature_k", None), metered)
             setter = camera.set_colour_temperature
+        # Before the setter: a white balance stepped from fixed to auto between
+        # two frames must still be remembered as the value auto has to leave.
+        self._note_fixed_wb()
+        before = getattr(camera, _SELECTION_ATTRIBUTES[cell], None)
         try:
             setter(value)
         except CameraError as exc:
             self._log(f"camera: {exc}")
+        self._restart_control_check(new_selection=True)
+        if getattr(camera, _SELECTION_ATTRIBUTES[cell], None) != before:
+            # The control changed (a rejected step, or + on the top step, leaves
+            # it as it was): trace it, in place of any step still waiting.
+            self._trace = (cell, self._clock.monotonic())
 
     def _cells(self, reading: MeterReading, metered_k: Any) -> tuple[Cell, Cell, Cell]:
         """The strip's three read-outs for this frame.
@@ -618,6 +950,8 @@ class ViewfinderLoop:
             self._restart_rate_window()
             return
         self._was_live = True
+        if not was_live:
+            self._restart_control_check()
         if want is None:
             # No frame thread (step() driven directly): read one frame here.
             grab = self._read_grab(self._grab_seq + 1)
@@ -629,15 +963,7 @@ class ViewfinderLoop:
         if fresh:
             self._grab_seq = grab.seq
             if grab.error is not None:
-                self._log(f"camera: {grab.error}")
-                self._restart_rate_window()
-                if isinstance(grab.error, CameraStalled):
-                    # One late frame is survivable. A camera that has stopped
-                    # delivering them does not recover inside this process, so the
-                    # loop ends and the caller exits for a restart.
-                    self._camera_stalls += 1
-                    if self._camera_stalls >= CAMERA_STALL_LIMIT:
-                        raise grab.error
+                self._camera_failed(grab.error)
                 return
             self._camera_stalls = 0
             frame = grab.frame
@@ -660,6 +986,9 @@ class ViewfinderLoop:
                 if stepscale.is_usable(value):
                     self._metered[cell] = float(value)
             self._view = (frame.rgb, reading, metered_k)
+            checked_at = self._clock.monotonic()
+            self._trace_step(frame.rgb, metadata, checked_at)
+            self._verify_controls(metadata, checked_at, frame.rgb)
         if self._view is None:
             # Nothing has arrived yet: the first frame of a slow shutter.
             return

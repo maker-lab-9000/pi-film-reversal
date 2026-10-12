@@ -171,7 +171,12 @@ integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW st
 width. Under `run()` it reads preview frames on a `pifilm-frames` thread (touch is on `pifilm-touch`)
 and redraws the latest frame every step, so the controls stay responsive at a 1 s shutter;
 `Picamera2Camera` backs this with two locks: a preview read holds only the request lock, the
-control setters only the configuration lock, and a still holds both (request first). The DSI panel has no brightness control, so it
+control setters only the configuration lock, and a still holds both (request first). Each new
+frame's metadata is checked against the fixed shutter/ISO/white balance: a mismatch lasting 3 s and
+6 frames is logged and resent (`reassert_controls`), and after two resends the live view is
+restarted (`restart_preview`), because the Pi 4 has been seen to ignore a live control; each
+successful step also logs one `control: ...` trace line about 2 s later (selection, what the camera
+reports, the picture's R/G and B/G). The DSI panel has no brightness control, so it
 skips the idle dim step and only turns off. All hardware imports (`pykms`, `spidev`, `gpiozero`,
 `smbus2`) are lazy, inside the `open_*` factories, so the package imports on a Mac and in tests.
 `fake.py` (`--display fake`) writes frames to a PNG instead. The loop shares the

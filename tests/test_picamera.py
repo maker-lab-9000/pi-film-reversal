@@ -219,6 +219,7 @@ def install_picamera(monkeypatch):
                 self.configure_calls = []
                 self.configured_controls = []
                 self.switch_calls = []
+                self.switch_mode_calls = []
                 self.configure_count = 0
                 self.start_count = 0
                 self.capture_count = 0
@@ -312,6 +313,9 @@ def install_picamera(monkeypatch):
                 if capture_error is not None:
                     raise capture_error
                 return request
+
+            def switch_mode(self, config, wait=None):
+                self.switch_mode_calls.append((config, wait))
 
             def autofocus_cycle(self):
                 self.autofocus_cycle_count += 1
@@ -1518,6 +1522,251 @@ def test_a_still_without_a_preview_stream_also_excludes_the_setters(install_pica
         held.release.set()
     assert read_done.wait(5.0) and read_errors == []
     assert set_done.wait(2.0) and set_errors == [] and camera.shutter_us == 4000
+    camera.close()
+
+
+def _controls_snapshot(inst):
+    return [dict(config["controls"]) for config in (inst.created_config, inst.preview_config)]
+
+
+def test_reassert_controls_resends_the_fixed_selection_in_one_call(install_picamera):
+    """Seen on the Pi 4: a control sent to the running camera sometimes does not
+    take effect. The resend is what each setter sent live, together, and it
+    leaves the configurations and the selection alone."""
+    state = install_picamera(frame_limits={"still": (100, 50_000), "preview": (100, 33_333)})
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    camera.set_shutter(250_000)
+    camera.set_iso(400)
+    camera.set_colour_temperature(5600)
+    sent = inst.set_controls_calls[-3:]
+    expected = {**sent[0], **sent[1], **sent[2]}
+    assert expected == {
+        "ExposureTime": 250_000, "FrameDurationLimits": (100, 251_000),
+        "AnalogueGain": 4.0, "ColourTemperature": 5600,
+    }
+    configs, calls = _controls_snapshot(inst), len(inst.set_controls_calls)
+    camera.reassert_controls()
+    assert inst.set_controls_calls[calls:] == [expected]
+    assert _controls_snapshot(inst) == configs
+    assert (camera.shutter_us, camera.iso, camera.colour_temperature_k) == (250_000, 400, 5600)
+    camera.close()
+
+
+def test_reassert_controls_resends_auto_through_the_mode_controls(install_picamera):
+    state = install_picamera(with_exposure_time_mode=True, with_analogue_gain_mode=True)
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    camera.reassert_controls()
+    assert inst.set_controls_calls[-1] == {
+        "ExposureTimeMode": _ExposureTimeModeEnum.Auto,
+        "AnalogueGainMode": _AnalogueGainModeEnum.Auto,
+        "AwbEnable": True,
+    }
+    camera.set_shutter(4000)
+    camera.set_iso(800)
+    camera.reassert_controls()
+    assert inst.set_controls_calls[-1] == {
+        "ExposureTimeMode": _ExposureTimeModeEnum.Manual, "ExposureTime": 4000,
+        "AnalogueGainMode": _AnalogueGainModeEnum.Manual, "AnalogueGain": 8.0,
+        "AwbEnable": True,
+    }
+    camera.close()
+
+
+def test_reassert_controls_on_legacy_libcamera_resends_auto_as_zeroes(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    camera.reassert_controls()
+    assert state.instance.set_controls_calls[-1] == {
+        "ExposureTime": 0, "AnalogueGain": 0.0, "AwbEnable": True,
+    }
+    camera.close()
+
+
+def test_reassert_controls_leaves_locked_exposure_alone(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True, ae_lock=True)
+    camera.set_colour_temperature(6500)
+    camera.reassert_controls()
+    assert state.instance.set_controls_calls[-1] == {"ColourTemperature": 6500}
+    camera.close()
+
+
+def test_reassert_controls_leaves_a_locked_white_balance_alone(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True, awb_lock=True)
+    camera.set_shutter(4000)
+    camera.reassert_controls()
+    assert state.instance.set_controls_calls[-1] == {"ExposureTime": 4000, "AnalogueGain": 0.0}
+    camera.close()
+
+
+def test_reassert_controls_sends_nothing_when_nothing_is_adjustable(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True, ae_lock=True, awb_lock=True)
+    calls = len(state.instance.set_controls_calls)
+    camera.reassert_controls()
+    assert len(state.instance.set_controls_calls) == calls
+    camera.close()
+
+
+def test_reassert_controls_on_a_closed_camera_is_an_error(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera(preview=True)
+    camera.close()
+    with pytest.raises(CameraError, match="closed"):
+        camera.reassert_controls()
+
+
+def test_reassert_controls_wraps_a_camera_failure(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    camera.set_shutter(4000)
+
+    def refuse(controls):
+        raise RuntimeError("control rejected")
+
+    state.instance.set_controls = refuse
+    with pytest.raises(CameraError, match="failed to resend the controls: control rejected"):
+        camera.reassert_controls()
+    assert camera.shutter_us == 4000
+    camera.close()
+
+
+def test_reassert_controls_waits_for_a_still_capture(install_picamera):
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    inst = state.instance
+    held = _HeldCapture(inst, "switch_mode_and_capture_request", FakeRequest(big))
+    calls = len(inst.set_controls_calls)
+    read_done, read_errors = _in_thread(lambda: camera.read(full=True))
+    try:
+        assert held.inside.wait(2.0)
+        sent, send_errors = _in_thread(camera.reassert_controls)
+        assert not sent.wait(0.1)
+        assert len(inst.set_controls_calls) == calls
+    finally:
+        held.release.set()
+    assert read_done.wait(5.0) and read_errors == []
+    assert sent.wait(2.0) and send_errors == []
+    assert len(inst.set_controls_calls) == calls + 1
+    camera.close()
+
+
+def test_restart_preview_switches_to_the_preview_configuration_with_a_timeout(
+    install_picamera,
+):
+    """Seen on the Pi 4: a live control is sometimes ignored for good and only a
+    photo cures it, because the photo reconfigures the camera. This is that
+    reconfiguration without the photo; the configuration holds the selection."""
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    camera.set_colour_temperature(6500)
+    camera.set_shutter(500_000)
+    configure_calls, live_calls = len(inst.configure_calls), len(inst.set_controls_calls)
+    camera.restart_preview()
+    assert len(inst.switch_mode_calls) == 1
+    config, wait = inst.switch_mode_calls[0]
+    assert config["preview"] is inst.preview_config
+    assert config["controls"]["ColourTemperature"] == 6500
+    assert config["controls"]["ExposureTime"] == 500_000
+    assert wait == pytest.approx(30.0 + 4 * 0.5)
+    assert len(inst.configure_calls) == configure_calls
+    assert len(inst.set_controls_calls) == live_calls
+    assert (camera.shutter_us, camera.colour_temperature_k) == (500_000, 6500)
+    camera.close()
+
+
+def test_restart_preview_that_times_out_is_a_stall(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    inst.switch_mode = lambda config, wait=None: (_ for _ in ()).throw(TimeoutError())
+    with pytest.raises(CameraStalled, match="live view restart within 30.0 s"):
+        camera.restart_preview()
+    assert inst.cancel_count == 1
+    # The locks were released: a control can still be set and a frame asked for.
+    camera.set_shutter(4000)
+    camera.close()
+
+
+def test_restart_preview_wraps_a_camera_failure(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    state.instance.switch_mode = lambda config, wait=None: (_ for _ in ()).throw(
+        RuntimeError("device busy"))
+    with pytest.raises(CameraError, match="failed to restart the live view: device busy") as hit:
+        camera.restart_preview()
+    assert not isinstance(hit.value, CameraStalled)
+    camera.close()
+
+
+def test_restart_preview_needs_a_preview_stream(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    with pytest.raises(CameraError, match="no preview stream"):
+        camera.restart_preview()
+    assert state.instance.switch_mode_calls == []
+    camera.close()
+
+
+def test_restart_preview_on_a_closed_camera_is_an_error(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    camera.close()
+    with pytest.raises(CameraError, match="closed"):
+        camera.restart_preview()
+    assert state.instance.switch_mode_calls == []
+
+
+def test_restart_preview_waits_for_a_preview_read_in_flight(install_picamera):
+    """It stops the camera, so like a still it must not start while a request
+    is still being copied: the request lock comes first."""
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    inst = state.instance
+    held = _HeldCapture(inst, "capture_request", FakeRequest(small))
+    read_done, read_errors = _in_thread(lambda: camera.read(full=False))
+    try:
+        assert held.inside.wait(2.0)
+        restarted, restart_errors = _in_thread(camera.restart_preview)
+        assert not restarted.wait(0.1)
+        assert inst.switch_mode_calls == []
+        # Waiting for the request lock, it does not yet hold the configuration
+        # lock: a setter still gets through, as it does beside any preview read.
+        set_done, set_errors = _in_thread(lambda: camera.set_iso(400))
+        assert set_done.wait(2.0) and set_errors == []
+    finally:
+        held.release.set()
+    assert read_done.wait(2.0) and read_errors == []
+    assert restarted.wait(2.0) and restart_errors == []
+    assert len(inst.switch_mode_calls) == 1
+    camera.close()
+
+
+def test_a_restart_in_progress_excludes_reads_and_setters(install_picamera):
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(small))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    inst = state.instance
+    held = _HeldCapture(inst, "switch_mode", None)
+    restarted, restart_errors = _in_thread(camera.restart_preview)
+    try:
+        assert held.inside.wait(2.0)
+        set_done, set_errors = _in_thread(lambda: camera.set_iso(400))
+        read_done, read_errors = _in_thread(lambda: camera.read(full=False))
+        assert not set_done.wait(0.1) and not read_done.is_set()
+        assert camera.iso is None and inst.capture_count == 0
+    finally:
+        held.release.set()
+    assert restarted.wait(2.0) and restart_errors == []
+    assert set_done.wait(2.0) and set_errors == [] and camera.iso == 400
+    assert read_done.wait(2.0) and read_errors == []
     camera.close()
 
 

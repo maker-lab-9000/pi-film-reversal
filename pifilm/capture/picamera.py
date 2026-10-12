@@ -74,7 +74,8 @@ record describes. So a still (``read(full=True)``) holds both locks, always
 the request lock first and the configuration lock second, a preview read holds
 only the request lock, and a setter holds only the configuration lock. No
 thread ever waits for the request lock while holding the configuration lock,
-so the two cannot deadlock.
+so the two cannot deadlock. ``reassert_controls`` is a setter in this respect,
+and ``restart_preview``, which stops and reconfigures the camera, is a still.
 """
 
 from __future__ import annotations
@@ -452,8 +453,13 @@ class Picamera2Camera:
         return base + _TIMEOUT_SHUTTERS * (self.shutter_us or 0) / 1_000_000
 
     @staticmethod
-    def _stalled(camera: Any, still: bool, timeout: float) -> CameraStalled:
+    def _stalled(
+        camera: Any, still: bool, timeout: float, what: str | None = None,
+    ) -> CameraStalled:
         """Build the error for a read that timed out, and clear Picamera2's queue.
+
+        ``what`` names the thing that did not arrive when it was not a frame
+        (the live view restart).
 
         The timed-out job stays queued inside Picamera2; left there it would take
         the next frame and nobody would release it. The state goes into the
@@ -473,8 +479,8 @@ class Picamera2Camera:
             camera.cancel_all_and_flush()
         except Exception:
             pass
-        kind = "still" if still else "preview"
-        return CameraStalled(f"no {kind} frame within {timeout:.1f} s ({detail})")
+        what = what or ("still frame" if still else "preview frame")
+        return CameraStalled(f"no {what} within {timeout:.1f} s ({detail})")
 
     def _update_fps(self, metadata: Any) -> None:
         try:
@@ -609,6 +615,76 @@ class Picamera2Camera:
                 _set_config_control(config, name, value)
                 _drop_config_control(config, stale)
         self.colour_temperature_k = kelvin
+
+    def reassert_controls(self) -> None:
+        """Send the current selection to the running camera again, in one call.
+
+        On the Pi 4 a control sent to the running camera has been seen not to
+        take effect: a white balance was selected and the live view kept the
+        old colour until a photo was taken (a still re-applies the whole
+        configuration, which is why the photo was right). The cause is not
+        known, so the viewfinder checks each frame's metadata against the
+        selection and calls this when they keep disagreeing.
+
+        What is sent is what the setters sent live: the shutter and ISO controls
+        for ``shutter_us`` and ``iso`` (auto included), unless ``--ae-lock``
+        fixed the exposure, and ``ColourTemperature`` or ``AwbEnable``, unless
+        the white balance is not adjustable. The configurations already hold
+        the selection and are not touched, nor is any attribute. With nothing
+        adjustable nothing is sent.
+        """
+        camera = self._camera
+        if camera is None:
+            raise CameraError("Cannot resend the controls on a closed Picamera2 camera")
+        running = "preview" if self._preview_config is not None else "still"
+        with self._config_lock:
+            try:
+                controls: dict[str, Any] = {}
+                if self.exposure_adjustable:
+                    controls.update(
+                        self._shutter_controls(self.shutter_us, self._frame_limits[running])
+                    )
+                    controls.update(self._iso_controls(self.iso))
+                if self.wb_adjustable:
+                    if self.colour_temperature_k is None:
+                        controls["AwbEnable"] = True
+                    else:
+                        controls["ColourTemperature"] = self.colour_temperature_k
+                if controls:
+                    camera.set_controls(controls)
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to resend the controls: {exc}") from exc
+
+    def restart_preview(self) -> None:
+        """Stop the camera, apply the preview configuration again and restart it.
+
+        The second remedy for a live control the camera ignores (see
+        ``reassert_controls``): on the Pi 4 one has been seen ignored for good,
+        a fixed value and a return to auto alike, until a photo was taken. What
+        the photo does that a resend does not is reconfigure the camera, and
+        this is that reconfiguration without the photo. The preview
+        configuration's controls already hold the selection, because the
+        setters write them there, so nothing else is sent.
+
+        It stops the camera, so like a still it holds both locks, the request
+        lock first: no read is in flight and no setter runs meanwhile. It
+        therefore waits for a preview read in progress, up to one exposure.
+        It waits as long as a still does; no answer in that time is a stalled
+        camera. Only a camera with a preview stream has a live view to restart.
+        """
+        camera = self._camera
+        if camera is None:
+            raise CameraError("Cannot restart the live view on a closed Picamera2 camera")
+        if self._preview_config is None:
+            raise CameraError("Cannot restart the live view: this camera has no preview stream")
+        timeout = self._frame_timeout(True)
+        with self._request_lock, self._config_lock:
+            try:
+                camera.switch_mode(self._preview_config, wait=timeout)
+            except TimeoutError:
+                raise self._stalled(camera, True, timeout, "live view restart") from None
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to restart the live view: {exc}") from exc
 
     def _shutter_controls(
         self, us: int | None, limits: tuple[int, int] | None,

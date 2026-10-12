@@ -304,6 +304,46 @@ is selected, and only that one.
   drifting after 8 s; by eye it settles in about 12 s. A photo taken meanwhile uses
   whatever auto has reached. Nothing was changed for this: the damping is part of the
   sensor tuning.
+- **The controls are checked against the camera.** On the Pi 4 a control sent to the
+  running camera has been seen not to take effect: a white balance was selected and the
+  live view kept the old colour, once for over a minute and sometimes for good, until a
+  photo was taken (the photo was right, because each still re-applies the whole
+  configuration). The cause is not yet known. So every new camera frame's metadata is
+  compared with what is fixed: `ColourTemperature` within 100 K of a fixed white
+  balance, `ExposureTime` within 5 % of a fixed shutter, `AnalogueGain` within 5 % of a
+  fixed ISO, and, after `WB` has been returned to `AUTO`, a `ColourTemperature` that
+  has left the old fixed value. A frame without the value cannot tell and is never a
+  fault. A disagreement that lasts 3 s and 6 camera frames is written to the journal
+  and the controls are sent again:
+  `camera: white balance 7500K not in the live view after 3.2 s (camera reports 4250K); resending`
+  (likewise `shutter 1/250`, `ISO 800`, and
+  `auto white balance has not moved from 7500K`). If two resends change nothing, the
+  live view is restarted, which reconfigures the camera as a photo does, and the picture
+  freezes for a moment:
+  `camera: white balance 7500K still not in the live view after 2 resends; restarting the live view`.
+  The first frame that agrees again logs `camera: ... applied after resend` or
+  `... applied after restarting the live view`. If even the restart does not help,
+  `camera: ... not applied even after restarting the live view` is logged once, the
+  resends go on every 3 s, and the restart is tried again a minute later; the
+  `resending` line is then written at most once in 30 s, with a count of the ones held
+  back. These lines are the evidence of the camera not taking a live control: when the
+  colour or exposure on screen does not match the cells, look for them with
+  `journalctl -u pifilm-capture | grep 'camera:'`. A step, a photo, a review or a dark
+  screen starts the wait again. The `resending` and `restarting the live view` lines
+  end with the picture's colour, `; picture R/G 1.03 B/G 0.96` (the means of the
+  preview frame's red and blue channels over its green one).
+- **Every step leaves a trace.** A `+`/`-` step that changes a control is followed,
+  on the first new camera frame at least 2 s later, by one journal line with what was
+  selected, what the camera reports and what the picture looks like:
+  `control: WB 7500K selected; camera reports 7500K gains (3.35, 1.36), exposure 1/60, ISO 400; picture R/G 2.42 B/G 0.00`
+  (`WB AUTO selected` for a return to auto; `-` for a value the frame does not carry).
+  All three reported values are written whichever control was stepped. A second step
+  before the line is written replaces it, and a photo, a review or a dark screen
+  cancels it. The camera alone applies a live white balance correctly, even after a
+  photo (tried on the Pi), so the fault above is somewhere in how the app runs it;
+  this line is how a case is caught where the camera reports the selected value and
+  the picture does not show it, which the check above cannot see. A step the camera
+  rejects, or `+` on a top step, changes nothing and is not traced.
 
 Shutter notes:
 
@@ -480,6 +520,7 @@ process falls back to the mode it would have run in without `--display`.
 | `cannot claim display GPIO 25/27/18` | GPIO already held — usually a leftover `dtoverlay=fbtft`, or another process | Remove any `dtoverlay=fbtft` line from `config.txt`; check the `gpio` group |
 | `cannot reset the touch controller on GPIO 17` | GPIO 17 busy, or a wiring fault on `TP_RST` | Check the `TP_RST` connection; confirm nothing else claims GPIO 17 |
 | `touch controller at 0x58 not answering on /dev/i2c-1` | Nothing responded to the probe read at open — usually the ribbon cable | Check the ribbon cable and `TP_RST` wiring, and that the panel has power; confirm with `sudo i2cdetect -y 1` showing `58` |
+| `not in the live view after ... resending`, `restarting the live view`, `applied after resend` | The camera did not take a control sent to it while running (seen on the Pi 4, cause not yet known); the viewfinder sent it again, and after two resends restarted the live view | Nothing to do when an `applied after ...` line follows. `not applied even after restarting the live view` means neither helped: take a photo (it reconfigures the camera) and keep the journal lines, see [Manual controls](#manual-controls) |
 | `the V4L2 backend has no preview mode` | The camera is a USB/UVC one; the viewfinder needs Picamera2's preview-mode split and libcamera metadata | Nothing to fix unless a Pi camera is intended: check `--camera`/`--device` and that `python3-picamera2` is installed |
 
 ## 9. The 3.5" DSI panel
