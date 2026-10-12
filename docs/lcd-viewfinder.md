@@ -425,6 +425,29 @@ subject in focus reads about as high as a bright one.
 
 - **A full bar means sharp; a short bar means soft**, with no need to have seen
   a sharp frame first. Far out of focus reads close to zero.
+- **Nothing to focus on also reads zero.** The bar only scores edges that stand
+  clearly out of the frame's own noise and shading, so a plain surface (a wall,
+  skin close up) leaves it empty however the ring is set. Aim the middle of the
+  frame at something with an edge in it. A surface covered edge to edge in one
+  even texture, such as grass filling the frame, reads lower than its sharpness
+  deserves and changes little until it is well out of focus.
+- **Measured on the Pi 4 + IMX477 at ISO 1600, 1/15 s (2026-10-13)**, on saved
+  preview frames. Before that date the edge threshold assumed fine-grained
+  noise, and the ISP's blotchy noise passed as detail, so a lens left
+  completely out of focus read higher than a slightly soft one:
+
+  | Frame | Old bar | Bar now |
+  | --- | --- | --- |
+  | Monitor text, sharp | 1.00 | 1.00 |
+  | Monitor text, slightly soft | 0.33 to 0.40 | 0.07 to 0.10 |
+  | Monitor text, completely out | 0.43 to 0.45 | 0.05 to 0.14 |
+  | Room scene, sharp | 0.78 to 0.81 | 0.71 to 0.74 |
+  | Room scene, slightly soft | 0.28 | 0.11 to 0.18 |
+  | Room scene, completely out | 0.43 to 0.45 | 0.00 |
+  | Plain surface, any focus | 0.50 to 0.67 | 0.00 to 0.06 |
+
+  Run live on the Pi 4 on 2026-10-13: the bar was near empty fully defocused,
+  climbed toward focus and peaked where the picture looked sharpest.
 - **The amber tick is the best level of the last few seconds.** Rack through
   focus, then turn back until the white fill reaches the tick again.
 - **The tick fades** (it halves in about three seconds), so it lets go of an

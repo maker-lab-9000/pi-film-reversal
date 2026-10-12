@@ -12,8 +12,17 @@ is better. The score must be *absolute* - a blurred frame reads low on its own.
 The first version showed a Laplacian variance against its own decaying peak, and
 on the device a lens left out of focus read full: with no sharp frame since
 switching on, the blurred frame *was* the peak. So the score is a blur ratio that
-the scene's contrast cancels out of, gated against sensor noise, and the tracker
-only places the "best seen" mark.
+the scene's contrast cancels out of, measured only at edges that stand clear of
+the frame's own noise, and the tracker only places the "best seen" mark.
+
+The second version chose those edges with a noise estimate calibrated on white
+noise. On the Pi 4 at ISO 1600 a lens left completely out of focus read 0.43 to
+0.67 of the bar, more than a slightly soft frame did: the ISP's noise reduction
+leaves the preview's noise in soft blotches, about five times stronger at the
+scale the edges are chosen at than white noise of the same fine grain, so most of
+a featureless frame passed as edges and its noise was scored as detail. The edge
+threshold is now taken from the frame's own re-blurred steps (see
+``focus_score``), which needs no model of the noise.
 """
 
 from __future__ import annotations
@@ -33,16 +42,19 @@ CLIP_LEVEL = 254
 # its area): the subject is what the user points the middle of the finder at, and
 # a sharp background at the edges must not hold the bar up while the subject is soft.
 FOCUS_REGION = 0.5
-# Only edges whose re-blurred step is this many times the step noise alone makes
-# there are scored: at 1/15 s and ISO 1580 the preview carries pixel noise that a
-# sharpness measure would otherwise read as detail.
-FOCUS_NOISE_GATE = 4.0
-# Neighbour-step standard deviation of unit white noise after the binomial smoothing
-# and the 9-tap re-blur in ``focus_score`` (measured): the noise estimate in step units.
-_REBLURRED_NOISE_STEP = 0.043
-# Step that the re-blur removes at an edge pixel from unit noise alone (measured on
-# a noisy ramp): subtracted per scored pixel so noise does not read as sharpness.
-_NOISE_LOST_STEP = 0.07
+# An edge is a pixel whose re-blurred step is this many robust standard deviations
+# (from the median absolute deviation) of all the re-blurred steps in the region.
+# In a frame with nothing sharp those steps are noise and slow shading, so nothing
+# stands that far out; a real edge does. Measured on preview frames from the Pi 4
+# at ISO 1600 (2026-10-13): at 6, fully defocused frames score 0.00 to 0.08 raw and
+# sharp text 0.54, where the noise-model gate it replaces gave 0.24 to 0.37 and 0.55.
+FOCUS_EDGE_SIGMAS = 6.0
+# ... and at least this many 8-bit levels per pixel, so the one-level stairs of a
+# smooth gradient in a noiseless frame are not edges either.
+FOCUS_EDGE_FLOOR = 0.5
+# Fewer edge pixels than this share of the region is nothing to focus on: a few
+# hot pixels or one speck must not set the bar.
+FOCUS_MIN_EDGE_FRACTION = 0.0005
 # The raw blur ratio a sharply focused preview reaches (0.55-0.65 on real 12 MP
 # captures reduced to preview size, before noise), mapped to a full bar.
 FOCUS_FULL_SCALE = 0.55
@@ -103,12 +115,20 @@ _BINOMIAL = np.array([1, 4, 6, 4, 1], dtype=np.float32) / 16   # a Gaussian, sig
 _REBLUR = np.full(9, 1 / 9, dtype=np.float32)
 
 
-def _noise_sigma(luma: np.ndarray) -> float:
-    """Immerkaer's fast estimate: the [1,-2,1] x [1,-2,1] mask cancels smooth
-    image structure and leaves mostly noise."""
-    d2 = luma[:-2] - 2 * luma[1:-1] + luma[2:]
-    r = d2[:, :-2] - 2 * d2[:, 1:-1] + d2[:, 2:]
-    return float(np.sqrt(np.pi / 2) * np.mean(np.abs(r)) / 6)
+# Mean of the positive half of a unit normal: what noise alone adds, per pixel, to
+# a sum that keeps only the positive part of (step - re-blurred step).
+_HALF_NORMAL_MEAN = 0.399
+_SPREAD_STRIDE = 3
+
+
+def _spread(steps: np.ndarray) -> float:
+    """Robust standard deviation of a field of signed steps (median absolute
+    deviation): the level of what is ordinary in the frame, be it noise or slow
+    shading, which the few pixels of a real edge do not move. Every third pixel
+    each way is plenty for a median and keeps the score near its old cost (about
+    4 ms a frame on a laptop against 11 ms with every pixel)."""
+    sample = steps[::_SPREAD_STRIDE, ::_SPREAD_STRIDE]
+    return 1.4826 * float(np.median(np.abs(sample - np.median(sample))))
 
 
 def focus_score(preview_rgb: np.ndarray) -> float:
@@ -122,14 +142,18 @@ def focus_score(preview_rgb: np.ndarray) -> float:
 
     Noise would look like the finest detail of all, so the image is lightly
     smoothed first, and only edges count: pixels whose *re-blurred* step stands
-    well clear of what noise alone would make there (``FOCUS_NOISE_GATE``). The
-    re-blurred step is nearly noise-free and barely changes with focus, so
-    choosing edges by it does not favour the sharp pixels - gating on the raw
-    step does, and made a blurred low-contrast frame read sharp. What noise
-    itself adds to the lost contrast at those pixels is known from the noise
-    estimate and subtracted (``_NOISE_LOST_STEP``). A frame with no
-    edges above the gate (a blank wall, or pure noise) scores 0.0: nothing to
-    focus on is not the same as sharp.
+    far out from the rest of the region's (``FOCUS_EDGE_SIGMAS`` robust standard
+    deviations, and at least ``FOCUS_EDGE_FLOOR``). The re-blurred step barely
+    changes with focus, so choosing edges by it does not favour the sharp
+    pixels - gating on the raw step does, and made a blurred low-contrast frame
+    read sharp. Taking the threshold from the frame itself makes it right for
+    whatever noise the frame has, blotchy or fine, without a model of it. What
+    noise itself adds to the lost contrast at those pixels is estimated the
+    same way, from the spread of the frame's own fine steps, and subtracted.
+    A frame with too few edges (a blank wall, pure noise, a
+    lens far out of focus) scores 0.0: nothing to focus on is not the same as
+    sharp. The price is a region filled edge to edge with one even texture and
+    nothing standing out of it, which also reads as nothing to focus on.
 
     Plain gamma-encoded bytes, not linear light: this is a contrast measure and
     sRGB encoding is what makes mid-tone detail visible to it. Array slicing only,
@@ -145,18 +169,21 @@ def focus_score(preview_rgb: np.ndarray) -> float:
         + 0.587 * centre[..., 1].astype(np.float32)
         + 0.114 * centre[..., 2].astype(np.float32)
     )
-    noise = _noise_sigma(luma)
-    gate = FOCUS_NOISE_GATE * _REBLURRED_NOISE_STEP * noise
     luma = _smooth(_smooth(luma, 0, _BINOMIAL), 1, _BINOMIAL)
     lost = kept = 0.0
+    found = total = 0
     for axis in (0, 1):
-        step = np.abs(np.diff(luma, axis=axis))
-        reblurred = np.abs(np.diff(_smooth(luma, axis, _REBLUR), axis=axis))
-        edges = reblurred > max(gate, 1e-3)
+        fine = np.diff(luma, axis=axis)
+        coarse = np.diff(_smooth(luma, axis, _REBLUR), axis=axis)
+        step, reblurred = np.abs(fine), np.abs(coarse)
+        edges = reblurred > max(FOCUS_EDGE_SIGMAS * _spread(coarse), FOCUS_EDGE_FLOOR)
+        count = int(edges.sum())
+        found += count
+        total += edges.size
         kept += float(step[edges].sum())
         lost += float(np.maximum(0.0, step - reblurred)[edges].sum())
-        lost -= _NOISE_LOST_STEP * noise * int(edges.sum())
-    if kept <= 0.0:
+        lost -= _HALF_NORMAL_MEAN * _spread(fine) * count
+    if kept <= 0.0 or found < FOCUS_MIN_EDGE_FRACTION * total:
         return 0.0
     return max(0.0, min(1.0, lost / kept / FOCUS_FULL_SCALE))
 

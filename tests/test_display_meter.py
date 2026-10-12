@@ -206,3 +206,62 @@ def test_iso_max_flags_a_saturated_gain():
 def test_no_iso_max_without_a_known_maximum_or_gain():
     assert compute_reading({"AnalogueGain": 40.0}, _frame(), None).iso_max is False
     assert compute_reading({}, _frame(), None, max_gain=22.26).iso_max is False
+
+
+def _blotchy(shape, sd, seed=0, passes=2):
+    """Noise as the ISP's noise reduction leaves it: soft blotches, not fine grain."""
+    n = np.random.default_rng(seed).normal(0.0, 1.0, shape)
+    for _ in range(passes):
+        n = (n + np.roll(n, 1, 0) + np.roll(n, -1, 0)
+             + np.roll(n, 1, 1) + np.roll(n, -1, 1)) / 5
+    return n / n.std() * sd
+
+
+def _defocused(shape=(480, 640)):
+    """A frame with the lens far out: slow shading and nothing else."""
+    yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+    return 60.0 + 0.08 * xx + 0.05 * yy
+
+
+def _as_frame(field):
+    g = np.clip(field, 0, 255).astype(np.uint8)
+    return np.stack([g, g, g], axis=-1)
+
+
+@pytest.mark.parametrize("sd", [1.0, 2.0, 4.0])
+def test_a_defocused_frame_with_blotchy_noise_reads_empty(sd):
+    """Found on the Pi 4 at ISO 1600 on 2026-10-13: a lens left completely out of
+    focus read 0.43 to 0.67 of the bar, more than a slightly soft frame. The edge
+    gate was calibrated on fine grain, and the ISP's blotchy noise passed it."""
+    frame = _as_frame(_defocused() + _blotchy((480, 640), sd))
+    assert focus_score(frame) <= 0.05
+
+
+def test_a_defocused_frame_without_noise_reads_empty():
+    """The one-level stairs of an 8-bit gradient are not edges."""
+    assert focus_score(_as_frame(_defocused())) == 0.0
+
+
+def test_fine_grain_alone_reads_empty():
+    frame = _as_frame(_defocused() + np.random.default_rng(5).normal(0, 3.0, (480, 640)))
+    assert focus_score(frame) <= 0.05
+
+
+def test_blotchy_noise_does_not_hide_a_sharp_scene_or_lift_a_blurred_one():
+    sharp = _scene((240, 320)).astype(np.float32)
+    blurred = _blur(_blur(_scene((240, 320)), k=9), k=9).astype(np.float32)
+    noise = _blotchy((240, 320), 2.0, seed=2)[..., None]
+    clean_sharp = focus_score(sharp.astype(np.uint8))
+    noisy_sharp = focus_score(np.clip(sharp + noise, 0, 255).astype(np.uint8))
+    noisy_blurred = focus_score(np.clip(blurred + noise, 0, 255).astype(np.uint8))
+    assert noisy_sharp >= 0.7
+    assert abs(noisy_sharp - clean_sharp) <= 0.15
+    assert noisy_blurred <= 0.25
+    assert noisy_sharp - noisy_blurred >= 0.5
+
+
+def test_a_few_specks_are_not_something_to_focus_on():
+    field = _defocused()
+    field[240, 320] += 80.0
+    field[250, 300] += 80.0
+    assert focus_score(_as_frame(field)) == 0.0
