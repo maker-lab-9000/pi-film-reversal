@@ -62,6 +62,7 @@ when present; and ``dng`` (the sidecar filename) when a DNG was written.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import json
 import os
@@ -133,6 +134,31 @@ class _PendingExposure:
     ev: float
 
 
+@contextlib.contextmanager
+def _stage(stages: dict[str, float], name: str):
+    """Time the enclosed block into ``stages[name]``, in milliseconds."""
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        stages[name] = round((time.perf_counter() - started) * 1000.0, 1)
+
+
+def _capture_stages(frame: Frame, shutter: float) -> dict[str, float]:
+    """Start a capture's stage timings (``stage_ms`` in its record) with the camera.
+
+    ``capture`` is the whole ``camera.read()``; a backend that breaks its own time
+    down (Picamera2: the mode switch and request, the copy out of the buffer, the
+    DNG) adds ``capture_<stage>`` beside it. Later stages are added as they run, so
+    the record says where a slow shot went. Durations are not reproducible and so
+    stay out of the audit fields a regrade is checked against.
+    """
+    stages = {"capture": round((time.perf_counter() - shutter) * 1000.0, 1)}
+    for name, value in (getattr(frame, "timings", None) or {}).items():
+        stages[f"capture_{name}"] = float(value)
+    return stages
+
+
 class CaptureSession:
     def __init__(
         self,
@@ -195,20 +221,22 @@ class CaptureSession:
         # And the manual ISO (None = auto).
         iso = getattr(self.camera, "iso", None)
         frame = self.camera.read()
+        stages = _capture_stages(frame, shutter)
         if self.double_exposure:
             return self._capture_double(
-                frame, ev, shutter, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
+                frame, ev, shutter, stages, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
             )
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
         t0 = time.perf_counter()
         graded, info = self.pipeline.process(
-            frame.rgb, rng=np.random.default_rng(seed), ev=ev,
+            frame.rgb, rng=np.random.default_rng(seed), ev=ev, timings=stages,
         )
         pipeline_ms = (time.perf_counter() - t0) * 1000.0
 
-        day_dir, stem, t, original, dng_name = self._write_original(frame)
-        pifilm = save_jpeg(graded, day_dir / f"{stem}_graded.jpg")
+        day_dir, stem, t, original, dng_name = self._write_original(frame, stages)
+        with _stage(stages, "save_graded"):
+            pifilm = save_jpeg(graded, day_dir / f"{stem}_graded.jpg")
         shutter_to_saved_ms = (time.perf_counter() - shutter) * 1000.0
 
         record = {
@@ -226,6 +254,7 @@ class CaptureSession:
             **self.camera.stream_info.to_dict(),
             "pipeline_ms": round(pipeline_ms, 1),
             "shutter_to_saved_ms": round(shutter_to_saved_ms, 1),
+            "stage_ms": stages,
             **({"camera_metadata": frame.metadata} if frame.metadata else {}),
             **({"dng": dng_name} if dng_name else {}),
         }
@@ -233,14 +262,14 @@ class CaptureSession:
         return CaptureResult(original, pifilm, record)
 
     def _capture_double(
-        self, frame: Frame, ev: float, shutter: float, *, shutter_us: int | None,
-        wb_k: int | None, iso: int | None,
+        self, frame: Frame, ev: float, shutter: float, stages: dict[str, float], *,
+        shutter_us: int | None, wb_k: int | None, iso: int | None,
     ) -> CaptureResult:
         # The pending frame is taken off the session before anything that can fail, so
         # any failure from here on returns the count to 0/2 (spec section 5). A camera
         # error is raised by read() before this point and leaves 1/2 in place for a retry.
         pending, self._pending = self._pending, None
-        day_dir, stem, t, original, dng_name = self._write_original(frame)
+        day_dir, stem, t, original, dng_name = self._write_original(frame, stages)
         camera_fields = {
             "frame_source": frame.source,
             "shutter_us": shutter_us,
@@ -262,7 +291,9 @@ class CaptureSession:
             }
             # The card before the log line: a failed exposure 1 leaves no ``index: 1``
             # record behind for an exposure 2 that will never follow it.
-            card = self._exposure_card(1, 2)
+            with _stage(stages, "card"):
+                card = self._exposure_card(1, 2)
+            record["stage_ms"] = stages
             self._append_record(day_dir, record)
             self._pending = _PendingExposure(frame.rgb, self._relative(original), ev)
             return CaptureResult(original, card, record, exposure=(1, 2))
@@ -270,11 +301,14 @@ class CaptureSession:
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
         t0 = time.perf_counter()
         # Each frame goes in as shot, EV included; the composite is graded at ev=0.
+        with _stage(stages, "composite"):
+            combined = composite(pending.rgb, frame.rgb)
         graded, info = self.pipeline.process(
-            composite(pending.rgb, frame.rgb), rng=np.random.default_rng(seed), ev=0.0,
+            combined, rng=np.random.default_rng(seed), ev=0.0, timings=stages,
         )
         pipeline_ms = (time.perf_counter() - t0) * 1000.0
-        pifilm = save_jpeg(graded, day_dir / f"{stem}_double_graded.jpg")
+        with _stage(stages, "save_graded"):
+            pifilm = save_jpeg(graded, day_dir / f"{stem}_double_graded.jpg")
         record = {
             "timestamp": t.isoformat(timespec="seconds"),
             "original": original.name,
@@ -285,6 +319,7 @@ class CaptureSession:
             "params_version": PARAMS_VERSION,
             "pipeline_ms": round(pipeline_ms, 1),
             "shutter_to_saved_ms": round((time.perf_counter() - shutter) * 1000.0, 1),
+            "stage_ms": stages,
             "double": {
                 "index": 2, "of": 2, "method": COMPOSITE_METHOD,
                 "originals": [pending.original, self._relative(original)],
@@ -294,19 +329,23 @@ class CaptureSession:
         self._append_record(day_dir, record)
         return CaptureResult(original, pifilm, record, exposure=(2, 2))
 
-    def _write_original(self, frame: Frame) -> tuple[Path, str, datetime, Path, str | None]:
+    def _write_original(
+        self, frame: Frame, stages: dict[str, float],
+    ) -> tuple[Path, str, datetime, Path, str | None]:
         has_original = frame.jpeg is not None or frame.source == "picamera2"
         suffix = "original" if has_original else "ungraded"
         day_dir, stem, t = self._allocate(suffix)
         original = day_dir / f"{stem}_{suffix}.jpg"
-        if frame.jpeg is not None:
-            original.write_bytes(frame.jpeg)
-        else:
-            save_jpeg(frame.rgb, original)
+        with _stage(stages, "save_original"):
+            if frame.jpeg is not None:
+                original.write_bytes(frame.jpeg)
+            else:
+                save_jpeg(frame.rgb, original)
         dng_name = None
         if frame.dng is not None and self._save_dng:
-            dng_path = day_dir / f"{stem}.dng"
-            dng_path.write_bytes(frame.dng)
+            with _stage(stages, "save_dng"):
+                dng_path = day_dir / f"{stem}.dng"
+                dng_path.write_bytes(frame.dng)
             dng_name = dng_path.name
         return day_dir, stem, t, original, dng_name
 

@@ -127,7 +127,10 @@ fitted on normalized input; grain runs last because it models developed film.
   OpenCV window. Output:
   `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,graded|double_graded}.jpg` plus an audit
   line in `captures.jsonl` (LUT hash, normalisation hash and grain seed allow regenerating the
-  graded file).
+  graded file). Each record also carries `stage_ms`, the
+  milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, LUT,
+  grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`
+  is the plan those numbers feed.
 - Double exposure: `CaptureSession` owns the mode and pending first frame; `pifilm/double.py`
   adds the two ungraded frames in linear light (one stop down each), and the composite is
   graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card in a temp dir
