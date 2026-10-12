@@ -213,8 +213,11 @@ damping holds still for about 2 s) restarts the live view through
 `Picamera2Camera.restart_preview`, a `switch_mode` to the preview configuration,
 which already holds the selection. It is not resent first. Shutter and ISO are
 resent after 3 s and 6 frames and the live view is restarted after two resends
-without effect. There is one restart per selection, and never two within 5 s; a
-step, agreement, or leaving the live view allows another. What the user sees and
+without effect. There is one restart per control per selection, and never two within
+5 s; a step that changes that control, or leaving the live view, allows another,
+and agreement in between does not. The auto case restarts at most once per return
+to auto: after it auto is not watched again until a white balance is next fixed,
+because on a capped lens or a dark scene auto reports the old value for good. What the user sees and
 the exact lines are in
 [`lcd-viewfinder.md`](lcd-viewfinder.md#manual-controls).
 

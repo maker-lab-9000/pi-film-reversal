@@ -162,13 +162,15 @@ WB_RESTART_FRAMES = 6
 # the old value for about 2 s before it starts to drift, and a restart inside
 # that would be a false alarm.
 WB_AUTO_RESTART_SECONDS = 4.0
-# One restart per episode, an episode being one unbroken disagreement of one
-# control with one selected value. A restart that did not help is not repeated
-# (a 60 s hold-off was tried first and left the user stuck in the wrong colour
-# after the first restart, 2026-10-12); a step, agreement, or leaving the live
-# view begins a new episode that may restart again. Whatever the episodes, two
-# restarts are never closer than this, so no run of taps can make the picture
-# blink continuously.
+# One restart per control per selection. A restart that did not help is not
+# repeated (a 60 s hold-off was tried first and left the user stuck in the
+# wrong colour after the first restart, 2026-10-12), and neither is one that
+# helped for a moment: a control that agrees for a frame and then disagrees
+# again would otherwise buy a new restart every time and blink for as long as
+# it flapped. Only a step that changes that control, or coming back to the live
+# view, allows another. Whatever the selections, two restarts are never closer
+# than this, counted from the end of the first, so no run of taps can make the
+# picture blink continuously.
 CONTROL_RESTART_MIN_INTERVAL = 5.0
 # The camera by itself applies a live control correctly, even after a photo
 # (tried on the Pi: the reported value and the picture both change), so the
@@ -182,6 +184,9 @@ CONTROL_TRACE_SECONDS = 2.0
 # attribute that holds each selection.
 _TRACE_NAMES = ("SHUTTER", "ISO", "WB")
 _SELECTION_ATTRIBUTES = ("shutter_us", "iso", "colour_temperature_k")
+# The control check's keys for each cell: white balance has one for a fixed
+# value and one for a return to auto.
+_CHECK_KEYS = (("shutter",), ("iso",), ("wb", "awb"))
 # A camera that never takes the control is resent to every few seconds, but
 # the line is written this often at most, per control.
 CONTROL_LOG_INTERVAL = 30.0
@@ -210,17 +215,15 @@ class _Episode:
 
     ``began`` is when it was first seen and ``since`` when its current wait
     started, both on the loop's clock; ``frames`` counts the new camera frames
-    of that wait. ``restarted`` says the one restart this episode may have has
-    been used, ``told`` that its failure has been reported, and ``awaiting``
-    names the remedy ("resend" or "restart") whose effect has yet to be seen.
+    of that wait. ``awaiting`` names the remedy ("resend" or "restart") whose
+    effect has yet to be seen. Whether the control's restart has been used is
+    not the episode's to know: that outlives it (``_restart_spent``).
     """
 
     began: float
     since: float
     frames: int = 0
     resends: int = 0
-    restarted: bool = False
-    told: bool = False
     awaiting: str | None = None
 
 
@@ -279,16 +282,18 @@ class ViewfinderLoop:
         # Verifying the fixed controls (see CONTROL_RESEND_SECONDS): the
         # disagreement in progress for each control, by its key; when each
         # control's resend line was last written and how many have been held
-        # back since; when the live view was last restarted; and the last white
-        # balance that was fixed, until auto is seen to have left it.
+        # back since; the controls whose one restart for the current selection
+        # has been used, and those for which its failure has been reported;
+        # when the last restart ended; and the last white balance that was
+        # fixed, until auto is seen to have left it or has been restarted for.
         self._episodes: dict[str, _Episode] = {}
         self._resend_logged: dict[str, tuple[float, int]] = {}
+        self._restart_spent: set[str] = set()
+        self._restart_told: set[str] = set()
         self._restarted_at: float | None = None
         self._last_fixed_k: float | None = None
         # The step waiting for its trace line: the cell and when it was stepped.
         self._trace: tuple[int, float] | None = None
-        self._resend_logged: dict[str, tuple[float, int]] = {}
-        self._last_fixed_k: float | None = None
         self.state = "LIVE"
         # Which of the three controls this camera can change, by cell. A fixed
         # shutter or ISO needs a backend with the setter (Picamera2, the fake)
@@ -460,24 +465,34 @@ class ViewfinderLoop:
             if grab.error is not None:
                 halt.wait(self._frame_period)
 
-    def _restart_control_check(self, *, new_selection: bool = False) -> None:
-        """End every episode: the controls get their full wait again.
+    def _control_check_entering_live(self) -> None:
+        """Start the control check afresh on coming back to the live view.
 
-        Called when the live view is left, because a still re-applies the whole
-        configuration and what the frames before it showed says nothing about
-        the ones after, and when a control is stepped (``new_selection``),
-        because a new value has just been sent and is a new question: its line
-        may be written at once. Either way the next disagreement is a new
-        episode, with its own restart. Leaving the live view also drops a
-        pending trace line.
+        Runs on the first live step after colour bars, a review, a notice or a
+        dark screen (and on the very first step). A still re-applies the whole
+        configuration, so what the frames before it showed says nothing about
+        the ones after: every episode ends, every control may have its restart
+        again, and a pending trace line is dropped, since it would describe the
+        photo's reconfiguration and not the step.
         """
         self._episodes.clear()
-        if new_selection:
-            self._resend_logged.clear()
-        else:
-            # A trace across a photo would describe the photo's reconfiguration,
-            # not the step.
-            self._trace = None
+        self._restart_spent.clear()
+        self._restart_told.clear()
+        self._trace = None
+
+    def _control_check_stepped(self, cell: int, changed: bool) -> None:
+        """Start the waits again after a ``+``/``-`` step on ``cell``.
+
+        A value has just been sent, so every control gets its full wait and
+        the resend line may be written at once. Only a step that changed the
+        selection makes it a new selection with a restart of its own, and only
+        for the control that was stepped.
+        """
+        self._episodes.clear()
+        self._resend_logged.clear()
+        if changed:
+            self._restart_spent.difference_update(_CHECK_KEYS[cell])
+            self._restart_told.difference_update(_CHECK_KEYS[cell])
 
     def _note_fixed_wb(self) -> None:
         kelvin = getattr(self._camera, "colour_temperature_k", None)
@@ -603,12 +618,18 @@ class ViewfinderLoop:
 
         Called once per camera frame, never for a redraw: only a new frame is
         new evidence. A control that agrees ends its episode; one the frame
-        cannot tell about is left as it is. For one that disagrees, shutter and
-        ISO are sent again and, after ``CONTROL_RESENDS_BEFORE_RESTART``
-        resends without effect, the live view is restarted; white balance goes
-        straight to the restart (see the constants for why). An episode has one
-        restart: if the disagreement outlives it, that is said once, shutter
-        and ISO go on being resent and white balance is left alone.
+        cannot tell about keeps its episode but starts its wait again, so the
+        frame that brings the metadata back is not acted on at once. For one
+        that disagrees, shutter and ISO are sent again and, after
+        ``CONTROL_RESENDS_BEFORE_RESTART`` resends without effect, the live
+        view is restarted; white balance goes straight to the restart (see the
+        constants for why). A control has one restart per selection
+        (``_restart_spent``), whether or not it agreed in between: once it is
+        used, a disagreement is said once, shutter and ISO go on being resent
+        and white balance is left alone. A restart for an auto white balance
+        that has not moved also ends the watch on auto: on a capped lens or in
+        the dark auto reports the old value for good, and that must not cost a
+        restart after every photo.
 
         A failed resend is logged and survived like any other camera error from
         a control; so is a failed restart, except that one which times out is a
@@ -624,7 +645,12 @@ class ViewfinderLoop:
         )
         restart_line: str | None = None
         resend_due = False
-        for kind, what, fault in self._control_checks(metadata):
+        checks = self._control_checks(metadata)
+        judged = {kind for kind, _, _ in checks}
+        for kind, episode in self._episodes.items():
+            if kind not in judged:
+                episode.since, episode.frames = now, 0
+        for kind, what, fault in checks:
             if fault is None:
                 self._resend_logged.pop(kind, None)
                 episode = self._episodes.pop(kind, None)
@@ -643,16 +669,17 @@ class ViewfinderLoop:
                 seconds = WB_AUTO_RESTART_SECONDS if kind == "awb" else WB_RESTART_SECONDS
                 if episode.frames < WB_RESTART_FRAMES or now - episode.since < seconds:
                     continue
-                if episode.restarted:
-                    # The restart has had a full wait and the camera still
+                if kind in self._restart_spent:
+                    # The restart has had a full wait and the camera
                     # disagrees. Said once, and nothing more is tried.
-                    if not episode.told:
-                        episode.told = True
+                    if kind not in self._restart_told:
+                        self._restart_told.add(kind)
                         self._log(
                             f"camera: {what} not applied even after restarting the live view"
                         )
                 elif not callable(restart):
-                    episode.restarted = episode.told = True
+                    self._restart_spent.add(kind)
+                    self._restart_told.add(kind)
                     self._log(
                         f"camera: {before} after {elapsed}{after}; cannot restart the "
                         f"live view; {self._picture(rgb)}"
@@ -669,11 +696,12 @@ class ViewfinderLoop:
             ):
                 continue
             episode.since, episode.frames = now, 0
-            if episode.restarted and not episode.told:
-                episode.told = True
+            spent = kind in self._restart_spent
+            if spent and kind not in self._restart_told:
+                self._restart_told.add(kind)
                 self._log(f"camera: {what} not applied even after restarting the live view")
             if (
-                not episode.restarted
+                not spent
                 and episode.resends >= CONTROL_RESENDS_BEFORE_RESTART
                 and may_restart
                 and restart_line is None
@@ -699,12 +727,13 @@ class ViewfinderLoop:
             self._resend_logged[kind] = (now, 0)
         if restart_line is not None:
             self._log(restart_line)
-            self._restarted_at = now
             # The restart re-applies every control, so it is the one restart of
-            # every episode open now, and each gets a full wait to show it.
-            for episode in self._episodes.values():
-                episode.restarted, episode.awaiting = True, None
-                episode.since, episode.frames = now, 0
+            # every control with an episode open now.
+            self._restart_spent.update(self._episodes)
+            if self._episodes.pop("awb", None) is not None:
+                # Auto is not watched again until a white balance is next fixed.
+                self._last_fixed_k = None
+            failure: CameraError | None = None
             try:
                 # On the loop thread, and it waits for the frame thread's read
                 # in flight (one exposure) and then for the camera to restart:
@@ -712,14 +741,24 @@ class ViewfinderLoop:
                 # a restart; the alternative is a third thread.
                 restart()
             except CameraError as exc:
+                failure = exc
+            # Timed from the end, not the start: a restart can take seconds,
+            # and neither the five seconds to the next one nor the wait to see
+            # this one's effect may be shortened by that.
+            done = self._clock.monotonic()
+            self._restarted_at = done
+            for episode in self._episodes.values():
+                episode.since, episode.frames, episode.awaiting = done, 0, None
+            if failure is not None:
                 # Not restarted, so there is nothing to report as surviving it;
-                # the episode's one attempt is spent all the same.
-                for episode in self._episodes.values():
-                    episode.told = True
-                self._camera_failed(exc)
+                # the one attempt is spent all the same.
+                self._restart_told.update(self._episodes)
+                self._camera_failed(failure)
                 return
             for episode in self._episodes.values():
                 episode.awaiting = "restart"
+            # The time the restart took is not the live view's frame rate.
+            self._restart_rate_window()
             return
         if not resend_due:
             return
@@ -821,10 +860,11 @@ class ViewfinderLoop:
             setter(value)
         except CameraError as exc:
             self._log(f"camera: {exc}")
-        self._restart_control_check(new_selection=True)
-        if getattr(camera, _SELECTION_ATTRIBUTES[cell], None) != before:
-            # The control changed (a rejected step, or + on the top step, leaves
-            # it as it was): trace it, in place of any step still waiting.
+        # A rejected step, or + on the top step, leaves the control as it was.
+        changed = getattr(camera, _SELECTION_ATTRIBUTES[cell], None) != before
+        self._control_check_stepped(cell, changed)
+        if changed:
+            # Trace it, in place of any step still waiting.
             self._trace = (cell, self._clock.monotonic())
 
     def _cells(self, reading: MeterReading, metered_k: Any) -> tuple[Cell, Cell, Cell]:
@@ -1021,7 +1061,7 @@ class ViewfinderLoop:
             return
         self._was_live = True
         if not was_live:
-            self._restart_control_check()
+            self._control_check_entering_live()
         if want is None:
             # No frame thread (step() driven directly): read one frame here.
             grab = self._read_grab(self._grab_seq + 1)
