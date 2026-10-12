@@ -1,5 +1,6 @@
 # pifilm/display/shutter.py
-"""Shutter-priority steps for the viewfinder's shutter buttons. Pure.
+"""Shutter-priority steps for the viewfinder's ``+``/``-`` keys while the SHUTTER
+cell is selected. Pure.
 
 The series is the standard 1/3-stop shutter scale from 1/2000 s to 1 s, as
 (microseconds, label) pairs, with ``None`` meaning ``A``: full auto exposure. ``+``
@@ -12,7 +13,7 @@ picture; the next tap moves it. "Nearest" is measured in stops (log2), not
 microseconds, because a stop is what the eye sees. Before any metered frame (the
 first frame, or after a camera error) the start is 1/125, a safe hand-held speed.
 
-The labels are ASCII only: the viewfinder's default font has no glyphs beyond it.
+The labels are ASCII only, the rule for every text the viewfinder draws.
 """
 
 from __future__ import annotations

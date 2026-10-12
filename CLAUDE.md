@@ -20,7 +20,7 @@ Pi network, Pi service, Stick, optional training) and says which machine each st
 `docs/nextcloud-sync.md` the optional Pi→Nextcloud photo archive; `docs/photo-volume.md` the fixed-size photo
 volume that keeps captures from filling the Pi's root filesystem; `docs/lcd-viewfinder.md` the optional
 Waveshare LCD viewfinder (the 3.5" DSI panel and the fallback 2.8" SPI panel: setup, screen layout,
-meter, hardware acceptance); and
+manual controls, meter, hardware acceptance); and
 `docs/known-issues.md` tracks understood-but-unfixed defects. The bundled LUT in `pifilm/data/` is a handcrafted,
 untrained starter preset (`trained: false`). Trained artifacts, training data, `data/`, `artifacts/`,
 `ektar100/`, `velvia/` are all gitignored and not in a clone.
@@ -114,9 +114,11 @@ fitted on normalized input; grain runs last because it models developed film.
   per model). An optional `preview` mode adds a second, cheap stream for the LCD viewfinder;
   `read(full=True)` switches to the still configuration, captures, and returns to preview.
   `set_shutter` gives shutter priority (`ExposureTimeMode` on libcamera 0.5, legacy `ExposureTime`
-  otherwise), written into both configurations like `set_ev`.
-  `set_colour_temperature` fixes the white balance in kelvin the same way (the viewfinder's
-  `WB` pill, `--white-balance K`). Every read waits a bounded time
+  otherwise), written into both configurations so a later configure does not undo it.
+  `set_iso` fixes the analogue gain the same way (ISO 100 is gain 1.0; `AnalogueGainMode` on
+  current libcamera, legacy `AnalogueGain` otherwise) and `set_colour_temperature` fixes the
+  white balance in kelvin (the viewfinder's `WB` cell, `--white-balance K`). There is no
+  exposure compensation: `ExposureValue` is sent as 0.0 so `ev_comp` stays in records. Every read waits a bounded time
   for its frame and raises `CameraStalled` (see `docs/known-issues.md`); three stalled preview
   reads end the viewfinder and the process exits 1 for a systemd restart.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
@@ -156,11 +158,17 @@ DSI panel through DRM/KMS (`pykms`, two swapped buffers; the Pi must boot to the
 service owns the screen) and `evtouch.py` reads its Goodix touch from kernel input events, found
 by device name; `st7789.py` and `cst3530.py` drive the SPI panel and its touch controller.
 `touch.py` holds the shared `TouchPoint`/`Tap`/`TapDetector`. `meter.py` computes the light-meter
-readout (pure, from preview metadata + pixels); `shutter.py` is the shutter-priority step scale
-(pure) and `whitebalance.py` the manual white-balance step scale in kelvin
-(pure); `ui.py` renders the live/review/message screens and hit-tests taps in 320×240 base units
-at an integer `scale` (pure); `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine
-and takes the scale from the display's width. The DSI panel has no brightness control, so it
+readout (pure, from preview metadata + pixels). The manual controls are pure step scales:
+`shutter.py` (shutter speed), `iso.py` (100 to 1600), `whitebalance.py` (3200 to 7500 K), the
+last two over the generic `stepscale.py` (an auto end, and a first step from auto that lands on
+what the camera is metering). `liveview.py` draws the live screen, an SLR-finder style black
+strip of three selectable cells (SHUTTER, ISO, WB) with one `+`/`-` pair, shutter button at the
+top right, meter dots, `2x`, battery and focus gauge, from cached anti-aliased tiles in the
+bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
+holds only the review, processing and message screens. Both work in 320×240 base units at an
+integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine
+(it also lights `+`/`-`/shutter while a finger is on them) and takes the scale from the display's
+width. The DSI panel has no brightness control, so it
 skips the idle dim step and only turns off. All hardware imports (`pykms`, `spidev`, `gpiozero`,
 `smbus2`) are lazy, inside the `open_*` factories, so the package imports on a Mac and in tests.
 `fake.py` (`--display fake`) writes frames to a PNG instead. The loop shares the

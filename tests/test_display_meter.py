@@ -6,7 +6,6 @@ from pifilm.display.meter import (
     FocusTracker,
     compute_reading,
     focus_score,
-    format_ev,
     format_shutter,
 )
 
@@ -22,42 +21,35 @@ def test_format_shutter():
     assert format_shutter(1_000_000) == "1.0s"
 
 
-def test_format_ev():
-    assert format_ev(0.0) == "0"
-    assert format_ev(1 / 3) == "+0.3"
-    assert format_ev(-4 / 3) == "-1.3"
-
-
 def test_reading_from_metadata():
     meta = {"ExposureTime": 4000, "AnalogueGain": 2.0, "DigitalGain": 1.5, "Lux": 640.4}
-    r = compute_reading(meta, _grey(118), 1 / 3, None)
+    r = compute_reading(meta, _grey(118), None)
     assert r.shutter == "1/250"
     assert r.iso == 300
     assert r.lux == pytest.approx(640.4)
-    assert r.ev_comp == pytest.approx(1 / 3)
     assert r.battery_percent is None and r.external_power is None
 
 
 def test_mid_grey_frame_reads_zero_deviation():
     # sRGB 118 ≈ 18 % linear reflectance
-    r = compute_reading({}, _grey(118), 0.0, None)
+    r = compute_reading({}, _grey(118), None)
     assert r.deviation_ev == pytest.approx(0.0, abs=0.05)
     assert r.clip_pct == 0.0
 
 
 def test_dark_and_bright_frames_swing_and_clamp():
-    assert compute_reading({}, _grey(0), 0.0, None).deviation_ev == -3.0
-    assert compute_reading({}, _grey(255), 0.0, None).deviation_ev == pytest.approx(2.47, abs=0.05)
+    assert compute_reading({}, _grey(0), None).deviation_ev == -3.0
+    assert compute_reading({}, _grey(255), None).deviation_ev == pytest.approx(2.47, abs=0.05)
 
 
 def test_clip_pct_counts_any_channel_at_ceiling():
     frame = _grey(50)
     frame[:24, :, 1] = 254
-    assert compute_reading({}, frame, 0.0, None).clip_pct == pytest.approx(50.0)
+    assert compute_reading({}, frame, None).clip_pct == pytest.approx(50.0)
 
 
 def test_missing_metadata_gives_none_fields_without_raising():
-    r = compute_reading(None, _grey(118), 0.0, None)
+    r = compute_reading(None, _grey(118), None)
     assert r.shutter is None and r.iso is None and r.lux is None
 
 
@@ -66,7 +58,7 @@ def test_battery_fields_come_from_power():
         percent = 87
         external_power = True
 
-    r = compute_reading({}, _grey(118), 0.0, P())
+    r = compute_reading({}, _grey(118), P())
     assert (r.battery_percent, r.external_power) == (87, True)
 
 
@@ -194,9 +186,9 @@ def test_focus_tracker_clamps_to_the_unit_range():
 
 
 def test_reading_carries_focus_when_given_and_none_otherwise():
-    r = compute_reading({}, _grey(118), 0.0, None)
+    r = compute_reading({}, _grey(118), None)
     assert r.focus is None and r.focus_peak is None
-    r = compute_reading({}, _grey(118), 0.0, None, focus=0.4, focus_peak=0.7)
+    r = compute_reading({}, _grey(118), None, focus=0.4, focus_peak=0.7)
     assert r.focus == pytest.approx(0.4) and r.focus_peak == pytest.approx(0.7)
 
 
@@ -206,17 +198,11 @@ def _frame():
 
 def test_iso_max_flags_a_saturated_gain():
     meta = {"ExposureTime": 1000, "AnalogueGain": 21.9}
-    assert compute_reading(meta, _frame(), 0.0, None, max_gain=22.26).iso_max is True
+    assert compute_reading(meta, _frame(), None, max_gain=22.26).iso_max is True
     meta["AnalogueGain"] = 21.0
-    assert compute_reading(meta, _frame(), 0.0, None, max_gain=22.26).iso_max is False
+    assert compute_reading(meta, _frame(), None, max_gain=22.26).iso_max is False
 
 
 def test_no_iso_max_without_a_known_maximum_or_gain():
-    assert compute_reading({"AnalogueGain": 40.0}, _frame(), 0.0, None).iso_max is False
-    assert compute_reading({}, _frame(), 0.0, None, max_gain=22.26).iso_max is False
-
-
-def test_shutter_fixed_follows_the_chosen_value():
-    meta = {"ExposureTime": 4000, "AnalogueGain": 2.0}
-    assert compute_reading(meta, _frame(), 0.0, None, shutter_us=4000).shutter_fixed is True
-    assert compute_reading(meta, _frame(), 0.0, None).shutter_fixed is False
+    assert compute_reading({"AnalogueGain": 40.0}, _frame(), None).iso_max is False
+    assert compute_reading({}, _frame(), None, max_gain=22.26).iso_max is False

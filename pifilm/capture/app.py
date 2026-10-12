@@ -54,7 +54,8 @@ unchanged LUT; the negotiated stream format, so a camera that quietly
 dropped to a different mode is visible; two timings, because the pipeline cost
 and the time from shutter to durable file are different numbers and only the
 second is what the user waits for; ``shutter_us`` (the fixed exposure time under
-shutter priority, null on auto); ``camera_metadata`` (per-shot camera metadata)
+shutter priority, null on auto); ``iso`` (the fixed ISO, null on auto);
+``camera_metadata`` (per-shot camera metadata)
 when present; and ``dng`` (the sidecar filename) when a DNG was written.
 """
 
@@ -191,9 +192,13 @@ class CaptureSession:
         shutter_us = getattr(self.camera, "shutter_us", None)
         # And the manual white balance (None = auto).
         wb_k = getattr(self.camera, "colour_temperature_k", None)
+        # And the manual ISO (None = auto).
+        iso = getattr(self.camera, "iso", None)
         frame = self.camera.read()
         if self.double_exposure:
-            return self._capture_double(frame, ev, shutter, shutter_us=shutter_us, wb_k=wb_k)
+            return self._capture_double(
+                frame, ev, shutter, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
+            )
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
         t0 = time.perf_counter()
@@ -213,6 +218,7 @@ class CaptureSession:
             "frame_source": frame.source,
             **info,
             "shutter_us": shutter_us,
+            "iso": iso,
             "colour_temperature_k": wb_k,
             "grain_seed": seed,
             "params_version": PARAMS_VERSION,
@@ -228,7 +234,7 @@ class CaptureSession:
 
     def _capture_double(
         self, frame: Frame, ev: float, shutter: float, *, shutter_us: int | None,
-        wb_k: int | None,
+        wb_k: int | None, iso: int | None,
     ) -> CaptureResult:
         # The pending frame is taken off the session before anything that can fail, so
         # any failure from here on returns the count to 0/2 (spec section 5). A camera
@@ -238,6 +244,7 @@ class CaptureSession:
         camera_fields = {
             "frame_source": frame.source,
             "shutter_us": shutter_us,
+            "iso": iso,
             "colour_temperature_k": wb_k,
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
@@ -708,8 +715,8 @@ def _reject_picamera2_only_flags(
     whether that is V4L2 (however it was chosen) or ``--fake``.
 
     Covers ``--tuning-file``, ``--autofocus``, ``--af-range``, ``--ae-lock``,
-    ``--awb-lock``, ``--colour-gains``, ``--ae-constraint``, ``--ae-metering``
-    and ``--ev``. ``--device`` (which itself selects V4L2) and ``--no-dng``
+    ``--awb-lock``, ``--colour-gains``, ``--white-balance``, ``--ae-constraint``
+    and ``--ae-metering``. ``--device`` (which itself selects V4L2) and ``--no-dng``
     (wired independently into ``CaptureSession`` and meaningful on any backend)
     are deliberately excluded, and so is ``--display``: it is a warning rather
     than an error (see ``_drop_display_on_v4l2``), and it runs against
@@ -726,7 +733,6 @@ def _reject_picamera2_only_flags(
         ("--white-balance", args.white_balance is not None),
         ("--ae-constraint", args.ae_constraint is not None),
         ("--ae-metering", args.ae_metering is not None),
-        ("--ev", args.ev is not None),
     ]
     offenders = [name for name, given in picamera_only if given]
     if offenders:
@@ -904,7 +910,8 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Picamera2: disable auto-exposure at whatever value it holds right "
             "before capture starts (not a converged/settled value); for controlled "
-            "shoots (default: auto)"
+            "shoots. The viewfinder's SHUTTER and ISO controls are then greyed out "
+            "(default: auto)"
         ),
     )
     parser.add_argument(
@@ -924,7 +931,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Picamera2: start with the white balance fixed at K kelvin "
             f"({COLOUR_TEMPERATURE_RANGE_K[0]}-{COLOUR_TEMPERATURE_RANGE_K[1]}; higher is "
-            "warmer). The viewfinder's WB pill can change it or return to auto "
+            "warmer). The viewfinder's WB control can change it or return to auto "
             "(default: auto)"
         ),
     )
@@ -938,10 +945,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ae-metering", choices=("centre", "spot", "matrix"), default=None,
         help="Picamera2 AE metering (default: centre-weighted)",
-    )
-    parser.add_argument(
-        "--ev", type=float, default=None, metavar="STOPS",
-        help="Picamera2 exposure compensation in stops, -8 to 8 (default: 0)",
     )
     parser.add_argument(
         "--no-dng", action="store_true", help="disable the Picamera2 DNG sidecar output",
@@ -1065,7 +1068,6 @@ def main(argv: list[str] | None = None) -> int:
                     colour_temperature=args.white_balance,
                     ae_constraint=args.ae_constraint or "normal",
                     ae_metering=args.ae_metering or "centre",
-                    ev=args.ev if args.ev is not None else 0.0,
                     preview=True if display_pair is not None else None,
                 )
             else:

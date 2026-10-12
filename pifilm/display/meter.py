@@ -3,8 +3,8 @@ libcamera metadata. Pure functions; nothing here touches hardware.
 
 The needle (``deviation_ev``) is the scene's mean linear luminance against an
 18 % mid-grey, in stops. With auto-exposure converged it rests near zero and only
-swings when AE has run out of range or EV compensation is dialled in, which is
-exactly what a camera's meter shows in auto mode.
+swings when AE has run out of range, or when the shutter and ISO are both fixed by
+hand and the exposure is the user's, which is exactly what a camera's meter shows.
 
 ``focus_score``/``FocusTracker`` serve the other manual control: the IMX477 has
 no autofocus, so the ring is turned by hand and the screen has to say which way
@@ -56,7 +56,6 @@ ISO_MAX_FRACTION = 0.98
 class MeterReading:
     shutter: str | None
     iso: int | None
-    ev_comp: float
     lux: float | None
     deviation_ev: float
     clip_pct: float
@@ -64,8 +63,6 @@ class MeterReading:
     external_power: bool | None
     focus: float | None = None
     focus_peak: float | None = None
-    # Shutter priority: the user fixed the exposure time, so the readout marks it.
-    shutter_fixed: bool = False
     # Analogue gain is at the sensor's maximum: a fixed shutter this fast cannot be
     # compensated and the frame will be dark.
     iso_max: bool = False
@@ -76,12 +73,6 @@ def format_shutter(exposure_us: float) -> str:
     if seconds >= 1.0:
         return f"{seconds:.1f}s"
     return f"1/{round(1.0 / seconds)}"
-
-
-def format_ev(ev: float) -> str:
-    if abs(ev) < 0.05:
-        return "0"
-    return f"{ev:+.1f}"
 
 
 def _number(metadata: dict, key: str) -> float | None:
@@ -198,9 +189,9 @@ class FocusTracker:
 
 
 def compute_reading(
-    metadata: dict | None, preview_rgb: np.ndarray, ev_comp: float, power: Any,
+    metadata: dict | None, preview_rgb: np.ndarray, power: Any,
     *, focus: float | None = None, focus_peak: float | None = None,
-    shutter_us: int | None = None, max_gain: float | None = None,
+    max_gain: float | None = None,
 ) -> MeterReading:
     meta = metadata or {}
     exposure = _number(meta, "ExposureTime")
@@ -225,6 +216,6 @@ def compute_reading(
         and analogue >= ISO_MAX_FRACTION * max_gain
     )
     return MeterReading(
-        shutter, iso, float(ev_comp), lux, deviation, clip_pct, battery, external,
-        focus, focus_peak, shutter_us is not None, iso_max,
+        shutter, iso, lux, deviation, clip_pct, battery, external,
+        focus, focus_peak, iso_max,
     )

@@ -8,14 +8,27 @@ controller knowing about displays.
 Double exposure adds a third state, NOTICE: after exposure 1 of a pair there is
 nothing developed to review, so a short "Exposure 1/2" message replaces the
 review and the loop returns to LIVE for the second exposure.
-Shutter taps go straight to the camera, like EV taps, so they also work while a
-job is processing.
+The live screen (``liveview.py``) is select-and-adjust: a tap on one of the strip's
+three cells (SHUTTER, ISO, WB) selects it, and one ``+``/``-`` pair steps whichever
+is selected. While a job is processing the colour bars hide the cells and the
+keys, so those taps are ignored then, like the ``2x`` toggle's. Which cells the
+camera can change is decided once, at start-up; a cell it cannot change is drawn
+grey and is never selected. Each control is automatic
+while the camera holds ``None`` for it, and the first step out of auto lands on the
+step nearest what the camera is metering, so the picture does not jump.
+
+Press feedback. Actions fire on release (that is what makes a tap a tap, and why a
+resting finger never repeats a step), but a key that only reacted on release would
+feel dead, so ``+``, ``-`` and the shutter button are drawn lit while a finger is
+on them. The finger's position is recorded on every touch poll for that. A tap can
+also be over between two frames, so a tap on a key lights it for
+``PRESS_FLASH_SECONDS`` as well.
 
 Under ``run()`` touch is polled on its own thread ("pifilm-touch"), not inside
 the frame loop. At the long shutter speeds (up to 1 s) the preview read blocks
 for a whole frame, so a frame loop that polled touch would look at the panel
 about once a second. Touch is polled, not latched, on either panel, and ``TapDetector``
-needs to see the finger down and then up within its 0.6 s hold limit, so a
+needs to see the finger down and then up within its hold limit, so a
 quick tap would fall between two polls and never register. The thread polls
 every ``touch_period`` of real time and queues finished taps; ``step()`` takes
 at most one per call and handles it on the loop's clock as before. While the
@@ -46,24 +59,35 @@ from PIL import Image
 
 from ..capture.errors import CameraError, CameraStalled
 from ..imageio import load_rgb
-from . import DisplayError, shutter, whitebalance
+from . import DisplayError, iso, shutter, stepscale, whitebalance
 from .idle import IdleDimmer, Screen
-from .meter import FocusTracker, compute_reading, focus_score, format_ev
-from .touch import Tap, TapDetector
-from .ui import (
+from .liveview import (
+    DASH,
+    PRESS_KEYS,
+    SELECT_ACTIONS,
     Action,
+    Cell,
+    LiveState,
     hit,
-    iso_label,
     render_live,
-    render_message,
-    render_processing,
-    render_review,
-    text_or_dash,
 )
+from .meter import FocusTracker, MeterReading, compute_reading, focus_score
+from .touch import Tap, TapDetector
+from .ui import iso_label, render_message, render_processing, render_review, text_or_dash
 
-EV_STEP = 1.0 / 3.0
-EV_LIMIT = 2.0
 RATE_LOG_INTERVAL = 10.0
+# How long a tapped key stays lit after the finger is up.
+PRESS_FLASH_SECONDS = 0.15
+# The longest press that still counts as a tap. The detector's own default is
+# 0.6 s, which was right when nothing showed a press; now the keys light under
+# the finger, which invites a longer, more deliberate press, and a key that lit
+# and then did nothing on release reads as a fault.
+TAP_MAX_HOLD = 1.5
+# Cell indexes, taken from the screen's own order so the two cannot drift.
+SHUTTER_CELL, ISO_CELL, WB_CELL = (
+    SELECT_ACTIONS.index(action)
+    for action in (Action.SELECT_SHUTTER, Action.SELECT_ISO, Action.SELECT_WB)
+)
 # Consecutive preview reads that may time out before the loop gives the camera up.
 CAMERA_STALL_LIMIT = 3
 # Idle dimming: half brightness after a minute untouched, off after five. The
@@ -97,21 +121,41 @@ class ViewfinderLoop:
         # reports taps in its own pixels. The tap detector's drag limit is in panel
         # pixels too, so it grows with the scale.
         self._scale = max(1, int(getattr(display, "width", 320)) // 320)
-        self._taps = TapDetector(max_move=20.0 * self._scale)
+        self._taps = TapDetector(max_hold=TAP_MAX_HOLD, max_move=20.0 * self._scale)
         self._touch_period = touch_period
         # Set only while run()'s touch thread is alive; step() then reads taps
         # from it instead of polling the panel itself.
         self._tap_queue: queue.Queue[Tap] | None = None
         self.state = "LIVE"
-        self.ev_comp = float(getattr(camera, "ev", 0.0))
-        # Shutter priority exists only on backends that can fix the exposure time
-        # (Picamera2, the fake); on V4L2 the buttons are neither drawn nor live.
-        self._shutter_ok = callable(getattr(camera, "set_shutter", None))
-        # Manual white balance needs a backend that can fix the colour temperature
-        # and has not had its white balance fixed from the command line already.
-        self._wb_ok = (callable(getattr(camera, "set_colour_temperature", None))
-                       and getattr(camera, "wb_adjustable", True) is not False)
-        self._metered_us: float | None = None
+        # Which of the three controls this camera can change, by cell. A fixed
+        # shutter or ISO needs a backend with the setter (Picamera2, the fake)
+        # whose auto-exposure was not locked from the command line
+        # (``exposure_adjustable``, False under --ae-lock). Manual white balance
+        # likewise needs one that has not had its white balance fixed already,
+        # and whose libcamera has a settable ColourTemperature (both reported as
+        # ``wb_adjustable``).
+        exposure_ok = getattr(camera, "exposure_adjustable", True) is not False
+        self._available = (
+            exposure_ok and callable(getattr(camera, "set_shutter", None)),
+            exposure_ok and callable(getattr(camera, "set_iso", None)),
+            callable(getattr(camera, "set_colour_temperature", None))
+            and getattr(camera, "wb_adjustable", True) is not False,
+        )
+        # The cell that + and - act on: the first one the camera can change, kept
+        # until another is tapped. None when it can change none of them.
+        self.selected: int | None = next(
+            (cell for cell, ok in enumerate(self._available) if ok), None)
+        # What auto is using now, by cell: exposure time (us), ISO, kelvin. Each
+        # keeps its last usable value, so a frame without metadata or a camera
+        # error does not send the next first step back to the default.
+        self._metered: list[float | None] = [None, None, None]
+        # Where the finger is, in panel pixels, or None when it is up. Written by
+        # whoever polls touch (the touch thread under run()) and read by step():
+        # one assignment of an immutable tuple is the only cross-thread traffic,
+        # so it needs no lock.
+        self._finger: tuple[int, int] | None = None
+        # A tapped key and the loop-clock time until which it stays lit.
+        self._flash: tuple[Action, float] | None = None
         self._seen_finished = controller.snapshot().finished_count
         self._review_since = 0.0
         self._notice_since = 0.0
@@ -173,6 +217,15 @@ class ViewfinderLoop:
             else:
                 self._touch_suppressed += 1
             points = []
+        except Exception:
+            # Anything else is the caller's to report (the touch thread logs it
+            # and carries on), but the finger last seen is no longer known to
+            # be there: forget it, or its key stays lit while the fault lasts.
+            self._finger = None
+            raise
+        # Recorded on every poll, an empty one included, so a key never stays
+        # lit after the finger has left or the panel has stopped answering.
+        self._finger = (points[0].x, points[0].y) if points else None
         if self._touch_debug and points:
             self._log(f"touch: {[(p.x, p.y) for p in points]}")
         return self._taps.feed(points, monotonic())
@@ -247,29 +300,94 @@ class ViewfinderLoop:
         except Exception as exc:
             self._log(f"display: backlight {level}%: {exc}")
 
-    def _set_ev(self, value: float) -> None:
-        value = max(-EV_LIMIT, min(EV_LIMIT, round(value / EV_STEP) * EV_STEP))
-        try:
-            self._camera.set_ev(value)
-        except CameraError as exc:
-            self._log(f"camera: {exc}")
+    def _step_selected(self, up: bool) -> None:
+        """Move the selected control one step; ``up`` is the ``+`` key.
+
+        ``+`` is a faster shutter, a higher ISO or a warmer white balance. A
+        control the camera rejects is logged and left as it was: the setters
+        change nothing when they raise.
+        """
+        cell = self.selected
+        if cell is None:
             return
-        self.ev_comp = value
-
-    def _step_shutter(self, action: Action) -> None:
-        step = shutter.faster if action is Action.SHUTTER_FASTER else shutter.slower
-        value = step(getattr(self._camera, "shutter_us", None), self._metered_us)
+        camera, metered = self._camera, self._metered[cell]
+        if cell == SHUTTER_CELL:
+            step = shutter.faster if up else shutter.slower
+            value = step(getattr(camera, "shutter_us", None), metered)
+            setter = camera.set_shutter
+        elif cell == ISO_CELL:
+            # Steps the sensor's gain cannot reach are left off the scale, so
+            # the first step from auto never lands on one the camera refuses.
+            max_gain = getattr(camera, "max_gain", None)
+            max_iso = max_gain * 100 if stepscale.is_usable(max_gain) else None
+            step = iso.higher if up else iso.lower
+            value = step(getattr(camera, "iso", None), metered, max_iso)
+            setter = camera.set_iso
+        else:
+            step = whitebalance.warmer if up else whitebalance.cooler
+            value = step(getattr(camera, "colour_temperature_k", None), metered)
+            setter = camera.set_colour_temperature
         try:
-            self._camera.set_shutter(value)
+            setter(value)
         except CameraError as exc:
             self._log(f"camera: {exc}")
 
-    def _step_wb(self) -> None:
-        value = whitebalance.next_step(getattr(self._camera, "colour_temperature_k", None))
-        try:
-            self._camera.set_colour_temperature(value)
-        except CameraError as exc:
-            self._log(f"camera: {exc}")
+    def _cells(self, reading: MeterReading, metered_k: Any) -> tuple[Cell, Cell, Cell]:
+        """The strip's three read-outs for this frame.
+
+        A fixed control shows the value the camera holds; an automatic one shows
+        what this frame was metered at, or a dash when the frame does not say.
+        A control the camera cannot change shows the metered value too, but
+        without the ``AUTO`` tag: under --ae-lock, --awb-lock or --colour-gains
+        it is fixed, only not by this screen.
+        Automatic ISO reads ``MAX`` when the gain has nowhere left to go, which
+        is the warning that a fixed shutter this fast will underexpose.
+        """
+        camera = self._camera
+        us = getattr(camera, "shutter_us", None)
+        fixed_iso = getattr(camera, "iso", None)
+        kelvin = getattr(camera, "colour_temperature_k", None)
+        if us is not None:
+            shutter_text = shutter.label(us)
+        else:
+            shutter_text = reading.shutter or DASH
+        if fixed_iso is not None:
+            iso_text = iso.label(fixed_iso)
+        elif reading.iso_max:
+            iso_text = "MAX"
+        else:
+            iso_text = str(reading.iso) if reading.iso is not None else DASH
+        if kelvin is not None:
+            wb_text = whitebalance.value_label(kelvin)
+        elif stepscale.is_usable(metered_k):
+            wb_text = whitebalance.value_label(metered_k)
+        else:
+            wb_text = DASH
+        shutter_ok, iso_ok, wb_ok = self._available
+        return (
+            Cell("SHUTTER", shutter_text, auto=shutter_ok and us is None, enabled=shutter_ok),
+            Cell("ISO", iso_text, auto=iso_ok and fixed_iso is None, enabled=iso_ok),
+            Cell("WB", wb_text, auto=wb_ok and kelvin is None, enabled=wb_ok),
+        )
+
+    def _pressed(self, now: float) -> Action | None:
+        """The key to draw lit: the one under the finger, else a tap's flash.
+
+        ``now`` is the time this step began, not the time the frame is drawn:
+        at a one-second shutter the preview read between the two outlasts the
+        flash, and a tap handled in this step must still be seen in its frame.
+        """
+        finger = self._finger
+        if finger is not None:
+            action = hit(finger[0], finger[1], self._scale)
+            if action in PRESS_KEYS:
+                return action
+        if self._flash is not None:
+            action, until = self._flash
+            if now < until:
+                return action
+            self._flash = None
+        return None
 
     def _review_image(self, job: Any) -> Image.Image:
         """Render the review screen for a finished job, whatever state it is in.
@@ -277,9 +395,8 @@ class ViewfinderLoop:
         The caption goes through ``compute_reading`` rather than formatting the
         metadata here, so a zero or non-numeric ``ExposureTime`` is handled by
         the meter's guards and the review agrees with the live readout instead
-        of doing its own arithmetic. A double's composite was graded at EV 0 from
-        two frames shot at their own EVs, so its caption shows the pair's recorded
-        EVs (``EV e1/e2``), not wherever the dial is now. Everything is caught: this
+        of doing its own arithmetic. A double's caption is marked ``2x`` and
+        shows the second exposure's values. Everything is caught: this
         runs on the loop thread, and after Task 9 that is the process's main thread, so an
         unreadable file or a malformed record must cost one screen, not the
         Stick server.
@@ -291,15 +408,9 @@ class ViewfinderLoop:
         try:
             rgb, _ = load_rgb(job.result.pifilm)
             meta = job.result.record.get("camera_metadata") or {}
-            reading = compute_reading(meta, rgb, self.ev_comp, None)
-            ev_text = format_ev(self.ev_comp)
-            double = getattr(job.result, "exposure", None) == (2, 2)
-            if double:
-                evs = (job.result.record.get("double") or {}).get("ev_comp")
-                if isinstance(evs, list) and len(evs) == 2:
-                    ev_text = "/".join(format_ev(float(ev)) for ev in evs)
-            caption = f"{text_or_dash(reading.shutter)}  {iso_label(reading.iso)}  EV {ev_text}"
-            if double:
+            reading = compute_reading(meta, rgb, None)
+            caption = f"{text_or_dash(reading.shutter)}  {iso_label(reading.iso)}"
+            if getattr(job.result, "exposure", None) == (2, 2):
                 caption = f"2x  {caption}"
             return render_review(rgb, caption, scale=self._scale)
         except Exception as exc:
@@ -320,7 +431,8 @@ class ViewfinderLoop:
         now = self._clock.monotonic()
         if tap is not None:
             # On a dark screen the user cannot see what they touch, so the tap
-            # only wakes it. Dimmed, the buttons are visible and the tap acts.
+            # only wakes it (and, being dropped here, lights no key). Dimmed, the
+            # buttons are visible and the tap acts.
             if self._idle.screen(now) is Screen.OFF:
                 tap = None
             self._idle.wake(now)
@@ -331,6 +443,7 @@ class ViewfinderLoop:
         if snap.finished_count != self._seen_finished and snap.last_finished_job is not None:
             self._seen_finished = snap.finished_count
             self._processing_shown = False
+            self._flash = None
             job = snap.last_finished_job
             if job.state == "complete" and getattr(job.result, "exposure", None) == (1, 2):
                 self.state = "NOTICE"
@@ -358,20 +471,25 @@ class ViewfinderLoop:
             return
         if tap is not None:
             action = hit(tap.x, tap.y, self._scale)
+            if snap.active_job is not None and action is not Action.SHUTTER:
+                # While a job runs the colour bars hide the cells, the keys and
+                # the 2x toggle (spec section 5), so a tap there was not aimed at
+                # them: no step, no selection, no toggle and no flash. Only the
+                # shutter tap goes on, to the controller, which answers busy.
+                action = Action.NONE
+            if action in PRESS_KEYS:
+                self._flash = (action, now + PRESS_FLASH_SECONDS)
             if action is Action.SHUTTER:
                 self._controller.submit(str(uuid.uuid4()))
-            elif action is Action.EV_MINUS:
-                self._set_ev(self.ev_comp - EV_STEP)
-            elif action is Action.EV_PLUS:
-                self._set_ev(self.ev_comp + EV_STEP)
-            elif (action in (Action.SHUTTER_FASTER, Action.SHUTTER_SLOWER)
-                  and self._shutter_ok):
-                self._step_shutter(action)
-            elif action is Action.WB_NEXT and self._wb_ok:
-                self._step_wb()
-            elif action is Action.DOUBLE_TOGGLE and snap.active_job is None:
-                # Ignored while a job runs (spec section 5): the badge is hidden behind
-                # the colour bars, so a tap there was not aimed at it.
+            elif action in SELECT_ACTIONS:
+                # hit() knows nothing of the camera: a grey cell still reports
+                # its tap, and is ignored here.
+                cell = SELECT_ACTIONS.index(action)
+                if self._available[cell]:
+                    self.selected = cell
+            elif action in (Action.PLUS, Action.MINUS):
+                self._step_selected(action is Action.PLUS)
+            elif action is Action.DOUBLE_TOGGLE:
                 self._controller.set_double_exposure(not snap.double_exposure)
         if snap.active_job is not None:
             # The grade takes about three seconds, and the camera belongs to the
@@ -380,7 +498,9 @@ class ViewfinderLoop:
             # frame. Drawn once per job, because re-blitting identical bars at
             # 10 fps would only occupy the SPI bus. Touch keeps being polled
             # above, so a shutter tap still reaches the controller (which
-            # answers busy) and EV taps still work.
+            # answers busy). A key's flash must not outlive the live view it
+            # was drawn on.
+            self._flash = None
             if not self._processing_shown:
                 self._show(render_processing(self._processing_label(snap), scale=self._scale))
                 self._processing_shown = True
@@ -405,23 +525,29 @@ class ViewfinderLoop:
                     raise
             return
         self._camera_stalls = 0
-        exposure = (frame.metadata or {}).get("ExposureTime")
-        if isinstance(exposure, (int, float)) and exposure > 0:
-            self._metered_us = float(exposure)
         power = self._power() if self._power is not None else None
         # Manual focus aid: the bar is the absolute sharpness of the frame's centre,
         # the tracker only remembers the best of the last few seconds for the mark.
         level = focus_score(frame.rgb)
         peak = self._focus.update(level, self._clock.monotonic())
+        max_gain = getattr(self._camera, "max_gain", None)
         reading = compute_reading(
-            frame.metadata, frame.rgb, self.ev_comp, power, focus=level, focus_peak=peak,
-            shutter_us=getattr(self._camera, "shutter_us", None),
-            max_gain=getattr(self._camera, "max_gain", None),
+            frame.metadata, frame.rgb, power, focus=level, focus_peak=peak,
+            max_gain=max_gain if stepscale.is_usable(max_gain) else None,
         )
+        metadata = frame.metadata or {}
+        metered_k = metadata.get("ColourTemperature")
+        for cell, value in enumerate((metadata.get("ExposureTime"), reading.iso, metered_k)):
+            if stepscale.is_usable(value):
+                self._metered[cell] = float(value)
         self._show(render_live(
-            frame.rgb, reading, (snap.double_exposure, snap.exposures_taken),
-            shutter_buttons=self._shutter_ok, wb_button=self._wb_ok,
-            wb_k=getattr(self._camera, "colour_temperature_k", None), scale=self._scale,
+            frame.rgb, reading,
+            LiveState(
+                cells=self._cells(reading, metered_k), selected=self.selected,
+                pressed=self._pressed(now),
+                double=(snap.double_exposure, snap.exposures_taken),
+            ),
+            scale=self._scale,
         ))
         self._frames += 1
         now = self._clock.monotonic()

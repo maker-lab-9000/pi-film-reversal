@@ -13,19 +13,25 @@ from pifilm.capture.controller import CaptureController
 from pifilm.capture.errors import CameraError, CameraStalled
 from pifilm.display import DisplayError, viewfinder
 from pifilm.display.cst3530 import TouchPoint
-from pifilm.display.meter import format_ev
-from pifilm.display.ui import (
+from pifilm.display.liveview import (
     BAR_TOP,
+    CELL_HIT_X0,
+    CELL_PITCH,
     DOUBLE_BOX,
+    MINUS_CENTRE,
+    PLUS_CENTRE,
     SHUTTER_CENTRE,
-    SHUTTER_MINUS_BOX,
-    SHUTTER_PLUS_BOX,
-    WB_BOX,
+    Action,
+    Cell,
 )
 from pifilm.display.viewfinder import (
     CAMERA_STALL_LIMIT,
-    EV_STEP,
+    ISO_CELL,
     NOTICE_SECONDS,
+    PRESS_FLASH_SECONDS,
+    SHUTTER_CELL,
+    TAP_MAX_HOLD,
+    WB_CELL,
     ViewfinderLoop,
 )
 from pifilm.grain import GrainParams
@@ -34,6 +40,9 @@ from pifilm.normalize import NormalizeParams
 from pifilm.pipeline import Pipeline
 
 DEFAULT_METADATA = {"ExposureTime": 4000, "AnalogueGain": 1.0, "Lux": 500.0}
+# A frame with all three metered values, none of them on a step: 1/250 s is a
+# shutter step, ISO 760 is nearest 800 and 4249 K is nearest 4000 K.
+METERED = {"ExposureTime": 4000, "AnalogueGain": 7.6, "ColourTemperature": 4249, "Lux": 500.0}
 
 
 class FakeDisplay:
@@ -232,7 +241,7 @@ def test_shutter_tap_submits_through_the_controller_and_reviews_the_result(
     assert ctl.snapshot().last_finished_job.state == "complete"
     assert len(display.images) == before + 1
     assert calls["message"] == []
-    assert len(calls["review"]) == 1 and "ISO" in calls["review"][0]
+    assert calls["review"] == ["1/250  ISO 100"]
 
 
 def test_processing_shows_colour_bars_instead_of_the_live_view(tmp_path, monkeypatch):
@@ -297,21 +306,6 @@ def test_review_ends_on_tap_or_timeout(controller):
     assert loop.state == "LIVE"
 
 
-def test_ev_taps_step_by_a_third_and_clamp(controller):
-    camera, ctl = controller
-    loop, touch, display, clock = _loop(camera, ctl)
-    for _ in range(8):
-        touch.tap(310, BAR_TOP + 10)
-    for _ in range(16):
-        loop.step()
-    assert loop.ev_comp == pytest.approx(2.0)
-    assert camera.ev == pytest.approx(2.0)
-    touch.tap(10, BAR_TOP + 10)
-    loop.step()
-    loop.step()
-    assert loop.ev_comp == pytest.approx(2.0 - EV_STEP)
-
-
 def test_failed_job_shows_a_message_in_review(tmp_path, monkeypatch):
     class Boom:
         camera = None
@@ -349,7 +343,7 @@ def test_zero_exposure_time_in_the_record_still_reviews(tmp_path, monkeypatch):
         assert loop.state == "REVIEW"
         assert len(display.images) == 1
         assert calls["message"] == []
-        assert calls["review"] == ["-  ISO -  EV 0"]
+        assert calls["review"] == ["-  ISO -"]
     finally:
         ctl.close()
 
@@ -494,12 +488,25 @@ def _spy_live(monkeypatch):
     readings = []
     real = viewfinder.render_live
 
-    def spy(frame_rgb, reading, double=None, shutter_buttons=False, **kwargs):
+    def spy(frame_rgb, reading, state, **kwargs):
         readings.append(reading)
-        return real(frame_rgb, reading, double, shutter_buttons, **kwargs)
+        return real(frame_rgb, reading, state, **kwargs)
 
     monkeypatch.setattr(viewfinder, "render_live", spy)
     return readings
+
+
+def _spy_states(monkeypatch):
+    """Record the ``LiveState`` of every live frame, still drawing it."""
+    states = []
+    real = viewfinder.render_live
+
+    def spy(frame_rgb, reading, state, **kwargs):
+        states.append(state)
+        return real(frame_rgb, reading, state, **kwargs)
+
+    monkeypatch.setattr(viewfinder, "render_live", spy)
+    return states
 
 
 def _sharp_frame(shape=(96, 128), seed=0):
@@ -632,19 +639,28 @@ def test_no_camera_reads_or_frames_while_the_screen_is_off(controller):
     assert reads["n"] == before_reads and len(display.images) == before_frames
 
 
-def test_a_tap_on_a_dark_screen_only_wakes_it(controller, monkeypatch):
-    """The user cannot see what they are touching: the shutter must not fire."""
+@pytest.mark.parametrize("key", [SHUTTER_CENTRE, PLUS_CENTRE, MINUS_CENTRE])
+def test_a_tap_on_a_dark_screen_only_wakes_it_and_lights_nothing(controller, monkeypatch, key):
+    """The user cannot see what they are touching: the shutter must not fire, no
+    value may change, and the key under the finger is not lit when the screen
+    comes back."""
     camera, ctl = controller
+    states = _spy_states(monkeypatch)
     loop, touch, display, clock = _idle_loop(camera, ctl)
     submitted = []
     monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
     clock.t = 300.0
     loop.step()
     assert display.levels[-1] == 0
-    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    drawn = len(states)
+    _tap(loop, touch, clock, key)
+    loop.step()
     assert submitted == []
+    assert camera.shutter_us is None
     assert display.levels[-1] == 80
     assert loop.state == "LIVE"
+    woken = states[drawn:]
+    assert woken and all(state.pressed is None for state in woken)
 
 
 def test_a_tap_on_a_dimmed_screen_restores_it_and_acts(controller, monkeypatch):
@@ -744,20 +760,13 @@ def test_badge_taps_during_processing_are_ignored(tmp_path):
 
 def test_live_view_draws_the_badge_from_the_snapshot(controller, monkeypatch):
     camera, ctl = controller
-    seen = []
-    real = viewfinder.render_live
-
-    def spy(frame, reading, double=None, shutter_buttons=False, **kwargs):
-        seen.append(double)
-        return real(frame, reading, double, shutter_buttons, **kwargs)
-
-    monkeypatch.setattr(viewfinder, "render_live", spy)
+    states = _spy_states(monkeypatch)
     loop, touch, display, clock = _loop(camera, ctl)
     loop.step()
-    assert seen[-1] == (False, 0)
+    assert states[-1].double == (False, 0)
     _enable_double(loop, touch, clock, ctl)
     loop.step()
-    assert seen[-1] == (True, 0)
+    assert states[-1].double == (True, 0)
 
 
 def test_exposure_one_shows_a_notice_not_a_review(controller, monkeypatch):
@@ -801,13 +810,9 @@ def test_exposure_two_reviews_the_composite_with_a_2x_caption(controller, monkey
     loop.step()
     ctl.submit("exp-2")
     _until(lambda: ctl.snapshot().finished_count == 2)
-    loop._set_ev(1.0)  # the dial has moved since: the caption must show the shots' EVs
     loop.step()
     assert loop.state == "REVIEW"
-    caption = calls["review"][-1]
-    assert caption.startswith("2x")
-    assert caption.endswith(f"EV {format_ev(0.0)}/{format_ev(0.0)}")
-    assert caption.isascii()
+    assert calls["review"][-1] == "2x  1/250  ISO 100"
     job = ctl.snapshot().last_finished_job
     assert job.result.pifilm.name.endswith("_double_graded.jpg")
 
@@ -842,94 +847,637 @@ def test_processing_labels_follow_the_pair(tmp_path, monkeypatch):
         ctl.close()
 
 
-# -- shutter priority -------------------------------------------------------------
+# -- manual controls: select a cell, then + / - -------------------------------------
+
+SETTERS = ("set_shutter", "set_iso", "set_colour_temperature")
 
 
-def _centre(box):
-    x0, y0, x1, y1 = box
-    return (x0 + x1) // 2, (y0 + y1) // 2
+def _cell(index):
+    """A point in the middle of a strip cell's hit column."""
+    return CELL_HIT_X0 + CELL_PITCH * index + CELL_PITCH // 2, BAR_TOP + 16
 
 
-def test_first_shutter_tap_from_auto_lands_on_the_metered_speed(controller):
+def _values(camera):
+    return camera.shutter_us, camera.iso, camera.colour_temperature_k
+
+
+@pytest.fixture
+def metered(tmp_path):
+    camera, ctl = _make_controller(tmp_path, METERED)
+    yield camera, ctl
+    ctl.close()
+
+
+def test_the_shutter_cell_is_selected_at_start(controller, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert loop.selected == SHUTTER_CELL
+    assert states[-1].selected == SHUTTER_CELL
+
+
+def test_plus_and_minus_change_only_the_selected_control(metered):
+    camera, ctl = metered
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()  # one live frame, so the loop has metered values
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert _values(camera) == (4000, None, None)
+    _tap(loop, touch, clock, _cell(ISO_CELL))
+    assert loop.selected == ISO_CELL
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert _values(camera) == (4000, 800, None)
+    _tap(loop, touch, clock, _cell(WB_CELL))
+    assert loop.selected == WB_CELL
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert _values(camera) == (4000, 800, 4000)
+    _tap(loop, touch, clock, MINUS_CENTRE)
+    assert _values(camera) == (4000, 800, 3200)
+    _tap(loop, touch, clock, _cell(SHUTTER_CELL))
+    assert loop.selected == SHUTTER_CELL
+    _tap(loop, touch, clock, MINUS_CENTRE)
+    assert _values(camera) == (5000, 800, 3200)
+
+
+@pytest.mark.parametrize("key", [PLUS_CENTRE, MINUS_CENTRE])
+@pytest.mark.parametrize(("cell", "expected"), [
+    (SHUTTER_CELL, (4000, None, None)),
+    (ISO_CELL, (None, 800, None)),
+    (WB_CELL, (None, None, 4000)),
+])
+def test_the_first_step_from_auto_lands_on_the_metered_step(metered, cell, expected, key):
+    """Either direction: switching a control to manual must not jump the picture."""
+    camera, ctl = metered
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _cell(cell))
+    _tap(loop, touch, clock, key)
+    assert _values(camera) == expected
+
+
+def test_plus_is_a_faster_shutter_and_minus_a_slower_one(controller):
     camera, ctl = controller  # FakeCamera with ExposureTime 4000 in its metadata
     loop, touch, display, clock = _loop(camera, ctl)
-    loop.step()  # one live frame, so the loop has a metered exposure
-    _tap(loop, touch, clock, _centre(SHUTTER_PLUS_BOX))
+    loop.step()
+    _tap(loop, touch, clock, PLUS_CENTRE)
     assert camera.shutter_us == 4000
-    _tap(loop, touch, clock, _centre(SHUTTER_PLUS_BOX))
+    _tap(loop, touch, clock, PLUS_CENTRE)
     assert camera.shutter_us == 3125
-    _tap(loop, touch, clock, _centre(SHUTTER_MINUS_BOX))
-    _tap(loop, touch, clock, _centre(SHUTTER_MINUS_BOX))
+    _tap(loop, touch, clock, MINUS_CENTRE)
+    _tap(loop, touch, clock, MINUS_CENTRE)
     assert camera.shutter_us == 5000
 
 
-def test_a_shutter_tap_before_any_metered_frame_starts_at_1_125(controller):
+def test_plus_is_a_higher_iso_and_a_warmer_white_balance(metered):
+    camera, ctl = metered
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _cell(ISO_CELL))
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert camera.iso == 1600
+    _tap(loop, touch, clock, _cell(WB_CELL))
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert camera.colour_temperature_k == 5000
+
+
+@pytest.mark.parametrize(("cell", "expected"), [
+    (SHUTTER_CELL, (8000, None, None)),
+    (ISO_CELL, (None, 400, None)),
+    (WB_CELL, (None, None, 5600)),
+])
+def test_a_step_before_any_metered_frame_starts_at_the_default(controller, cell, expected):
     camera, ctl = controller
     loop, touch, display, clock = _loop(camera, ctl)
-    touch.tap(*_centre(SHUTTER_MINUS_BOX))
     camera.read = lambda **k: (_ for _ in ()).throw(CameraError("no frame"))
-    loop.step()
-    clock.t += 0.1
-    loop.step()
-    assert camera.shutter_us == 8000
+    _tap(loop, touch, clock, _cell(cell))
+    _tap(loop, touch, clock, MINUS_CENTRE)
+    assert _values(camera) == expected
 
 
-def test_live_view_passes_shutter_state_to_meter_and_renderer(controller, monkeypatch):
+@pytest.mark.parametrize("metadata", [
+    None,
+    {},
+    {"ExposureTime": 0, "AnalogueGain": 0, "ColourTemperature": 0},
+    {"ExposureTime": float("nan"), "AnalogueGain": float("nan"),
+     "ColourTemperature": float("nan")},
+    {"ExposureTime": "n/a", "AnalogueGain": "n/a", "ColourTemperature": "n/a"},
+    {"ExposureTime": True, "AnalogueGain": True, "ColourTemperature": True},
+    {"ExposureTime": float("inf"), "AnalogueGain": -1.0, "ColourTemperature": -5600},
+])
+def test_meaningless_metered_values_fall_back_to_the_defaults(tmp_path, monkeypatch, metadata):
+    """The first frames can arrive with no metadata, or with zeros in it."""
+    camera, ctl = _make_controller(tmp_path, metadata)
+    try:
+        states = _spy_states(monkeypatch)
+        loop, touch, display, clock = _loop(camera, ctl)
+        loop.step()
+        assert states[-1].cells[WB_CELL].value == "-"
+        _tap(loop, touch, clock, PLUS_CENTRE)
+        assert camera.shutter_us == 8000
+        _tap(loop, touch, clock, _cell(WB_CELL))
+        _tap(loop, touch, clock, PLUS_CENTRE)
+        assert camera.colour_temperature_k == 5600
+        _tap(loop, touch, clock, _cell(ISO_CELL))
+        _tap(loop, touch, clock, PLUS_CENTRE)
+        assert camera.iso == 400
+        assert loop.state == "LIVE"
+    finally:
+        ctl.close()
+
+
+@pytest.mark.parametrize(("cell", "setter", "bottom"), [
+    (SHUTTER_CELL, "set_shutter", 1_000_000),   # the slowest step, 1 s
+    (ISO_CELL, "set_iso", 100),
+    (WB_CELL, "set_colour_temperature", 3200),
+])
+def test_minus_below_the_bottom_step_returns_the_control_to_auto(controller, cell, setter, bottom):
+    camera, ctl = controller
+    getattr(camera, setter)(bottom)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _cell(cell))
+    _tap(loop, touch, clock, MINUS_CENTRE)
+    assert _values(camera) == (None, None, None)
+
+
+@pytest.mark.parametrize(("cell", "setter", "top"), [
+    (SHUTTER_CELL, "set_shutter", 500),         # the fastest step, 1/2000
+    (ISO_CELL, "set_iso", 1600),
+    (WB_CELL, "set_colour_temperature", 7500),
+])
+def test_plus_at_the_top_step_stays_there(controller, cell, setter, top):
+    camera, ctl = controller
+    getattr(camera, setter)(top)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _cell(cell))
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert _values(camera)[cell] == top
+
+
+def _make_unavailable(monkeypatch, camera, how):
+    if how == "wb_not_adjustable":
+        camera.wb_adjustable = False
+    else:
+        monkeypatch.setattr(type(camera), how, None, raising=False)
+
+
+@pytest.mark.parametrize(("how", "cell"), [
+    ("set_shutter", SHUTTER_CELL),
+    ("set_iso", ISO_CELL),
+    ("set_colour_temperature", WB_CELL),
+    ("wb_not_adjustable", WB_CELL),
+])
+def test_a_control_the_camera_cannot_change_is_grey_and_cannot_be_selected(
+    metered, monkeypatch, how, cell,
+):
+    camera, ctl = metered
+    states = _spy_states(monkeypatch)
+    _make_unavailable(monkeypatch, camera, how)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    # The first cell the camera can change is the one selected at start.
+    start = ISO_CELL if cell == SHUTTER_CELL else SHUTTER_CELL
+    assert loop.selected == start
+    _tap(loop, touch, clock, _cell(cell))
+    assert loop.selected == start
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    _tap(loop, touch, clock, MINUS_CENTRE)
+    assert _values(camera)[cell] is None
+    assert loop.state == "LIVE"
+    enabled = [c.enabled for c in states[-1].cells]
+    assert enabled == [index != cell for index in range(3)]
+    assert states[-1].selected == start
+
+
+def test_plus_and_minus_do_nothing_when_no_control_is_selectable(metered, monkeypatch):
+    camera, ctl = metered
+    states = _spy_states(monkeypatch)
+    for setter in SETTERS:
+        _make_unavailable(monkeypatch, camera, setter)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert loop.selected is None
+    for point in (_cell(SHUTTER_CELL), _cell(ISO_CELL), _cell(WB_CELL), PLUS_CENTRE,
+                  MINUS_CENTRE):
+        _tap(loop, touch, clock, point)
+    assert loop.selected is None
+    assert _values(camera) == (None, None, None)
+    assert loop.state == "LIVE"
+    assert states[-1].selected is None
+    assert not any(c.enabled for c in states[-1].cells)
+
+
+@pytest.mark.parametrize(("cell", "setter"), list(enumerate(SETTERS)))
+def test_a_rejected_control_is_logged_not_fatal(metered, cell, setter):
+    camera, ctl = metered
+    lines = []
+
+    def reject(value):
+        raise CameraError("control rejected")
+
+    setattr(camera, setter, reject)
+    loop, touch, display, clock = _loop(camera, ctl, log=lines.append)
+    loop.step()
+    _tap(loop, touch, clock, _cell(cell))
+    assert loop.selected == cell
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert "camera: control rejected" in lines
+    assert loop.state == "LIVE"
+    assert _values(camera) == (None, None, None)
+    loop.step()
+    assert len(display.images) >= 2
+
+
+@pytest.mark.parametrize("cell", [SHUTTER_CELL, ISO_CELL])
+def test_locked_auto_exposure_greys_the_shutter_and_iso_cells(metered, monkeypatch, cell):
+    """``--ae-lock``: the camera reports ``exposure_adjustable = False``."""
+    camera, ctl = metered
+    states = _spy_states(monkeypatch)
+    camera.exposure_adjustable = False
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert loop.selected == WB_CELL
+    _tap(loop, touch, clock, _cell(cell))
+    assert loop.selected == WB_CELL
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert _values(camera) == (None, None, 4000)
+    assert [c.enabled for c in states[-1].cells] == [False, False, True]
+
+
+def test_a_cell_the_camera_cannot_change_shows_its_value_without_auto(metered, monkeypatch):
+    """Under ``--awb-lock`` the white balance is fixed, not automatic, and under
+    ``--ae-lock`` so is the exposure: the tag would be a lie. The value still reads."""
+    camera, ctl = metered
+    states = _spy_states(monkeypatch)
+    camera.exposure_adjustable = False
+    camera.wb_adjustable = False
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert loop.selected is None
+    assert states[-1].cells == (
+        Cell("SHUTTER", "1/250", auto=False, enabled=False),
+        Cell("ISO", "760", auto=False, enabled=False),
+        Cell("WB", "4200K", auto=False, enabled=False),
+    )
+
+
+def test_iso_steps_above_the_sensors_gain_limit_are_not_offered(tmp_path):
+    """Metered ISO 1250 is nearest 1600, which a sensor with gain 8 cannot reach:
+    the first step from auto must land on a value ``set_iso`` accepts."""
+    camera, ctl = _make_controller(
+        tmp_path, {"ExposureTime": 4000, "AnalogueGain": 12.5, "Lux": 500.0})
+    try:
+        camera.max_gain = 8.0
+        loop, touch, display, clock = _loop(camera, ctl)
+        loop.step()
+        _tap(loop, touch, clock, _cell(ISO_CELL))
+        _tap(loop, touch, clock, PLUS_CENTRE)
+        assert camera.iso == 800
+        _tap(loop, touch, clock, PLUS_CENTRE)
+        assert camera.iso == 800
+        _tap(loop, touch, clock, MINUS_CENTRE)
+        assert camera.iso == 400
+    finally:
+        ctl.close()
+
+
+@pytest.mark.parametrize("bad", [None, 0, float("nan"), "n/a"])
+def test_an_unknown_gain_limit_offers_every_iso_step(metered, bad):
+    camera, ctl = metered
+    camera.max_gain = bad
+    camera.set_iso(800)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _cell(ISO_CELL))
+    _tap(loop, touch, clock, PLUS_CENTRE)
+    assert camera.iso == 1600
+
+
+def test_automatic_cells_show_the_metered_values(metered, monkeypatch):
+    camera, ctl = metered
+    states = _spy_states(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert states[-1].cells == (
+        Cell("SHUTTER", "1/250", auto=True, enabled=True),
+        Cell("ISO", "760", auto=True, enabled=True),
+        Cell("WB", "4200K", auto=True, enabled=True),
+    )
+
+
+def test_fixed_cells_show_the_fixed_values_without_auto(metered, monkeypatch):
+    camera, ctl = metered
+    states = _spy_states(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    for cell in (SHUTTER_CELL, ISO_CELL, WB_CELL):
+        _tap(loop, touch, clock, _cell(cell))
+        _tap(loop, touch, clock, PLUS_CENTRE)   # onto the metered step
+        _tap(loop, touch, clock, PLUS_CENTRE)   # and one step on
+    loop.step()
+    assert states[-1].cells == (
+        Cell("SHUTTER", "1/320", auto=False, enabled=True),
+        Cell("ISO", "1600", auto=False, enabled=True),
+        Cell("WB", "5000K", auto=False, enabled=True),
+    )
+    assert states[-1].selected == WB_CELL
+
+
+def test_the_iso_cell_reads_max_when_auto_gain_is_at_its_limit(metered, monkeypatch):
+    camera, ctl = metered
+    camera.max_gain = 7.6   # the metered analogue gain: nothing left to give
+    states = _spy_states(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    assert states[-1].cells[ISO_CELL] == Cell("ISO", "MAX", auto=True, enabled=True)
+    camera.set_iso(800)   # a fixed ISO shows its own value, limit or not
+    loop.step()
+    assert states[-1].cells[ISO_CELL] == Cell("ISO", "800", auto=False, enabled=True)
+
+
+def test_cells_show_a_dash_when_the_frame_has_no_metadata(tmp_path, monkeypatch):
+    camera, ctl = _make_controller(tmp_path, None)
+    try:
+        states = _spy_states(monkeypatch)
+        loop, touch, display, clock = _loop(camera, ctl)
+        loop.step()
+        assert [c.value for c in states[-1].cells] == ["-", "-", "-"]
+        assert all(c.auto for c in states[-1].cells)
+    finally:
+        ctl.close()
+
+
+def test_the_meter_is_told_the_sensors_gain_limit(controller, monkeypatch):
     camera, ctl = controller
     seen = {}
-    real_render, real_compute = viewfinder.render_live, viewfinder.compute_reading
-
-    def render(frame, reading, double=None, shutter_buttons=False, **kwargs):
-        seen["buttons"], seen["fixed"] = shutter_buttons, reading.shutter_fixed
-        return real_render(frame, reading, double, shutter_buttons, **kwargs)
+    real_compute = viewfinder.compute_reading
 
     def compute(*a, **k):
         seen["max_gain"] = k.get("max_gain")
         return real_compute(*a, **k)
 
-    monkeypatch.setattr(viewfinder, "render_live", render)
     monkeypatch.setattr(viewfinder, "compute_reading", compute)
     camera.max_gain = 16.0
-    camera.set_shutter(4000)
     loop, touch, display, clock = _loop(camera, ctl)
     loop.step()
-    assert seen == {"buttons": True, "fixed": True, "max_gain": 16.0}
+    assert seen == {"max_gain": 16.0}
 
 
-def test_a_camera_without_set_shutter_draws_no_buttons_and_ignores_taps(
+# -- press feedback -----------------------------------------------------------------
+
+
+def test_a_finger_held_on_plus_lights_it_every_frame_and_steps_once_on_release(
     controller, monkeypatch,
 ):
+    """Actions fire on release, never while the finger is down: no key repeat."""
     camera, ctl = controller
-    seen = []
-    real_render = viewfinder.render_live
-
-    def render(frame, reading, double=None, shutter_buttons=False, **kwargs):
-        seen.append(shutter_buttons)
-        return real_render(frame, reading, double, shutter_buttons, **kwargs)
-
-    monkeypatch.setattr(viewfinder, "render_live", render)
-    monkeypatch.setattr(type(camera), "set_shutter", None, raising=False)
+    states = _spy_states(monkeypatch)
     loop, touch, display, clock = _loop(camera, ctl)
-    loop.step()
-    _tap(loop, touch, clock, _centre(SHUTTER_PLUS_BOX))
-    assert seen and not any(seen)
-    assert camera.shutter_us is None
-    assert ctl.snapshot().finished_count == 0
+    touch.script = [[TouchPoint(*PLUS_CENTRE, 10)]] * 5
+    for _ in range(5):
+        loop.step()
+        assert states[-1].pressed is Action.PLUS
+        assert camera.shutter_us is None
+        clock.t += 0.1
+    loop.step()   # the finger is up
+    assert camera.shutter_us == 4000
+    for _ in range(5):
+        clock.t += 0.1
+        loop.step()
+    assert camera.shutter_us == 4000
+    assert states[-1].pressed is None
 
 
-def test_a_rejected_shutter_is_logged_not_fatal(controller):
+def test_a_one_second_press_on_plus_still_steps_exactly_once(controller, monkeypatch):
+    """A lit key invites a longer press than a blind tap; it must still count."""
     camera, ctl = controller
-    lines = []
+    states = _spy_states(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    touch.script = [[TouchPoint(*PLUS_CENTRE, 10)]] * 10
+    for _ in range(10):
+        loop.step()
+        assert states[-1].pressed is Action.PLUS
+        assert camera.shutter_us is None
+        clock.t += 0.1
+    assert clock.t == pytest.approx(1.0)
+    loop.step()   # the finger is up, 1.0 s after it went down
+    assert camera.shutter_us == 4000
+    for _ in range(5):
+        clock.t += 0.1
+        loop.step()
+    assert camera.shutter_us == 4000
 
-    def reject(us):
-        raise CameraError("control rejected")
 
-    camera.set_shutter = reject
-    loop, touch, display, clock = _loop(camera, ctl, log=lines.append)
+def test_a_finger_resting_on_a_key_lights_it_but_never_steps(controller, monkeypatch):
+    """Longer than ``TAP_MAX_HOLD`` is not a tap: a resting thumb changes nothing."""
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    polls = int(TAP_MAX_HOLD / 0.1) + 2
+    touch.script = [[TouchPoint(*MINUS_CENTRE, 10)]] * polls
+    for _ in range(polls):
+        loop.step()
+        assert states[-1].pressed is Action.MINUS
+        clock.t += 0.1
+    assert clock.t > TAP_MAX_HOLD
     loop.step()
-    _tap(loop, touch, clock, _centre(SHUTTER_PLUS_BOX))
-    assert any("control rejected" in line for line in lines)
-    assert loop.state == "LIVE"
+    clock.t += PRESS_FLASH_SECONDS
+    loop.step()
+    assert camera.shutter_us is None
+    assert states[-1].pressed is None
+
+
+@pytest.mark.parametrize(("key", "action"), [
+    (PLUS_CENTRE, Action.PLUS), (MINUS_CENTRE, Action.MINUS), (SHUTTER_CENTRE, Action.SHUTTER),
+])
+def test_a_tap_keeps_its_key_lit_for_the_flash_after_the_finger_is_up(
+    controller, monkeypatch, key, action,
+):
+    """A tap can be over before a frame is drawn; the key must still be seen to react."""
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    monkeypatch.setattr(ctl, "submit", lambda rid: None)
+    loop, touch, display, clock = _loop(camera, ctl)
+    _tap(loop, touch, clock, key)             # the second step saw no finger
+    assert states[-1].pressed is action
+    clock.t += PRESS_FLASH_SECONDS / 2
+    loop.step()
+    assert states[-1].pressed is action
+    clock.t += PRESS_FLASH_SECONDS / 2 + 0.01
+    loop.step()
+    assert states[-1].pressed is None
+
+
+def test_only_the_keys_light_under_a_finger(controller, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl)
+    for point in (_cell(ISO_CELL), _badge_centre(), (160, 100)):
+        touch.script = [[TouchPoint(*point, 10)], []]
+        loop.step()
+        assert states[-1].pressed is None
+        clock.t += 0.1
+        loop.step()
+        assert states[-1].pressed is None
+        clock.t += 1.0
+
+
+def test_a_touch_error_lights_nothing(controller, monkeypatch):
+    """A failed read is "no finger": a key must not stay lit behind a dead panel."""
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    touch = GlitchyTouch(fail_on=(1,))
+    touch.script = [[TouchPoint(*PLUS_CENTRE, 10)]]
+    loop, _, display, clock = _loop(camera, ctl, touch=touch)
+    loop.step()
+    assert states[-1].pressed is Action.PLUS
+    clock.t += TAP_MAX_HOLD + 0.5   # too long to be a tap, so no flash either
+    loop.step()   # this read fails
+    assert states[-1].pressed is None
+
+
+class BrokenTouch(ScriptedTouch):
+    """A touch device whose driver raises something that is not a DisplayError."""
+
+    def __init__(self):
+        super().__init__()
+        self.broken = False
+
+    def read(self):
+        if self.broken:
+            raise OSError("input device went away")
+        return super().read()
+
+
+def test_an_unexpected_touch_error_does_not_leave_a_key_lit(controller):
+    """The touch thread logs such an error and carries on; the finger it last saw
+    must not stay recorded, or the key under it is lit for as long as the fault lasts."""
+    camera, ctl = controller
+    touch = BrokenTouch()
+    touch.script = [[TouchPoint(*PLUS_CENTRE, 10)]]
+    loop, _, display, clock = _loop(camera, ctl, touch=touch)
+    assert loop._poll_tap() is None
+    assert loop._pressed(clock.monotonic()) is Action.PLUS
+    touch.broken = True
+    with pytest.raises(OSError):
+        loop._poll_tap()
+    assert loop._pressed(clock.monotonic()) is None
+
+
+def test_the_touch_thread_clears_a_lit_key_when_the_device_fails(controller, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    lines = []
+    touch = BrokenTouch()
+    touch.script = [[TouchPoint(*PLUS_CENTRE, 10)]] * 100_000
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=time, frame_period=0.02,
+                          log=lines.append)
+    stop = threading.Event()
+    runner = threading.Thread(target=loop.run, args=(stop,), daemon=True)
+    runner.start()
+    try:
+        _until(lambda: any(state.pressed is Action.PLUS for state in list(states)))
+        touch.broken = True
+        _until(lambda: "touch: input device went away" in lines)
+        drawn = len(states)
+        _until(lambda: len(states) >= drawn + 3)
+        assert all(state.pressed is None for state in list(states)[drawn + 1:])
+    finally:
+        stop.set()
+        runner.join(5.0)
+    assert not runner.is_alive()
+    assert camera.shutter_us is None
+
+
+# -- controls while a job is processing ----------------------------------------------
+
+
+@pytest.mark.parametrize(("point", "kind"), [
+    (None, "select"), (PLUS_CENTRE, "plus"), (MINUS_CENTRE, "minus"),
+])
+def test_cell_and_key_taps_during_processing_are_ignored(tmp_path, monkeypatch, point, kind):
+    """The colour bars hide the cells and the keys, as they hide the 2x toggle:
+    no value change, no selection change and no flash."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        states = _spy_states(monkeypatch)
+        camera.set_shutter(4000)
+        loop, touch, display, clock = _loop(camera, ctl)
+        loop.step()
+        ctl.submit("busy")
+        _until(lambda: session.started.is_set())
+        _tap(loop, touch, clock, point or _cell(ISO_CELL))
+        assert loop.selected == SHUTTER_CELL
+        assert _values(camera) == (4000, None, None)
+        session.release.set()
+        _until(lambda: ctl.snapshot().finished_count == 1)
+        loop.step()
+        assert loop.state == "REVIEW"
+        _tap(loop, touch, clock, (160, 100))   # back to LIVE, clock barely moved
+        assert loop.state == "LIVE"
+        loop.step()
+        assert states[-1].pressed is None
+        assert states[-1].selected == SHUTTER_CELL
+        assert _values(camera) == (4000, None, None)
+        # and the same tap acts again once the live view is back
+        _tap(loop, touch, clock, point or _cell(ISO_CELL))
+        assert (loop.selected, camera.shutter_us) == {
+            "select": (ISO_CELL, 4000), "plus": (SHUTTER_CELL, 3125),
+            "minus": (SHUTTER_CELL, 5000),
+        }[kind]
+    finally:
+        session.release.set()
+        ctl.close()
+
+
+def test_a_shutter_tap_during_processing_still_reaches_the_controller(tmp_path, monkeypatch):
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        loop, touch, display, clock = _loop(camera, ctl)
+        ctl.submit("busy")
+        _until(lambda: session.started.is_set())
+        submitted = []
+        monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
+        _tap(loop, touch, clock, SHUTTER_CENTRE)
+        assert len(submitted) == 1
+    finally:
+        session.release.set()
+        ctl.close()
+
+
+def test_the_shutter_key_is_not_lit_when_the_live_view_returns_after_the_shot(
+    tmp_path, monkeypatch,
+):
+    """The tap's flash belongs to the frame it was tapped on. The fake clock does
+    not move here, so only clearing the flash (not its timeout) can pass this."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        states = _spy_states(monkeypatch)
+        loop, touch, display, clock = _loop(camera, ctl)
+        touch.tap(*SHUTTER_CENTRE)
+        loop.step()   # down
+        loop.step()   # up -> tap -> submit; this frame shows the key lit
+        assert states[-1].pressed is Action.SHUTTER
+        _until(lambda: session.started.is_set())
+        loop.step()   # colour bars
+        session.release.set()
+        _until(lambda: ctl.snapshot().finished_count == 1)
+        loop.step()
+        assert loop.state == "REVIEW"
+        touch.tap(160, 100)
+        loop.step()
+        loop.step()
+        assert loop.state == "LIVE"
+        drawn = len(states)
+        loop.step()
+        assert len(states) == drawn + 1
+        assert states[-1].pressed is None
+    finally:
+        session.release.set()
+        ctl.close()
 
 
 # -- touch on its own thread (long exposures) ---------------------------------------
@@ -986,12 +1534,38 @@ def test_a_quick_tap_registers_while_a_long_exposure_blocks_the_preview(controll
     runner.start()
     try:
         assert reading.wait(2.0), "the loop never read a preview frame"
-        touch.press(_centre(SHUTTER_MINUS_BOX), hold=0.15)
+        touch.press(MINUS_CENTRE, hold=0.15)
         _until(lambda: camera.shutter_us is None, timeout=3.0)
     finally:
         stop.set()
         runner.join(5.0)
     assert not runner.is_alive()
+
+
+def test_a_finger_held_on_plus_is_drawn_lit_while_the_touch_thread_polls(
+    controller, monkeypatch,
+):
+    """Under run() the finger's position comes from the touch thread, not the loop."""
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    touch = TimedTouch()
+    loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=time, frame_period=0.02)
+    stop = threading.Event()
+    runner = threading.Thread(target=loop.run, args=(stop,), daemon=True)
+    runner.start()
+    try:
+        _until(lambda: len(states) >= 2)
+        assert all(state.pressed is None for state in list(states))
+        touch.press(PLUS_CENTRE, hold=0.5)
+        _until(lambda: any(state.pressed is Action.PLUS for state in list(states)))
+        assert camera.shutter_us is None          # lit while down, nothing fired yet
+        _until(lambda: camera.shutter_us == 4000)  # one step, on release
+        _until(lambda: states[-1].pressed is None)
+    finally:
+        stop.set()
+        runner.join(5.0)
+    assert not runner.is_alive()
+    assert camera.shutter_us == 4000
 
 
 def test_the_touch_thread_stops_with_the_loop(controller):
@@ -1100,6 +1674,21 @@ def test_taps_are_hit_tested_at_the_display_scale(controller, monkeypatch):
     assert len(submitted) == 1
 
 
+def test_cells_and_keys_are_hit_tested_at_the_display_scale(controller, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl, display=BigDisplay())
+    x, y = _cell(ISO_CELL)
+    _tap(loop, touch, clock, (2 * x, 2 * y))
+    assert loop.selected == ISO_CELL
+    touch.script = [[TouchPoint(2 * PLUS_CENTRE[0], 2 * PLUS_CENTRE[1], 10)], []]
+    loop.step()
+    assert states[-1].pressed is Action.PLUS
+    clock.t += 0.1
+    loop.step()
+    assert camera.iso == 100 and camera.shutter_us is None
+
+
 def test_review_and_processing_screens_use_the_display_scale(controller):
     camera, ctl = controller
     loop, touch, display, clock = _loop(camera, ctl, display=BigDisplay())
@@ -1159,71 +1748,3 @@ def test_a_frame_between_stalls_resets_the_count(controller):
         camera.read = original
         loop.step()
     assert len(display.images) == 3
-
-
-def test_wb_taps_step_the_colour_temperature_and_wrap_to_auto(controller):
-    camera, ctl = controller
-    loop, touch, display, clock = _loop(camera, ctl)
-    loop.step()
-    _tap(loop, touch, clock, _centre(WB_BOX))
-    assert camera.colour_temperature_k == 3200
-    for _ in range(5):
-        _tap(loop, touch, clock, _centre(WB_BOX))
-    assert camera.colour_temperature_k == 7500
-    _tap(loop, touch, clock, _centre(WB_BOX))
-    assert camera.colour_temperature_k is None
-
-
-def test_live_view_passes_the_white_balance_to_the_renderer(controller, monkeypatch):
-    camera, ctl = controller
-    seen = []
-    real_render = viewfinder.render_live
-
-    def render(*args, **kwargs):
-        seen.append((kwargs.get("wb_button"), kwargs.get("wb_k")))
-        return real_render(*args, **kwargs)
-
-    monkeypatch.setattr(viewfinder, "render_live", render)
-    camera.set_colour_temperature(6500)
-    loop, touch, display, clock = _loop(camera, ctl)
-    loop.step()
-    assert seen == [(True, 6500)]
-
-
-@pytest.mark.parametrize("how", ["no_setter", "not_adjustable"])
-def test_a_camera_that_cannot_change_white_balance_draws_no_pill_and_ignores_taps(
-    controller, monkeypatch, how,
-):
-    camera, ctl = controller
-    seen = []
-    real_render = viewfinder.render_live
-
-    def render(*args, **kwargs):
-        seen.append(kwargs.get("wb_button"))
-        return real_render(*args, **kwargs)
-
-    monkeypatch.setattr(viewfinder, "render_live", render)
-    if how == "no_setter":
-        monkeypatch.setattr(type(camera), "set_colour_temperature", None, raising=False)
-    else:
-        camera.wb_adjustable = False
-    loop, touch, display, clock = _loop(camera, ctl)
-    loop.step()
-    _tap(loop, touch, clock, _centre(WB_BOX))
-    assert seen and not any(seen)
-    assert camera.colour_temperature_k is None
-
-
-def test_a_rejected_white_balance_is_logged_not_fatal(controller):
-    camera, ctl = controller
-    lines = []
-
-    def reject(k):
-        raise CameraError("control rejected")
-
-    camera.set_colour_temperature = reject
-    loop, touch, display, clock = _loop(camera, ctl, log=lines.append)
-    loop.step()
-    _tap(loop, touch, clock, _centre(WB_BOX))
-    assert any("control rejected" in line for line in lines)
-    assert loop.state == "LIVE"

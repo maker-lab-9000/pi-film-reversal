@@ -1,60 +1,19 @@
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from pifilm.display.meter import MeterReading
 from pifilm.display.ui import (
-    AMBER,
-    BAR_TOP,
     DASH,
-    DOUBLE_BOX,
-    FOCUS_BAR_X0,
-    FOCUS_BAR_X1,
-    FOCUS_BAR_Y0,
-    FOCUS_BAR_Y1,
     HEIGHT,
-    HIT_MARGIN,
-    NEEDLE_X0,
-    NEEDLE_Y,
     PROCESSING_BARS,
     PROCESSING_DIM,
-    SHUTTER_CENTRE,
-    SHUTTER_MINUS_BOX,
-    SHUTTER_PLUS_BOX,
-    SHUTTER_RADIUS,
-    WB_BOX,
     WIDTH,
-    Action,
-    hit,
+    _letterbox,
     iso_label,
-    render_live,
     render_message,
     render_processing,
     render_review,
     text_or_dash,
 )
-
-
-def _reading(**over):
-    base = dict(shutter="1/250", iso=100, ev_comp=0.0, lux=640.0, deviation_ev=0.0,
-                clip_pct=3.2, battery_percent=87, external_power=False)
-    base.update(over)
-    return MeterReading(**base)
-
-
-def test_render_live_is_320x240_rgb_with_a_darker_bar():
-    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
-    img = render_live(frame, _reading())
-    assert isinstance(img, Image.Image) and img.size == (320, 240) and img.mode == "RGB"
-    above = img.getpixel((160, BAR_TOP - 10))
-    inside = img.getpixel((160, BAR_TOP + 4))
-    assert sum(inside) < sum(above)
-
-
-def test_render_live_letterboxes_a_16_9_frame():
-    frame = np.full((360, 640, 3), 200, dtype=np.uint8)
-    img = render_live(frame, _reading())
-    assert img.getpixel((5, 5)) == (0, 0, 0)  # top band
-    assert img.getpixel((160, 120)) != (0, 0, 0)
 
 
 def test_render_processing_draws_the_same_colour_bars_as_the_opencv_screen():
@@ -88,25 +47,27 @@ def test_render_processing_is_black_below_the_bars_and_carries_a_label():
     assert bottom.max() > 200  # the label is drawn in white in the bottom quarter
 
 
-def test_render_live_handles_missing_fields():
-    frame = np.full((480, 640, 3), 40, dtype=np.uint8)
-    img = render_live(frame, _reading(shutter=None, iso=None, lux=None,
-                                       battery_percent=None, external_power=None))
-    assert img.size == (320, 240)
-
-
 def test_render_review_and_message_sizes():
     graded = np.full((3040, 4056, 3), 90, dtype=np.uint8)[::8, ::8]
-    assert render_review(graded, "1/250  ISO 100  0").size == (320, 240)
+    assert render_review(graded, "1/250  ISO 100").size == (320, 240)
     assert render_message("Capture failed", "camera_error").size == (320, 240)
+
+
+def test_the_review_caption_sits_on_a_darker_band_at_the_bottom():
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    img = render_review(frame, "1/250  ISO 100")
+    assert img.getpixel((160, 120)) == (200, 200, 200)
+    assert sum(img.getpixel((160, HEIGHT - 3))) < sum(img.getpixel((160, 120)))
 
 
 def test_missing_value_placeholder_is_ascii_dash_not_tofu_box():
     # ImageFont.load_default's bundled bitmap font has no glyph for U+2014 (em dash) or
     # U+2212 (minus sign): both rasterise as a hollow square "tofu" box under it, not a dash.
-    # Missing-value placeholders and the EV-minus label must use ASCII "-" instead.
+    # Missing-value placeholders must use ASCII "-" instead.
     assert text_or_dash(None) == DASH == "-"
+    assert text_or_dash("1/250") == "1/250"
     assert iso_label(None) == "ISO -"
+    assert iso_label(400) == "ISO 400"
     font = ImageFont.load_default(size=14)
 
     def render(ch):
@@ -119,214 +80,21 @@ def test_missing_value_placeholder_is_ascii_dash_not_tofu_box():
     assert dash_pixels < box_pixels
 
 
-def test_hit_regions():
-    cx, cy = SHUTTER_CENTRE
-    assert hit(cx, cy) == Action.SHUTTER
-    assert hit(cx + SHUTTER_RADIUS + 4, cy) == Action.SHUTTER   # 6 px margin
-    assert hit(cx + SHUTTER_RADIUS + 20, cy) == Action.NONE
-    assert hit(10, BAR_TOP + 10) == Action.EV_MINUS
-    assert hit(310, BAR_TOP + 10) == Action.EV_PLUS
-    assert hit(160, BAR_TOP + 10) == Action.NONE
-    assert hit(160, 100) == Action.NONE
+def test_letterbox_bands_a_16_9_frame_and_fills_a_4_3_one():
+    """Shared with the live screen: the whole frame is shown, never cropped or stretched."""
+    wide = _letterbox(np.full((360, 640, 3), 200, dtype=np.uint8))
+    assert wide.size == (WIDTH, HEIGHT) and wide.mode == "RGB"
+    assert wide.getpixel((5, 5)) == (0, 0, 0)            # band above the picture
+    assert wide.getpixel((160, 120)) == (200, 200, 200)
+    full = _letterbox(np.full((480, 640, 3), 200, dtype=np.uint8))
+    assert full.getpixel((0, 0)) == full.getpixel((319, 239)) == (200, 200, 200)
 
 
-FOCUS_GREEN = (0, 220, 90)
-_BAR_MID_X = (FOCUS_BAR_X0 + FOCUS_BAR_X1) // 2
-
-
-def _live(focus):
-    frame = np.full((480, 640, 3), 128, dtype=np.uint8)
-    return render_live(frame, _reading(focus=focus))
-
-
-def test_focus_bar_fills_to_the_top_when_the_image_is_at_its_sharpest():
-    img = _live(1.0)
-    assert img.getpixel((_BAR_MID_X, FOCUS_BAR_Y1 - 5)) == FOCUS_GREEN   # near the bottom
-    assert img.getpixel((_BAR_MID_X, FOCUS_BAR_Y0 + 6)) == FOCUS_GREEN   # near the top
-
-
-def test_focus_bar_only_fills_from_the_bottom_when_focus_is_low():
-    img = _live(0.2)
-    assert img.getpixel((_BAR_MID_X, FOCUS_BAR_Y1 - 5)) == FOCUS_GREEN
-    assert img.getpixel((_BAR_MID_X, FOCUS_BAR_Y0 + 6)) != FOCUS_GREEN
-
-
-def test_no_focus_bar_is_drawn_when_focus_is_not_computed():
-    img = _live(None)
-    column = [img.getpixel((_BAR_MID_X, y)) for y in range(FOCUS_BAR_Y0, FOCUS_BAR_Y1 + 1)]
-    assert FOCUS_GREEN not in column
-
-
-def _amber_rows(img):
-    return [y for y in range(FOCUS_BAR_Y0, FOCUS_BAR_Y1 + 1)
-            if img.getpixel((_BAR_MID_X, y)) == AMBER]
-
-
-def test_focus_bar_peak_mark_sits_at_the_peak_level_over_the_green():
-    """The mark is what the user turns the ring back towards; it is drawn over
-    the green so a bar at the peak still shows it."""
-    frame = np.full((480, 640, 3), 128, dtype=np.uint8)
-    full = render_live(frame, _reading(focus=1.0, focus_peak=1.0))
-    assert _amber_rows(full) and max(_amber_rows(full)) <= FOCUS_BAR_Y0 + 3
-    half = render_live(frame, _reading(focus=0.2, focus_peak=0.5))
-    mid = (FOCUS_BAR_Y0 + FOCUS_BAR_Y1) // 2
-    assert _amber_rows(half) and all(abs(y - mid) <= 3 for y in _amber_rows(half))
-
-
-def test_focus_bar_has_no_peak_mark_before_anything_has_scored():
-    assert _amber_rows(_live(0.0)) == []
-
-
-def test_focus_bar_clears_the_ev_minus_button_and_its_hit_region():
-    assert FOCUS_BAR_Y1 <= BAR_TOP - 8
-    for y in (FOCUS_BAR_Y0, (FOCUS_BAR_Y0 + FOCUS_BAR_Y1) // 2, FOCUS_BAR_Y1):
-        assert hit(_BAR_MID_X, y) == Action.NONE
-
-
-def test_focus_bar_does_not_disturb_the_rest_of_the_screen():
-    frame = np.full((480, 640, 3), 128, dtype=np.uint8)
-    with_bar = np.array(render_live(frame, _reading(focus=0.5)))
-    without = np.array(render_live(frame, _reading(focus=None)))
-    right_of_bar = np.s_[:, FOCUS_BAR_X1 + 6:]
-    assert np.array_equal(with_bar[right_of_bar], without[right_of_bar])
-
-
-def _box_pixels(img):
-    x0, y0, x1, y1 = DOUBLE_BOX
-    return np.asarray(img)[y0:y1 + 1, x0:x1 + 1]
-
-
-def test_no_badge_unless_asked():
-    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
-    assert np.array_equal(
-        np.asarray(render_live(frame, _reading())),
-        np.asarray(render_live(frame, _reading(), None)),
-    )
-    # the corner is the plain frame
-    assert np.all(_box_pixels(render_live(frame, _reading()))[6:10, 2:6] == 200)
-
-
-def test_badge_off_is_dark_on_is_amber():
-    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
-    off = np.asarray(render_live(frame, _reading(), (False, 0)))
-    on = np.asarray(render_live(frame, _reading(), (True, 0)))
-    x, y = DOUBLE_BOX[0] + 4, (DOUBLE_BOX[1] + DOUBLE_BOX[3]) // 2
-    assert off[y, x].max() < 150
-    assert tuple(on[y, x]) == AMBER
-
-
-def test_badge_shows_progress():
-    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
-    zero = _box_pixels(render_live(frame, _reading(), (True, 0)))
-    one = _box_pixels(render_live(frame, _reading(), (True, 1)))
-    assert not np.array_equal(zero, one)
-
-
-def test_badge_tap_is_the_double_toggle():
-    x0, y0, x1, y1 = DOUBLE_BOX
-    assert hit((x0 + x1) // 2, (y0 + y1) // 2) is Action.DOUBLE_TOGGLE
-    assert hit(x1 + HIT_MARGIN, y1 + HIT_MARGIN) is Action.DOUBLE_TOGGLE
-    assert hit(x1 + HIT_MARGIN + 1, (y0 + y1) // 2) is Action.NONE
-
-
-def test_badge_region_overlaps_no_other_control():
-    x0, y0, x1, y1 = DOUBLE_BOX
-    for x in range(max(0, x0 - HIT_MARGIN), x1 + HIT_MARGIN + 1):
-        for y in range(max(0, y0 - HIT_MARGIN), y1 + HIT_MARGIN + 1):
-            assert hit(x, y) is Action.DOUBLE_TOGGLE
-    # clear of the focus bar's backing, which starts at FOCUS_BAR_Y0 - 4
-    assert y1 + HIT_MARGIN < FOCUS_BAR_Y0 - 4
-    assert hit(*SHUTTER_CENTRE) is Action.SHUTTER
-
-
-def _box_centre(box):
-    x0, y0, x1, y1 = box
-    return (x0 + x1) // 2, (y0 + y1) // 2
-
-
-def test_shutter_buttons_hit_inside_their_boxes_and_margins():
-    assert hit(*_box_centre(SHUTTER_PLUS_BOX)) is Action.SHUTTER_FASTER
-    assert hit(*_box_centre(SHUTTER_MINUS_BOX)) is Action.SHUTTER_SLOWER
-    x0, y0, x1, y1 = SHUTTER_PLUS_BOX
-    assert hit(x0 - HIT_MARGIN, y0 - HIT_MARGIN) is Action.SHUTTER_FASTER
-    x0, y0, x1, y1 = SHUTTER_MINUS_BOX
-    assert hit(x1 + HIT_MARGIN, y1 + HIT_MARGIN) is Action.SHUTTER_SLOWER
-
-
-def test_shutter_button_regions_overlap_no_other_control():
-    cx, cy = SHUTTER_CENTRE
-    for box, action in ((SHUTTER_PLUS_BOX, Action.SHUTTER_FASTER),
-                        (SHUTTER_MINUS_BOX, Action.SHUTTER_SLOWER)):
-        x0, y0, x1, y1 = box
-        for x in range(x0 - HIT_MARGIN, min(WIDTH, x1 + HIT_MARGIN + 1)):
-            for y in range(y0 - HIT_MARGIN, y1 + HIT_MARGIN + 1):
-                assert hit(x, y) is action, (x, y)
-    # the shutter button still owns its whole circle
-    assert hit(cx, cy - SHUTTER_RADIUS - HIT_MARGIN) is Action.SHUTTER
-    assert hit(cx, cy + SHUTTER_RADIUS + HIT_MARGIN) is Action.SHUTTER
-    assert SHUTTER_MINUS_BOX[3] + HIT_MARGIN < BAR_TOP - HIT_MARGIN
-
-
-def test_shutter_buttons_are_drawn_only_when_asked():
-    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
-    plain = np.asarray(render_live(frame, _reading()))
-    with_buttons = np.asarray(render_live(frame, _reading(), shutter_buttons=True))
-    x0, y0, x1, y1 = SHUTTER_PLUS_BOX
-    assert np.array_equal(plain[y0:y1 + 1, x0:x1 + 1], np.full_like(
-        plain[y0:y1 + 1, x0:x1 + 1], 200))
-    assert not np.array_equal(plain[y0:y1 + 1, x0:x1 + 1],
-                              with_buttons[y0:y1 + 1, x0:x1 + 1])
-
-
-def test_fixed_shutter_readout_is_prefixed(monkeypatch):
-    drawn = []
-    real = ImageDraw.ImageDraw.text
-
-    def spy(self, xy, text, *a, **k):
-        drawn.append(text)
-        return real(self, xy, text, *a, **k)
-
-    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
-    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
-    render_live(frame, _reading(shutter="1/250", shutter_fixed=True))
-    assert any(t.startswith("S 1/250") for t in drawn)
-    drawn.clear()
-    render_live(frame, _reading(shutter="1/250"))
-    assert any(t.startswith("1/250") for t in drawn)
-
-
-def test_iso_max_is_amber(monkeypatch):
-    calls = []
-    real = ImageDraw.ImageDraw.text
-
-    def spy(self, xy, text, *a, **k):
-        calls.append((text, k.get("fill")))
-        return real(self, xy, text, *a, **k)
-
-    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
-    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
-    render_live(frame, _reading(iso_max=True))
-    assert ("ISO MAX", AMBER + (255,)) in calls
-
-
-def test_fixed_or_maxed_readout_clears_the_needle(monkeypatch):
-    runs = []
-    real = ImageDraw.ImageDraw.text
-
-    def spy(self, xy, text, *a, **k):
-        if xy[1] == BAR_TOP + 3:  # line 1 only
-            runs.append((xy[0], text, k["font"]))
-        return real(self, xy, text, *a, **k)
-
-    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
-    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
-    for over in (dict(iso_max=True, ev_comp=1.7, iso=3200),
-                 dict(iso_max=True, ev_comp=-1.7, iso=3200),
-                 dict(iso_max=False, ev_comp=-1.7, iso=2200)):
-        runs.clear()
-        render_live(frame, _reading(shutter="1/2000", shutter_fixed=True, **over))
-        right = max(x + font.getlength(text) for x, text, font in runs)
-        assert right <= NEEDLE_X0 - 6, (over, right)
+def test_letterbox_fits_the_frame_to_a_640x480_panel():
+    wide = _letterbox(np.full((360, 640, 3), 200, dtype=np.uint8), (640, 480))
+    assert wide.size == (640, 480)
+    assert wide.getpixel((320, 30)) == (0, 0, 0)          # band above the picture
+    assert wide.getpixel((320, 240)) == (200, 200, 200)   # picture, not stretched
 
 
 # -- scale ----------------------------------------------------------------------
@@ -335,9 +103,7 @@ def test_fixed_or_maxed_readout_clears_the_needle(monkeypatch):
 def test_every_screen_renders_at_640x480_at_scale_2():
     frame = np.full((480, 640, 3), 200, dtype=np.uint8)
     images = [
-        render_live(frame, _reading(focus=0.5, focus_peak=0.7), (True, 1),
-                    shutter_buttons=True, scale=2),
-        render_review(frame, "1/250  ISO 100  EV 0", scale=2),
+        render_review(frame, "1/250  ISO 100", scale=2),
         render_processing(scale=2),
         render_message("Capture failed", "camera busy", scale=2),
     ]
@@ -347,23 +113,9 @@ def test_every_screen_renders_at_640x480_at_scale_2():
 
 def test_scale_1_is_the_default_and_unchanged():
     frame = np.full((480, 640, 3), 200, dtype=np.uint8)
-    assert render_live(frame, _reading(), scale=1).tobytes() == render_live(
-        frame, _reading()).tobytes()
-
-
-def test_render_live_letterboxes_a_16_9_frame_at_scale_2():
-    frame = np.full((360, 640, 3), 200, dtype=np.uint8)
-    img = render_live(frame, _reading(battery_percent=None), scale=2)
-    assert img.getpixel((320, 30)) == (0, 0, 0)          # band above the picture
-    assert img.getpixel((320, 240)) == (200, 200, 200)   # picture, not stretched
-
-
-def test_the_bar_is_in_the_same_place_at_scale_2():
-    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
-    img = render_live(frame, _reading(), scale=2)
-    above = img.getpixel((320, 2 * (BAR_TOP - 10)))
-    inside = img.getpixel((320, 2 * (BAR_TOP + 4)))
-    assert sum(inside) < sum(above)
+    assert render_review(frame, "1/250  ISO 100", scale=1).tobytes() == render_review(
+        frame, "1/250  ISO 100").tobytes()
+    assert render_processing(scale=1).tobytes() == render_processing().tobytes()
 
 
 def test_processing_bars_leave_no_gaps_at_scale_2():
@@ -372,56 +124,3 @@ def test_processing_bars_leave_no_gaps_at_scale_2():
     for x in (boundary - 1, boundary):
         assert img.getpixel((x, 100)) != (0, 0, 0)
     assert img.getpixel((639, 100)) != (0, 0, 0)
-
-
-def test_hit_regions_scale_with_the_screen():
-    cx, cy = SHUTTER_CENTRE
-    points = [
-        (cx, cy), (10, BAR_TOP + 10), (310, BAR_TOP + 10), (160, 100),
-        ((DOUBLE_BOX[0] + DOUBLE_BOX[2]) // 2, (DOUBLE_BOX[1] + DOUBLE_BOX[3]) // 2),
-        ((SHUTTER_PLUS_BOX[0] + SHUTTER_PLUS_BOX[2]) // 2, SHUTTER_PLUS_BOX[1] + 5),
-        ((SHUTTER_MINUS_BOX[0] + SHUTTER_MINUS_BOX[2]) // 2, SHUTTER_MINUS_BOX[1] + 5),
-    ]
-    for x, y in points:
-        assert hit(2 * x, 2 * y, scale=2) == hit(x, y)
-        assert hit(2 * x + 1, 2 * y + 1, scale=2) == hit(x, y)
-    assert hit(639, 479, scale=2) == Action.EV_PLUS
-
-
-def test_needle_scale_ticks_are_drawn_at_every_scale():
-    """The ticks pass no line width. Pillow 12 draws nothing for a width of 0, so
-    the wrapper must not turn "unspecified" into 0 (it did, and the ticks vanished
-    from the 2.8" panel with no other test noticing)."""
-    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
-    for scale in (1, 2):
-        img = render_live(frame, _reading(), scale=scale)
-        tick = img.getpixel((scale * NEEDLE_X0, scale * (NEEDLE_Y - 2)))   # end of the -3 tick
-        bar = img.getpixel((scale * (NEEDLE_X0 + 6), scale * (NEEDLE_Y - 2)))
-        assert sum(tick) > sum(bar) + 150, scale
-
-
-def test_wb_pill_hits_inside_its_box_and_overlaps_no_other_control():
-    x0, y0, x1, y1 = WB_BOX
-    for x in range(x0 - HIT_MARGIN, x1 + HIT_MARGIN + 1):
-        for y in range(max(0, y0 - HIT_MARGIN), y1 + HIT_MARGIN + 1):
-            assert hit(x, y) is Action.WB_NEXT, (x, y)
-    # one unclaimed column separates it from the double-exposure toggle
-    assert hit(x0 - HIT_MARGIN - 1, (y0 + y1) // 2) is Action.NONE
-    assert hit(x0 - HIT_MARGIN - 2, (y0 + y1) // 2) is Action.DOUBLE_TOGGLE
-    assert hit(x1 + HIT_MARGIN + 1, (y0 + y1) // 2) is Action.NONE
-    assert hit(*_box_centre(WB_BOX), scale=1) is Action.WB_NEXT
-    assert hit(2 * (x0 + 10), 2 * (y0 + 5), scale=2) is Action.WB_NEXT
-
-
-def test_wb_pill_is_drawn_only_when_asked_and_turns_amber_when_fixed():
-    frame = np.full((240, 320, 3), 200, dtype=np.uint8)
-    x0, y0, x1, y1 = WB_BOX
-    region = lambda image: np.asarray(image)[y0:y1 + 1, x0:x1 + 1]  # noqa: E731
-    plain = region(render_live(frame, _reading()))
-    auto = region(render_live(frame, _reading(), wb_button=True))
-    fixed = region(render_live(frame, _reading(), wb_button=True, wb_k=5600))
-    assert np.array_equal(plain, np.full_like(plain, 200))
-    assert not np.array_equal(plain, auto)
-    amber = np.array(AMBER, dtype=np.uint8)
-    assert not (auto == amber).all(axis=-1).any()
-    assert (fixed == amber).all(axis=-1).mean() > 0.4

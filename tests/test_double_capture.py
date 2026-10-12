@@ -100,9 +100,10 @@ def test_exposure_two_grades_the_composite_once(tmp_path, pipeline, monkeypatch)
 def test_each_exposure_keeps_the_ev_it_was_shot_at(tmp_path, pipeline):
     session = _session(tmp_path, pipeline)
     session.set_double_exposure(True)
-    session.camera.set_ev(-1.0)
+    # No camera sets a non-zero EV any more; the session still reads the attribute.
+    session.camera.ev = -1.0
     session.capture()
-    session.camera.set_ev(0.0)
+    session.camera.ev = 0.0
     session.capture()
     assert _records(session)[1]["double"]["ev_comp"] == [-1.0, 0.0]
 
