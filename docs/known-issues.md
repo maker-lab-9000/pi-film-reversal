@@ -218,6 +218,15 @@ step, agreement, or leaving the live view allows another. What the user sees and
 the exact lines are in
 [`lcd-viewfinder.md`](lcd-viewfinder.md#manual-controls).
 
+Run on the Pi 4 on 2026-10-12 with this containment in place: four white-balance
+changes made after a photo (to 4000 K, 5600 K, 4000 K and 6500 K) were each
+reported `not in the live view after 1.5 s`, restarted once, and reported
+`applied after restarting the live view` within a second, with the picture's
+R/G and B/G following (for example 1.53 / 0.66 to 2.09 / 0.04 for 2533 K to
+4000 K). Shutter changes after a photo applied live with no restart. With the
+frame thread, taps at a 1 s shutter answered at once and the journal kept
+about 10 fps at fast shutters.
+
 ### If someone investigates further
 
 Collect the journal around a failure:
