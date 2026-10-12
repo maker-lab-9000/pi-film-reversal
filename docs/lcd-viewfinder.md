@@ -328,13 +328,17 @@ is selected, and only that one.
     (likewise `ISO 800`). If two resends change nothing the live view is restarted:
     `camera: shutter 1/250 still not in the live view after 2 resends; restarting the live view; picture ...`.
   The first frame that agrees again logs `camera: ... applied after resend` or
-  `... applied after restarting the live view`. There is one restart per selection: if
-  the disagreement outlives it, `camera: ... not applied even after restarting the live view`
-  is logged once and the live view is not restarted again for that value (shutter and
-  ISO go on being resent every 3 s, with the `resending` line written at most once in
-  30 s and a count of the ones held back; white balance is left alone). A step, a
+  `... applied after restarting the live view`. There is one restart per control per
+  selection: if the disagreement outlives it, or goes away and comes back,
+  `camera: ... not applied even after restarting the live view` is logged once and the
+  live view is not restarted again for that value (shutter and ISO go on being resent
+  every 3 s, with the `resending` line written at most once in 30 s and a count of the
+  ones held back; white balance is left alone). A step that changes that control, a
   photo, a review or a dark screen starts afresh and may restart again, but two
-  restarts are never less than 5 s apart. The lines end with the picture's colour,
+  restarts are never less than 5 s apart. A restart for an auto white balance that has
+  not moved also ends the watch on auto until a white balance is next fixed, so a
+  capped lens or a dark scene, where auto reports the old value for good, costs one
+  blink and no more. The lines end with the picture's colour,
   the means of the preview frame's red and blue channels over its green one. They are
   the evidence of the camera not taking a live control:
   `journalctl -u pifilm-capture | grep -E 'camera:|control:'`.

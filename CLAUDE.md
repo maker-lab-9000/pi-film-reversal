@@ -175,7 +175,7 @@ control setters only the configuration lock, and a still holds both (request fir
 frame's metadata is checked against the fixed shutter/ISO/white balance, because the Pi 4 ignores
 live white-balance changes after a photo (`docs/known-issues.md`): a white-balance mismatch lasting
 1.5 s and 6 frames restarts the live view at once (`restart_preview`), a shutter/ISO one lasting 3 s
-is resent (`reassert_controls`) and restarted after two resends, one restart per selection; each
+is resent (`reassert_controls`) and restarted after two resends, one restart per control per selection; each
 successful step also logs one `control: ...` trace line about 2 s later (selection, what the camera
 reports, the picture's R/G and B/G). The DSI panel has no brightness control, so it
 skips the idle dim step and only turns off. All hardware imports (`pykms`, `spidev`, `gpiozero`,

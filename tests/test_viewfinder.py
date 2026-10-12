@@ -2612,13 +2612,9 @@ def test_an_auto_white_balance_that_has_not_moved_is_given_four_seconds(controll
     assert (camera.reassert_count, camera.restart_count) == (0, 1)
     assert logs == ["camera: auto white balance has not moved from 7500K after 4.0 s; "
                     "restarting the live view" + PICTURE]
-    camera._metadata = {**AGREEING, "ColourTemperature": 7400}
-    _live_frames(loop, clock, 1, dt=0.5)
-    assert logs[-1] == "camera: auto white balance applied after restarting the live view"
-    # Auto has taken over: landing on the old value later is not a fault.
-    camera._metadata = dict(AGREEING)
+    # That was the one restart of this return to auto; auto is not watched again.
     _live_frames(loop, clock, 40, dt=0.5)
-    assert camera.restart_count == 1
+    assert camera.restart_count == 1 and len(logs) == 1
 
 
 def test_an_auto_white_balance_that_moves_in_time_is_left_alone(controller):
@@ -2728,6 +2724,181 @@ def test_a_camera_that_cannot_restart_still_gets_the_white_balance_line(controll
     assert camera.reassert_count == 0
     assert logs == ["camera: white balance 7500K not in the live view after 1.6 s "
                     "(camera reports 4250K); cannot restart the live view" + PICTURE]
+
+
+# -- the control check: review follow-ups -------------------------------------------
+
+
+@pytest.mark.parametrize("fix, key, value, mismatch", [
+    (_fix_shutter, "ExposureTime", 4000 * 1.051, True),
+    (_fix_shutter, "ExposureTime", 4000 * 0.949, True),
+    (_fix_shutter, "ExposureTime", 4000 * 1.049, False),
+    (_fix_shutter, "ExposureTime", 4000 * 0.951, False),
+    (_fix_iso, "AnalogueGain", 8.0 * 1.051, True),
+    (_fix_iso, "AnalogueGain", 8.0 * 0.949, True),
+    (_fix_iso, "AnalogueGain", 8.0 * 1.049, False),
+    (_fix_iso, "AnalogueGain", 8.0 * 0.951, False),
+    (_fix_wb, "ColourTemperature", 7601, True),
+    (_fix_wb, "ColourTemperature", 7399, True),
+    (_fix_wb, "ColourTemperature", 7599, False),
+    (_fix_wb, "ColourTemperature", 7401, False),
+])
+def test_the_tolerances_are_five_per_cent_and_a_hundred_kelvin(
+    controller, fix, key, value, mismatch,
+):
+    camera, ctl = controller
+    fix(camera)
+    camera._metadata = {**AGREEING, key: value}
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 6)
+    assert (camera.reassert_count + camera.restart_count == 1) is mismatch
+    assert bool(logs) is mismatch
+
+
+def test_a_white_balance_that_flaps_restarts_the_live_view_once(controller):
+    """A control that agrees for a frame and disagrees again must not buy a new
+    restart each time: the picture would blink every five seconds for as long
+    as it went on. The restart belongs to the selection."""
+    camera, ctl = controller
+    _fix_wb(camera)
+    wrong = camera._metadata
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 1
+    for _ in range(5):
+        camera._metadata = dict(AGREEING)
+        _live_frames(loop, clock, 1, dt=WB_STEP)
+        camera._metadata = wrong
+        _live_frames(loop, clock, 30, dt=WB_STEP)       # nearly ten seconds each time
+    assert (camera.reassert_count, camera.restart_count) == (0, 1)
+    assert sum("; restarting the live view;" in line for line in logs) == 1
+    assert sum("not applied even after" in line for line in logs) == 1
+    # A step that changes the white balance is a new selection: one more restart.
+    _tap(loop, touch, clock, _cell(WB_CELL))
+    _tap(loop, touch, clock, MINUS_CENTRE)
+    assert camera.colour_temperature_k == 6500
+    _live_frames(loop, clock, 30, dt=WB_STEP)
+    assert camera.restart_count == 2
+
+
+def test_a_shutter_that_flaps_is_restarted_once_and_then_only_resent(controller):
+    camera, ctl = controller
+    _fix_shutter(camera)
+    wrong = camera._metadata
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 18)
+    assert (camera.reassert_count, camera.restart_count) == (2, 1)
+    for _ in range(3):
+        camera._metadata = dict(AGREEING)
+        _live_frames(loop, clock, 1)
+        camera._metadata = wrong
+        _live_frames(loop, clock, 30)                   # five waits: five resends
+    assert (camera.reassert_count, camera.restart_count) == (17, 1)
+
+
+def test_a_step_of_another_control_does_not_buy_a_new_restart(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 1
+    clock.t += 10.0
+    _tap(loop, touch, clock, PLUS_CENTRE)               # the shutter cell is selected
+    assert camera.shutter_us is not None
+    camera._metadata = {**camera._metadata, "ExposureTime": camera.shutter_us}
+    _live_frames(loop, clock, 30, dt=WB_STEP)
+    assert camera.restart_count == 1
+
+
+def test_two_controls_that_disagree_share_one_restart(controller):
+    """The restart re-applies every control, so it is spent for each of them."""
+    camera, ctl = controller
+    camera.set_shutter(4000)
+    camera.set_colour_temperature(7500)
+    camera._metadata = {**AGREEING, "ExposureTime": 33333, "ColourTemperature": 4250}
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert camera.restart_count == 1                    # the white balance's
+    _live_frames(loop, clock, 120)                      # the shutter: resends only
+    assert camera.restart_count == 1 and camera.reassert_count >= 10
+    assert sum("restarting the live view;" in line for line in logs) == 1
+
+
+@pytest.mark.parametrize("fails", [True, False])
+def test_the_five_seconds_between_restarts_count_from_the_end_of_the_first(controller, fails):
+    """A restart can take seconds (it waits for the exposure in flight and for
+    the camera); counted from its start, the gap to the next would shrink."""
+    camera, ctl = controller
+    loop, touch, clock, logs = _wb_selected_then_ignored(camera, ctl)
+    attempts = []
+
+    def slow_restart():
+        attempts.append(clock.t)
+        clock.t += 3.0
+        if fails:
+            raise CameraError("Picamera2 failed to restart the live view: busy")
+
+    camera.restart_preview = slow_restart
+    _live_frames(loop, clock, 6, dt=WB_STEP)
+    assert len(attempts) == 1
+    finished = attempts[0] + 3.0
+    _tap(loop, touch, clock, PLUS_CENTRE)               # a new selection, also ignored
+    _live_frames(loop, clock, 12, dt=WB_STEP)           # past both limits
+    assert clock.t - finished < 5.0 and len(attempts) == 1
+    clock.t = finished + 5.01                           # 5.0 is a rounding error either way
+    _live_frames(loop, clock, 1)
+    assert len(attempts) == 2
+
+
+def test_a_still_auto_white_balance_is_restarted_once_and_never_again(controller):
+    """With the lens capped or in the dark, auto reports the old value exactly
+    and for good. One restart is the remedy; a second after every photo is not."""
+    camera, ctl = controller
+    camera.set_colour_temperature(7500)
+    camera._metadata = dict(AGREEING)
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 2, dt=0.5)
+    camera.set_colour_temperature(None)
+    _live_frames(loop, clock, 40, dt=0.5)
+    assert camera.restart_count == 1 and len(logs) == 1
+    ctl.submit("one")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "REVIEW"
+    _tap(loop, touch, clock, (5, 5))
+    _live_frames(loop, clock, 40, dt=0.5)
+    assert camera.restart_count == 1 and len(logs) == 1
+
+
+def test_frames_that_cannot_tell_restart_the_wait_without_ending_it(controller):
+    """Without this, a control whose metadata went missing for a minute would
+    be acted on by the first frame that brought it back."""
+    camera, ctl = controller
+    _fix_shutter(camera)
+    wrong = camera._metadata
+    loop, touch, clock, logs = _check_loop(camera, ctl)
+    _live_frames(loop, clock, 5)
+    camera._metadata = None
+    _live_frames(loop, clock, 1)
+    camera._metadata = wrong
+    _live_frames(loop, clock, 5)
+    assert camera.reassert_count == 0 and logs == []
+    _live_frames(loop, clock, 1)
+    assert camera.reassert_count == 1
+    assert "after 7.0 s" in logs[0]                     # counted from the first disagreement
+
+
+def test_the_time_a_restart_takes_is_not_averaged_into_the_frame_rate(controller):
+    camera, ctl = controller
+    _fix_wb(camera)
+    loop, touch, clock, logs = _check_loop(camera, ctl, prefix="viewfinder:")
+
+    def slow_restart():
+        clock.t += 8.0
+
+    camera.restart_preview = slow_restart
+    _live_frames(loop, clock, 60, dt=WB_STEP)
+    assert float(logs[0].split()[1]) > 3.0              # 3.1 frames a second, not 0.8
 
 
 # -- a trace line after every control step ------------------------------------------
