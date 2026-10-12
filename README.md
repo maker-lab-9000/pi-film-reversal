@@ -65,7 +65,7 @@ More in [the viewfinder guide](docs/lcd-viewfinder.md).
 
 ## Hardware
 - Raspberry Pi 4, 4GB RAM
-- M5Stack StickS3 (display, trigger)
+- M5Stack StickS3 (display, trigger) - disabled
 - Waveshare 3.5 inch DSI LCD (E) touchscreen (viewfinder, shutter, manual shutter / ISO / white balance, light meter, focus gauge, battery)
 - A momentary push button on two jumper wires (physical shutter button, GPIO 21)
 - x728 UPS Shield + Geekworm X728-C1 Metal Case
@@ -82,14 +82,11 @@ Full walkthrough: **[the setup guide](docs/setup.md)** — ordered by dependency
 More detail lives in the docs: the [network & deployment guide](docs/sticks3-remote.md)
 (hotspot, Ethernet, service, rollback) and the [firmware README](firmware/sticks3/README.md)
 
-| Last captured photo | Ready to capture |
-| --- | --- |
-| <img src="docs/images/sticks3-ready.jpg" alt="M5Stack StickS3 showing TV colour bars and the READY prompt" height="280"> | <img src="docs/images/sticks3-captured-photo.jpg" alt="M5Stack StickS3 displaying a captured room photo" height="280"> |
 
 ## From shutter button to saved photo
 
 ```text
-Press the button (GPIO 21) — or tap the screen, or press the Stick
+Press the button (GPIO 21) — or tap the screen
     ↓
 The Pi takes one photo at a time. A press during a photo is ignored.
     ↓ colour bars on the screen
@@ -99,7 +96,7 @@ Grade: normalize → 3D LUT → grain
     ↓
 Save: original JPEG + raw DNG + graded JPEG + one line in captures.jsonl
     ↓
-The screen shows the graded photo. The Stick shows a small copy.
+The screen shows the graded photo.
 ```
 
 The grading has three steps, always in this order:
@@ -228,7 +225,7 @@ How it behaves:
 - **No-op off the wired LAN** — each run exits at once unless `eth0` has a home-LAN IP and Nextcloud answers a TCP connect, so a frequent timer is cheap.
 - **Incremental** — syncs the originals, `_graded.jpg`, `.dng` raws and `captures.jsonl`, skipping anything already uploaded.
 
-Scheduling is a **systemd timer, not cron**: `pifilm-nextcloud-sync.timer` runs the oneshot a few minutes after boot, then every 15 min (`OnUnitActiveSec=15min`, `Persistent=true`). Nothing runs until you install and enable it.
+Scheduling is a **systemd timer, not cron**: `pifilm-nextcloud-sync.timer` runs the oneshot a few minutes after boot, then every 15 min (`OnUnitActiveSec=15min`, `Persistent=true`).
 
 Setup, on the Pi:
 
