@@ -131,16 +131,21 @@ fitted on normalized input; grain runs last because it models developed film.
   `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,graded|double_graded}.jpg` plus an audit
   line in `captures.jsonl` (LUT hash, normalisation hash and grain seed allow regenerating the
   graded file). `--grade background` (the default) splits a shot into two sides: the
-  capture side saves the original, writes a pending entry, makes a quick grade (reduced four
-  times each way, no grain; what the review screen and the Stick show) and frees the camera;
+  capture side saves the original, writes a pending entry, makes a quick grade (reduced by a whole
+  factor to about 1,000 px on the long side, no grain; what the review screen and the Stick show) and frees the camera;
   the grade side (`_run_grade`, on the queue's worker) grades at full size, saves the graded
   file, appends the record and removes the entry, in that order. Such a record gains
   `shutter_to_ready_ms`, `grade: "background"`, stages `preview` and `queued`, and
   `recovered: true` when it was finished at a later start from the saved JPEG.
   `--grade inline` is the earlier behaviour, with no queue and no new fields; `--state-dir`
-  moves the pending entries (default `~/.local/state/pifilm/pending`). SIGTERM ends every
-  loop the way Ctrl-C does (`main` turns the first one into an interrupt), so a service stop
-  finishes the queue; a power cut or a kill leaves entries for the next start. Each record also carries `stage_ms`, the
+  moves the pending entries (default `~/.local/state/pifilm/pending`). With background grading the original (and DNG) are
+  fsynced before the entry is written, and the graded file and the log line before it is removed.
+  SIGTERM ends every loop the way Ctrl-C does (`main` raises `_Terminated` in the main thread;
+  the viewfinder's own handler sets its stop event instead), and every clean-up starts with
+  `_ignore_sigterm`, so a later SIGTERM cannot break into it. A stop finishes the photographs
+  taken in this run; recovered grades not yet started keep their entries for the next start,
+  as does anything a power cut or a kill interrupts. Just after a restart with many unfinished
+  grades the recovered ones go first, and a fourth new shot waits for them. Each record also carries `stage_ms`, the
   milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, LUT,
   grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`
   is the plan those numbers feed.
@@ -150,12 +155,13 @@ fitted on normalized input; grain runs last because it models developed film.
   (never under the synced output folder); toggled via `CaptureController.set_double_exposure`.
 - `gradequeue.py`: `GradeQueue`, one `pifilm-grade` worker with three waiting places (a full
   queue makes the next capture wait), and the pending entries: atomically written JSON files
-  that let the next start finish a grade a power cut interrupted. An entry that fails twice is
-  renamed `*.failed`. No camera, pipeline or display in it.
+  that let the next start finish a grade a power cut interrupted. A failed grade is logged by its entry's name; an entry that fails twice is
+  renamed `*.failed` (a second log line says so). `close()` finishes the running job and
+  those accepted by `submit`, and drops the recovery backlog not yet started. No camera, pipeline or display in it.
 - `controller.py`: `CaptureController` serializes captures on one worker thread, one active job at
   a time, idempotent by `request_id`. Shared by the local SPACE key, the LCD, the GPIO shutter
   button and the remote API. `ControllerSnapshot.pending_grades` is read live from the session
-  (it includes a recovery backlog), and closing finishes the grades before the camera closes.
+  (it includes a recovery backlog), and closing finishes this run's grades before the camera closes.
 - `button.py`: optional physical shutter button (`--shutter-gpio BCM`, documented on BCM 21 with
   ground on physical pin 39). gpiozero `Button` with the internal pull-up, lazy import; a press
   calls `CaptureController.submit` like an LCD tap, so a press during a capture is dropped as

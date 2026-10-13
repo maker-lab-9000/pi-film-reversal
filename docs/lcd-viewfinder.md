@@ -175,7 +175,7 @@ message screens keep the default font.
 | Battery tag (outlined, top left, right of `2x`) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | Developing count (amber number on a dark patch, right of the battery tag) | How many photographs are still being graded behind the shutter; see [Developing count](#developing-count). Absent at zero and with `--grade inline` | — |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
-| Review screen | Full-screen quick grade (the frame reduced four times each way, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
+| Review screen | Full-screen quick grade (the frame reduced by a whole factor to about 1,000 pixels on the long side, four times each way for the IMX477, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
 Press feedback: `+`, `-` and the shutter button light while a finger is on them, not
 only on release, and a tap shorter than one frame still lights its key for 0.15 s.
@@ -195,12 +195,17 @@ The full-resolution grade of a photograph runs behind the shutter, on a queue
 beside the battery tag says how many photographs are still developing. It counts the
 grade that is running and the ones waiting. It disappears at zero.
 
-- At zero every graded file and its record are on disk, so it is safe to switch off.
+- At zero nothing is being graded and nothing is waiting, so it is safe to switch off.
+  Every graded file and its record are then on disk, unless a grade failed: a failed
+  grade is reported in the log and its entry is kept for the next start, or set aside
+  as `.failed` after two failures.
 - The queue holds three waiting grades. When it is full the next capture waits for
   a place, with the processing screen showing. That is why the shutter may wait
   although the last picture has already been reviewed.
 - Just after a restart the number can be higher than the queue allows: grades left
-  unfinished by a power cut are counted too, and are finished first.
+  unfinished by a power cut are counted too, and are finished first. With many of
+  them, three new photographs can be taken at once and a fourth waits until the
+  recovered grades are done.
 - Numbers above 99 are drawn as `99`.
 
 The review screen and the Stick show the quick grade, not the final file: it is

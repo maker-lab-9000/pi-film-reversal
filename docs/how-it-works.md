@@ -61,14 +61,14 @@ frame that ran out of gain (`MAX` in the `ISO` cell) is normalised like any dark
 The three steps above take about 2 s on a full-resolution frame on the Pi 4. By
 default (`--grade background`) the camera does not wait for them:
 
-1. The frame is read and the original JPEG is saved (and the DNG, when enabled).
-   From here the photograph survives a power cut.
+1. The frame is read and the original JPEG is saved (and the DNG, when enabled),
+   and both are synced to the disk. From here the photograph survives a power cut.
 2. A pending entry is written: a small JSON file outside the photo folder
    (`~/.local/state/pifilm/pending/`, or `--state-dir PATH`) with the original's
    name, the grain seed, the EV and the camera fields of the record.
 3. A quick grade is made for the review screen and the Stick: the frame reduced
-   four times each way (1014 × 760 from the IMX477), through the same pipeline
-   without grain. The camera is now free for the next photograph.
+   by a whole factor to about 1,000 pixels on the long side (four times each way,
+   1014 × 760, from the IMX477), through the same pipeline without grain. The camera is now free for the next photograph.
 4. Behind the shutter, one worker thread grades the full frame, saves
    `*_graded.jpg`, appends the record to `captures.jsonl` and deletes the pending
    entry, in that order. Photographs are graded in the order they were shot.
@@ -91,17 +91,25 @@ photographs are still developing.
 **Recovery.** At start-up the pending entries that belong to the same output folder
 are finished first, on the same worker. A recovered grade starts from the saved JPEG,
 not from the frame in memory, so it can differ from the uninterrupted grade by JPEG
-rounding; its record carries `recovered: true` and has no shutter timings. An entry
-that fails twice is renamed `*.failed` and reported in the log.
+rounding; its record carries `recovered: true` and has no shutter timings. Just after
+a restart with many unfinished grades, the recovered ones go first: three new
+photographs can be taken at once and a fourth waits until they are done. A grade
+that fails is reported in the log by its entry's name; an entry that fails twice is
+renamed `*.failed` and a second line says so.
 
-**Stopping.** A stop finishes the queue before the process exits, with or without
-the LCD viewfinder: SIGTERM (how systemd stops the service) ends the loops the way
-Ctrl-C does. What is not finished, because the power went or the process was
-killed, is completed at the next start.
+**Stopping.** A stop finishes the photographs taken in this run (the grade that is
+running and those waiting) before the process exits, with or without the LCD
+viewfinder: SIGTERM (how systemd stops the service) ends the loops the way Ctrl-C
+does, and once the clean-up has begun a further SIGTERM is ignored. Recovered
+grades that have not started are not waited for: their entries stay and the next
+start finishes them, so a stop is never longer than this run's queue. What is not
+finished, because the power went or the process was killed, is also completed at
+the next start.
 
 **Order in the log.** Records are written when a grade is saved, so they are in
-shot order. One exception: exposure 1 of a double is logged at once, and can land
-one line ahead of a single photograph that was still being graded.
+shot order. One exception: exposure 1 of a double is logged at once, so its line
+can land ahead of the photographs still waiting to be graded (up to four: the one
+being graded and three waiting).
 
 `--grade inline` restores the earlier order: the full grade is saved before the
 camera is free, there is no queue and no pending entry, and records have none of the
