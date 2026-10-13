@@ -50,6 +50,34 @@ LUT to the GPU would save at most 0.8 s; the GPU pays off only if grain (and
 normalisation) move with it. Grain is therefore first, on the CPU, whatever the
 spike says, since the CPU path stays as the reference and as `pifilm-process`.
 
+After the byte-identical grain speed-up (PR #56), two captures on the Pi: grain
+2,501 and 2,519 ms, shutter to saved 5,678 and 5,388 ms. What is left of grain,
+timed part by part on the Pi (12 MP, HP5): two random fields about 660 ms, two
+blurs 340 ms, three standard deviations 370 ms, two table lookups 280 ms, the
+arithmetic 300 ms and more. No single part dominates, but everything that builds
+the noise field (random numbers, blur, normalising) is over half of it.
+
+GPU spike result (step 2, 2026-10-13, `scripts/experiments/gpu_lut_spike.py` on
+branch `spike/gpu-lut`):
+
+- It works: V3D 4.2, OpenGL ES 3.1, Mesa 26.2, a windowless (surfaceless) context,
+  no new packages. Largest texture 4096, so the IMX477 fits and the IMX708 needs
+  tiles.
+- Memory is not a problem: free graphics memory stayed at about 497 MB with the
+  12 MP textures loaded, and two full-resolution stills and a preview frame were
+  taken with them loaded.
+- Accuracy: never more than one level from the CPU reference; 0.04 % to 3.5 % of
+  values differ by one.
+- Speed: the LUT alone is no faster. GPU 890 ms against the CPU's 845 ms: the
+  shader takes 118 ms, but packing RGB to RGBA (310 ms), reading back (180 ms)
+  and unpacking (260 ms) cost the rest.
+
+Verdict: GPU grading is worth building only as one pass that does normalise, LUT
+and grain together, with the packing avoided (the camera can deliver four-byte
+pixels; the JPEG encoder can read them). Then one upload, one shader and one
+read-back replace about 3.6 s of CPU work. A GPU grain needs a noise texture, so
+step 3's grain tile is designed to be that texture: one grain, two backends.
+
 ## Steps
 
 ### 1. Measure: per-stage timings in `captures.jsonl`
