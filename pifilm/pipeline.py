@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 
 import numpy as np
 
@@ -40,6 +41,14 @@ from .artifacts import Artifacts
 from .color import linear_to_srgb, srgb_to_linear
 from .grain import add_grain
 from .normalize import normalize_u8
+
+
+def _lap(timings: dict | None, stage: str, started: float) -> float:
+    """Record the milliseconds since ``started`` under ``stage``; return now."""
+    now = time.perf_counter()
+    if timings is not None:
+        timings[stage] = round((now - started) * 1000.0, 1)
+    return now
 
 
 class Pipeline:
@@ -57,21 +66,30 @@ class Pipeline:
         grain: bool = True,
         rng: np.random.Generator | None = None,
         ev: float = 0.0,
+        timings: dict | None = None,
     ) -> tuple[np.ndarray, dict]:
+        """Grade one frame. ``timings``, when given, is filled with the milliseconds
+        each stage took (``normalize``, ``lut``, and ``grain`` when it ran). It is
+        an out-parameter and not part of the returned audit dict, because that dict
+        is what a regrade is reproduced from and a duration is not reproducible."""
         if rgb_u8.dtype != np.uint8 or rgb_u8.ndim != 3 or rgb_u8.shape[2] != 3:
             raise ValueError(
                 f"process() expects an RGB uint8 array of shape (H, W, 3); "
                 f"got dtype {rgb_u8.dtype} shape {rgb_u8.shape}"
             )
         ev = float(ev)
+        started = time.perf_counter()
         if ev != 0.0:
             rgb_u8 = _ev_table(-ev)[rgb_u8]
         normalised, gains = normalize_u8(rgb_u8, self.artifacts.normalize)
         if ev != 0.0:
             normalised = _ev_table(ev)[normalised]
+        started = _lap(timings, "normalize", started)
         graded = self.artifacts.lut.apply_pillow(normalised, self._filter)
+        started = _lap(timings, "lut", started)
         if grain and self.artifacts.grain.enabled:
             graded = add_grain(graded, self.artifacts.grain, rng)
+            _lap(timings, "grain", started)
         return graded, {
             "wb_gains": [round(float(g), 4) for g in gains.wb],
             "exposure_gain": round(float(gains.exposure), 4),

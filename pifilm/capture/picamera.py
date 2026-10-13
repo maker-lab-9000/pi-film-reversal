@@ -86,6 +86,7 @@ import numbers
 import sys
 import tempfile
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -155,6 +156,13 @@ def serialisable_metadata(raw: dict) -> dict:
             except (TypeError, ValueError):
                 pass
     return out
+
+
+def _lap(timings: dict[str, float], stage: str, started: float) -> float:
+    """Record the milliseconds since ``started`` under ``stage``; return now."""
+    now = time.perf_counter()
+    timings[stage] = round((now - started) * 1000.0, 1)
+    return now
 
 
 class Picamera2Camera:
@@ -381,6 +389,10 @@ class Picamera2Camera:
 
             still = full or self._preview is None
             timeout = self._frame_timeout(still)
+            # Stage timings for the capture record (stills only): the mode switch
+            # and capture, the copy out of the camera's buffer, and the DNG.
+            started = time.perf_counter()
+            timings: dict[str, float] = {}
             try:
                 if full and self._preview is not None:
                     # Switches to the still configuration, captures, and restores
@@ -403,6 +415,7 @@ class Picamera2Camera:
             processing_failed = False
             try:
                 try:
+                    started = _lap(timings, "request", started)
                     bgr = request.make_array("main")
                     if not isinstance(bgr, np.ndarray):
                         raise CameraError("Picamera2 main array is not a NumPy array")
@@ -420,6 +433,7 @@ class Picamera2Camera:
                         # come from the binned viewfinder stream and would
                         # otherwise make a record claim the wrong frame rate.
                         self._update_fps({"FrameDuration": metadata.get("FrameDuration", 0)})
+                    started = _lap(timings, "array", started)
                     dng = None
                     if full and self._save_dng:
                         # The ".dng" suffix is load-bearing: PiDNG (used by save_dng)
@@ -430,8 +444,10 @@ class Picamera2Camera:
                             request.save_dng(tmp.name)
                             tmp.seek(0)
                             dng = tmp.read()
+                        _lap(timings, "dng", started)
                     return Frame(
-                        rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng
+                        rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng,
+                        timings=timings if full else None,
                     )
                 except CameraError:
                     processing_failed = True

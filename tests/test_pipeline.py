@@ -153,3 +153,28 @@ def test_ev_zero_is_the_unchanged_grade(pipeline):
     a = pipeline.process(frame, grain=False)[0]
     b = pipeline.process(frame, grain=False, ev=0.0)[0]
     assert np.array_equal(a, b)
+
+
+def test_process_reports_how_long_each_stage_took(pipeline):
+    """Step 1 of the pipeline roadmap: decisions about speed rest on per-stage
+    numbers from the Pi, so the pipeline has to hand them over."""
+    rgb = np.full((24, 32, 3), 120, np.uint8)
+    timings = {}
+    _, info = pipeline.process(rgb, rng=np.random.default_rng(0), timings=timings)
+    assert set(timings) == {"normalize", "lut", "grain"}
+    assert all(isinstance(v, float) and v >= 0.0 for v in timings.values())
+    # The audit fields are what a regrade is reproduced from: timings stay out.
+    assert not any("ms" in key or key == "timings" for key in info)
+
+
+def test_a_skipped_grain_stage_is_not_timed(pipeline):
+    timings = {}
+    pipeline.process(np.full((24, 32, 3), 120, np.uint8), grain=False, timings=timings)
+    assert set(timings) == {"normalize", "lut"}
+
+
+def test_timings_do_not_change_the_pixels(pipeline):
+    rgb = np.random.default_rng(3).integers(0, 255, (24, 32, 3), dtype=np.uint8)
+    plain, _ = pipeline.process(rgb, rng=np.random.default_rng(1))
+    timed, _ = pipeline.process(rgb, rng=np.random.default_rng(1), timings={})
+    assert np.array_equal(plain, timed)

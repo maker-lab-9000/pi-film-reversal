@@ -94,6 +94,9 @@ class Frame:
     source: str  # "raw-mjpeg", "decoded", or "picamera2"
     metadata: dict | None = None  # per-shot camera metadata (picamera2)
     dng: bytes | None = None      # in-memory DNG for this frame (picamera2)
+    # How long the backend spent on this frame, by stage, in milliseconds (a full
+    # Picamera2 read: request, array, dng). None when the backend does not say.
+    timings: dict | None = None
 
 
 class Camera(Protocol):

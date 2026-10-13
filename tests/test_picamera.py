@@ -2250,3 +2250,31 @@ def test_start_up_colour_temperature_conflicts_are_refused(install_picamera):
         Picamera2Camera(colour_temperature=6500, awb_lock=True)
     with pytest.raises(CameraError):
         Picamera2Camera(colour_temperature=1000)
+
+
+def test_a_still_reports_how_long_the_camera_stages_took(install_picamera):
+    """Step 1 of the pipeline roadmap: about two seconds of a shot are spent
+    outside the grading pipeline, and only the backend can say on what."""
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    install_picamera(request=FakeRequest(big))
+    camera = Picamera2Camera(save_dng=True)
+    frame = camera.read(full=True)
+    assert set(frame.timings) == {"request", "array", "dng"}
+    assert all(isinstance(v, float) and v >= 0.0 for v in frame.timings.values())
+    camera.close()
+
+
+def test_a_still_without_a_dng_has_no_dng_stage(install_picamera):
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    install_picamera(request=FakeRequest(big))
+    camera = Picamera2Camera(save_dng=False)
+    assert set(camera.read(full=True).timings) == {"request", "array"}
+    camera.close()
+
+
+def test_a_preview_frame_carries_no_stage_timings(install_picamera):
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    install_picamera(request=FakeRequest(small))
+    camera = Picamera2Camera(preview=(640, 480), save_dng=False)
+    assert camera.read(full=False).timings is None
+    camera.close()

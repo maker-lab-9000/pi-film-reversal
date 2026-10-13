@@ -1916,3 +1916,59 @@ def test_bad_white_balance_arguments_are_refused(camera_cli, tmp_path, argv):
     with pytest.raises(SystemExit) as caught:
         camera_cli.main([*argv, "--no-preview", "--out", str(tmp_path / "shots")])
     assert caught.value.code == 2
+
+
+def test_record_breaks_the_shot_down_by_stage(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    record = session.capture().record
+    stages = record["stage_ms"]
+    assert set(stages) == {
+        "capture", "normalize", "lut", "grain", "save_original", "save_graded",
+    }
+    assert all(isinstance(v, float) and v >= 0.0 for v in stages.values())
+    # The parts cannot exceed the whole (rounding to 0.1 ms aside), and the
+    # existing totals stay in the record.
+    assert sum(stages.values()) <= record["shutter_to_saved_ms"] + 1.0
+    assert record["pipeline_ms"] >= 0.0
+
+
+def test_camera_stage_timings_are_carried_into_the_record(tmp_path, pipeline):
+    camera = FakeCamera([synthetic_frame(90, 160)])
+    real_read = camera.read
+
+    def read(**kwargs):
+        frame = real_read(**kwargs)
+        frame.timings = {"request": 400.0, "array": 30.0, "dng": 900.0}
+        return frame
+
+    camera.read = read
+    stages = _session(tmp_path, pipeline, camera=camera).capture().record["stage_ms"]
+    assert stages["capture_request"] == 400.0
+    assert stages["capture_array"] == 30.0
+    assert stages["capture_dng"] == 900.0
+
+
+def test_a_saved_dng_is_timed(tmp_path, pipeline):
+    camera = FakeCamera([synthetic_frame(90, 160)])
+    real_read = camera.read
+
+    def read(**kwargs):
+        frame = real_read(**kwargs)
+        frame.dng = b"raw"
+        return frame
+
+    camera.read = read
+    record = _session(tmp_path, pipeline, camera=camera).capture().record
+    assert record["stage_ms"]["save_dng"] >= 0.0
+
+
+def test_double_exposure_records_are_broken_down_too(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    session.set_double_exposure(True)
+    first = session.capture().record["stage_ms"]
+    second = session.capture().record["stage_ms"]
+    assert set(first) == {"capture", "save_original", "card"}
+    assert set(second) == {
+        "capture", "save_original", "composite", "normalize", "lut", "grain",
+        "save_graded",
+    }
