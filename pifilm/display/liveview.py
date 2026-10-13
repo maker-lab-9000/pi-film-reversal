@@ -30,7 +30,8 @@ it changes between frames, so the screen is assembled from small tiles:
 
 - static tiles, cached with ``functools.lru_cache`` and keyed by exactly what
   they show: the strip background, one tile per cell, the shutter and ``+``/``-``
-  keys (keyed by which is pressed), and the ``2x`` and battery tags;
+  keys (keyed by which is pressed), and the ``2x`` and battery tags with the
+  count of photographs still developing;
 - dynamic tiles: the lit meter dot and the lux/clip text (cached too, they repeat)
   and the focus gauge (drawn every frame; it is 7 units wide).
 
@@ -89,6 +90,17 @@ BATTERY_X0 = 35
 # The amber 2x tag widens to its "2x 1/2" label but stops this far short of the
 # battery tag, whatever font is in use.
 TAG_GAP = 2
+# The count of photographs still being graded: an amber number on a dark patch just
+# past the battery tag's right end (or where that tag would start, without one).
+# It cannot go on the tag's left, where the 2x tag ends two units away. The patch
+# has no outline, so it does not read as a third key, and is darker than a key's
+# fill: amber on a key's grey is hard to read against a bright sky. Two digits are
+# the limit: the queue holds three, and only a backlog recovered at start-up goes
+# higher.
+DEVELOPING_GAP = 3
+DEVELOPING_PADDING = 3  # each side of the number
+DEVELOPING_MAX = 99
+DEVELOPING_FILL = (0, 0, 0, 190)
 FOCUS_TRACK = (6, 22, 9, 198)
 FOCUS_TICK_X = (4, 11)
 FOCUS_TICK_HEIGHT = 1.5
@@ -153,6 +165,7 @@ class LiveState:
     selected: int | None = 0                 # index into cells; None when nothing is selectable
     pressed: Action | None = None            # PLUS, MINUS or SHUTTER while lit
     double: tuple[bool, int] | None = None   # (enabled, exposures taken); None hides the 2x toggle
+    developing: int = 0                      # photographs still being graded; 0 draws nothing
 
 
 @lru_cache(maxsize=4)
@@ -378,9 +391,15 @@ def _controls_tile(pressed: Action | None, scale: int) -> Image.Image:
     return canvas.finish()
 
 
-@lru_cache(maxsize=8)
-def _tags_tile(double: tuple[bool, int] | None, battery: str | None, scale: int) -> Image.Image:
-    """The 2x double-exposure toggle and the battery tag, top left."""
+@lru_cache(maxsize=32)
+def _tags_tile(double: tuple[bool, int] | None, battery: str | None, scale: int,
+               developing: int = 0) -> Image.Image:
+    """The 2x double-exposure toggle, the battery tag and the developing count, top left.
+
+    One tile for the three because the count's place depends on the battery text's
+    width. ``developing`` is already limited to ``DEVELOPING_MAX`` by the caller, so
+    the cache holds few of these.
+    """
     canvas = _Canvas(_TAGS_BOX, scale)
     font = canvas.font(SEMIBOLD, TAG_SIZE)
 
@@ -402,10 +421,20 @@ def _tags_tile(double: tuple[bool, int] | None, battery: str | None, scale: int)
             tag((x0, y0, min(max(x1, wanted), BATTERY_X0 - TAG_GAP), y1), label, True)
         else:
             tag(DOUBLE_BOX, "2x", False)
+    left = float(BATTERY_X0)
     if battery is not None:
         right = BATTERY_X0 + canvas.text_width(battery, font) + 2 * TAG_PADDING
-        tag((BATTERY_X0, DOUBLE_BOX[1], min(right, _TAGS_BOX[2] - 1), DOUBLE_BOX[3]),
-            battery, False)
+        right = min(right, _TAGS_BOX[2] - 1)
+        tag((BATTERY_X0, DOUBLE_BOX[1], right, DOUBLE_BOX[3]), battery, False)
+        # From a whole unit, so the tag's soft edge and the patch never share a pixel.
+        left = math.ceil(right) + DEVELOPING_GAP
+    if developing > 0:
+        label = str(developing)
+        box = (left, DOUBLE_BOX[1],
+               left + canvas.text_width(label, font) + 2 * DEVELOPING_PADDING, DOUBLE_BOX[3])
+        canvas.pill(box, TAG_RADIUS, fill=DEVELOPING_FILL)
+        canvas.text(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), label, font, AMBER,
+                    anchor="mm")
     return canvas.finish()
 
 
@@ -481,8 +510,9 @@ def render_live(
     battery = None
     if reading.battery_percent is not None:
         battery = f"{'AC ' if reading.external_power else ''}{reading.battery_percent}%"
-    if state.double is not None or battery is not None:
-        paste(_tags_tile(state.double, battery, scale), *_TAGS_BOX[:2])
+    developing = max(0, min(DEVELOPING_MAX, state.developing))
+    if state.double is not None or battery is not None or developing:
+        paste(_tags_tile(state.double, battery, scale, developing), *_TAGS_BOX[:2])
     if reading.focus is not None:
         paste(_focus_tile(reading.focus, reading.focus_peak, scale), *_FOCUS_BOX[:2])
     return img
