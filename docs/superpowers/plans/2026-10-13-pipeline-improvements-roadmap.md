@@ -29,9 +29,26 @@ One 12 MP frame on a laptop (proportions only, 2026-10-13):
 | Grain | 1.11 s | 1.80 s |
 | JPEG encode, one file | 0.82 s | 0.74 s |
 
-About two seconds of the Pi's shutter-to-saved time are outside the grading
-pipeline (mode switch and capture, DNG extraction, two JPEG encodes, file writes)
-and are not broken down anywhere yet.
+One shot on the Pi, by stage (step 1's `stage_ms`, 2026-10-13, one capture, HP5
+grain, shutter to saved 6,838 ms):
+
+| Stage | Time | Share |
+| --- | --- | --- |
+| Grain | 3,626 ms | 53 % |
+| Capture: camera request | 431 ms | 6 % |
+| Capture: array copy | 322 ms | 5 % |
+| Capture: DNG extraction | 501 ms | 7 % |
+| LUT | 825 ms | 12 % |
+| Normalise | 328 ms | 5 % |
+| Save original JPEG | 389 ms | 6 % |
+| Save graded JPEG | 369 ms | 5 % |
+| Save DNG | 27 ms | 0 % |
+
+The parts add up to 6,827 ms, so nothing of a shot is unaccounted for. What it
+says: grain is more than half of a shot and four times the LUT. Moving only the
+LUT to the GPU would save at most 0.8 s; the GPU pays off only if grain (and
+normalisation) move with it. Grain is therefore first, on the CPU, whatever the
+spike says, since the CPU path stays as the reference and as `pifilm-process`.
 
 ## Steps
 
