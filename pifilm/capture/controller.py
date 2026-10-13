@@ -51,6 +51,10 @@ class ControllerSnapshot:
     # sees a job finish also sees the count that job left behind.
     double_exposure: bool = False
     exposures_taken: int = 0
+    # Photographs whose full-resolution grade is not on disk yet, read from the
+    # session when the snapshot is taken (not when a job finishes): the number
+    # falls while no capture is running, and a display has to see it reach zero.
+    pending_grades: int = 0
 
 
 @dataclass(frozen=True)
@@ -113,6 +117,9 @@ class CaptureController:
             return self._jobs.get(request_id)
 
     def snapshot(self) -> ControllerSnapshot:
+        # Read outside the lock: the session answers from its grade queue's own
+        # lock, and nothing here needs the two numbers to be from one instant.
+        pending_grades = self._read_pending_grades()
         with self._lock:
             active = (
                 self._jobs[self._active_request_id]
@@ -127,6 +134,7 @@ class CaptureController:
                 self._last_finished_job,
                 self._double[0],
                 self._double[1],
+                pending_grades,
             )
 
     def close(self) -> None:
@@ -166,9 +174,33 @@ class CaptureController:
                 else:
                     self._finish(request_id, "complete", result=result)
         finally:
+            # The grades first: they need no camera, and closing a camera that has
+            # stopped answering can wait for ever (see ``STALL_EXIT_DEADLINE`` in
+            # the app). Whatever this raises, the camera must still be closed.
+            close_grades = getattr(self._session, "close_grades", None)
+            if callable(close_grades):
+                try:
+                    close_grades()
+                except Exception:
+                    pass
             close = getattr(getattr(self._session, "camera", None), "close", None)
             if callable(close):
                 close()
+
+    def _read_pending_grades(self) -> int:
+        """The session's count of unfinished grades; 0 when it has none to give.
+
+        Called from display threads on every frame, so a session without the
+        property, one that raises, or one that answers with something that is not
+        a count all read as 0 instead of failing the caller.
+        """
+        try:
+            value = getattr(self._session, "pending_grades", 0)
+        except Exception:
+            return 0
+        if isinstance(value, bool) or not isinstance(value, int):
+            return 0
+        return max(0, value)
 
     def _read_double(self) -> tuple[bool, int]:
         """The session's (mode, count), or the last value seen if it cannot be read.
