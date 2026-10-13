@@ -154,7 +154,8 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   file, appends the record and removes the entry, in that order. Such a record gains
   `shutter_to_ready_ms`, `grade: "background"`, stages `preview` and `queued`, and
   `recovered: true` when it was finished at a later start from the saved JPEG.
-  `--grade inline` is the earlier behaviour, with no queue and no new fields; `--state-dir`
+  `--grade inline` is the earlier behaviour, with no queue and none of those fields (its records
+  do carry `pipeline_backend`, always `"cpu"`); `--state-dir`
   moves the pending entries (default `~/.local/state/pifilm/pending`). The grade
   worker fsyncs the original (and DNG) as its first step, not the capture (that cost up to 1 s a
   shot on the Pi's SD card), and the graded file and the log line before the entry is removed.
@@ -168,7 +169,11 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   `GpuGrader` on its own thread before its first job and close it after its last; a session
   grading inline never opens one, and the quick grade and a shot a closing queue refused stay on
   the CPU. A photograph the GPU fails on is graded on the CPU in the same call and logged as
-  `gpu grade failed (...)`. Every record of a graded photograph has `pipeline_backend`
+  `gpu grade failed (...)`. An open that hangs in the driver would hold the only grade worker
+  at every start, so the worker writes a marker, `gpu-opening`, beside the state directory
+  (`~/.local/state/pifilm/gpu-opening`) before the open and removes it when the open returns; a
+  start that finds the marker logs one `gpu grading off: ...` line naming it, grades on the CPU
+  and leaves it for a person to delete. Every record of a graded photograph has `pipeline_backend`
   (`"gpu-1"` or `"cpu"`): after `stage_ms` in an inline record, last in a background one. Each record also carries `stage_ms`, the
   milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, LUT,
   grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`

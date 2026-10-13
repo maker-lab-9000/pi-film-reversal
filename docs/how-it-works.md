@@ -115,7 +115,7 @@ being graded and three waiting).
 
 `--grade inline` restores the earlier order: the full grade is saved before the
 camera is free, there is no queue and no pending entry, and records have none of the
-new fields.
+new fields above. They do have `pipeline_backend`, always `cpu` (see the next section).
 
 ### Grading on the GPU
 
@@ -150,6 +150,15 @@ More than 1 level of difference anywhere, or any graphics error, and GPU grading
 off for this run. The log has one line either way: `gpu grading on (...)` or
 `gpu grading off: ...` with the reason. The service starts in both cases.
 
+**If opening the GPU hangs.** A driver that blocks while the GPU is opened would
+hold the only grade worker: no photograph would be graded, and the next start
+would hang the same way. So the worker writes a marker file, `gpu-opening`, beside
+the pending entries (`~/.local/state/pifilm/gpu-opening`) before it opens the GPU,
+and removes it when the open returns, whether or not it worked. A start that finds
+the marker does not open the GPU. It logs
+`gpu grading off: the last start did not finish opening the GPU; delete <path> to try again`
+and grades on the CPU until the file is deleted.
+
 **Fallback.** A photograph the GPU fails on is graded on the CPU at once, from the
 same seed, so it is never lost and never waits. The log names it
 (`gpu grade failed (...)`). Three failures in a row switch the GPU off for the run.
@@ -161,7 +170,7 @@ move pixels. A GPU grade adds the stages `gpu`, `gpu_upload`, `gpu_shader` and
 `gpu_readback` to `stage_ms` and has no `lut` or `grain` stage.
 
 **Reproducibility.** `pifilm-process` regrades on the CPU. A record marked `cpu`
-still reproduces byte for byte. A record marked `gpu-1` does not: the GPU's file is
+still reproduces pixel for pixel. A record marked `gpu-1` does not: the GPU's file is
 the more exact of the two, because the CPU rounds colours to bytes before the LUT.
 Against a CPU regrade it differs by about 0.2 to 0.6 levels on average and by a few
 levels at most on ordinary colours. On strongly saturated areas, where the look's

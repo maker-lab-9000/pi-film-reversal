@@ -21,7 +21,8 @@ real capture folder, which holds ``<time>_original.jpg`` next to
   one-pass shader, which does not round between its stages as the CPU does,
   so the regraded file is close to the Pi's and not the same bytes (see
   ``pifilm.pipeline``). The tool says so once per run. Records graded on the
-  CPU, and records from before the field existed, still reproduce exactly.
+  CPU, and records from before the field existed, still reproduce pixel for
+  pixel.
 * **Clobbering.** ``a.jpg`` and ``a.png`` would produce the same output
   name, and re-running would silently overwrite. Same-stem inputs get their
   extension folded into the output name, existing outputs are skipped unless
