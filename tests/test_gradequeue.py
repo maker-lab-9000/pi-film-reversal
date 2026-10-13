@@ -418,3 +418,86 @@ def test_a_failure_whose_entry_is_already_gone_is_not_reported_as_given_up(tmp_p
     assert queue.submit(GradeJob("bad", entry=tmp_path / "gone.json"))
     assert queue.close(WAIT)
     assert lines == ["grade failed (gone.json): boom"]
+
+
+# --- the worker's own start and stop ----------------------------------------
+
+
+def test_on_start_and_on_stop_run_on_the_worker_around_every_job():
+    """What the worker owns for its whole life (a graphics context) has to be
+    made and released on the worker's own thread."""
+    events = []
+
+    def note(what):
+        events.append((what, threading.current_thread().name))
+
+    queue = GradeQueue(
+        lambda job: note(job.payload), backlog=[GradeJob("old")],
+        on_start=lambda: note("start"), on_stop=lambda: note("stop"),
+    )
+    try:
+        assert queue.submit(GradeJob("new")) is True
+    finally:
+        assert queue.close(WAIT)
+    # The backlog job may be dropped by the close; whatever ran, ran in between.
+    assert events[0] == ("start", "pifilm-grade")
+    assert events[-1] == ("stop", "pifilm-grade")
+    assert ("new", "pifilm-grade") in events
+    assert [what for what, _ in events].count("start") == 1
+    assert [what for what, _ in events].count("stop") == 1
+
+
+def test_on_start_runs_before_the_backlog():
+    order = []
+    run = Recorder()
+    run.expect = 1
+    queue = GradeQueue(lambda job: (order.append(job.payload), run(job)),
+                       backlog=[GradeJob("old")], on_start=lambda: order.append("start"))
+    try:
+        assert run.done.wait(WAIT)
+    finally:
+        assert queue.close(WAIT)
+    assert order == ["start", "old"]
+
+
+def test_on_stop_has_run_when_close_returns_and_not_before():
+    stopped = threading.Event()
+    run = Recorder(hold=["held"])
+    queue = GradeQueue(run, on_stop=stopped.set)
+    try:
+        assert queue.submit(GradeJob("held")) is True
+        assert run.started["held"].wait(WAIT)
+        assert not stopped.wait(BLOCKED)
+        run.release["held"].set()
+    finally:
+        assert queue.close(WAIT)
+    assert stopped.is_set()
+    assert run.ran == ["held"]
+
+
+def test_an_on_start_that_raises_is_logged_and_jobs_still_run():
+    log = []
+    run = Recorder()
+
+    def broken():
+        raise RuntimeError("no gpu here")
+
+    queue = GradeQueue(run, on_start=broken, log=log.append)
+    try:
+        assert queue.submit(GradeJob("a")) is True
+    finally:
+        assert queue.close(WAIT)
+    assert run.ran == ["a"]
+    assert log == ["grade worker start-up failed: no gpu here"]
+
+
+def test_an_on_stop_that_raises_is_logged_and_the_worker_still_ends():
+    log = []
+
+    def broken():
+        raise RuntimeError("context lost")
+
+    queue = GradeQueue(Recorder(), on_stop=broken, log=log.append)
+    assert queue.close(WAIT)
+    assert log == ["grade worker shutdown failed: context lost"]
+    assert queue.submit(GradeJob("late")) is False
