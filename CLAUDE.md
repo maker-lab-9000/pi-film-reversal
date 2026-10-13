@@ -37,7 +37,7 @@ python3.12 -m venv .venv
 
 # Tests. pyproject sets pytest `pythonpath = ["."]` because tests import `scripts/` and
 # `firmware/sticks3/scripts/` as namespace packages from the repo root.
-.venv/bin/pytest -q -m 'not slow'                     # ~40s, ~380 tests
+.venv/bin/pytest -q -m 'not slow'                     # ~85s, ~1430 tests
 .venv/bin/pytest -q tests/test_lut.py                 # one file
 .venv/bin/pytest -q tests/test_lut.py -k identity     # one test by name
 .venv/bin/pytest -q -m slow                           # builds a wheel, installs into a temp venv, runs pifilm-process
@@ -138,9 +138,9 @@ fitted on normalized input; grain runs last because it models developed film.
   `shutter_to_ready_ms`, `grade: "background"`, stages `preview` and `queued`, and
   `recovered: true` when it was finished at a later start from the saved JPEG.
   `--grade inline` is the earlier behaviour, with no queue and no new fields; `--state-dir`
-  moves the pending entries (default `~/.local/state/pifilm/pending`). SIGTERM finishes the
-  queue only when the LCD viewfinder is running; headless, the process ends at once and the
-  next start completes the grades. Each record also carries `stage_ms`, the
+  moves the pending entries (default `~/.local/state/pifilm/pending`). SIGTERM ends every
+  loop the way Ctrl-C does (`main` turns the first one into an interrupt), so a service stop
+  finishes the queue; a power cut or a kill leaves entries for the next start. Each record also carries `stage_ms`, the
   milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, LUT,
   grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`
   is the plan those numbers feed.

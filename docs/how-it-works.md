@@ -94,10 +94,14 @@ not from the frame in memory, so it can differ from the uninterrupted grade by J
 rounding; its record carries `recovered: true` and has no shutter timings. An entry
 that fails twice is renamed `*.failed` and reported in the log.
 
-**Stopping.** A normal stop finishes the queue before the process exits. A stop by
-SIGTERM (how systemd stops the service) does so only when the LCD viewfinder is
-running; in headless mode the process ends at once and the unfinished grades are
-completed at the next start.
+**Stopping.** A stop finishes the queue before the process exits, with or without
+the LCD viewfinder: SIGTERM (how systemd stops the service) ends the loops the way
+Ctrl-C does. What is not finished, because the power went or the process was
+killed, is completed at the next start.
+
+**Order in the log.** Records are written when a grade is saved, so they are in
+shot order. One exception: exposure 1 of a double is logged at once, and can land
+one line ahead of a single photograph that was still being graded.
 
 `--grade inline` restores the earlier order: the full grade is saved before the
 camera is free, there is no queue and no pending entry, and records have none of the
