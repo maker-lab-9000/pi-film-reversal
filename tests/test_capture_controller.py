@@ -324,3 +324,90 @@ def test_an_unreadable_double_state_keeps_the_last_known_value():
         assert controller.snapshot().double_exposure is True
     finally:
         controller.close()
+
+
+class GradingSession:
+    """Minimal session with the background-grading surface of ``CaptureSession``."""
+
+    def __init__(self, events=None, fail_close=False) -> None:
+        self.events = events if events is not None else []
+        self.camera = Mock()
+        self.camera.close.side_effect = lambda: self.events.append("camera")
+        self.pending_grades = 0
+        self.fail_close = fail_close
+
+    def capture(self):
+        return Result("saved")
+
+    def close_grades(self, timeout=None):
+        self.events.append("grades")
+        if self.fail_close:
+            raise RuntimeError("grades would not close")
+        return True
+
+
+def test_snapshot_follows_the_sessions_pending_grades():
+    session = GradingSession()
+    controller = CaptureController(session)
+    try:
+        assert controller.snapshot().pending_grades == 0
+        session.pending_grades = 2
+        assert controller.snapshot().pending_grades == 2
+        session.pending_grades = 0
+        assert controller.snapshot().pending_grades == 0
+    finally:
+        controller.close()
+
+
+def test_a_session_without_pending_grades_reports_none():
+    controller = CaptureController(_Session())
+    try:
+        assert controller.snapshot().pending_grades == 0
+    finally:
+        controller.close()
+
+
+def test_unusable_pending_grades_report_none():
+    """A display draws this number on every frame; it must never raise there."""
+
+    class Raising(GradingSession):
+        @property
+        def pending_grades(self):
+            raise RuntimeError("queue unavailable")
+
+        @pending_grades.setter
+        def pending_grades(self, value):
+            pass
+
+    for session in (Raising(), BlockingSession()):  # the second has no such attribute
+        controller = CaptureController(session)
+        try:
+            assert controller.snapshot().pending_grades == 0
+        finally:
+            getattr(session, "release", threading.Event()).set()
+            controller.close()
+    odd = GradingSession()
+    controller = CaptureController(odd)
+    try:
+        for value in ("3", None, 2.5, True, -1):
+            odd.pending_grades = value
+            assert controller.snapshot().pending_grades == 0
+    finally:
+        controller.close()
+
+
+def test_close_finishes_the_grades_before_closing_the_camera():
+    """The camera's close can hang on a stalled sensor; the grades must not wait on it."""
+    session = GradingSession()
+    controller = CaptureController(session)
+    controller.close()
+    assert session.events == ["grades", "camera"]
+    controller.close()  # a second close is harmless
+    assert session.events == ["grades", "camera"]
+
+
+def test_close_still_closes_the_camera_when_the_grades_will_not_close():
+    session = GradingSession(fail_close=True)
+    controller = CaptureController(session)
+    controller.close()
+    assert session.events == ["grades", "camera"]

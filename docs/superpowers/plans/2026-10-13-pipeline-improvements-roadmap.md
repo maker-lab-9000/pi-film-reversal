@@ -166,6 +166,22 @@ decisions on queue depth and memory, what a power loss leaves behind (a journal 
 pending grades), double exposure, and what the Stick is told. Gets its own design
 document before any code.
 
+Built: the design and its decisions are in
+[2026-10-13-background-grading-design.md](../specs/2026-10-13-background-grading-design.md),
+the implementation plan in
+[2026-10-13-background-grading.md](2026-10-13-background-grading.md). The queue is
+`pifilm/capture/gradequeue.py`; `--grade inline` switches it off.
+
+Pi numbers, 2026-10-13, eight shots with the originals synced before the camera was
+free: shutter to ready 2,537 to 3,689 ms, against 3,651 ms inline. The two syncs took
+most of the gain: `save_dng` went from 27 ms to 557 to 1,114 ms and `save_original`
+from 343 ms to 480 to 1,107 ms. The syncs then moved to the grade worker; without
+them the same shots would have been ready in about 1.8 to 2.0 s (capture 1.2 to 1.5 s,
+original 0.34 s, quick grade 0.18 s). To be measured again.
+
+Behind the shutter the grade is slower than inline, as expected with the camera and
+live view running beside it: shutter to saved 4.8 to 6.4 s.
+
 ### 7. GPU grading
 
 Wanted by the owner (2026-10-13). Built from step 2's measurements, with its own
