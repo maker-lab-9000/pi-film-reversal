@@ -1,4 +1,5 @@
 import struct
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,18 @@ def _state_home_under_tmp(tmp_path_factory, monkeypatch):
     ``--state-dir`` would otherwise read, and could write, the developer's own.
     """
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path_factory.mktemp("xdg-state")))
+
+
+@pytest.fixture(autouse=True)
+def _temporary_files_under_pytest(tmp_path_factory, monkeypatch):
+    """Keep every test's temporary files inside pytest's own tree.
+
+    A ``CaptureSession`` makes a private ``pifilm-cards-*`` directory for its
+    exposure cards and quick grades and, like the service, never removes it, so a
+    run used to leave dozens behind in the system's temporary directory. pytest
+    prunes its own tree.
+    """
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path_factory.mktemp("tmp")))
 
 
 def _s15f16(x: float) -> int:

@@ -2,6 +2,7 @@ import argparse
 import builtins
 import io
 import json
+import os
 import sys
 import threading
 import time
@@ -2129,8 +2130,10 @@ def test_background_record_is_the_inline_record_plus_the_new_fields(
     assert not NEW_KEYS & set(inline)
     assert not {"preview", "queued"} & set(inline["stage_ms"])
 
-    session = background(now=lambda: FIXED)
+    # Held until capture() has returned, so "ready" is always measured before "saved".
+    session = background(hold=True, now=lambda: FIXED)
     result = session.capture()
+    session.pipeline.release()
     assert session.close_grades(timeout=5)
     (record,) = _lines(session.out_root)
     # Today's fields in today's order, the new ones after them.
@@ -2697,3 +2700,195 @@ def test_main_inline_writes_no_state(tmp_path, monkeypatch):
     (record,) = _lines(out)
     assert not NEW_KEYS & set(record)
     assert not state.exists()
+
+
+def _record_syncs(monkeypatch):
+    """Record every ``os.fsync`` (as the file's inode) and every entry removal, in order."""
+    from pifilm.capture import app
+
+    events = []
+    real_fsync, real_remove = os.fsync, app.remove_entry
+
+    def fsync(fd):
+        events.append(os.fstat(fd).st_ino)
+        return real_fsync(fd)
+
+    def remove(path):
+        events.append("remove")
+        return real_remove(path)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(app, "remove_entry", remove)
+    return events
+
+
+def test_a_background_grade_is_on_disk_before_its_entry_is_removed(monkeypatch, background):
+    """The entry's removal can reach the disk before data that was only written.
+
+    Without the two syncs a power cut just after a grade could leave no entry, no
+    record and an empty graded file, with nothing left to say a grade is owed.
+    """
+    events = _record_syncs(monkeypatch)
+    session = background(now=lambda: FIXED)
+    result = session.capture()
+    assert session.close_grades(timeout=5)
+    graded = result.graded.stat().st_ino
+    log = (result.graded.parent / "captures.jsonl").stat().st_ino
+    assert [e for e in events if e in (graded, log, "remove")] == [graded, log, "remove"]
+
+
+def test_a_recovered_grade_is_on_disk_before_its_entry_is_removed(
+    tmp_path, monkeypatch, background,
+):
+    result, path, text = _interrupted_shot(tmp_path, background)
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+    events = _record_syncs(monkeypatch)
+    again = background()
+    assert again.close_grades(timeout=5)
+    graded = result.graded.stat().st_ino
+    log = (result.graded.parent / "captures.jsonl").stat().st_ino
+    assert [e for e in events if e in (graded, log, "remove")] == [graded, log, "remove"]
+
+
+def test_an_inline_capture_syncs_nothing(tmp_path, pipeline, monkeypatch):
+    events = _record_syncs(monkeypatch)
+    session = _session(tmp_path, pipeline)
+    session.capture()
+    session.set_double_exposure(True)
+    session.capture()
+    session.capture()
+    assert events == []
+
+
+def test_a_recovered_record_never_joins_a_torn_line(tmp_path, background):
+    """A power cut can leave half a line at the end of the log, with no newline."""
+    result, path, text = _interrupted_shot(tmp_path, background)
+    log = result.graded.parent / "captures.jsonl"
+    whole = log.read_text()
+    assert whole.endswith("\n")
+    log.write_text(whole[: len(whole) // 2])  # the record was being written when it went
+    path.write_text(text)
+
+    again = background(now=lambda: FIXED)
+    shot = again.capture()
+    assert again.close_grades(timeout=5)
+    lines = log.read_text().splitlines()
+    assert len(lines) == 3 and lines[0] == whole[: len(whole) // 2]
+    recovered, new = json.loads(lines[1]), json.loads(lines[2])
+    assert recovered["recovered"] is True and recovered["pifilm"] == result.graded.name
+    assert new["pifilm"] == shot.graded.name
+    assert log.read_text().endswith("\n")
+    assert "\n\n" not in log.read_text()  # a whole log gets no blank line
+
+
+class _Signals:
+    """Stands in for ``signal.signal``: keeps the handlers instead of installing them."""
+
+    def __init__(self):
+        self.previous = object()
+        self.calls = []
+
+    def __call__(self, number, handler):
+        self.calls.append((number, handler))
+        return self.previous
+
+    def deliver(self):
+        """What the kernel does on SIGTERM: run the handler installed first."""
+        self.calls[0][1](self.calls[0][0], None)
+
+
+def test_sigterm_ends_the_headless_service_cleanly(monkeypatch, tmp_path):
+    """systemd stops the service with SIGTERM; the clean-up, which finishes the
+    queued grades, has to run as it does on Ctrl-C."""
+    import signal as signal_module
+
+    from pifilm.capture import app
+
+    signals, closed = _Signals(), []
+
+    class Listener:
+        def __init__(self, controller, token, listen, power=None):
+            pass
+
+        def start(self):
+            pass
+
+        def close(self):
+            closed.append("remote")
+
+    real_close = app.CaptureSession.close_grades
+
+    def close_grades(self, timeout=None):
+        closed.append("grades")
+        return real_close(self, timeout)
+
+    def sleep(_):
+        signals.deliver()
+        raise AssertionError("SIGTERM did not end the loop")
+
+    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "secret")
+    monkeypatch.setattr(app, "RemoteCaptureServer", Listener)
+    monkeypatch.setattr(app.CaptureSession, "close_grades", close_grades)
+    monkeypatch.setattr(app, "has_display", lambda: False)
+    monkeypatch.setattr(app.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(app.signal, "signal", signals)
+    monkeypatch.setattr(app.time, "sleep", sleep)
+
+    assert app.main(["--fake", "--no-preview", "--out", str(tmp_path / "shots"),
+                     "--state-dir", str(tmp_path / "state"),
+                     "--remote-listen", "127.0.0.1:8765"]) == 0
+    assert closed == ["remote", "grades"]
+    assert not any(t.name == "pifilm-grade" for t in threading.enumerate())
+    # Installed for SIGTERM, and the handler that was there put back on the way out.
+    assert [number for number, _ in signals.calls] == [signal_module.SIGTERM] * 2
+    assert signals.calls[-1][1] is signals.previous
+    signals.deliver()  # a second SIGTERM must not break into the clean-up
+
+
+def test_sigterm_ends_the_terminal_loop_cleanly(monkeypatch, tmp_path):
+    from pifilm.capture import app
+
+    signals = _Signals()
+    terminal = Mock()
+    terminal.read = lambda *args, **kwargs: signals.deliver()
+    terminal.__enter__ = Mock(return_value=terminal)
+    terminal.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(app, "TerminalKeys", lambda: terminal)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(app.signal, "signal", signals)
+    assert main(["--fake", "--no-preview", "--out", str(tmp_path / "shots"),
+                 "--state-dir", str(tmp_path / "state")]) == 0
+    assert not any(t.name == "pifilm-grade" for t in threading.enumerate())
+    assert signals.calls[-1][1] is signals.previous
+
+
+def test_main_off_the_main_thread_installs_no_signal_handler(monkeypatch, tmp_path):
+    """``signal.signal`` raises outside the main thread; ``main`` must still run there."""
+    from pifilm.capture import app
+
+    signals = _Signals()
+    terminal = Mock()
+    terminal.read = lambda *args, **kwargs: "q"
+    terminal.__enter__ = Mock(return_value=terminal)
+    terminal.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(app, "TerminalKeys", lambda: terminal)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(app.signal, "signal", signals)
+    codes = []
+    thread = threading.Thread(target=lambda: codes.append(main(
+        ["--fake", "--no-preview", "--out", str(tmp_path / "shots"),
+         "--state-dir", str(tmp_path / "state")])))
+    thread.start()
+    thread.join(5)
+    assert codes == [0]
+    assert signals.calls == []
+
+
+def test_private_pictures_stay_out_of_the_real_temporary_directory(
+    background, tmp_path_factory,
+):
+    """The suite's own guard: a session's cards and quick grades land in pytest's tree."""
+    result = background().capture()
+    assert tmp_path_factory.getbasetemp().resolve() in result.pifilm.resolve().parents

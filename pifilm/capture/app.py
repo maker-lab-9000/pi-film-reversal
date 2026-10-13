@@ -75,6 +75,18 @@ removes. Neither leaves a photograph without a record or with two. An entry can
 also come back after it was removed (its removal is not synced to disk), and the
 same check covers that.
 
+Why the grade side syncs the graded file and the log before it removes the entry:
+on ext4 a removal can reach the disk before data that was only written (delayed
+allocation), so a power cut a few seconds after a grade could otherwise leave no
+entry, no record and an empty graded file, with nothing left to say a grade is
+owed. The inline path never had an entry to remove and is not synced. A log whose
+last line was cut short by a power cut gets a newline before the next record, so
+a record is never joined to half of another.
+
+Stopping: ``main`` turns SIGTERM, which is how systemd stops the service, into the
+same exit as Ctrl-C, so its clean-up runs and the queued grades are finished
+before the process ends.
+
 Why the entry is written before the quick grade: from the moment the original is
 on disk the photograph must be finishable without this process, and the quick
 grade is the first thing after it that can fail.
@@ -117,6 +129,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import current_thread, main_thread
 
 import numpy as np
 
@@ -260,6 +273,15 @@ def _quick_frame(rgb: np.ndarray) -> np.ndarray:
         return rgb
     size = (max(1, width // factor), max(1, height // factor))
     return cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+
+
+def _sync_file(path: Path) -> None:
+    """Force a file that was just written onto the disk."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _already_recorded(day_dir: Path, graded: str) -> bool:
@@ -592,7 +614,9 @@ class CaptureSession:
         )
         pipeline_ms = (time.perf_counter() - t0) * 1000.0
         with _stage(stages, "save_graded"):
-            save_jpeg(graded, day_dir / work.graded)
+            # Synced inside the stage: "saved" means on the disk, and the entry
+            # below must not be removed before the file it stands for is there.
+            _sync_file(save_jpeg(graded, day_dir / work.graded))
         saved_ms = None
         if work.shutter is not None:
             saved_ms = (time.perf_counter() - work.shutter) * 1000.0
@@ -618,7 +642,7 @@ class CaptureSession:
         record["grade"] = "background"
         if recovered:
             record["recovered"] = True
-        self._append_record(day_dir, record)
+        self._append_record(day_dir, record, durable=True)
         remove_entry(job.entry)
 
     def _unfinished(self) -> list[GradeJob]:
@@ -777,9 +801,28 @@ class CaptureSession:
         return path.relative_to(self.out_root).as_posix()
 
     @staticmethod
-    def _append_record(day_dir: Path, record: dict) -> None:
-        with (day_dir / "captures.jsonl").open("a") as fh:
-            fh.write(json.dumps(record) + "\n")
+    def _append_record(day_dir: Path, record: dict, *, durable: bool = False) -> None:
+        """Append one line to the day's log.
+
+        ``durable`` is the grade side's: the line is synced to disk before the
+        caller removes the pending entry, and a log left without a final newline
+        (a line cut short by a power cut) is given one first.
+        """
+        path = day_dir / "captures.jsonl"
+        if not durable:
+            with path.open("a") as fh:
+                fh.write(json.dumps(record) + "\n")
+            return
+        line = (json.dumps(record) + "\n").encode()
+        with path.open("a+b") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            if size:
+                fh.seek(size - 1)
+                if fh.read(1) != b"\n":
+                    line = b"\n" + line
+            fh.write(line)  # append mode: always at the end, wherever the read left off
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def _exposure_card(self, index: int, of: int) -> Path:
         """The Stick's picture for a partial double; never under ``out_root``.
@@ -1276,6 +1319,42 @@ def _arm_exit_deadline(seconds: float, code: int) -> None:
     timer.start()
 
 
+class _Terminated(KeyboardInterrupt):
+    """SIGTERM, raised in the main thread so a stop unwinds exactly as Ctrl-C does."""
+
+
+@contextlib.contextmanager
+def _sigterm_as_interrupt():
+    """While inside, the first SIGTERM raises ``_Terminated`` in the main thread.
+
+    systemd stops the service with SIGTERM, and Python's default for it ends the
+    process on the spot: no ``finally`` runs, so the queued grades were left for
+    the next start to recover. Raising makes every loop ``main`` can sit in end
+    the way it already does for Ctrl-C. Only the first one raises: a second
+    SIGTERM arriving during the clean-up must not break into it. (The viewfinder
+    installs its own handler over this one while it runs, and puts this one back.)
+
+    ``signal.signal`` only works in the main thread, so anywhere else this does
+    nothing; a caller there cannot be sent a signal's exception anyway.
+    """
+    if current_thread() is not main_thread():
+        yield
+        return
+    fired = False
+
+    def handler(*_: object) -> None:
+        nonlocal fired
+        if not fired:
+            fired = True
+            raise _Terminated()
+
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     display, touch = display_pair
     stop = threading.Event()
@@ -1359,6 +1438,12 @@ def _idle_seconds(text: str) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Held until the clean-up in ``_main`` is over, so a stop finishes the grades.
+    with _sigterm_as_interrupt():
+        return _main(argv)
+
+
+def _main(argv: list[str] | None) -> int:
     parser = argparse.ArgumentParser(
         prog="pifilm-capture",
         description="Capture Parr-graded photos from a supported camera.",
@@ -1670,6 +1755,8 @@ def main(argv: list[str] | None = None) -> int:
         with TerminalKeys() as keys:
             run_headless_loop(session, keys.read)
         return 0
+    except _Terminated:
+        return 0  # stopped by SIGTERM; the clean-up below is the whole of the exit
     finally:
         if button is not None:
             # The GPIO library can raise while joining its thread or releasing
