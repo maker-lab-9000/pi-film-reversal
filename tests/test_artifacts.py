@@ -285,3 +285,21 @@ def test_two_scale_grain_in_a_version_2_file_is_refused(tmp_path):
     p.write_text(json.dumps(data))
     with pytest.raises(ArtifactsError, match="version 3"):
         Artifacts.load(tmp_path / "a")
+
+
+def test_tile_grain_writes_version_4_and_loads(tmp_path):
+    grain = GrainParams(model="two_scale_tile", strength=0.025, tile_px=512)
+    write_artifact(tmp_path / "a", LUT3D.identity(9), NormalizeParams(), grain)
+    assert json.loads((tmp_path / "a" / "params.json").read_text())["version"] == 4
+    assert Artifacts.load(tmp_path / "a").grain == grain
+
+
+def test_tile_grain_in_a_version_3_file_is_refused(tmp_path):
+    write_artifact(tmp_path / "a", LUT3D.identity(9), NormalizeParams(),
+                   GrainParams(model="two_scale_tile"))
+    p = tmp_path / "a" / "params.json"
+    data = json.loads(p.read_text())
+    data["version"] = 3
+    p.write_text(json.dumps(data))
+    with pytest.raises(ArtifactsError, match="version 4"):
+        Artifacts.load(tmp_path / "a")
