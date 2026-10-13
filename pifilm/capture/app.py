@@ -57,6 +57,43 @@ second is what the user waits for; ``shutter_us`` (the fixed exposure time under
 shutter priority, null on auto); ``iso`` (the fixed ISO, null on auto);
 ``camera_metadata`` (per-shot camera metadata)
 when present; and ``dng`` (the sidecar filename) when a DNG was written.
+
+Grading behind the shutter
+--------------------------
+With ``background=True`` (``--grade background``, the command's default) a shot is
+split in two. The capture side reads the frame, saves the original, writes a
+pending entry, makes a quick grade for the screen and the Stick, and hands the
+full frame to a ``GradeQueue``; the camera is then free. The grade side
+(``_run_grade``, on the queue's one worker) grades at full size, saves the graded
+file, appends the record and removes the entry, in that order.
+
+Why that order on the grade side: a crash after the file and before the record
+leaves the entry, so the next start grades again and writes the one record; a
+crash after the record and before the entry is removed leaves an entry whose
+record already exists, which the next start sees in ``captures.jsonl`` and only
+removes. Neither leaves a photograph without a record or with two. An entry can
+also come back after it was removed (its removal is not synced to disk), and the
+same check covers that.
+
+Why the entry is written before the quick grade: from the moment the original is
+on disk the photograph must be finishable without this process, and the quick
+grade is the first thing after it that can fail.
+
+The graded file is the same in both modes, byte for byte: same frame, same seed
+drawn at the same place in the seed stream, same pipeline call, same encoder. The
+quick grade is not that file. It has no grain and is normalised on the reduced
+frame, and it lives in the session's private temporary directory, never under
+``OUT``, so the Nextcloud sync never uploads it.
+
+The record is written by the grade side, so it lands when the graded file does,
+in shot order (one worker). It gains ``shutter_to_ready_ms`` (shutter to the
+camera being free, the wait the photographer feels), ``grade: "background"``, and
+the stages ``preview`` and ``queued``. A grade finished at the next start has no
+shutter to measure from: it carries ``recovered: true`` instead of the two
+shutter timings, and it was made from the saved JPEG, not the frame in memory.
+
+``background=False`` is the code as it was before any of this: no queue, no
+state directory, no new record fields.
 """
 
 from __future__ import annotations
@@ -75,8 +112,9 @@ import threading
 import time
 import tty
 import uuid
+from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -102,6 +140,15 @@ from .button import (
 from .camera import Camera, CameraError, FakeCamera, Frame, V4L2Camera
 from .controller import CaptureController, JobSnapshot
 from .errors import CameraStalled
+from .gradequeue import (
+    GradeJob,
+    GradeQueue,
+    default_state_dir,
+    note_failure,
+    read_entries,
+    remove_entry,
+    write_entry,
+)
 from .picamera import COLOUR_TEMPERATURE_RANGE_K, Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
 from .remote import RemoteCaptureServer
@@ -113,6 +160,13 @@ DEFAULT_OUT = Path("~/Pictures/pifilm")
 WINDOW_NAME = "Parr  [SPACE capture | P toggle grade | Q quit]"
 CAPTURE_WINDOW_NAME = "Parr captures  [SPACE capture | Q quit]"
 
+# The quick grade's long edge, in pixels: a quarter of the IMX477's 4056, which is
+# more than the 640 x 480 panel and the Stick's 240 x 135 thumbnail can show.
+QUICK_LONG_EDGE = 1014
+# Quick grades kept in the private directory. Only the newest is ever shown; the
+# rest are kept for a client still downloading an earlier one.
+QUICK_KEEP = 16
+
 
 @dataclass
 class CaptureResult:
@@ -123,6 +177,105 @@ class CaptureResult:
     # ``pifilm`` is the "Exposure 1/2" card, not a photo: nothing is graded until the
     # second exposure lands on the same "negative" (see ``pifilm.double``).
     exposure: tuple[int, int] | None = None
+    # Where the graded file is, or will be once its background grade finishes. Graded
+    # inline it is ``pifilm``; behind the shutter ``pifilm`` is the quick grade and
+    # this is the final path. None after exposure 1 of a double: nothing is graded.
+    graded: Path | None = None
+
+
+@dataclass
+class _GradeWork:
+    """One photograph's grade: the payload of a ``GradeJob``.
+
+    The first eight fields are exactly what the pending entry holds, so a grade
+    can be done again from the entry alone. The rest exists only for a shot taken
+    by this process; a recovered grade has ``frames`` None and reads its originals
+    from disk.
+    """
+
+    day: str  # the day folder's name; the graded file and its record go there
+    graded: str  # the graded file's name
+    originals: list[str]  # relative to out_root; two for a double, exposure 1 first
+    seed: int
+    ev: float
+    record: dict  # the record's capture-time fields
+    double: dict | None = None  # {"ev_comp": [ev1, ev2], "method": ...} for a double
+    frames: tuple[np.ndarray, ...] | None = None
+    stages: dict[str, float] = field(default_factory=dict)
+    shutter: float | None = None  # time.perf_counter() at the shutter
+    # Shutter to the camera being free. Known only after the job is handed over, by
+    # which time the worker may already be grading it, so the worker waits on
+    # ``ready`` before it reads the number for the record.
+    ready_ms: float | None = None
+    ready: threading.Event = field(default_factory=threading.Event)
+
+    def entry(self, out_root: Path) -> dict:
+        return {
+            "out_root": str(out_root),
+            "day": self.day,
+            "graded": self.graded,
+            "originals": list(self.originals),
+            "seed": self.seed,
+            "ev": self.ev,
+            "double": self.double,
+            "record": self.record,
+        }
+
+    @classmethod
+    def from_entry(cls, payload: dict) -> _GradeWork:
+        """The work a pending entry describes. Raises on anything it cannot trust.
+
+        An entry is read back from disk at start-up, so every name in it is checked
+        before it is joined to the output folder: a damaged or foreign file must
+        fail its grade (and be set aside by the queue), not write somewhere else.
+        """
+        day, graded = payload["day"], payload["graded"]
+        originals, record, double = payload["originals"], payload["record"], payload.get("double")
+        for name in (day, graded):
+            if not isinstance(name, str) or not name or Path(name).name != name:
+                raise ValueError(f"pending entry has a bad name: {name!r}")
+        if (
+            not isinstance(originals, list)
+            or len(originals) != (2 if double is not None else 1)
+            or not all(isinstance(name, str) and name for name in originals)
+            or any(Path(name).is_absolute() or ".." in Path(name).parts for name in originals)
+        ):
+            raise ValueError(f"pending entry has bad originals: {originals!r}")
+        if not isinstance(record, dict) or not isinstance(double, dict | None):
+            raise ValueError("pending entry has a bad record")
+        return cls(day, graded, originals, int(payload["seed"]), float(payload["ev"]),
+                   record, double)
+
+
+def _quick_frame(rgb: np.ndarray) -> np.ndarray:
+    """The frame reduced by a whole factor to about ``QUICK_LONG_EDGE`` on its long edge.
+
+    A whole factor, so every output pixel is the plain mean of a block of sensor
+    pixels (``INTER_AREA``), which is cheap and does not alias. A frame already
+    that small is returned as it is, not copied.
+    """
+    height, width = rgb.shape[:2]
+    factor = max(1, round(max(height, width) / QUICK_LONG_EDGE))
+    if factor == 1:
+        return rgb
+    size = (max(1, width // factor), max(1, height // factor))
+    return cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+
+
+def _already_recorded(day_dir: Path, graded: str) -> bool:
+    """Whether ``captures.jsonl`` in ``day_dir`` already has the record for ``graded``."""
+    try:
+        lines = (day_dir / "captures.jsonl").read_text().splitlines()
+    except (OSError, ValueError):
+        return False
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue  # a line cut short by a power cut says nothing about this grade
+        if isinstance(record, dict) and record.get("pifilm") == graded:
+            return True
+    return False
 
 
 @dataclass
@@ -169,10 +322,16 @@ class CaptureSession:
         seed_rng: np.random.Generator | None = None,
         package_version: str = __version__,
         save_dng: bool = True,
+        *,
+        background: bool = False,
+        state_dir: Path | None = None,
+        queue_depth: int = 3,
+        log: Callable[[str], None] = print,
     ) -> None:
         self.camera = camera
         self.pipeline = pipeline
         self.out_root = Path(out_root).expanduser()
+        self._log = log
         self._now = now or datetime.now
         self._seed_rng = seed_rng or np.random.default_rng()
         self._package_version = package_version
@@ -182,6 +341,15 @@ class CaptureSession:
         self.double_exposure = False
         self._pending: _PendingExposure | None = None
         self._card_dir: Path | None = None
+        self._previews: deque[Path] = deque()
+        # Grading behind the shutter (see the module docstring). Without a queue
+        # every shot is graded inline and the state directory is never touched.
+        self._queue: GradeQueue | None = None
+        if background:
+            self._state_dir = Path(state_dir) if state_dir is not None else default_state_dir()
+            self._queue = GradeQueue(
+                self._run_grade, depth=queue_depth, backlog=self._unfinished(), log=log,
+            )
         # Off the start-up path: a shot taken before it finishes just builds the
         # same thing itself.
         still_size = getattr(camera, "still_size", None)
@@ -236,6 +404,10 @@ class CaptureSession:
             )
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
+        if self._queue is not None:
+            return self._capture_background(
+                frame, ev, shutter, stages, seed, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
+            )
         t0 = time.perf_counter()
         graded, info = self.pipeline.process(
             frame.rgb, rng=np.random.default_rng(seed), ev=ev, timings=stages,
@@ -267,7 +439,225 @@ class CaptureSession:
             **({"dng": dng_name} if dng_name else {}),
         }
         self._append_record(day_dir, record)
-        return CaptureResult(original, pifilm, record)
+        return CaptureResult(original, pifilm, record, graded=pifilm)
+
+    def _capture_background(
+        self, frame: Frame, ev: float, shutter: float, stages: dict[str, float], seed: int, *,
+        shutter_us: int | None, wb_k: int | None, iso: int | None,
+    ) -> CaptureResult:
+        """A single shot graded behind the shutter: everything up to handing it over."""
+        day_dir, stem, t, original, dng_name = self._write_original(frame, stages)
+        graded = day_dir / f"{stem}_graded.jpg"
+        # The inline record without what grading adds. ``ev_comp`` marks where the
+        # pipeline's fields go, so the finished record keeps the inline order.
+        fields = {
+            "timestamp": t.isoformat(timespec="seconds"),
+            "original": original.name,
+            "pifilm": graded.name,
+            "frame_source": frame.source,
+            "ev_comp": ev,
+            "shutter_us": shutter_us,
+            "iso": iso,
+            "colour_temperature_k": wb_k,
+            "grain_seed": seed,
+            "params_version": PARAMS_VERSION,
+            "package_version": self._package_version,
+            **self.camera.stream_info.to_dict(),
+            **({"camera_metadata": frame.metadata} if frame.metadata else {}),
+            **({"dng": dng_name} if dng_name else {}),
+        }
+        work = _GradeWork(
+            day_dir.name, graded.name, [self._relative(original)], seed, ev, fields,
+            frames=(frame.rgb,), stages=stages, shutter=shutter,
+        )
+        return self._hand_over(work, stem, original, graded, exposure=None)
+
+    def _hand_over(
+        self, work: _GradeWork, stem: str, original: Path, graded: Path, *,
+        exposure: tuple[int, int] | None,
+    ) -> CaptureResult:
+        """Entry, quick grade, queue: the end of the capture side of a background shot."""
+        assert self._queue is not None and work.frames is not None and work.shutter is not None
+        job = GradeJob(payload=work, entry=self._write_entry(work, stem))
+        try:
+            preview = self._quick_grade(work, stem)
+        except Exception:
+            # No picture for the screen, so the shot is reported as failed, but the
+            # photograph is on disk and its grade must still be done in this run.
+            self._submit(job, shutter=work.shutter)
+            raise
+        # A copy, taken now: once the job is handed over the worker adds its own
+        # stages to the job's dict.
+        stages_so_far = dict(work.stages)
+        self._submit(job, shutter=work.shutter)
+        record = {**work.record, "shutter_to_ready_ms": work.ready_ms, "stage_ms": stages_so_far}
+        return CaptureResult(original, preview, record, exposure=exposure, graded=graded)
+
+    def _write_entry(self, work: _GradeWork, stem: str) -> Path | None:
+        """Write the shot's pending entry; None (and one log line) when that fails.
+
+        A state directory that cannot be written costs the protection against a
+        power cut, not the photograph: the grade still runs from memory.
+        """
+        try:
+            base = name = f"{work.day}_{stem}"
+            k = 1
+            # Another output folder's unfinished entry may share this name (the same
+            # second on another day's clock); it is not ours to overwrite.
+            while (self._state_dir / f"{name}.json").exists():
+                k += 1
+                name = f"{base}-{k}"
+            return write_entry(self._state_dir, name, work.entry(self.out_root.absolute()))
+        except (OSError, ValueError, TypeError) as exc:
+            self._say(f"warning: could not write the pending entry for {work.graded} ({exc}); "
+                      "this grade will not survive a power cut")
+            return None
+
+    def _quick_grade(self, work: _GradeWork, stem: str) -> Path:
+        """The picture for the screen and the Stick: reduced, no grain, never under ``out_root``."""
+        assert work.frames is not None
+        with _stage(work.stages, "preview"):
+            small = [_quick_frame(rgb) for rgb in work.frames]
+            rgb = composite(small[0], small[1]) if len(small) == 2 else small[0]
+            quick, _ = self.pipeline.process(rgb, grain=False, ev=work.ev)
+            path = save_jpeg(quick, self._private_dir() / f"preview-{stem}.jpg")
+        # The same name can come round again on another day; the older file is
+        # then already replaced and must not be deleted as if it were old.
+        if path in self._previews:
+            self._previews.remove(path)
+        self._previews.append(path)
+        while len(self._previews) > QUICK_KEEP:
+            self._previews.popleft().unlink(missing_ok=True)
+        return path
+
+    def _submit(self, job: GradeJob, *, shutter: float) -> None:
+        """Hand the job to the queue, waiting for a place if it is full.
+
+        A queue that refuses is closing. The photograph is then finished here, on
+        the capture's own thread, after the grades already accepted (so records
+        stay in shot order and two full frames are never graded at once).
+        """
+        assert self._queue is not None
+        work: _GradeWork = job.payload
+        asked = time.perf_counter()
+        try:
+            accepted = self._queue.submit(job)
+        finally:
+            # Set whatever happened: the worker waits on it before writing the record.
+            work.ready_ms = round((time.perf_counter() - shutter) * 1000.0, 1)
+            work.ready.set()
+        if accepted:
+            return
+        self._queue.close()
+        job.queued_at, job.started_at = asked, time.perf_counter()
+        try:
+            self._run_grade(job)
+        except Exception as exc:
+            # As the queue does for its own jobs: the entry stays, one attempt used.
+            self._say(f"grade failed: {exc}")
+            if job.entry is not None:
+                note_failure(job.entry)
+
+    def _run_grade(self, job: GradeJob) -> None:
+        """The grade side of a shot: grade, save, record, remove the entry.
+
+        Runs on the queue's worker (or on the capture thread for the one shot a
+        closing queue refused). Anything raised here is the queue's to count; the
+        entry is left for another attempt.
+        """
+        work = job.payload if isinstance(job.payload, _GradeWork) else _GradeWork.from_entry(
+            job.payload
+        )
+        recovered = work.frames is None
+        day_dir = self.out_root / work.day
+        if recovered and _already_recorded(day_dir, work.graded):
+            # The grade had finished; only the entry was left behind.
+            remove_entry(job.entry)
+            return
+        stages = work.stages
+        stages["queued"] = (
+            0.0 if recovered else round(max(0.0, job.started_at - job.queued_at) * 1000.0, 1)
+        )
+        frames = work.frames
+        if frames is None:
+            frames = tuple(load_rgb(self.out_root / name)[0] for name in work.originals)
+        t0 = time.perf_counter()
+        if work.double is not None:
+            with _stage(stages, "composite"):
+                rgb = composite(frames[0], frames[1])
+        else:
+            rgb = frames[0]
+        graded, info = self.pipeline.process(
+            rgb, rng=np.random.default_rng(work.seed), ev=work.ev, timings=stages,
+        )
+        pipeline_ms = (time.perf_counter() - t0) * 1000.0
+        with _stage(stages, "save_graded"):
+            save_jpeg(graded, day_dir / work.graded)
+        saved_ms = None
+        if work.shutter is not None:
+            saved_ms = (time.perf_counter() - work.shutter) * 1000.0
+            work.ready.wait()
+
+        # Today's order for today's fields, the new ones after them. The fields that
+        # close the inline record close this one too.
+        closing = ("double",) if "double" in work.record else ("camera_metadata", "dng")
+        record: dict = {}
+        for key, value in work.record.items():
+            if key == "ev_comp":
+                record.update(info)
+            elif key not in closing:
+                record[key] = value
+        record.update(info)  # an entry without ``ev_comp`` still gets them; no reorder otherwise
+        record["pipeline_ms"] = round(pipeline_ms, 1)
+        if saved_ms is not None:
+            record["shutter_to_saved_ms"] = round(saved_ms, 1)
+        record["stage_ms"] = stages
+        record.update({key: work.record[key] for key in closing if key in work.record})
+        if work.ready_ms is not None:
+            record["shutter_to_ready_ms"] = work.ready_ms
+        record["grade"] = "background"
+        if recovered:
+            record["recovered"] = True
+        self._append_record(day_dir, record)
+        remove_entry(job.entry)
+
+    def _unfinished(self) -> list[GradeJob]:
+        """Jobs for the pending entries a previous run of this output folder left.
+
+        Entries of another output folder are left where they are. Nothing in an
+        entry is trusted or even looked at here beyond that: this runs at start-up
+        and must not raise, so a damaged entry fails later, on the worker.
+        """
+        mine = str(self.out_root.absolute())
+        jobs = [
+            GradeJob(payload=payload, entry=path)
+            for path, payload in read_entries(self._state_dir)
+            if payload.get("out_root") == mine
+        ]
+        if jobs:
+            self._say(f"recovering {len(jobs)} unfinished grade(s)")
+        return jobs
+
+    def _say(self, message: str) -> None:
+        try:
+            self._log(message)
+        except Exception:
+            pass  # a closed stdout must not cost a photograph
+
+    @property
+    def pending_grades(self) -> int:
+        """Photographs whose graded file is not on disk yet; 0 when grading inline."""
+        return self._queue.pending if self._queue is not None else 0
+
+    def close_grades(self, timeout: float | None = None) -> bool:
+        """Finish the grades already accepted and stop the worker.
+
+        True when nothing is left running (always, when grading inline); False when
+        ``timeout`` ran out first. Safe to call again, and from any thread: it
+        takes no lock a capture holds, so it also releases a capture that is
+        waiting for a place in a full queue.
+        """
+        return self._queue.close(timeout) if self._queue is not None else True
 
     def _capture_double(
         self, frame: Frame, ev: float, shutter: float, stages: dict[str, float], *,
@@ -307,6 +697,30 @@ class CaptureSession:
             return CaptureResult(original, card, record, exposure=(1, 2))
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
+        if self._queue is not None:
+            graded = day_dir / f"{stem}_double_graded.jpg"
+            double = {"ev_comp": [pending.ev, ev], "method": COMPOSITE_METHOD}
+            originals = [pending.original, self._relative(original)]
+            # Today's exposure-2 record without what grading adds (see
+            # ``_capture_background``); the composite is graded at ev=0.
+            fields = {
+                "timestamp": t.isoformat(timespec="seconds"),
+                "original": original.name,
+                "pifilm": graded.name,
+                **camera_fields,
+                "ev_comp": 0.0,
+                "grain_seed": seed,
+                "params_version": PARAMS_VERSION,
+                "double": {
+                    "index": 2, "of": 2, "method": COMPOSITE_METHOD,
+                    "originals": originals, "ev_comp": [pending.ev, ev],
+                },
+            }
+            work = _GradeWork(
+                day_dir.name, graded.name, originals, seed, 0.0, fields, double,
+                frames=(pending.rgb, frame.rgb), stages=stages, shutter=shutter,
+            )
+            return self._hand_over(work, stem, original, graded, exposure=(2, 2))
         t0 = time.perf_counter()
         # Each frame goes in as shot, EV included; the composite is graded at ev=0.
         with _stage(stages, "composite"):
@@ -335,7 +749,7 @@ class CaptureSession:
             },
         }
         self._append_record(day_dir, record)
-        return CaptureResult(original, pifilm, record, exposure=(2, 2))
+        return CaptureResult(original, pifilm, record, exposure=(2, 2), graded=pifilm)
 
     def _write_original(
         self, frame: Frame, stages: dict[str, float],
@@ -375,13 +789,17 @@ class CaptureSession:
         re-created if it has gone: systemd-tmpfiles ages /tmp under a long-running
         service (the unit has no PrivateTmp), and a vanished card must not fail a shot.
         """
-        if self._card_dir is None:
-            self._card_dir = Path(tempfile.mkdtemp(prefix="pifilm-cards-"))
-        self._card_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path = self._card_dir / f"exposure-{index}-of-{of}.jpg"
+        path = self._private_dir() / f"exposure-{index}-of-{of}.jpg"
         if not path.exists():
             path.write_bytes(render_exposure_card(index, of))
         return path
+
+    def _private_dir(self) -> Path:
+        """The session's temporary directory for pictures that are not photographs."""
+        if self._card_dir is None:
+            self._card_dir = Path(tempfile.mkdtemp(prefix="pifilm-cards-"))
+        self._card_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return self._card_dir
 
     def preview_frame(self, graded: bool = True, size: tuple[int, int] = (640, 360)) -> np.ndarray:
         # full=False: the live preview must not pay Picamera2's per-frame autofocus
@@ -400,6 +818,14 @@ def _announce(result: CaptureResult, out: Callable[[str], None]) -> None:
         out(
             f"Saved {result.original.name} as exposure 1/2 in "
             f"{r['shutter_to_saved_ms']:.0f} ms; waiting for the second exposure"
+        )
+        return
+    if "wb_gains" not in r:
+        # Graded behind the shutter: the record so far has nothing from the grade.
+        graded = result.graded.name if result.graded is not None else result.pifilm.name
+        out(
+            f"Saved {result.original.name} in {r['shutter_to_ready_ms']:.0f} ms; "
+            f"grading {graded} in the background"
         )
         return
     clamps = [k for k, v in r["clamped"].items() if v]
@@ -1038,6 +1464,17 @@ def main(argv: list[str] | None = None) -> int:
         help="take a photo when a push button wired between this BCM pin and ground is "
              "pressed (for example 21: physical pin 40, with ground on pin 39)",
     )
+    parser.add_argument(
+        "--grade", choices=("background", "inline"), default="background",
+        help="'background' frees the camera once the original is saved and grades the "
+             "full-resolution file behind the shutter; 'inline' grades before the camera "
+             "is free, as before (default: background)",
+    )
+    parser.add_argument(
+        "--state-dir", type=Path, default=None, metavar="PATH",
+        help="where unfinished background grades are kept so a restart can finish them "
+             "(default: $XDG_STATE_HOME/pifilm/pending, or ~/.local/state/pifilm/pending)",
+    )
     args = parser.parse_args(argv)
 
     if args.shutter_gpio is not None:
@@ -1133,6 +1570,8 @@ def main(argv: list[str] | None = None) -> int:
         args.out,
         seed_rng=np.random.default_rng(args.seed),
         save_dng=not args.no_dng,
+        background=args.grade == "background",
+        state_dir=args.state_dir,
     )
     controller: CaptureController | None = None
     remote: RemoteCaptureServer | None = None
@@ -1248,8 +1687,17 @@ def main(argv: list[str] | None = None) -> int:
         if remote is not None:
             remote.close()
         if controller is not None:
+            # Its worker finishes the queued grades, then closes the camera.
             controller.close()
         else:
+            # No controller, or one a loop owned and has already closed: finishing
+            # the grades twice is harmless.
+            close_grades = getattr(session, "close_grades", None)
+            if callable(close_grades):
+                try:
+                    close_grades()
+                except Exception as exc:
+                    print(f"warning: grades did not finish cleanly ({exc})", file=sys.stderr)
             camera.close()
 
 

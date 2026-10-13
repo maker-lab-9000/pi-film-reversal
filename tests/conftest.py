@@ -9,6 +9,17 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def _state_home_under_tmp(tmp_path_factory, monkeypatch):
+    """Keep every test out of the real ``~/.local/state``.
+
+    ``pifilm-capture`` grades in the background by default and keeps its pending
+    entries under ``$XDG_STATE_HOME``, so a test that runs ``main`` without
+    ``--state-dir`` would otherwise read, and could write, the developer's own.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path_factory.mktemp("xdg-state")))
+
+
 def _s15f16(x: float) -> int:
     """ICC s15Fixed16Number."""
     return int(round(x * 65536.0))
