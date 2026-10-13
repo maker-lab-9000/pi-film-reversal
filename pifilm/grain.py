@@ -106,28 +106,42 @@ class GrainParams:
 def add_grain(
     rgb_u8: np.ndarray, params: GrainParams, rng: np.random.Generator | None = None
 ) -> np.ndarray:
+    """Add grain to the luminance of an 8-bit frame.
+
+    The luminance the envelope is read at is one of 256 byte values, so the
+    envelope (times ``strength``) is a 256-entry table indexed by the Y byte,
+    and only Y is ever made a float: Cr and Cb pass through as bytes. That is
+    the same arithmetic, value for value, as interpolating the envelope at
+    every pixel and rounding all three channels (which this did until
+    2026-10-13, at about twice the time on a 12 MP frame); the result is
+    identical byte for byte, so no grain model or params version changed.
+    """
     if not params.enabled or params.strength <= 0:
         return rgb_u8.copy()
     rng = rng if rng is not None else np.random.default_rng()
 
-    ycc = cv2.cvtColor(np.ascontiguousarray(rgb_u8), cv2.COLOR_RGB2YCrCb).astype(np.float32)
-    luma = ycc[..., 0] / 255.0
+    ycc = cv2.cvtColor(np.ascontiguousarray(rgb_u8), cv2.COLOR_RGB2YCrCb)
+    y = ycc[..., 0]
+    levels = np.arange(256, dtype=np.float32) / 255.0
 
     if params.model == "two_scale":
-        noise = _two_scale_noise(luma.shape, params, rng)
-        envelope = np.interp(luma, params.envelope_luma, params.envelope_rel).astype(np.float32)
-        ycc[..., 0] = np.clip(luma + params.strength * envelope * noise, 0.0, 1.0) * 255.0
-        return cv2.cvtColor(np.clip(np.round(ycc), 0, 255).astype(np.uint8),
-                            cv2.COLOR_YCrCb2RGB)
+        noise = _two_scale_noise(y.shape, params, rng)
+        envelope = np.interp(levels, params.envelope_luma, params.envelope_rel).astype(np.float32)
+    else:
+        noise = rng.standard_normal(y.shape, dtype=np.float32)
+        if params.blur_sigma > 0:
+            noise = cv2.GaussianBlur(noise, (0, 0), params.blur_sigma)
+            noise /= max(float(noise.std()), 1e-6)
+        envelope = 4.0 * levels * (1.0 - levels)
 
-    noise = rng.standard_normal(luma.shape, dtype=np.float32)
-    if params.blur_sigma > 0:
-        noise = cv2.GaussianBlur(noise, (0, 0), params.blur_sigma)
-        noise /= max(float(noise.std()), 1e-6)
-
-    envelope = 4.0 * luma * (1.0 - luma)
-    ycc[..., 0] = np.clip(luma + params.strength * envelope * noise, 0.0, 1.0) * 255.0
-    return cv2.cvtColor(np.clip(np.round(ycc), 0, 255).astype(np.uint8), cv2.COLOR_YCrCb2RGB)
+    # luma + strength * envelope * noise, in place in the noise field.
+    noise *= (params.strength * envelope)[y]
+    noise += levels[y]
+    np.clip(noise, 0.0, 1.0, out=noise)
+    noise *= 255.0
+    np.rint(noise, out=noise)
+    ycc[..., 0] = noise   # already within 0..255
+    return cv2.cvtColor(ycc, cv2.COLOR_YCrCb2RGB)
 
 
 def _two_scale_noise(shape: tuple[int, int], params: GrainParams,

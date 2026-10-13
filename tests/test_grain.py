@@ -140,3 +140,46 @@ def test_gaussian_to_dict_is_unchanged_so_old_artifacts_stay_byte_identical():
 def test_two_scale_invalid_params_name_the_field(kwargs, field):
     with pytest.raises(ValueError, match=field):
         GrainParams(**kwargs)
+
+
+def _reference_add_grain(rgb_u8, params, rng):
+    """``add_grain`` as it was before the 2026-10-13 speed-up, kept as the
+    reference the faster version must match byte for byte."""
+    import cv2
+
+    from pifilm.grain import _two_scale_noise
+
+    ycc = cv2.cvtColor(np.ascontiguousarray(rgb_u8), cv2.COLOR_RGB2YCrCb).astype(np.float32)
+    luma = ycc[..., 0] / 255.0
+    if params.model == "two_scale":
+        noise = _two_scale_noise(luma.shape, params, rng)
+        envelope = np.interp(luma, params.envelope_luma, params.envelope_rel).astype(np.float32)
+    else:
+        noise = rng.standard_normal(luma.shape, dtype=np.float32)
+        if params.blur_sigma > 0:
+            noise = cv2.GaussianBlur(noise, (0, 0), params.blur_sigma)
+            noise /= max(float(noise.std()), 1e-6)
+        envelope = 4.0 * luma * (1.0 - luma)
+    ycc[..., 0] = np.clip(luma + params.strength * envelope * noise, 0.0, 1.0) * 255.0
+    return cv2.cvtColor(np.clip(np.round(ycc), 0, 255).astype(np.uint8), cv2.COLOR_YCrCb2RGB)
+
+
+@pytest.mark.parametrize("params", [
+    GrainParams(),
+    GrainParams(strength=0.05),
+    GrainParams(strength=0.3, blur_sigma=0.0),
+    GrainParams(model="two_scale", strength=0.02),
+    GrainParams(model="two_scale", strength=0.4),
+    GrainParams(model="two_scale", strength=0.05, fine_share=1.0),
+])
+def test_add_grain_matches_the_reference_byte_for_byte(params):
+    """Old records regrade with the same seed, so the pixels must not move."""
+    rng = np.random.default_rng(11)
+    img = rng.integers(0, 256, (301, 402, 3), dtype=np.uint8)
+    img[:40] = 0
+    img[40:80] = 255
+    img[80:120] = np.linspace(0, 255, 402).astype(np.uint8)[None, :, None]
+    for seed in (0, 1, 2):
+        want = _reference_add_grain(img, params, np.random.default_rng(seed))
+        got = add_grain(img, params, rng=np.random.default_rng(seed))
+        assert np.array_equal(got, want)
