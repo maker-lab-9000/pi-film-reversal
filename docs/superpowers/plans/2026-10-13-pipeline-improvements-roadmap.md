@@ -124,6 +124,28 @@ LUT, grain), the fallback to the CPU path, how memory is kept clear of the
 camera's still capture, the IMX708's oversize frame, and the tolerance the tests
 hold it to. A graded live view becomes possible once it exists.
 
+Quality requirements for the design (from a second outside note, 2026-10-13,
+checked against this codebase):
+
+- Stay in float from input to output and round once, with dithering. Today the
+  frame is rounded to 8 bits after normalisation and again after the LUT.
+- Fetch LUT texels with `texelFetch` and interpolate in `highp` float in the
+  shader; never the GPU's built-in filtering, whose blend weights are coarse.
+  With `texelFetch` there is no texel-centre offset to get wrong.
+- LUT texture in half or full float, never RGBA8.
+- Tetrahedral interpolation is then a few lines; whether to adopt it is a look
+  decision (it changes pixels against the trilinear reference), judged by gallery.
+- Record the backend and its version in `captures.jsonl` (`pipeline_backend`), so
+  a regrade knows which path made a photograph. GPU grain will not match NumPy's
+  for the same `grain_seed`.
+- Frames wider than the GPU's largest texture are graded in tiles; the LUT has no
+  seams, grain and any neighbourhood effect need overlap.
+
+Two statements in that note do not hold here: grain is already scaled by
+luminance (both grain models have an envelope), and there is no "preview equals
+capture" guarantee to keep, because the live view is ungraded today. A graded
+live view from the same shader would be new.
+
 ## Considered and not planned
 
 - **Grading from the raw stream.** Right in principle (the LUT currently sits on
