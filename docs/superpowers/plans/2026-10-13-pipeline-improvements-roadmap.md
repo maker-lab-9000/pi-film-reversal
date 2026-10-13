@@ -166,6 +166,14 @@ decisions on queue depth and memory, what a power loss leaves behind (a journal 
 pending grades), double exposure, and what the Stick is told. Gets its own design
 document before any code.
 
+Built: the design and its decisions are in
+[2026-10-13-background-grading-design.md](../specs/2026-10-13-background-grading-design.md),
+the implementation plan in
+[2026-10-13-background-grading.md](2026-10-13-background-grading.md). The queue is
+`pifilm/capture/gradequeue.py`; `--grade inline` switches it off.
+
+Pi numbers: to be measured.
+
 ### 7. GPU grading
 
 Wanted by the owner (2026-10-13). Built from step 2's measurements, with its own

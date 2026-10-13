@@ -130,7 +130,17 @@ fitted on normalized input; grain runs last because it models developed film.
   OpenCV window. Output:
   `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,graded|double_graded}.jpg` plus an audit
   line in `captures.jsonl` (LUT hash, normalisation hash and grain seed allow regenerating the
-  graded file). Each record also carries `stage_ms`, the
+  graded file). `--grade background` (the default) splits a shot into two sides: the
+  capture side saves the original, writes a pending entry, makes a quick grade (reduced four
+  times each way, no grain; what the review screen and the Stick show) and frees the camera;
+  the grade side (`_run_grade`, on the queue's worker) grades at full size, saves the graded
+  file, appends the record and removes the entry, in that order. Such a record gains
+  `shutter_to_ready_ms`, `grade: "background"`, stages `preview` and `queued`, and
+  `recovered: true` when it was finished at a later start from the saved JPEG.
+  `--grade inline` is the earlier behaviour, with no queue and no new fields; `--state-dir`
+  moves the pending entries (default `~/.local/state/pifilm/pending`). SIGTERM finishes the
+  queue only when the LCD viewfinder is running; headless, the process ends at once and the
+  next start completes the grades. Each record also carries `stage_ms`, the
   milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, LUT,
   grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`
   is the plan those numbers feed.
@@ -138,9 +148,14 @@ fitted on normalized input; grain runs last because it models developed film.
   adds the two ungraded frames in linear light (one stop down each), and the composite is
   graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card in a temp dir
   (never under the synced output folder); toggled via `CaptureController.set_double_exposure`.
+- `gradequeue.py`: `GradeQueue`, one `pifilm-grade` worker with three waiting places (a full
+  queue makes the next capture wait), and the pending entries: atomically written JSON files
+  that let the next start finish a grade a power cut interrupted. An entry that fails twice is
+  renamed `*.failed`. No camera, pipeline or display in it.
 - `controller.py`: `CaptureController` serializes captures on one worker thread, one active job at
   a time, idempotent by `request_id`. Shared by the local SPACE key, the LCD, the GPIO shutter
-  button and the remote API.
+  button and the remote API. `ControllerSnapshot.pending_grades` is read live from the session
+  (it includes a recovery backlog), and closing finishes the grades before the camera closes.
 - `button.py`: optional physical shutter button (`--shutter-gpio BCM`, documented on BCM 21 with
   ground on physical pin 39). gpiozero `Button` with the internal pull-up, lazy import; a press
   calls `CaptureController.submit` like an LCD tap, so a press during a capture is dropped as
@@ -169,7 +184,9 @@ readout (pure, from preview metadata + pixels). The manual controls are pure ste
 last two over the generic `stepscale.py` (an auto end, and a first step from auto that lands on
 what the camera is metering). `liveview.py` draws the live screen, an SLR-finder style black
 strip of three selectable cells (SHUTTER, ISO, WB) with one `+`/`-` pair, shutter button at the
-top right, meter dots, `2x`, battery and focus gauge, from cached anti-aliased tiles in the
+top right, meter dots, `2x`, battery, the developing count (an amber number right of the
+battery tag: `LiveState.developing`, from the snapshot's `pending_grades` at every frame,
+absent at zero) and focus gauge, from cached anti-aliased tiles in the
 bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
 holds only the review, processing and message screens. Both work in 320×240 base units at an
 integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine

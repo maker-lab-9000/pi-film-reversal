@@ -56,6 +56,53 @@ with shutter and ISO both fixed there is no auto-exposure and the meter is the g
 There is no exposure compensation (removed 2026-10-11). The grade does not change: a
 frame that ran out of gain (`MAX` in the `ISO` cell) is normalised like any dark frame.
 
+### The order of a shot
+
+The three steps above take about 2 s on a full-resolution frame on the Pi 4. By
+default (`--grade background`) the camera does not wait for them:
+
+1. The frame is read and the original JPEG is saved (and the DNG, when enabled).
+   From here the photograph survives a power cut.
+2. A pending entry is written: a small JSON file outside the photo folder
+   (`~/.local/state/pifilm/pending/`, or `--state-dir PATH`) with the original's
+   name, the grain seed, the EV and the camera fields of the record.
+3. A quick grade is made for the review screen and the Stick: the frame reduced
+   four times each way (1014 × 760 from the IMX477), through the same pipeline
+   without grain. The camera is now free for the next photograph.
+4. Behind the shutter, one worker thread grades the full frame, saves
+   `*_graded.jpg`, appends the record to `captures.jsonl` and deletes the pending
+   entry, in that order. Photographs are graded in the order they were shot.
+
+The record is therefore written when the graded file is saved, not when the shutter
+is pressed. It gains `shutter_to_ready_ms` (shutter to the camera being free),
+`grade: "background"`, and the stages `preview` and `queued` in `stage_ms`;
+`shutter_to_saved_ms` now includes the time spent waiting in the queue. The graded
+file is byte for byte the one inline grading would write: same frame, seed and
+pipeline.
+
+The quick grade is not the final file. It has no grain and its normalisation is
+measured on the reduced frame, so its tone can differ slightly. It is kept in a
+private temporary directory, never in the photo folder.
+
+At most three grades wait at once, each holding its frame in memory. When the queue
+is full the next capture waits for a place. The viewfinder shows how many
+photographs are still developing.
+
+**Recovery.** At start-up the pending entries that belong to the same output folder
+are finished first, on the same worker. A recovered grade starts from the saved JPEG,
+not from the frame in memory, so it can differ from the uninterrupted grade by JPEG
+rounding; its record carries `recovered: true` and has no shutter timings. An entry
+that fails twice is renamed `*.failed` and reported in the log.
+
+**Stopping.** A normal stop finishes the queue before the process exits. A stop by
+SIGTERM (how systemd stops the service) does so only when the LCD viewfinder is
+running; in headless mode the process ends at once and the unfinished grades are
+completed at the next start.
+
+`--grade inline` restores the earlier order: the full grade is saved before the
+camera is free, there is no queue and no pending entry, and records have none of the
+new fields.
+
 ### Double exposure
 
 With the viewfinder's `2x` toggle on, two captures make one picture

@@ -173,8 +173,9 @@ message screens keep the default font.
 | Focus gauge (vertical bar, left edge) | Absolute sharpness of the central quarter of the frame, 0 (far out of focus, or nothing to focus on) to full; an amber tick marks the best level of the last few seconds | — |
 | `2x` toggle (outlined tag, top left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
 | Battery tag (outlined, top left, right of `2x`) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
-| Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
-| Review screen | Full-screen graded result, one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
+| Developing count (amber number on a dark patch, right of the battery tag) | How many photographs are still being graded behind the shutter; see [Developing count](#developing-count). Absent at zero and with `--grade inline` | — |
+| Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
+| Review screen | Full-screen quick grade (the frame reduced four times each way, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
 Press feedback: `+`, `-` and the shutter button light while a finger is on them, not
 only on release, and a tap shorter than one frame still lights its key for 0.15 s.
@@ -186,6 +187,24 @@ when they will do nothing (the top of a scale).
 While the processing screen is showing, taps on the cells, on `+`/`-` and on `2x`
 are ignored: the colour bars hide them, so nothing is selected or stepped. A tap on
 the shutter button's place still reaches the controller, which answers busy.
+
+### Developing count
+
+The full-resolution grade of a photograph runs behind the shutter, on a queue
+(`--grade background`, the default). While any grade is unfinished, an amber number
+beside the battery tag says how many photographs are still developing. It counts the
+grade that is running and the ones waiting. It disappears at zero.
+
+- At zero every graded file and its record are on disk, so it is safe to switch off.
+- The queue holds three waiting grades. When it is full the next capture waits for
+  a place, with the processing screen showing. That is why the shutter may wait
+  although the last picture has already been reviewed.
+- Just after a restart the number can be higher than the queue allows: grades left
+  unfinished by a power cut are counted too, and are finished first.
+- Numbers above 99 are drawn as `99`.
+
+The review screen and the Stick show the quick grade, not the final file: it is
+reduced and has no grain, and its tone can differ slightly from the graded file.
 
 ### Idle dimming
 
@@ -535,6 +554,21 @@ Not yet run on hardware. The branch is `feat/manual-controls-ui`.
 | 7 | The shutter button is not hit while working `+`/`-` | Not yet run |
 | 8 | `2x`, focus gauge, battery, review, idle screen-off, Stick and GPIO button work as before | Not yet run |
 | 9 | About 10 fps is kept (`viewfinder: N fps` in the journal) | Not yet run |
+
+#### Background grading
+
+Not yet run on hardware. The branch is `feat/background-grade`; the design is
+[2026-10-13-background-grading-design.md](superpowers/specs/2026-10-13-background-grading-design.md).
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | A single shot: the review appears and the camera is free in about 1.6 s; the graded file appears a few seconds later; the record has `shutter_to_ready_ms` | |
+| 2 | Five shots as fast as the camera allows: all five graded files and records are present, in order; the developing count rises and returns to zero | |
+| 3 | A double exposure: the card, then the composite's review; one graded file | |
+| 4 | Stick: the picture arrives after each shot, as before | |
+| 5 | Power cut with the count above zero (pull the supply with the UPS off, or `kill -9`): after the restart the missing graded files appear, and their records are marked `recovered` | |
+| 6 | `--grade inline`: behaves as before this change | |
+| 7 | Ten minutes of ordinary use: no preview stall, and the live view is acceptable | |
 
 ## 8. Troubleshooting
 
