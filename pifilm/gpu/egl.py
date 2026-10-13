@@ -17,11 +17,19 @@ difference from it is listed here to be checked on the hardware:
   The display is left initialised (``eglTerminate`` would end it for the whole
   process).
 * ``EGL_PLATFORM`` is set to ``surfaceless`` around the display's creation
-  only and then put back, so nothing else in the process inherits it.
+  only and then put back, so the variable is not left changed for child
+  processes. The process itself stays surfaceless: Mesa settles its native
+  platform at the first ``eglGetDisplay`` and keeps it. That is harmless here,
+  where nothing else uses EGL (``pykms`` and Picamera2 without a preview do
+  not), and it also means a process that called ``eglGetDisplay`` before this
+  would not get the surfaceless platform from the variable.
 * ``argtypes`` are declared on the GL functions that take a pointer, as the
   spike did for EGL only, and on the two EGL functions ``close`` adds.
 * After a GL error the remaining error flags are read off, so one failed pass
-  is not reported again by the next.
+  is not reported again by the next; the error is read before the framebuffer's
+  status is judged, so an allocation that ran out of memory says so. A table,
+  tile or LUT whose load failed is deleted, so the next load makes it afresh
+  and does not refill a texture that never got its storage.
 * The set-up, the tables, the LUT and the tile are each checked for a GL
   error (the spike checked after allocation and after a pass), and a frame or
   a table of the wrong shape is refused before it reaches a GL call.
@@ -240,7 +248,7 @@ class EglDevice:
                 raise GpuError(f"table {name} has shape {np.shape(values)}, not {shape}")
         for name, values, _ in named:
             self._table(name, values)
-        self._check("the tables")
+        self._check_load("the tables", "chan", "tone", "gain")
 
     def load_tile(self, tile: np.ndarray | None) -> None:
         self._require_open()
@@ -254,7 +262,7 @@ class EglDevice:
         gl.glTexStorage2D(GL_TEXTURE_2D, 1, GL_R16F, size, size)
         gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, size, size, GL_RED, GL_FLOAT, ptr(data))
         self.tile_size = size
-        self._check("the tile")
+        self._check_load("the tile", "tile")
 
     def load_lut(self, table: np.ndarray) -> None:
         self._require_open()
@@ -268,7 +276,7 @@ class EglDevice:
         gl.glTexStorage3D(GL_TEXTURE_3D, 1, GL_RGB32F, n, n, n)
         gl.glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, n, n, n, GL_RGB, GL_FLOAT, ptr(data))
         self.n = n
-        self._check("the LUT")
+        self._check_load("the LUT", "lut")
 
     def _allocate(self, width: int, height: int) -> None:
         """The frame's input and output textures and the framebuffer, for this
@@ -289,6 +297,9 @@ class EglDevice:
         gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                   GL_TEXTURE_2D, self.textures["out"], 0)
         status = gl.glCheckFramebufferStatus(GL_FRAMEBUFFER)
+        # First, so a storage call that failed (out of memory, most likely) is
+        # reported by its own code and its flag does not wait for the next pass.
+        self._check("allocation")
         if status != 0x8CD5:
             raise GpuError(f"framebuffer incomplete: 0x{status:x}")
         gl.glViewport(0, 0, width, height)
@@ -298,6 +309,18 @@ class EglDevice:
     def _require_open(self) -> None:
         if self._ctx is None:
             raise GpuError("the device is closed")
+
+    def _check_load(self, where: str, *names: str) -> None:
+        """``_check`` for a loader: on an error the textures it was filling are
+        deleted and forgotten. A texture is named before its storage is made,
+        so one whose storage failed would otherwise be refilled, and fail, on
+        every later load."""
+        try:
+            self._check(where)
+        except GpuError:
+            for name in names:
+                self._delete(name)
+            raise
 
     def _check(self, where: str) -> None:
         gl = self.gl

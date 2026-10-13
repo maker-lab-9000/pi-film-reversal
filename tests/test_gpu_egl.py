@@ -517,3 +517,48 @@ def test_the_grader_drives_the_device_end_to_end(libs):
     assert GpuGrader.open(tile_artifacts(), log=lines.append) is None
     assert len(lines) == 1 and lines[0].startswith("gpu grading off: self-test: ")
     assert libs.args_of("eglDestroyContext") == [(0xD15, 0xC7)]
+
+
+# --- fix round 1: no error flag or half-made texture is left behind -------------
+
+
+def test_an_incomplete_framebuffer_reports_the_gl_error_behind_it_and_leaves_no_flag(libs):
+    # Out of memory in glTexStorage2D is the likely cause on the Pi: the message
+    # carries that code, and the flag is not left for the next pass to trip on.
+    device = _ready(libs)
+    status = [0x8CD6]
+    libs._glCheckFramebufferStatus = lambda target: status[0]
+    libs.errors = [0x505]
+    with pytest.raises(GpuError, match="GL error after allocation: 0x505"):
+        device.run(_frame(), use_tone=False, placement=None)
+    assert libs.errors == []
+    status[0] = 0x8CD5
+    assert device.run(_frame(), use_tone=False, placement=None).shape == (4, 6, 4)
+
+
+@pytest.mark.parametrize("load, names, storage", [
+    (lambda d: d.load_tables(_tables()), ("chan", "tone", "gain"), "glTexStorage2D"),
+    (lambda d: d.load_tile(np.zeros((8, 8), np.float32)), ("tile",), "glTexStorage2D"),
+    (lambda d: d.load_lut(_lut()), ("lut",), "glTexStorage3D"),
+])
+def test_a_load_that_fails_leaves_no_texture_and_the_next_load_starts_clean(
+        libs, load, names, storage):
+    device = egl.open_device()
+    libs.errors = [0x505]
+    with pytest.raises(GpuError, match="0x505"):
+        load(device)
+    assert not set(names) & set(device.textures)
+    assert len(libs.args_of("glDeleteTextures")) == len(names)
+    made = len(libs.args_of(storage))
+    load(device)
+    assert set(names) <= set(device.textures)
+    assert len(libs.args_of(storage)) == 2 * made       # storage made again, not refilled
+
+
+def test_a_pass_after_a_failed_load_says_what_is_missing(libs):
+    device = _ready(libs)
+    libs.errors = [0x505]
+    with pytest.raises(GpuError):
+        device.load_tables(_tables())
+    with pytest.raises(GpuError, match="not loaded: chan, tone, gain"):
+        device.run(_frame(), use_tone=False, placement=None)
