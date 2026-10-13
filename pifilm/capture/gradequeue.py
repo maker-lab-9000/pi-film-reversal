@@ -72,10 +72,15 @@ def write_entry(state_dir: Path, name: str, payload: dict) -> Path:
     has them. The directory is created with mode 0o700: entries name files in the
     user's photo folder and are nobody else's business.
     """
+    if not name or Path(name).name != name or name.startswith("."):
+        raise ValueError(f"entry name must be a plain file name, got {name!r}")
     state_dir = Path(state_dir)
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = state_dir / f"{name}.json"
     _write_atomic(path, {"version": ENTRY_VERSION, "attempts": 0, **payload})
+    # The rename is in the directory, not in the file: without this a power cut
+    # just after the shot could lose the entry, which exists to survive one.
+    _fsync_dir(state_dir)
     return path
 
 
@@ -128,7 +133,13 @@ def note_failure(path: Path) -> bool:
                 pass  # the count is for a person reading the file; setting it aside matters
             _set_aside(path)
             return False
-        _write_atomic(path, payload)
+        try:
+            _write_atomic(path, payload)
+        except Exception:
+            # A count that cannot be written (disk full) would never rise, and the
+            # entry would be retried at every start for ever.
+            _set_aside(path)
+            return False
         return True
     except Exception:
         return False
@@ -156,6 +167,20 @@ def _set_aside(path: Path) -> None:
         os.replace(path, path.with_suffix(".failed"))
     except OSError:
         pass
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Make a rename in ``directory`` durable, where the platform allows it."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _write_atomic(path: Path, payload: dict) -> None:

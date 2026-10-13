@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from pifilm.capture import gradequeue
 from pifilm.capture.gradequeue import (
     ENTRY_VERSION,
     MAX_ATTEMPTS,
@@ -332,3 +333,29 @@ def test_default_state_dir_honours_xdg_state_home(tmp_path, monkeypatch):
 
     monkeypatch.setenv("XDG_STATE_HOME", "")
     assert default_state_dir() == Path.home() / ".local" / "state" / "pifilm" / "pending"
+
+
+@pytest.mark.parametrize("name", ["", "../x", "a/b", ".hidden"])
+def test_write_entry_refuses_a_name_that_is_not_a_plain_file_name(tmp_path, name):
+    with pytest.raises(ValueError, match="plain file name"):
+        gradequeue.write_entry(tmp_path / "state", name, {})
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_write_entry_syncs_the_directory(tmp_path, monkeypatch):
+    """The rename has to survive a power cut too, not only the file's bytes."""
+    synced = []
+    monkeypatch.setattr(gradequeue, "_fsync_dir", synced.append)
+    gradequeue.write_entry(tmp_path / "state", "shot", {})
+    assert synced == [tmp_path / "state"]
+
+
+def test_a_failure_count_that_cannot_be_written_sets_the_entry_aside(tmp_path, monkeypatch):
+    path = gradequeue.write_entry(tmp_path, "shot", {})
+
+    def full(*_):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(gradequeue, "_write_atomic", full)
+    assert gradequeue.note_failure(path) is False
+    assert not path.exists() and path.with_suffix(".failed").exists()
