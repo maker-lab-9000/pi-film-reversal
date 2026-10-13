@@ -27,11 +27,13 @@ from pifilm.capture.app import (
 from pifilm.capture.camera import CameraError, FakeCamera, Frame, StreamInfo, synthetic_frame
 from pifilm.capture.controller import CaptureController
 from pifilm.capture.gradequeue import read_entries, write_entry
+from pifilm.gpu.grader import GpuGrader
 from pifilm.grain import GrainParams
-from pifilm.imageio import load_rgb
+from pifilm.imageio import load_rgb, save_jpeg
 from pifilm.lut import LUT3D
 from pifilm.normalize import NormalizeParams
 from pifilm.pipeline import Pipeline
+from tests.gpu_fakes import FakeDevice, tile_artifacts
 
 
 def _jpeg_bytes(rgb):
@@ -2011,6 +2013,13 @@ FIXED = datetime(2026, 9, 3, 21, 5, 7)
 NEW_KEYS = {"shutter_to_ready_ms", "grade"}
 
 
+def _earlier_keys(record):
+    """The record's keys without what grading behind the shutter added, and without
+    ``pipeline_backend``, which sits after ``stage_ms`` in an inline record and
+    after ``grade`` in a background one."""
+    return [k for k in record if k not in NEW_KEYS and k != "pipeline_backend"]
+
+
 class _HeldPipeline:
     """A pipeline whose full grades each wait for one permit; quick grades pass.
 
@@ -2137,8 +2146,8 @@ def test_background_record_is_the_inline_record_plus_the_new_fields(
     assert session.close_grades(timeout=5)
     (record,) = _lines(session.out_root)
     # Today's fields in today's order, the new ones after them.
-    assert [k for k in record if k not in NEW_KEYS] == list(inline)
-    assert list(record)[-2:] == ["shutter_to_ready_ms", "grade"]
+    assert _earlier_keys(record) == _earlier_keys(inline)
+    assert list(record)[-3:] == ["shutter_to_ready_ms", "grade", "pipeline_backend"]
     assert record["grade"] == "background"
     assert "recovered" not in record
     assert {"capture", "save_original", "preview", "queued", "normalize", "lut", "grain",
@@ -2171,7 +2180,7 @@ def test_background_record_keeps_camera_metadata_and_dng_last(tmp_path, pipeline
     session.capture()
     assert session.close_grades(timeout=5)
     (record,) = _lines(session.out_root)
-    assert [k for k in record if k not in NEW_KEYS] == list(inline)
+    assert _earlier_keys(record) == _earlier_keys(inline)
     assert record["dng"] == "210507.dng" and record["camera_metadata"] == {"Lux": 1.0}
 
 
@@ -2340,7 +2349,7 @@ def test_background_double_exposure_matches_inline(tmp_path, pipeline, backgroun
     assert one["double"] == {"index": 1, "of": 2} and "grade" not in one
     assert two["double"] == inline.record["double"] and two["double"]["index"] == 2
     assert two["grade"] == "background" and two["ev_comp"] == 0.0
-    assert [k for k in two if k not in NEW_KEYS] == list(inline.record)
+    assert _earlier_keys(two) == _earlier_keys(inline.record)
     assert {"preview", "queued", "composite", "save_graded"} <= set(two["stage_ms"])
     assert read_entries(tmp_path / "state") == []
 
@@ -3134,3 +3143,291 @@ def test_sigterm_cannot_break_into_the_stall_exits_clean_up(camera_cli, monkeypa
     code, closed = _viewfinder_main(camera_cli, monkeypatch, tmp_path, run)
     assert code == 1  # still the exit that makes systemd restart the service
     assert closed == ["touch", "display", "remote", "grades", "camera"]
+
+
+# --- grading on the GPU ------------------------------------------------------
+
+
+@pytest.fixture
+def gpu(tmp_path, monkeypatch):
+    """Background sessions whose grader is a real ``GpuGrader`` on a fake device.
+
+    ``GpuGrader.open`` is replaced, so nothing here looks for a GPU. ``gpu.make``
+    builds a session (closed at the end, like ``background``'s); ``gpu.opened``
+    waits for the worker to have opened its grader and returns the device.
+    """
+    real_open = GpuGrader.open
+    box = SimpleNamespace(threads=[], devices=[], graders=[], available=True,
+                          pipeline=Pipeline(tile_artifacts()))
+    done = threading.Event()
+    made, held = [], []
+
+    def fake_open(artifacts, *, log=print):
+        box.threads.append(threading.current_thread().name)
+        try:
+            if not box.available:
+                log("gpu grading off: no GPU in this test")
+                return None
+            device = FakeDevice()
+            grader = real_open(artifacts, log=log, device_factory=lambda: device)
+            box.devices.append(device)
+            box.graders.append(grader)
+            return grader
+        finally:
+            done.set()
+
+    monkeypatch.setattr(GpuGrader, "open", staticmethod(fake_open))
+
+    def make(camera=None, *, hold=False, grade_backend="auto", background=True, **kwargs):
+        pipe = box.pipeline
+        if hold:
+            pipe = _HeldPipeline(pipe)
+            held.append(pipe)
+        log = []
+        state = {"state_dir": tmp_path / "state"} if background else {}
+        session = CaptureSession(
+            camera or FakeCamera([synthetic_frame(90, 160)]), pipe, tmp_path / "shots",
+            now=kwargs.pop("now", lambda: FIXED), seed_rng=np.random.default_rng(0),
+            background=background, log=log.append, grade_backend=grade_backend,
+            **state, **kwargs,
+        )
+        session.test_log = log
+        made.append(session)
+        return session
+
+    def opened():
+        assert done.wait(5), "the worker never opened a grader"
+        return box.devices[-1] if box.devices else None
+
+    box.make, box.opened = make, opened
+    yield box
+    for pipe in held:
+        pipe.release(100)
+    for session in made:
+        assert session.close_grades(timeout=5), "a grade worker outlived its test"
+
+
+def _gpu_bytes(tmp_path, seed, frame=None):
+    """The file a GPU grade of the fixture's frame with ``seed`` must be."""
+    pipe = Pipeline(tile_artifacts())
+    grader = GpuGrader(pipe.artifacts, FakeDevice(), log=lambda _: None)
+    frame = synthetic_frame(90, 160) if frame is None else frame
+    graded, _ = pipe.process(frame, rng=np.random.default_rng(seed), grader=grader)
+    assert graded.shape[2] == 4
+    return save_jpeg(graded, tmp_path / "expected-gpu.jpg").read_bytes()
+
+
+def _cpu_bytes(tmp_path, seed, frame=None):
+    pipe = Pipeline(tile_artifacts())
+    frame = synthetic_frame(90, 160) if frame is None else frame
+    graded, _ = pipe.process(frame, rng=np.random.default_rng(seed))
+    return save_jpeg(graded, tmp_path / "expected-cpu.jpg").read_bytes()
+
+
+def test_the_grade_worker_opens_the_grader_and_grades_on_it(tmp_path, gpu):
+    session = gpu.make()
+    result = session.capture()
+    device = gpu.opened()
+    assert session.close_grades(timeout=5)
+    assert gpu.threads == ["pifilm-grade"]
+    (record,) = _lines(session.out_root)
+    assert record["pipeline_backend"] == "gpu-1"
+    assert list(record)[-1] == "pipeline_backend"
+    assert {"normalize", "gpu", "gpu_upload", "gpu_shader", "gpu_readback"} <= set(
+        record["stage_ms"])
+    assert not {"lut", "grain"} & set(record["stage_ms"])
+    seed = record["grain_seed"]
+    assert result.graded.read_bytes() == _gpu_bytes(tmp_path, seed)
+    assert result.graded.read_bytes() != _cpu_bytes(tmp_path, seed)
+    # The self-test and the one photograph, both on the worker's thread.
+    assert [run["shape"] for run in device.runs] == [(64, 96, 3), (90, 160, 3)]
+    assert len(device.threads) == 1 and threading.get_ident() not in device.threads
+    assert device.closed == 1 and gpu.graders[0].enabled is False
+    assert session.test_log == ["gpu grading on (Fake GPU, self-test passed)"]
+    # What the capture job carries says nothing of a grade that had not happened.
+    assert "pipeline_backend" not in result.record
+
+
+def test_without_a_gpu_the_worker_grades_on_the_cpu(tmp_path, gpu):
+    gpu.available = False
+    session = gpu.make()
+    results = [session.capture() for _ in range(2)]
+    assert session.close_grades(timeout=5)
+    records = _lines(session.out_root)
+    assert [r["pipeline_backend"] for r in records] == ["cpu", "cpu"]
+    for result, record in zip(results, records, strict=True):
+        assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert {"normalize", "lut", "grain"} <= set(records[0]["stage_ms"])
+    assert gpu.threads == ["pifilm-grade"]
+    assert session.test_log == ["gpu grading off: no GPU in this test"]
+
+
+def test_a_photograph_the_gpu_fails_on_is_graded_on_the_cpu(tmp_path, gpu):
+    session = gpu.make()
+    gpu.opened().fail_next = 1
+    first, second = session.capture(), session.capture()
+    assert session.close_grades(timeout=5)
+    one, two = _lines(session.out_root)
+    assert (one["pipeline_backend"], two["pipeline_backend"]) == ("cpu", "gpu-1")
+    assert first.graded.read_bytes() == _cpu_bytes(tmp_path, one["grain_seed"])
+    assert second.graded.read_bytes() == _gpu_bytes(tmp_path, two["grain_seed"])
+    assert {"lut", "grain"} <= set(one["stage_ms"]) and "gpu" not in one["stage_ms"]
+    assert session.test_log[1:] == [
+        "gpu grade failed (210507_graded.jpg): GL error after grading: 0x505; "
+        "graded on the CPU",
+    ]
+    assert read_entries(tmp_path / "state") == []
+
+
+def test_three_failures_in_a_row_leave_the_rest_to_the_cpu_quietly(tmp_path, gpu):
+    session = gpu.make()
+    gpu.opened().fail_next = 3
+    results = [session.capture() for _ in range(5)]
+    assert session.close_grades(timeout=5)
+    records = _lines(session.out_root)
+    assert [r["pipeline_backend"] for r in records] == ["cpu"] * 5
+    for result, record in zip(results, records, strict=True):
+        assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    log = session.test_log
+    assert sum(line.startswith("gpu grade failed") for line in log) == 3
+    assert "gpu grading off: 3 failures in a row" in log
+    assert len(log) == 5  # on, three failures, off: nothing for the last two
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"grade_backend": "cpu"},
+    {"grade_backend": "cpu", "background": False},
+    {"grade_backend": "auto", "background": False},
+])
+def test_the_cpu_backend_and_inline_sessions_never_open_a_grader(tmp_path, gpu, kwargs):
+    session = gpu.make(**kwargs)
+    result = session.capture()
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    assert record["pipeline_backend"] == "cpu"
+    assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert gpu.threads == [] and session.test_log == []
+
+
+def test_an_inline_record_names_its_backend_after_the_stages(tmp_path, pipeline):
+    class MetaCamera(FakeCamera):
+        def read(self, full=True):
+            frame = super().read()
+            return Frame(frame.rgb, None, "picamera2", dng=b"raw", metadata={"Lux": 1.0})
+
+    session = CaptureSession(MetaCamera([synthetic_frame(90, 160)]), pipeline,
+                             tmp_path / "shots", seed_rng=np.random.default_rng(0))
+    record = session.capture().record
+    assert list(record)[-4:] == ["stage_ms", "pipeline_backend", "camera_metadata", "dng"]
+    assert record["pipeline_backend"] == "cpu"
+    assert _lines(session.out_root) == [record]
+
+
+def test_an_unknown_grade_backend_is_refused(tmp_path, pipeline):
+    with pytest.raises(ValueError, match="grade_backend"):
+        CaptureSession(FakeCamera([synthetic_frame(90, 160)]), pipeline, tmp_path / "shots",
+                       grade_backend="gpu")
+
+
+def test_a_shot_refused_by_a_closing_queue_is_graded_on_the_cpu(tmp_path, gpu):
+    """It is graded on the capture's thread, which the graphics context is not."""
+    session = gpu.make()
+    gpu.opened()
+    assert session.close_grades(timeout=5)
+    result = session.capture()
+    (record,) = _lines(session.out_root)
+    assert record["pipeline_backend"] == "cpu"
+    assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert len(gpu.devices[0].runs) == 1  # the self-test only
+
+
+def test_a_grader_is_not_used_from_the_capture_thread(tmp_path, gpu, monkeypatch):
+    """The same refused shot while the worker's grader is still open: the
+    grader says no by thread, and nothing is logged about it."""
+    session = gpu.make()
+    device = gpu.opened()
+    grader = gpu.graders[0]
+    with monkeypatch.context() as patch:
+        patch.setattr(session._queue, "submit", lambda job: False)
+        # The worker, and so its grader, live on past this shot.
+        patch.setattr(session._queue, "close", lambda timeout=None: True)
+        result = session.capture()
+    assert grader.enabled is True
+    (record,) = _lines(session.out_root)
+    assert record["pipeline_backend"] == "cpu"
+    assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert len(device.runs) == 1
+    assert session.test_log == ["gpu grading on (Fake GPU, self-test passed)"]
+
+
+def test_a_recovered_grade_records_what_graded_it(tmp_path, gpu):
+    first = gpu.make(hold=True, grade_backend="cpu")
+    result = first.capture()
+    first.pipeline.wait_entered()
+    ((path, _),) = read_entries(tmp_path / "state")
+    text = path.read_text()
+    first.pipeline.release()
+    assert first.close_grades(timeout=5)
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+
+    again = gpu.make()
+    gpu.opened()
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    (record,) = _lines(again.out_root)
+    assert record["recovered"] is True and record["pipeline_backend"] == "gpu-1"
+    assert list(record)[-3:] == ["grade", "recovered", "pipeline_backend"]
+    assert again.test_log[0] == "recovering 1 unfinished grade(s)"
+    # Graded from the saved JPEG, on the GPU.
+    assert gpu.devices[0].runs[-1]["shape"] == (90, 160, 3)
+    expected = _gpu_bytes(tmp_path, record["grain_seed"], load_rgb(result.original)[0])
+    assert result.graded.read_bytes() == expected
+
+
+def test_a_double_exposure_is_graded_on_the_gpu_and_exposure_1_names_no_backend(tmp_path, gpu):
+    session = gpu.make(FakeCamera(_double_frames()))
+    session.set_double_exposure(True)
+    session.capture()
+    session.capture()
+    assert session.close_grades(timeout=5)
+    one, two = _lines(session.out_root)
+    assert "pipeline_backend" not in one and "params_version" not in one
+    assert two["pipeline_backend"] == "gpu-1" and two["double"]["index"] == 2
+    assert "composite" in two["stage_ms"] and "gpu" in two["stage_ms"]
+
+
+def test_an_inline_double_exposure_records_the_cpu(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline, FakeCamera(_double_frames()))
+    session.set_double_exposure(True)
+    one, two = session.capture().record, session.capture().record
+    assert "pipeline_backend" not in one
+    assert two["pipeline_backend"] == "cpu"
+    assert list(two)[-3:] == ["stage_ms", "pipeline_backend", "double"]
+
+
+@pytest.mark.parametrize(("argv", "expected"), [
+    ([], "auto"),
+    (["--grade-backend", "auto"], "auto"),
+    (["--grade-backend", "cpu"], "cpu"),
+])
+def test_grade_backend_flag_reaches_the_session(camera_cli, monkeypatch, tmp_path, argv,
+                                                expected):
+    session_kwargs = {}
+
+    class RecordingSession:
+        def __init__(self, camera, pipeline, out, **kwargs):
+            session_kwargs.update(kwargs)
+            self.camera = camera
+
+    monkeypatch.setattr(camera_cli, "CaptureSession", RecordingSession)
+    assert camera_cli.main(["--fake", "--no-preview", "--out", str(tmp_path), *argv]) == 0
+    assert session_kwargs["grade_backend"] == expected
+
+
+def test_grade_backend_flag_refuses_anything_else(camera_cli, tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        camera_cli.main(["--fake", "--no-preview", "--out", str(tmp_path),
+                         "--grade-backend", "gpu"])
+    assert "--grade-backend" in capsys.readouterr().err
