@@ -408,13 +408,24 @@ def gains_to_luts(gains: Gains) -> np.ndarray:
     return luts
 
 
+def stats_gains(
+    rgb_u8: np.ndarray, params: NormalizeParams, max_stats_pixels: int = 300_000
+) -> Gains:
+    """The gains ``normalize_u8`` computes, from the same strided subsample.
+
+    On its own because the GPU pass (``pifilm.gpu``) applies the gains itself:
+    the statistics stay on the CPU and stay this code, so a record's audit
+    fields are the same whichever path graded the photograph."""
+    h, w = rgb_u8.shape[:2]
+    step = max(1, int(np.ceil(np.sqrt(h * w / max_stats_pixels))))
+    return compute_gains(rgb_u8[::step, ::step].astype(np.float32) / 255.0, params)
+
+
 def normalize_u8(
     rgb_u8: np.ndarray, params: NormalizeParams, max_stats_pixels: int = 300_000
 ) -> tuple[np.ndarray, Gains]:
     """Fast path for the Pi: statistics from a strided subsample, applied with ``cv2.LUT``."""
-    h, w = rgb_u8.shape[:2]
-    step = max(1, int(np.ceil(np.sqrt(h * w / max_stats_pixels))))
-    gains = compute_gains(rgb_u8[::step, ::step].astype(np.float32) / 255.0, params)
+    gains = stats_gains(rgb_u8, params, max_stats_pixels)
     table = np.ascontiguousarray(gains_to_luts(gains).T).reshape(256, 1, 3)
     out = cv2.LUT(np.ascontiguousarray(rgb_u8), table)
     ylut = tone_lut(gains)
