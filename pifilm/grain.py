@@ -188,6 +188,13 @@ def _two_scale_noise(shape: tuple[int, int], params: GrainParams,
     return total / max(float(total.std()), 1e-6)
 
 
+def warm(params: GrainParams, shape: tuple[int, int]) -> None:
+    """Build whatever ``add_grain`` would otherwise build on the first frame of
+    this ``(height, width)``: the tile model's tile (0.56 s on the Pi 4)."""
+    if params.enabled and params.strength > 0 and params.model == "two_scale_tile":
+        grain_tile(params, max(shape) / params.frame_width_mm)
+
+
 def _apply_tile(y: np.ndarray, gain: np.ndarray, params: GrainParams,
                 rng: np.random.Generator) -> np.ndarray:
     """``round(y + gain[y] * noise)`` saturated to a byte, the noise being the

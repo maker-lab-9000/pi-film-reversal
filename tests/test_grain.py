@@ -281,3 +281,17 @@ def test_only_the_tile_model_writes_tile_px():
     assert "tile_px" not in GrainParams().to_dict()
     p = _tile_params(tile_px=512)
     assert GrainParams.from_dict(p.to_dict()) == p
+
+
+def test_warm_builds_the_tile_only_for_the_tile_model():
+    from pifilm import grain
+
+    grain._tile.cache_clear()
+    grain.warm(_two_scale(), (300, 400))
+    grain.warm(_tile_params(enabled=False), (300, 400))
+    assert grain._tile.cache_info().currsize == 0
+    grain.warm(_tile_params(), (300, 400))
+    assert grain._tile.cache_info().currsize == 1
+    add_grain(np.full((300, 400, 3), 128, np.uint8), _tile_params(),
+              rng=np.random.default_rng(1))
+    assert grain._tile.cache_info().misses == 1

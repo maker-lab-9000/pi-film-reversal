@@ -39,7 +39,7 @@ import numpy as np
 
 from .artifacts import Artifacts
 from .color import linear_to_srgb, srgb_to_linear
-from .grain import add_grain
+from .grain import add_grain, warm
 from .normalize import normalize_u8
 
 
@@ -58,6 +58,11 @@ class Pipeline:
         self.normalize_sha1 = hashlib.sha1(
             json.dumps(artifacts.normalize.to_dict(), sort_keys=True).encode()
         ).hexdigest()
+
+    def warm(self, shape: tuple[int, int]) -> None:
+        """Prepare for frames of ``(height, width)``, so the first photograph does
+        not pay for what is built once (the tile grain's tile)."""
+        warm(self.artifacts.grain, shape)
 
     def process(
         self,
