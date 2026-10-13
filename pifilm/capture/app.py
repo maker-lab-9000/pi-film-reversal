@@ -113,7 +113,8 @@ shutter to measure from: it carries ``recovered: true`` instead of the two
 shutter timings, and it was made from the saved JPEG, not the frame in memory.
 
 ``background=False`` is the code as it was before any of this: no queue, no
-state directory, no new record fields.
+state directory, and none of these record fields. (Its records do carry
+``pipeline_backend``, always ``"cpu"``; see below.)
 
 Grading on the GPU
 ------------------
@@ -124,6 +125,17 @@ It is opened and closed on the worker (the queue's ``on_start`` and ``on_stop``)
 because a graphics context belongs to the thread that made it. Opening never
 fails the start: without a GPU, or with a look the pass does not cover, it logs
 one line and the worker grades on the CPU as before.
+
+Opening can do something worse than fail: it can hang, inside the driver, with
+no time limit, on the only grade worker. Then no grade ever runs, the fourth
+shot waits for a place that never frees, the stop waits for systemd's kill, and
+the next start would do it all again. So the worker writes a marker file,
+``gpu-opening``, before it opens the GPU and removes it when the open returns,
+with a grader or without. A start that finds the marker does not open the GPU:
+it logs one line naming the file and grades on the CPU, and the marker stays
+until a person deletes it. The marker sits beside the state directory, not in
+it, so it is never taken for a pending entry. Where it cannot be written there
+is no protection and the open goes ahead.
 
 Everything else stays on the CPU: the quick grade, the live preview, a session
 grading inline, and the one shot a closing queue refuses, which is graded on the
@@ -214,6 +226,9 @@ QUICK_KEEP = 16
 # ``_GradeWork.ready``). The capture side says so within microseconds of handing
 # the job over; the ceiling is for a capture ended by an interrupt before it could.
 READY_WAIT_S = 5.0
+# The file that says a start is, or was, in the middle of opening the GPU (see
+# "Grading on the GPU" in the module docstring). Beside the state directory.
+GPU_MARKER = "gpu-opening"
 GRADE_BACKENDS = ("auto", "cpu")
 
 
@@ -434,7 +449,29 @@ class CaptureSession:
     def _open_grader(self) -> None:
         """On the grade worker, before its first job. ``open`` logs its one line
         (on, or off and why) and returns None when the CPU is to grade."""
-        self._grader = GpuGrader.open(self.pipeline.artifacts, log=self._say)
+        marker = self._state_dir.parent / GPU_MARKER
+        try:
+            left_behind = marker.exists()
+        except OSError:
+            left_behind = False
+        if left_behind:
+            self._say("gpu grading off: the last start did not finish opening the GPU; "
+                      f"delete {marker} to try again")
+            return
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("pifilm-capture was opening the GPU for grading. If this file "
+                              "is still here after a start, that open never returned.\n")
+        except OSError:
+            pass  # no marker, no protection; the open is still worth trying
+        try:
+            self._grader = GpuGrader.open(self.pipeline.artifacts, log=self._say)
+        finally:
+            # Whatever it returned, it returned: the next start may try again.
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _close_grader(self) -> None:
         """On the grade worker, after its last job: the thread that may release

@@ -3158,17 +3158,22 @@ def gpu(tmp_path, monkeypatch):
     """
     real_open = GpuGrader.open
     box = SimpleNamespace(threads=[], devices=[], graders=[], available=True,
-                          pipeline=Pipeline(tile_artifacts()))
+                          pipeline=Pipeline(tile_artifacts()), max_texture=4096,
+                          hold=None, entered=threading.Event(),
+                          marker=tmp_path / "gpu-opening")
     done = threading.Event()
     made, held = [], []
 
     def fake_open(artifacts, *, log=print):
         box.threads.append(threading.current_thread().name)
         try:
+            box.entered.set()
+            if box.hold is not None:
+                assert box.hold.wait(5), "the held open was never released"
             if not box.available:
                 log("gpu grading off: no GPU in this test")
                 return None
-            device = FakeDevice()
+            device = FakeDevice(max_texture=box.max_texture)
             grader = real_open(artifacts, log=log, device_factory=lambda: device)
             box.devices.append(device)
             box.graders.append(grader)
@@ -3184,7 +3189,9 @@ def gpu(tmp_path, monkeypatch):
             pipe = _HeldPipeline(pipe)
             held.append(pipe)
         log = []
-        state = {"state_dir": tmp_path / "state"} if background else {}
+        state = {}
+        if background:
+            state["state_dir"] = kwargs.pop("state_dir", tmp_path / "state")
         session = CaptureSession(
             camera or FakeCamera([synthetic_frame(90, 160)]), pipe, tmp_path / "shots",
             now=kwargs.pop("now", lambda: FIXED), seed_rng=np.random.default_rng(0),
@@ -3201,6 +3208,8 @@ def gpu(tmp_path, monkeypatch):
 
     box.make, box.opened = make, opened
     yield box
+    if box.hold is not None:
+        box.hold.set()
     for pipe in held:
         pipe.release(100)
     for session in made:
@@ -3431,3 +3440,109 @@ def test_grade_backend_flag_refuses_anything_else(camera_cli, tmp_path, capsys):
         camera_cli.main(["--fake", "--no-preview", "--out", str(tmp_path),
                          "--grade-backend", "gpu"])
     assert "--grade-backend" in capsys.readouterr().err
+
+
+# --- the marker that keeps a hanging GPU from stopping every start ----------
+
+
+def test_a_marker_left_by_the_last_start_keeps_the_gpu_closed(tmp_path, gpu):
+    """An open that hangs holds the only grade worker for ever: no grade runs,
+    the fourth shot waits, and without the marker the next start does the same."""
+    gpu.marker.write_text("left by a start that never came back\n")
+    session = gpu.make()
+    results = [session.capture() for _ in range(2)]
+    assert session.close_grades(timeout=5)
+    assert gpu.threads == []
+    assert session.test_log == [
+        "gpu grading off: the last start did not finish opening the GPU; "
+        f"delete {gpu.marker} to try again",
+    ]
+    records = _lines(session.out_root)
+    assert [r["pipeline_backend"] for r in records] == ["cpu", "cpu"]
+    for result, record in zip(results, records, strict=True):
+        assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert gpu.marker.exists()  # only a person removes it
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_the_marker_is_gone_once_the_open_has_returned(gpu, available):
+    gpu.available = available
+    session = gpu.make()
+    gpu.opened()
+    assert session.close_grades(timeout=5)
+    assert gpu.threads == ["pifilm-grade"]
+    assert not gpu.marker.exists()
+    assert not any("did not finish" in line for line in session.test_log)
+
+
+def test_the_marker_is_there_for_as_long_as_the_open_takes(gpu):
+    gpu.hold = threading.Event()
+    session = gpu.make()
+    assert gpu.entered.wait(5)
+    assert gpu.marker.is_file()
+    assert not list(gpu.marker.parent.glob("state/*"))  # never among the entries
+    gpu.hold.set()
+    assert session.close_grades(timeout=5)
+    assert not gpu.marker.exists()
+
+
+def test_the_marker_is_written_where_no_state_directory_exists_yet(tmp_path, gpu):
+    gpu.hold = threading.Event()
+    gpu.marker = tmp_path / "deep" / "pifilm" / "gpu-opening"
+    session = gpu.make(state_dir=tmp_path / "deep" / "pifilm" / "pending")
+    assert gpu.entered.wait(5)
+    assert gpu.marker.is_file()
+    gpu.hold.set()
+    assert session.close_grades(timeout=5)
+    assert not gpu.marker.exists()
+
+
+def test_a_marker_that_cannot_be_written_does_not_stop_the_open(tmp_path, gpu):
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a directory")
+    session = gpu.make(state_dir=blocker / "pending")
+    gpu.opened()
+    session.capture()
+    assert session.close_grades(timeout=5)
+    assert gpu.threads == ["pifilm-grade"]
+    assert "gpu grading on (Fake GPU, self-test passed)" in session.test_log
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"grade_backend": "cpu"},
+    {"grade_backend": "cpu", "background": False},
+    {"grade_backend": "auto", "background": False},
+])
+def test_the_cpu_backend_and_inline_sessions_write_no_marker(gpu, monkeypatch, kwargs):
+    written = []
+    real_write = Path.write_text
+
+    def spy(self, *args, **kw):
+        written.append(self.name)
+        return real_write(self, *args, **kw)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    session = gpu.make(**kwargs)
+    session.capture()
+    assert session.close_grades(timeout=5)
+    assert "gpu-opening" not in written and not gpu.marker.exists()
+    # And a marker already there is nothing to them: no line about the GPU.
+    gpu.marker.write_text("stale\n")
+    other = gpu.make(**kwargs)
+    assert other.close_grades(timeout=5)
+    assert other.test_log == []
+
+
+def test_a_frame_wider_than_the_largest_texture_goes_to_the_cpu_quietly(tmp_path, gpu):
+    gpu.max_texture = 256  # the tile (256 px) and the self-test fit; the frame does not
+    frame = synthetic_frame(180, 320)
+    session = gpu.make(FakeCamera([frame]))
+    device = gpu.opened()
+    results = [session.capture() for _ in range(3)]
+    assert session.close_grades(timeout=5)
+    records = _lines(session.out_root)
+    assert [r["pipeline_backend"] for r in records] == ["cpu"] * 3
+    for result, record in zip(results, records, strict=True):
+        assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"], frame)
+    assert len(device.runs) == 1  # the self-test only
+    assert session.test_log == ["gpu grading on (Fake GPU, self-test passed)"]
