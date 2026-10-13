@@ -33,7 +33,14 @@ on. The entry stays on disk with one more attempt against it, so the grade is
 tried again at the next start. An entry that fails ``MAX_ATTEMPTS`` times is
 renamed ``*.failed``: it is kept for a person to look at, and it can no longer
 stop or slow a start-up. Entries that cannot be read at all are set aside the
-same way.
+same way. The log line names the entry, because the entry is the only thing that
+says which photograph it was, and a second line says when one is given up.
+
+Why ``close`` drops the backlog: a stop has to be short, and a backlog can be any
+length (every grade a long run of power cuts left). Those jobs hold no frame and
+their entries are still on disk, so nothing is lost by leaving the ones not yet
+started for the next start. What was accepted through ``submit`` in this run is
+different: its frame exists only in memory here, so ``close`` finishes it.
 
 Entry files are written to a temporary file and moved into place, so a reader
 sees the old entry, the new one, or none, never half of one. Temporary files
@@ -265,12 +272,20 @@ class GradeQueue:
     def close(self, timeout: float | None = None) -> bool:
         """Stop accepting, let the worker finish what was accepted, and join it.
 
+        Backlog jobs that have not started are dropped, not run: their entries
+        stay on disk for the next start. The job running and every job taken by
+        ``submit`` are finished.
+
         ``True`` when the worker finished, ``False`` when ``timeout`` ran out first.
         Calling it again is harmless, and is how to wait longer after a timeout.
         """
         with self._cond:
             self._closed = True
+            left = len(self._backlog)
+            self._backlog.clear()
             self._cond.notify_all()
+        if left:
+            self._say(f"leaving {left} unfinished grade(s) for the next start")
         if threading.current_thread() is self._worker:
             return False  # a job closing its own queue cannot wait for itself
         self._worker.join(timeout)
@@ -314,9 +329,31 @@ class GradeQueue:
 
     def _failed(self, job: GradeJob, exc: Exception) -> None:
         """Log and count a failed grade. Nothing here may end the worker."""
+        report_failure(job, exc, self._say)
+
+    def _say(self, message: str) -> None:
         try:
-            self._log(f"grade failed: {exc}")
+            self._log(message)
         except Exception:
             pass  # a closed stdout must not cost the photographs still queued
-        if job.entry is not None:
-            note_failure(job.entry)
+
+
+def report_failure(job: GradeJob, exc: Exception, log: Callable[[str], None]) -> None:
+    """Log a failed grade by its entry's name and count the attempt against the entry.
+
+    A second line says when that was the last attempt and the entry has been set
+    aside as ``*.failed``. ``log`` must not raise. For the queue's worker, and for
+    a caller that ran a job the queue refused.
+    """
+    if job.entry is None:
+        log(f"grade failed: {exc}")
+        return
+    entry = Path(job.entry)
+    log(f"grade failed ({entry.name}): {exc}")
+    try:
+        existed = entry.is_file()
+    except OSError:
+        existed = False
+    if not note_failure(entry) and existed:
+        log(f"grade given up ({entry.name}): failed {MAX_ATTEMPTS} times, "
+            f"kept as {entry.with_suffix('.failed').name}")

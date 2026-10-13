@@ -84,8 +84,16 @@ last line was cut short by a power cut gets a newline before the next record, so
 a record is never joined to half of another.
 
 Stopping: ``main`` turns SIGTERM, which is how systemd stops the service, into the
-same exit as Ctrl-C, so its clean-up runs and the queued grades are finished
-before the process ends.
+same exit as Ctrl-C, so its clean-up runs. The clean-up finishes the photographs
+taken in this run (the grade running and those waiting) before the process ends;
+grades recovered from an earlier run that have not started are left, with their
+entries, for the next start, so a stop is never longer than this run's queue.
+Once a clean-up has begun SIGTERM is ignored, in every mode, so a second one
+cannot interrupt it.
+
+Why the original is synced before the entry is written (background only): the
+entry is synced, so without this a power cut could leave an entry naming an
+original that never reached the disk, which no start could ever finish.
 
 Why the entry is written before the quick grade: from the moment the original is
 on disk the photograph must be finishable without this process, and the quick
@@ -157,9 +165,9 @@ from .gradequeue import (
     GradeJob,
     GradeQueue,
     default_state_dir,
-    note_failure,
     read_entries,
     remove_entry,
+    report_failure,
     write_entry,
 )
 from .picamera import COLOUR_TEMPERATURE_RANGE_K, Picamera2Camera
@@ -179,6 +187,10 @@ QUICK_LONG_EDGE = 1014
 # Quick grades kept in the private directory. Only the newest is ever shown; the
 # rest are kept for a client still downloading an earlier one.
 QUICK_KEEP = 16
+# How long the grade side waits to be told how long the shutter was held (see
+# ``_GradeWork.ready``). The capture side says so within microseconds of handing
+# the job over; the ceiling is for a capture ended by an interrupt before it could.
+READY_WAIT_S = 5.0
 
 
 @dataclass
@@ -245,7 +257,10 @@ class _GradeWork:
         day, graded = payload["day"], payload["graded"]
         originals, record, double = payload["originals"], payload["record"], payload.get("double")
         for name in (day, graded):
-            if not isinstance(name, str) or not name or Path(name).name != name:
+            if (
+                not isinstance(name, str) or not name or Path(name).name != name
+                or name in (".", "..")
+            ):
                 raise ValueError(f"pending entry has a bad name: {name!r}")
         if (
             not isinstance(originals, list)
@@ -576,9 +591,7 @@ class CaptureSession:
             self._run_grade(job)
         except Exception as exc:
             # As the queue does for its own jobs: the entry stays, one attempt used.
-            self._say(f"grade failed: {exc}")
-            if job.entry is not None:
-                note_failure(job.entry)
+            report_failure(job, exc, self._say)
 
     def _run_grade(self, job: GradeJob) -> None:
         """The grade side of a shot: grade, save, record, remove the entry.
@@ -620,7 +633,10 @@ class CaptureSession:
         saved_ms = None
         if work.shutter is not None:
             saved_ms = (time.perf_counter() - work.shutter) * 1000.0
-            work.ready.wait()
+            # Bounded: a capture ended by an interrupt may never set it, and this
+            # worker must not wait for ever. The grade is finished either way,
+            # once, and its record then goes without ``shutter_to_ready_ms``.
+            work.ready.wait(READY_WAIT_S)
 
         # Today's order for today's fields, the new ones after them. The fields that
         # close the inline record close this one too.
@@ -782,16 +798,25 @@ class CaptureSession:
         suffix = "original" if has_original else "ungraded"
         day_dir, stem, t = self._allocate(suffix)
         original = day_dir / f"{stem}_{suffix}.jpg"
+        # Behind the shutter a pending entry will name this file (exposure 1 of a
+        # double included), and the entry is synced: the file has to be on the
+        # disk first, or a power cut leaves an entry for an original that is not
+        # there. Inline has no entry and syncs nothing, as before.
+        durable = self._queue is not None
         with _stage(stages, "save_original"):
             if frame.jpeg is not None:
                 original.write_bytes(frame.jpeg)
             else:
                 save_jpeg(frame.rgb, original)
+            if durable:
+                _sync_file(original)
         dng_name = None
         if frame.dng is not None and self._save_dng:
             with _stage(stages, "save_dng"):
                 dng_path = day_dir / f"{stem}.dng"
                 dng_path.write_bytes(frame.dng)
+                if durable:
+                    _sync_file(dng_path)
             dng_name = dng_path.name
         return day_dir, stem, t, original, dng_name
 
@@ -1330,9 +1355,10 @@ def _sigterm_as_interrupt():
     systemd stops the service with SIGTERM, and Python's default for it ends the
     process on the spot: no ``finally`` runs, so the queued grades were left for
     the next start to recover. Raising makes every loop ``main`` can sit in end
-    the way it already does for Ctrl-C. Only the first one raises: a second
-    SIGTERM arriving during the clean-up must not break into it. (The viewfinder
-    installs its own handler over this one while it runs, and puts this one back.)
+    the way it already does for Ctrl-C. The viewfinder installs its own handler
+    over this one while it runs (it sets an event instead of raising). Every
+    clean-up then begins with ``_ignore_sigterm``, so no later SIGTERM can break
+    into it, whichever handler took the first.
 
     ``signal.signal`` only works in the main thread, so anywhere else this does
     nothing; a caller there cannot be sent a signal's exception anyway.
@@ -1353,6 +1379,23 @@ def _sigterm_as_interrupt():
         yield
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+def _ignore_sigterm() -> None:
+    """From here on SIGTERM does nothing: the clean-up is already under way.
+
+    Called at the start of every clean-up. Whichever handler took the first
+    SIGTERM (``main``'s, or the viewfinder's, which leaves ``main``'s unfired), a
+    second one must not raise inside ``controller.close()`` and leave the grades
+    unfinished and the camera open. ``main`` puts the original handler back when
+    it returns. Like the handler it replaces, it is only set from the main thread.
+    """
+    if current_thread() is main_thread():
+        signal.signal(signal.SIGTERM, _no_signal)
+
+
+def _no_signal(*_: object) -> None:
+    return None
 
 
 def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
@@ -1379,7 +1422,9 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
         stalled = exc
         _arm_exit_deadline(STALL_EXIT_DEADLINE, 1)
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        # Not ``previous`` yet: that is ``main``'s handler, which raises, and a
+        # SIGTERM while the panel closes would leave the rest of the clean-up undone.
+        _ignore_sigterm()
         touch.close()
         display.close()
     if stalled is not None:
@@ -1399,6 +1444,8 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     # loop of its own to keep the process alive.
     if not args.remote_listen:
         return 1
+    # Serving goes on, so a stop has to work again.
+    signal.signal(signal.SIGTERM, previous)
     return _serve_until_interrupt()
 
 
@@ -1758,6 +1805,7 @@ def _main(argv: list[str] | None) -> int:
     except _Terminated:
         return 0  # stopped by SIGTERM; the clean-up below is the whole of the exit
     finally:
+        _ignore_sigterm()
         if button is not None:
             # The GPIO library can raise while joining its thread or releasing
             # the line; that must not skip the closes below, which release the

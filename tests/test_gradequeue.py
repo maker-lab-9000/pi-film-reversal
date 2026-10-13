@@ -67,7 +67,9 @@ def test_backlog_runs_before_submitted_jobs():
     try:
         assert run.started["old-1"].wait(WAIT)
         assert queue.submit(GradeJob("new")) is True
+        run.expect = 5
         run.release["old-1"].set()
+        assert run.done.wait(WAIT)  # a close would leave the backlog not yet started
     finally:
         assert queue.close(WAIT)
     assert run.ran == ["old-1", "old-2", "old-3", "old-4", "new"]
@@ -114,7 +116,9 @@ def test_pending_counts_running_waiting_and_backlog():
         assert queue.submit(GradeJob("new-1"))
         assert queue.submit(GradeJob("new-2"))
         assert queue.pending == 4
+        run.expect = 4
         run.release["old-1"].set()
+        assert run.done.wait(WAIT)
     finally:
         run.release["old-1"].set()
         assert queue.close(WAIT)
@@ -141,7 +145,7 @@ def test_a_failing_run_is_logged_counted_and_does_not_stop_the_worker(tmp_path):
         # The worker notes the failure before it takes the next job.
         assert after.wait(WAIT)
         assert ran == ["good"]
-        assert lines == ["grade failed: disk full"]
+        assert lines == ["grade failed (120000_shot.json): disk full"]
         assert json.loads(entry.read_text())["attempts"] == 1
         assert read_entries(tmp_path)[0][1]["original"] == "x.jpg"
 
@@ -152,7 +156,11 @@ def test_a_failing_run_is_logged_counted_and_does_not_stop_the_worker(tmp_path):
     assert not entry.exists()
     assert (tmp_path / "120000_shot.failed").exists()
     assert read_entries(tmp_path) == []
-    assert len(lines) == 2
+    # The second failure is the last: one line for it, one saying where the entry went.
+    assert lines[1:] == [
+        "grade failed (120000_shot.json): disk full",
+        "grade given up (120000_shot.json): failed 2 times, kept as 120000_shot.failed",
+    ]
 
 
 def test_a_failing_job_without_an_entry_and_a_failing_log_do_not_stop_the_worker():
@@ -175,11 +183,13 @@ def test_a_failing_job_without_an_entry_and_a_failing_log_do_not_stop_the_worker
 
 
 def test_close_finishes_accepted_jobs_and_refuses_later_ones():
-    run = Recorder(hold=["a"])
+    run = Recorder(hold=["old", "a"])
     queue = GradeQueue(run, backlog=[GradeJob("old")])
+    assert run.started["old"].wait(WAIT)  # started, so close finishes it
     assert queue.submit(GradeJob("a"))
     assert queue.submit(GradeJob("b"))
     assert queue.submit(GradeJob("c"))
+    run.release["old"].set()
     run.release["a"].set()
     assert queue.close(WAIT) is True
     assert run.ran == ["old", "a", "b", "c"]
@@ -359,3 +369,52 @@ def test_a_failure_count_that_cannot_be_written_sets_the_entry_aside(tmp_path, m
     monkeypatch.setattr(gradequeue, "_write_atomic", full)
     assert gradequeue.note_failure(path) is False
     assert not path.exists() and path.with_suffix(".failed").exists()
+
+
+def test_close_leaves_backlog_that_has_not_started_for_the_next_start(tmp_path):
+    """A stop finishes this run's photographs; it does not wait for an old backlog."""
+    entries = [write_entry(tmp_path, f"old-{n}", {}) for n in (1, 2, 3)]
+    run = Recorder(hold=["old-1"])
+    lines = []
+    queue = GradeQueue(
+        run, backlog=[GradeJob(f"old-{n}", entry=entries[n - 1]) for n in (1, 2, 3)],
+        log=lines.append,
+    )
+    try:
+        assert run.started["old-1"].wait(WAIT)
+        assert queue.submit(GradeJob("new"))
+        assert queue.pending == 4
+        assert queue.close(timeout=0) is False  # the running job is still held
+        assert queue.pending == 2  # the running one and the one accepted in this run
+    finally:
+        run.release["old-1"].set()
+    assert queue.close(WAIT) is True
+    assert run.ran == ["old-1", "new"]
+    assert queue.pending == 0
+    assert all(entry.exists() for entry in entries)  # the queue never removes entries
+    assert [json.loads(e.read_text())["attempts"] for e in entries] == [0, 0, 0]
+    assert lines == ["leaving 2 unfinished grade(s) for the next start"]
+
+
+def test_a_failure_without_an_entry_is_logged_without_a_name():
+    lines = []
+
+    def run(job):
+        raise RuntimeError("boom")
+
+    queue = GradeQueue(run, log=lines.append)
+    assert queue.submit(GradeJob("bad"))
+    assert queue.close(WAIT)
+    assert lines == ["grade failed: boom"]
+
+
+def test_a_failure_whose_entry_is_already_gone_is_not_reported_as_given_up(tmp_path):
+    lines = []
+
+    def run(job):
+        raise RuntimeError("boom")
+
+    queue = GradeQueue(run, log=lines.append)
+    assert queue.submit(GradeJob("bad", entry=tmp_path / "gone.json"))
+    assert queue.close(WAIT)
+    assert lines == ["grade failed (gone.json): boom"]

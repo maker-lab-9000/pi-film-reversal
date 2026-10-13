@@ -2233,6 +2233,7 @@ def test_an_unfinished_grade_is_finished_at_the_next_start(tmp_path, background)
 
     again = background()
     assert again.test_log == ["recovering 1 unfinished grade(s)"]
+    _settle(again)
     assert again.close_grades(timeout=5)
     assert not path.exists()
     (record,) = _lines(again.out_root)
@@ -2255,6 +2256,7 @@ def test_recovery_does_not_record_a_finished_grade_twice(tmp_path, background):
     path.write_text(text)
 
     again = background()
+    _settle(again)
     assert again.close_grades(timeout=5)
     assert not path.exists()
     assert _lines(again.out_root) == before and len(before) == 1
@@ -2279,7 +2281,7 @@ def test_recovery_leaves_other_folders_alone_and_survives_a_missing_original(
     assert again.close_grades(timeout=5)
     assert shot.graded.exists()
     assert [line["pifilm"] for line in _lines(again.out_root)] == [shot.graded.name]
-    assert any(line.startswith("grade failed:") for line in again.test_log)
+    assert sum(line.startswith(f"grade failed ({path.name}): ") for line in again.test_log) == 1
     assert json.loads(path.read_text())["attempts"] == 1
     assert json.loads(foreign.read_text())["attempts"] == 0
     assert {p.name for p in (tmp_path / "state").iterdir()} == {path.name, foreign.name}
@@ -2294,10 +2296,14 @@ def test_a_damaged_entry_fails_on_the_worker_not_at_start_up(tmp_path, backgroun
     ):
         write_entry(tmp_path / "state", name, {"out_root": str(root.absolute()), **payload})
     session = background()
+    _settle(session)  # the two damaged entries are tried at start-up
     shot = session.capture()
     assert session.close_grades(timeout=5)
     assert shot.graded.exists()
-    assert sum(line.startswith("grade failed:") for line in session.test_log) == 2
+    assert [line for line in session.test_log if line.startswith("grade failed")] == [
+        "grade failed (escaping.json): pending entry has a bad name: '..'",
+        "grade failed (missing-keys.json): 'day'",
+    ]
     assert len(_lines(root)) == 1
     assert not list(tmp_path.glob("x.jpg")) and not list(tmp_path.parent.glob("x.jpg"))
 
@@ -2352,6 +2358,7 @@ def test_an_unfinished_double_is_finished_from_both_originals(tmp_path, backgrou
     path.write_text(text)
 
     again = background()
+    _settle(again)
     assert again.close_grades(timeout=5)
     record = _lines(again.out_root)[-1]
     assert record["recovered"] is True and record["double"]["index"] == 2
@@ -2490,7 +2497,9 @@ def test_a_failed_grade_is_logged_counted_and_does_not_block_the_next(
     _settle(session)
     second = session.capture()
     assert session.close_grades(timeout=5)
-    assert session.test_log == ["grade failed: No space left on device"]
+    assert session.test_log == [
+        "grade failed (2026-09-03_210507.json): No space left on device",
+    ]
     assert not first.graded.exists() and second.graded.exists()
     assert [line["pifilm"] for line in _lines(session.out_root)] == [second.graded.name]
     ((path, entry),) = read_entries(tmp_path / "state")
@@ -2498,6 +2507,7 @@ def test_a_failed_grade_is_logged_counted_and_does_not_block_the_next(
 
     # The next start tries once more, and this time the disk has room.
     again = background()
+    _settle(again)
     assert again.close_grades(timeout=5)
     assert first.graded.exists() and not path.exists()
     assert _lines(again.out_root)[-1]["recovered"] is True
@@ -2746,6 +2756,7 @@ def test_a_recovered_grade_is_on_disk_before_its_entry_is_removed(
     path.write_text(text)
     events = _record_syncs(monkeypatch)
     again = background()
+    _settle(again)
     assert again.close_grades(timeout=5)
     graded = result.graded.stat().st_ino
     log = (result.graded.parent / "captures.jsonl").stat().st_ino
@@ -2795,8 +2806,10 @@ class _Signals:
         return self.previous
 
     def deliver(self):
-        """What the kernel does on SIGTERM: run the handler installed first."""
-        self.calls[0][1](self.calls[0][0], None)
+        """What the kernel does on SIGTERM: run the handler installed now."""
+        number, handler = self.calls[-1]
+        assert callable(handler), "SIGTERM arrived with no handler of ours installed"
+        handler(number, None)
 
 
 def test_sigterm_ends_the_headless_service_cleanly(monkeypatch, tmp_path):
@@ -2816,11 +2829,13 @@ def test_sigterm_ends_the_headless_service_cleanly(monkeypatch, tmp_path):
             pass
 
         def close(self):
+            signals.deliver()  # a second SIGTERM, in the middle of the clean-up
             closed.append("remote")
 
     real_close = app.CaptureSession.close_grades
 
     def close_grades(self, timeout=None):
+        signals.deliver()
         closed.append("grades")
         return real_close(self, timeout)
 
@@ -2841,10 +2856,10 @@ def test_sigterm_ends_the_headless_service_cleanly(monkeypatch, tmp_path):
                      "--remote-listen", "127.0.0.1:8765"]) == 0
     assert closed == ["remote", "grades"]
     assert not any(t.name == "pifilm-grade" for t in threading.enumerate())
-    # Installed for SIGTERM, and the handler that was there put back on the way out.
-    assert [number for number, _ in signals.calls] == [signal_module.SIGTERM] * 2
+    # Installed for SIGTERM, silenced for the clean-up, and the handler that was
+    # there before put back on the way out.
+    assert [number for number, _ in signals.calls] == [signal_module.SIGTERM] * 3
     assert signals.calls[-1][1] is signals.previous
-    signals.deliver()  # a second SIGTERM must not break into the clean-up
 
 
 def test_sigterm_ends_the_terminal_loop_cleanly(monkeypatch, tmp_path):
@@ -2892,3 +2907,222 @@ def test_private_pictures_stay_out_of_the_real_temporary_directory(
     """The suite's own guard: a session's cards and quick grades land in pytest's tree."""
     result = background().capture()
     assert tmp_path_factory.getbasetemp().resolve() in result.pifilm.resolve().parents
+
+
+class _MetaCamera(FakeCamera):
+    """A Picamera2-style frame: no camera JPEG, a DNG and metadata."""
+
+    def read(self, full=True):
+        frame = super().read()
+        return Frame(frame.rgb, None, "picamera2", dng=b"raw", metadata={"Lux": 1.0})
+
+
+def test_a_background_original_is_on_disk_before_its_entry_is_written(
+    tmp_path, monkeypatch, background,
+):
+    """The entry names the original; an entry that outlives it can never be finished."""
+    from pifilm.capture import app
+
+    events = _record_syncs(monkeypatch)
+    real_write = app.write_entry
+
+    def write(state_dir, name, payload):
+        events.append("entry")
+        return real_write(state_dir, name, payload)
+
+    monkeypatch.setattr(app, "write_entry", write)
+    session = background(_MetaCamera([synthetic_frame(90, 160)]), hold=True, now=lambda: FIXED)
+    result = session.capture()
+    original = result.original.stat().st_ino
+    dng = (result.original.parent / "210507.dng").stat().st_ino
+    assert [e for e in events if e in (original, dng, "entry")] == [original, dng, "entry"]
+    session.pipeline.release()
+
+
+def test_both_originals_of_a_background_double_are_synced(monkeypatch, background):
+    events = _record_syncs(monkeypatch)
+    session = background(FakeCamera(_double_frames()), hold=True, now=lambda: FIXED)
+    session.set_double_exposure(True)
+    first = session.capture()
+    assert first.original.stat().st_ino in events  # no entry yet, but one will name it
+    second = session.capture()
+    assert second.original.stat().st_ino in events
+    session.pipeline.release()
+
+
+def test_an_inline_capture_with_a_dng_syncs_nothing(tmp_path, pipeline, monkeypatch):
+    events = _record_syncs(monkeypatch)
+    session = CaptureSession(_MetaCamera([synthetic_frame(90, 160)]), pipeline, tmp_path / "shots")
+    session.capture()
+    assert events == []
+
+
+def test_a_stop_leaves_the_recovery_backlog_for_the_next_start(tmp_path, background):
+    """Stopping finishes this run's photographs, not everything an old run left."""
+    first = background(hold=True, now=lambda: FIXED)
+    results = [first.capture() for _ in range(3)]
+    first.pipeline.wait_entered()
+    texts = {path: path.read_text() for path, _ in read_entries(tmp_path / "state")}
+    assert len(texts) == 3
+    first.pipeline.release(3)
+    assert first.close_grades(timeout=5)
+    for result in results:
+        result.graded.unlink()
+    (results[0].graded.parent / "captures.jsonl").unlink()
+    for path, text in texts.items():
+        path.write_text(text)
+
+    again = background(hold=True, now=lambda: FIXED)
+    assert again.pending_grades == 3
+    again.pipeline.wait_entered()  # the first recovered grade is running
+    shot = again.capture()  # a photograph of this run, behind it
+    assert again.close_grades(timeout=0) is False
+    assert again.pending_grades == 2  # the running one and this run's; the rest are left
+    again.pipeline.release(2)
+    assert again.close_grades(timeout=5)
+    assert again.pending_grades == 0
+    # One recovered grade had started and was finished. (Which one: entries are
+    # taken in name order, and "-2" sorts before the unsuffixed name.)
+    assert sum(r.graded.exists() for r in results) == 1
+    assert shot.graded.exists()
+    assert len(read_entries(tmp_path / "state")) == 2
+    assert "leaving 2 unfinished grade(s) for the next start" in again.test_log
+
+    # And the next start does finish them.
+    third = background()
+    _settle(third)
+    assert third.close_grades(timeout=5)
+    assert all(r.graded.exists() for r in results)
+    assert read_entries(tmp_path / "state") == []
+
+
+def test_a_grade_does_not_wait_for_ever_for_the_capture_side(
+    tmp_path, pipeline, monkeypatch, background,
+):
+    """An interrupt can end a capture between handing the job over and saying how
+    long the shutter was held. The grade is then finished without that number."""
+    from pifilm.capture import app
+
+    monkeypatch.setattr(app, "READY_WAIT_S", 0.01, raising=False)
+    session = background(now=lambda: FIXED)
+    day = session.out_root / "2026-09-03"
+    day.mkdir(parents=True)
+    entry = write_entry(tmp_path / "state", "by-hand", {})
+    work = app._GradeWork(
+        "2026-09-03", "x_graded.jpg", ["2026-09-03/x_ungraded.jpg"], 1, 0.0,
+        {"timestamp": "t", "pifilm": "x_graded.jpg", "ev_comp": 0.0},
+        frames=(synthetic_frame(90, 160),), shutter=time.perf_counter(),
+    )
+    done = threading.Event()
+
+    def grade():
+        session._run_grade(app.GradeJob(payload=work, entry=entry))  # ``ready`` is never set
+        done.set()
+
+    threading.Thread(target=grade, daemon=True).start()
+    assert done.wait(5), "the grade waited for ever for the capture side"
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    assert "shutter_to_ready_ms" not in record and "shutter_to_saved_ms" in record
+    assert (day / "x_graded.jpg").exists()
+    assert not entry.exists()
+
+
+def test_a_twice_failed_grade_is_reported_as_given_up(tmp_path, background):
+    result, path, text = _interrupted_shot(tmp_path, background)
+    result.original.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+    for _ in range(2):
+        again = background()
+        _settle(again)
+        assert again.close_grades(timeout=5)
+    assert again.test_log[0] == "recovering 1 unfinished grade(s)"
+    assert again.test_log[1].startswith(f"grade failed ({path.name}): ")
+    assert again.test_log[2] == (
+        f"grade given up ({path.name}): failed 2 times, kept as {path.stem}.failed"
+    )
+    assert path.with_suffix(".failed").exists() and not path.exists()
+
+
+class _Part:
+    """A display, a touch reader or a server that is sent SIGTERM while it closes."""
+
+    def __init__(self, signals, closed, name):
+        self._signals, self._closed, self._name = signals, closed, name
+
+    def start(self):
+        return None
+
+    def close(self):
+        self._signals.deliver()
+        self._closed.append(self._name)
+
+
+def _viewfinder_main(camera_cli, monkeypatch, tmp_path, run):
+    """Run ``main`` with a viewfinder whose loop is ``run``; SIGTERM arrives at every close."""
+    signals, closed = _Signals(), []
+
+    class Loop:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, stop):
+            return run(signals, stop)
+
+    class Camera(FakeCamera):
+        def close(self):
+            signals.deliver()
+            closed.append("camera")
+
+    real_close = camera_cli.CaptureSession.close_grades
+
+    def close_grades(self, timeout=None):
+        signals.deliver()
+        closed.append("grades")
+        return real_close(self, timeout)
+
+    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
+    monkeypatch.setattr(camera_cli, "FakeCamera", Camera)
+    monkeypatch.setattr(camera_cli.CaptureSession, "close_grades", close_grades)
+    monkeypatch.setattr(camera_cli, "RemoteCaptureServer",
+                        lambda *args, **kwargs: _Part(signals, closed, "remote"))
+    monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: (
+        _Part(signals, closed, "display"), _Part(signals, closed, "touch"),
+    ))
+    monkeypatch.setattr(camera_cli, "ViewfinderLoop", Loop)
+    monkeypatch.setattr(camera_cli, "_arm_exit_deadline", lambda seconds, code: None)
+    monkeypatch.setattr(camera_cli.signal, "signal", signals)
+    code = camera_cli.main([
+        "--fake", "--display", "waveshare28", "--no-preview",
+        "--remote-listen", "127.0.0.1:8765", "--out", str(tmp_path / "shots"),
+        "--state-dir", str(tmp_path / "state"),
+    ])
+    assert signals.calls[-1][1] is signals.previous
+    return code, closed
+
+
+def test_a_second_sigterm_cannot_break_into_the_viewfinders_clean_up(
+    camera_cli, monkeypatch, tmp_path,
+):
+    """The viewfinder's own handler takes the first SIGTERM, so ``main``'s has not
+    fired; a second one during the clean-up used to raise inside it and leave the
+    camera open."""
+    def run(signals, stop):
+        signals.deliver()  # the first SIGTERM: the viewfinder's handler sets ``stop``
+        assert stop.is_set()
+
+    code, closed = _viewfinder_main(camera_cli, monkeypatch, tmp_path, run)
+    assert code == 0
+    assert closed == ["touch", "display", "remote", "grades", "camera"]
+
+
+def test_sigterm_cannot_break_into_the_stall_exits_clean_up(camera_cli, monkeypatch, tmp_path):
+    from pifilm.capture.errors import CameraStalled
+
+    def run(signals, stop):
+        raise CameraStalled("no preview frame within 5.0 s")
+
+    code, closed = _viewfinder_main(camera_cli, monkeypatch, tmp_path, run)
+    assert code == 1  # still the exit that makes systemd restart the service
+    assert closed == ["touch", "display", "remote", "grades", "camera"]
