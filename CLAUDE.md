@@ -92,6 +92,9 @@ fitted on normalized input; grain runs last because it models developed film.
 - `grain.py`: `add_grain`, luminance-only. `model="gaussian"` is the original hand-set grain;
   `model="two_scale"` is Ilford HP5 Plus 400 measured from scans (fine + coarse clumps in mm of a
   36 mm frame, measured brightness envelope; `docs/experiments/2026-10-01-hp5-grain.md`).
+  `model="two_scale_tile"` is the same HP5 grain laid down from a noise tile built once
+  (`tile_px` square, seamless, fixed seed) and placed per shot by the seed (offset and one of
+  eight orientations); about a tenth of the time, different pixels, so its own model and version.
 - `lut.py`: `LUT3D` with `apply_numpy` (reference, used in tests/trainer) and `apply_pillow`
   (C fast path, used on the Pi). Both `.cube` and Pillow order the flat table red-fastest.
   `sha1_hex` is the LUT content identity.
@@ -252,9 +255,9 @@ be launched from the Pi's desktop session, not over SSH. Full guide: `docs/stick
 - `.env` holds Pi/Wi-Fi/token secrets and is gitignored. `.env.example` documents keys. Scripts parse
   it as `KEY=VALUE` data only; never source it or echo values. Never put the token, Wi-Fi password,
   or SSH password into a command line, source file, service unit, or commit.
-- `params.json` `version` is 2, or 3 when the artifact uses a non-Gaussian grain model
-  (`GRAIN_MODEL_VERSION`; older builds then refuse it instead of misreading the grain). The
-  loader reads 1 to `PARAMS_VERSION` (3). `lut_sha1` is required.
+- `params.json` `version` follows the grain model (`GRAIN_MODEL_VERSIONS`): 2 for Gaussian,
+  3 for `two_scale`, 4 for `two_scale_tile`, so an older build refuses grain it would misread.
+  The loader reads 1 to `PARAMS_VERSION` (4). `lut_sha1` is required.
 - Module docstrings carry the design rationale (why an order is fixed, why a check exists). Read them
   before changing behaviour; many encode failures found on real hardware.
 - Reference photographs must be credited to Martin Parr from primary sources with permission;

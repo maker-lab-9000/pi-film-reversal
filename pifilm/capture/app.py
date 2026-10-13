@@ -182,6 +182,14 @@ class CaptureSession:
         self.double_exposure = False
         self._pending: _PendingExposure | None = None
         self._card_dir: Path | None = None
+        # Off the start-up path: a shot taken before it finishes just builds the
+        # same thing itself.
+        still_size = getattr(camera, "still_size", None)
+        if still_size is not None:
+            threading.Thread(
+                target=pipeline.warm, args=((still_size[1], still_size[0]),),
+                name="pifilm-warm", daemon=True,
+            ).start()
 
     def _allocate(self, suffix: str) -> tuple[Path, str, datetime]:
         t = self._now()

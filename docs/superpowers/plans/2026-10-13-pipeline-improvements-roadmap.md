@@ -78,6 +78,11 @@ pixels; the JPEG encoder can read them). Then one upload, one shader and one
 read-back replace about 3.6 s of CPU work. A GPU grain needs a noise texture, so
 step 3's grain tile is designed to be that texture: one grain, two backends.
 
+Tile grain (`two_scale_tile`, PR #57) on the Pi, 2026-10-13: grain 706 ms, and
+1,266 ms on the first photograph, which also built the tile (now built at
+start-up). That shot was 3,651 ms from shutter to saved: capture 1,099, LUT 808,
+grain 706, the two JPEGs 714, normalise 290. From 6,838 ms at the start of the day.
+
 ## Steps
 
 ### 1. Measure: per-stage timings in `captures.jsonl`

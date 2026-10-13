@@ -1972,3 +1972,30 @@ def test_double_exposure_records_are_broken_down_too(tmp_path, pipeline):
         "capture", "save_original", "composite", "normalize", "lut", "grain",
         "save_graded",
     }
+
+
+def test_session_warms_the_pipeline_for_the_cameras_still_size(tmp_path):
+    """The tile grain's tile is built at start-up, not during the first photograph."""
+    import threading
+
+    warmed = threading.Event()
+    shapes = []
+
+    class _Pipeline:
+        def warm(self, shape):
+            shapes.append(shape)
+            warmed.set()
+
+    camera = FakeCamera()
+    camera.still_size = (4056, 3040)
+    CaptureSession(camera, _Pipeline(), tmp_path)
+    assert warmed.wait(5.0)
+    assert shapes == [(3040, 4056)]
+
+
+def test_session_without_a_still_size_does_not_warm(tmp_path):
+    class _Pipeline:
+        def warm(self, shape):
+            raise AssertionError("no size to warm for")
+
+    CaptureSession(FakeCamera(), _Pipeline(), tmp_path)

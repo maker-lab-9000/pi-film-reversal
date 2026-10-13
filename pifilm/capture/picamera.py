@@ -506,6 +506,11 @@ class Picamera2Camera:
         if duration > 0 and math.isfinite(duration):
             self._stream_info.fps = 1_000_000.0 / duration
 
+    @property
+    def still_size(self) -> tuple[int, int]:
+        """(width, height) of a full-resolution still."""
+        return self._native_size
+
     def set_shutter(self, us: int | None) -> None:
         """Fix the exposure time (shutter priority), or return to auto with ``None``.
 
