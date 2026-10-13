@@ -616,6 +616,9 @@ class CaptureSession:
         frames = work.frames
         if frames is None:
             frames = tuple(load_rgb(self.out_root / name)[0] for name in work.originals)
+        else:
+            with _stage(stages, "sync_original"):
+                self._sync_originals(work, day_dir)
         t0 = time.perf_counter()
         if work.double is not None:
             with _stage(stages, "composite"):
@@ -791,6 +794,28 @@ class CaptureSession:
         self._append_record(day_dir, record)
         return CaptureResult(original, pifilm, record, exposure=(2, 2), graded=pifilm)
 
+    def _sync_originals(self, work: _GradeWork, day_dir: Path) -> None:
+        """Force a fresh shot's originals and DNG onto the disk, first thing on the
+        grade worker.
+
+        The camera does not wait for this (see ``_write_original``), so for the
+        second or so until the worker gets here, longer behind a full queue, a
+        power cut can leave a pending entry whose original is empty; that
+        photograph is lost and its entry ends as ``*.failed``. Before grading went
+        behind the shutter nothing was synced at all and the same cut could take
+        the last half minute of photographs. A file that has gone is the grade's
+        problem to report, not this step's.
+        """
+        names = [self.out_root / name for name in work.originals]
+        dng = work.record.get("dng")
+        if dng:
+            names.append(day_dir / dng)
+        for path in names:
+            try:
+                _sync_file(path)
+            except OSError:
+                pass
+
     def _write_original(
         self, frame: Frame, stages: dict[str, float],
     ) -> tuple[Path, str, datetime, Path, str | None]:
@@ -798,25 +823,20 @@ class CaptureSession:
         suffix = "original" if has_original else "ungraded"
         day_dir, stem, t = self._allocate(suffix)
         original = day_dir / f"{stem}_{suffix}.jpg"
-        # Behind the shutter a pending entry will name this file (exposure 1 of a
-        # double included), and the entry is synced: the file has to be on the
-        # disk first, or a power cut leaves an entry for an original that is not
-        # there. Inline has no entry and syncs nothing, as before.
-        durable = self._queue is not None
+        # Not synced here. Forcing the original and the DNG onto the SD card took
+        # 0.2 s and 0.6 to 1.0 s on the Pi 4 (2026-10-13) and ate most of what
+        # grading behind the shutter gave; the grade worker syncs them as its
+        # first step instead (``_sync_originals``).
         with _stage(stages, "save_original"):
             if frame.jpeg is not None:
                 original.write_bytes(frame.jpeg)
             else:
                 save_jpeg(frame.rgb, original)
-            if durable:
-                _sync_file(original)
         dng_name = None
         if frame.dng is not None and self._save_dng:
             with _stage(stages, "save_dng"):
                 dng_path = day_dir / f"{stem}.dng"
                 dng_path.write_bytes(frame.dng)
-                if durable:
-                    _sync_file(dng_path)
             dng_name = dng_path.name
         return day_dir, stem, t, original, dng_name
 

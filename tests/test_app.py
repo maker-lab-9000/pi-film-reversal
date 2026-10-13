@@ -2917,26 +2917,33 @@ class _MetaCamera(FakeCamera):
         return Frame(frame.rgb, None, "picamera2", dng=b"raw", metadata={"Lux": 1.0})
 
 
-def test_a_background_original_is_on_disk_before_its_entry_is_written(
+def test_a_background_original_is_synced_by_the_grade_worker_not_the_capture(
     tmp_path, monkeypatch, background,
 ):
-    """The entry names the original; an entry that outlives it can never be finished."""
+    """Syncing 20 MB of DNG cost the Pi up to a second per shot, so the camera does
+    not wait for it: the worker syncs the original and the DNG before it grades."""
     from pifilm.capture import app
 
     events = _record_syncs(monkeypatch)
-    real_write = app.write_entry
+    real_sync = app._sync_file
+    threads = []
 
-    def write(state_dir, name, payload):
-        events.append("entry")
-        return real_write(state_dir, name, payload)
+    def sync(path):
+        threads.append(threading.current_thread().name)
+        return real_sync(path)
 
-    monkeypatch.setattr(app, "write_entry", write)
+    monkeypatch.setattr(app, "_sync_file", sync)
     session = background(_MetaCamera([synthetic_frame(90, 160)]), hold=True, now=lambda: FIXED)
     result = session.capture()
+    session.pipeline.wait_entered()  # the full grade has begun: the syncs are done
     original = result.original.stat().st_ino
     dng = (result.original.parent / "210507.dng").stat().st_ino
-    assert [e for e in events if e in (original, dng, "entry")] == [original, dng, "entry"]
+    assert [e for e in events if e in (original, dng)] == [original, dng]
+    assert threads == ["pifilm-grade", "pifilm-grade"]
     session.pipeline.release()
+    session.close_grades()
+    record = json.loads((result.original.parent / "captures.jsonl").read_text())
+    assert "sync_original" in record["stage_ms"]
 
 
 def test_both_originals_of_a_background_double_are_synced(monkeypatch, background):
@@ -2944,8 +2951,9 @@ def test_both_originals_of_a_background_double_are_synced(monkeypatch, backgroun
     session = background(FakeCamera(_double_frames()), hold=True, now=lambda: FIXED)
     session.set_double_exposure(True)
     first = session.capture()
-    assert first.original.stat().st_ino in events  # no entry yet, but one will name it
     second = session.capture()
+    session.pipeline.wait_entered()
+    assert first.original.stat().st_ino in events
     assert second.original.stat().st_ino in events
     session.pipeline.release()
 

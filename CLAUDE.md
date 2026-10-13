@@ -138,8 +138,9 @@ fitted on normalized input; grain runs last because it models developed film.
   `shutter_to_ready_ms`, `grade: "background"`, stages `preview` and `queued`, and
   `recovered: true` when it was finished at a later start from the saved JPEG.
   `--grade inline` is the earlier behaviour, with no queue and no new fields; `--state-dir`
-  moves the pending entries (default `~/.local/state/pifilm/pending`). With background grading the original (and DNG) are
-  fsynced before the entry is written, and the graded file and the log line before it is removed.
+  moves the pending entries (default `~/.local/state/pifilm/pending`). The grade
+  worker fsyncs the original (and DNG) as its first step, not the capture (that cost up to 1 s a
+  shot on the Pi's SD card), and the graded file and the log line before the entry is removed.
   SIGTERM ends every loop the way Ctrl-C does (`main` raises `_Terminated` in the main thread;
   the viewfinder's own handler sets its stop event instead), and every clean-up starts with
   `_ignore_sigterm`, so a later SIGTERM cannot break into it. A stop finishes the photographs

@@ -3,6 +3,14 @@
 Date: 2026-10-13. Step 6 of `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`.
 Branch `feat/background-grade`, pull request into `pipeline-improvements`.
 
+## Amendment, 2026-10-13 (after the first Pi numbers)
+
+The original and the DNG are not forced to disk before the camera is free: on the
+Pi's SD card that cost 0.8 to 1.5 s a shot. The grade worker syncs them as its first
+step. A power cut in the second or so between can lose that photograph; before this
+work nothing was synced and the window was about half a minute. "What can be lost:
+nothing that was acknowledged" below is therefore not exact.
+
 ## Goal
 
 The camera is ready for the next photograph as soon as the frame is safe on disk

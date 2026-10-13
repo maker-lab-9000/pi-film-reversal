@@ -62,7 +62,9 @@ The three steps above take about 2 s on a full-resolution frame on the Pi 4. By
 default (`--grade background`) the camera does not wait for them:
 
 1. The frame is read and the original JPEG is saved (and the DNG, when enabled),
-   and both are synced to the disk. From here the photograph survives a power cut.
+   The grade worker forces both onto the disk as its first step, usually within a
+   second; a power cut before that can lose the photograph. The camera does not wait
+   for it, because on the Pi's SD card that cost up to a second a shot.
 2. A pending entry is written: a small JSON file outside the photo folder
    (`~/.local/state/pifilm/pending/`, or `--state-dir PATH`) with the original's
    name, the grain seed, the EV and the camera fields of the record.
