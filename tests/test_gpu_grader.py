@@ -453,3 +453,56 @@ def test_a_failure_while_loading_the_tile_is_counted_and_the_tile_is_loaded_agai
         _grade(grader, artifacts, frame)
     assert np.array_equal(_grade(grader, artifacts, frame, seed=2)[..., :3],
                           _expected(artifacts, frame, 2))
+
+
+# --- fix round 1 -------------------------------------------------------------
+
+
+def test_grade_raises_only_gpu_error_even_when_the_placement_draw_fails():
+    class BadGenerator:
+        def integers(self, *args, **kwargs):
+            raise TypeError("not a generator")
+
+    grader, device, lines, artifacts = _open()
+    runs = len(device.runs)
+    gains = stats_gains(_frame(), artifacts.normalize)
+    for _ in range(3):
+        with pytest.raises(GpuError, match="TypeError: not a generator"):
+            grader.grade(_frame(), gains, BadGenerator())
+    assert len(device.runs) == runs
+    assert not grader.enabled and lines == ["gpu grading off: 3 failures in a row"]
+
+
+@pytest.mark.parametrize("name", ["stats_gains", "reference_pass", "pass_tables"])
+def test_any_exception_in_the_self_test_is_a_self_test_gpu_error(monkeypatch, name):
+    def broken(*args, **kwargs):
+        raise ValueError("bad numbers")
+
+    monkeypatch.setattr(grader_module, name, broken)
+    device = FakeDevice()
+    with pytest.raises(GpuError, match="self-test: ValueError: bad numbers"):
+        GpuGrader(tile_artifacts(), device, log=lambda _line: None)
+    assert device.closed == 1
+    lines: list[str] = []
+    assert GpuGrader.open(tile_artifacts(), log=lines.append, device_factory=FakeDevice) is None
+    assert lines == ["gpu grading off: self-test: ValueError: bad numbers"]
+
+
+def test_the_self_test_leaves_the_grain_tile_cache_alone():
+    from pifilm import grain as grain_module
+
+    artifacts = tile_artifacts()
+    grain_module._tile.cache_clear()
+    warmed = grain_tile(artifacts.grain, 4056 / artifacts.grain.frame_width_mm)
+    other = grain_tile(artifacts.grain, 640 / artifacts.grain.frame_width_mm)
+    before = grain_module._tile.cache_info()
+    _, device, _, _ = _open(artifacts)
+    after = grain_module._tile.cache_info()
+    assert (after.currsize, after.misses) == (before.currsize, before.misses)
+    # Both warmed tiles are still the cached objects.
+    assert grain_tile(artifacts.grain, 4056 / artifacts.grain.frame_width_mm) is warmed
+    assert grain_tile(artifacts.grain, 640 / artifacts.grain.frame_width_mm) is other
+    # And the self-test's tile is the one grain_tile would have made.
+    small = dataclasses.replace(artifacts.grain, tile_px=grader_module.SELF_TEST_TILE_PX)
+    assert device.tile_loads[1] == (64, 64)
+    assert np.array_equal(device.tile, grain_tile(small, 96 / small.frame_width_mm))

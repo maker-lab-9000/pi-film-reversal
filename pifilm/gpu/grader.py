@@ -14,7 +14,9 @@ exact half and for its float arithmetic. The frame has gradients and mid-tones
 on purpose: a flat frame normalises to black or white, where the grain's
 envelope is zero, and the grain would go untested. Its tile is a small one of
 the artifact's grain (``SELF_TEST_TILE_PX``), so the frame wraps round it and
-the start-up does not pay for a full tile at a scale no photograph has.
+the start-up does not pay for a full tile at a scale no photograph has. It is
+built beside ``grain_tile``'s two-slot cache, not through it, so it cannot
+push out a tile the session has warmed.
 
 **One thread.** A graphics context belongs to the thread that made it. The
 grader remembers that thread; from any other, ``can_grade`` says no, ``grade``
@@ -40,6 +42,7 @@ from typing import Protocol
 
 import numpy as np
 
+from .. import grain as grain_module
 from ..artifacts import Artifacts
 from ..grain import GrainParams, grain_tile, tile_placement
 from ..normalize import Gains, stats_gains
@@ -186,14 +189,17 @@ class GpuGrader:
             raise GpuError("gpu grading is off")
         if threading.get_ident() != self._thread:
             raise GpuError("the grader belongs to the thread that opened it")
-        params = self._artifacts.grain
-        placement = None
-        if grain and _grain_on(params):
-            rng = rng if rng is not None else np.random.default_rng()
-            placement = tile_placement(params, rng)
-        else:
-            params = dataclasses.replace(params, enabled=False)
         try:
+            try:
+                params = self._artifacts.grain
+                placement = None
+                if grain and _grain_on(params):
+                    rng = rng if rng is not None else np.random.default_rng()
+                    placement = tile_placement(params, rng)
+                else:
+                    params = dataclasses.replace(params, enabled=False)
+            except Exception as exc:  # noqa: BLE001 - one type leaves grade, see _run
+                raise GpuError(f"{type(exc).__name__}: {exc}") from exc
             out = self._run(rgb_u8, gains, params, placement, timings)
         except GpuError:
             self._failures += 1
@@ -250,6 +256,9 @@ class GpuGrader:
             self._self_test()
         except GpuError as exc:
             raise GpuError(f"self-test: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - the statistics, the tile or the
+            # reference can raise too, and __init__ promises one type.
+            raise GpuError(f"self-test: {type(exc).__name__}: {exc}") from exc
 
     def _self_test(self) -> None:
         frame = self_test_frame()
@@ -258,11 +267,16 @@ class GpuGrader:
         if _grain_on(grain):
             grain = dataclasses.replace(grain, tile_px=min(grain.tile_px, SELF_TEST_TILE_PX))
             placement = SELF_TEST_PLACEMENT
-            tile = self._tile(grain, frame.shape)
+            # The function under grain_tile's cache, called directly: that
+            # cache has two slots, and this small tile would push out one the
+            # session warmed for the camera's frame (0.56 s to rebuild on the Pi).
+            tile = grain_module._tile.__wrapped__(
+                grain.tile_px, max(frame.shape[:2]) / grain.frame_width_mm,
+                grain.fine_sigma_mm, grain.coarse_sigma_mm, grain.fine_share)
         else:
             grain = dataclasses.replace(grain, enabled=False)
             placement = tile = None
-        got = self._run(frame, gains, grain, placement, None)
+        got = self._run(frame, gains, grain, placement, None, tile=tile)
         want = reference_pass(frame, pass_tables(gains, grain), self._artifacts.lut.table,
                               tile, placement)
         worst = int(np.abs(got[..., :3].astype(np.int16) - want.astype(np.int16)).max())
@@ -276,10 +290,12 @@ class GpuGrader:
         return grain_tile(grain, max(shape[:2]) / grain.frame_width_mm)
 
     def _run(self, rgb_u8: np.ndarray, gains: Gains, grain: GrainParams,
-             placement: tuple[int, int, int] | None, timings: dict | None) -> np.ndarray:
+             placement: tuple[int, int, int] | None, timings: dict | None,
+             tile: np.ndarray | None = None) -> np.ndarray:
         """One pass on the device. Anything the device raises leaves as
         ``GpuError``: ctypes and NumPy have their own exceptions (a bad
-        argument, no memory), and the caller's fallback catches one type."""
+        argument, no memory), and the caller's fallback catches one type.
+        ``tile`` is the self-test's own; a photograph's comes from the cache."""
         try:
             tables = pass_tables(gains, grain)
             if placement is not None:
@@ -288,7 +304,8 @@ class GpuGrader:
                     # Forgotten first: a load that fails half way leaves no tile
                     # this key could be mistaken for.
                     self._tile_key = None
-                    self._device.load_tile(self._tile(grain, rgb_u8.shape))
+                    self._device.load_tile(
+                        tile if tile is not None else self._tile(grain, rgb_u8.shape))
                     self._tile_key = key
             self._device.load_tables(tables)
             out = self._device.run(rgb_u8, use_tone=tables.use_tone, placement=placement,
