@@ -501,3 +501,30 @@ def test_an_on_stop_that_raises_is_logged_and_the_worker_still_ends():
     assert queue.close(WAIT)
     assert log == ["grade worker shutdown failed: context lost"]
     assert queue.submit(GradeJob("late")) is False
+
+
+def test_a_blocked_on_start_holds_the_jobs_and_loses_none():
+    """The worker's set-up can be slow (a GPU context). Until it returns nothing
+    runs, and what was accepted meanwhile is still counted and still run."""
+    release = threading.Event()
+    entered = threading.Event()
+    run = Recorder()
+
+    def slow():
+        entered.set()
+        assert release.wait(WAIT)
+
+    queue = GradeQueue(run, depth=2, on_start=slow)
+    try:
+        assert entered.wait(WAIT)
+        assert queue.submit(GradeJob("a")) is True
+        assert queue.submit(GradeJob("b")) is True
+        assert queue.pending == 2
+        assert run.ran == []
+        assert queue.close(timeout=0.05) is False
+        assert queue.pending == 2 and run.ran == []
+    finally:
+        release.set()
+        assert queue.close(WAIT)
+    assert run.ran == ["a", "b"]
+    assert queue.pending == 0

@@ -216,14 +216,28 @@ def test_importing_the_module_loads_no_graphics_library():
     assert done.returncode == 0, done.stderr
 
 
-def test_open_device_raises_gpu_error_on_a_machine_without_egl():
+@pytest.fixture
+def no_graphics_libraries(monkeypatch):
+    """A machine without EGL, whatever this one has: a Linux machine with Mesa
+    (the Pi included) would otherwise load the real library here."""
+    import ctypes
+
+    def missing(name, *args, **kwargs):
+        raise OSError(f"{name}: cannot open shared object file: No such file or directory")
+
+    monkeypatch.setattr(ctypes, "CDLL", missing)
+
+
+def test_open_device_raises_gpu_error_on_a_machine_without_egl(no_graphics_libraries):
     before = os.environ.get("EGL_PLATFORM")
     with pytest.raises(GpuError, match="libEGL"):
         egl.open_device()
     assert os.environ.get("EGL_PLATFORM") == before
 
 
-def test_open_with_the_real_device_returns_none_on_a_machine_without_egl():
+def test_open_with_the_real_device_returns_none_on_a_machine_without_egl(
+    no_graphics_libraries,
+):
     lines: list[str] = []
     assert GpuGrader.open(tile_artifacts(), log=lines.append) is None
     assert len(lines) == 1 and lines[0].startswith("gpu grading off: ")
