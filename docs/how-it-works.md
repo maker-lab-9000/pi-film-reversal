@@ -117,6 +117,74 @@ being graded and three waiting).
 camera is free, there is no queue and no pending entry, and records have none of the
 new fields.
 
+### Grading on the GPU
+
+On the Pi 4 the grade worker can do the three steps as one pass on the GPU
+(`pifilm/gpu/`). Measured on 2026-10-13 with the IMX477 at 12 MP: about 0.67 s
+against 1.73 s on the CPU. The camera is already free by then, so the wait between
+photographs does not change. The graded file exists about a second sooner and a
+burst drains faster.
+
+**What runs where.** The GPU grades the worker's full-resolution grade when all of
+these hold: a GPU grader was set up at start, the look's grain is `two_scale_tile`
+(or grain is off), the frame is no wider than the GPU's largest texture (4096; the
+IMX477's 4056 fits, the IMX708's 4608 does not), and the EV is 0. Everything else
+is graded on the CPU as before: the quick grade for the screen, `--grade inline`,
+a shot taken while the service is stopping, `pifilm-process`, the trainer, and
+looks with the Gaussian or `two_scale` grain. A double exposure is composited on
+the CPU and the composite is then graded like any other frame.
+
+**The pass.** The statistics (white balance, levels) are measured on the CPU by the
+same code as before, so the audit fields of a record are the same whichever path
+graded. The shader then does, per pixel and in float: the per-channel
+normalisation tables, the luma tone curve, the 3D LUT with trilinear interpolation
+written out in the shader (never the GPU's own filtering), and the grain, from the
+same tile placed by the same seed as on the CPU. It rounds to bytes once, at the
+end. The CPU path rounds after normalising, after the tone curve, after the LUT
+and in the grain.
+
+**The self-test.** The GPU code cannot run in the test suite, so the service checks
+it at every start. The grader grades a 96 × 64 frame with a 64 px grain tile and
+compares it with a NumPy version of the same pass (`pifilm/gpu/reference.py`).
+More than 1 level of difference anywhere, or any graphics error, and GPU grading is
+off for this run. The log has one line either way: `gpu grading on (...)` or
+`gpu grading off: ...` with the reason. The service starts in both cases.
+
+**Fallback.** A photograph the GPU fails on is graded on the CPU at once, from the
+same seed, so it is never lost and never waits. The log names it
+(`gpu grade failed (...)`). Three failures in a row switch the GPU off for the run.
+Nothing shows on the screen.
+
+**The record.** Every record of a graded photograph has `pipeline_backend`: `gpu-1`
+or `cpu`. The number is the shader's version and rises with any change that can
+move pixels. A GPU grade adds the stages `gpu`, `gpu_upload`, `gpu_shader` and
+`gpu_readback` to `stage_ms` and has no `lut` or `grain` stage.
+
+**Reproducibility.** `pifilm-process` regrades on the CPU. A record marked `cpu`
+still reproduces byte for byte. A record marked `gpu-1` does not: the GPU's file is
+the more exact of the two, because the CPU rounds colours to bytes before the LUT.
+Against a CPU regrade it differs by about 0.2 to 0.6 levels on average and by a few
+levels at most on ordinary colours. On strongly saturated areas, where the look's
+LUT is steep, it differs by 10 to 20 levels. Measured on 2026-10-13: at most 5
+levels on a real photograph with the trained IMX477 look on the Pi, and up to 20 on
+synthetic saturated frames with the bundled starter look. `pifilm-process` says so
+once when the folder's log has such records. The grain lands in the same place on
+both paths.
+
+**The switch.** `--grade-backend auto` (the default) uses the GPU when it can.
+`--grade-backend cpu` never opens the GPU and is the earlier behaviour exactly.
+
+**Checking it.** `pifilm-gpu-check --artifacts DIR [--image FILE] [--runs N]` grades
+a full frame on the GPU, compares it with the reference and with the CPU, and
+prints the timings. It exits 0 when the GPU is within 1 level of the reference.
+The command appears only after `pip install -e .` has been run again in the Pi's
+venv; `python -m pifilm.gpu.check` with the same arguments works without that.
+The bundled starter look has Gaussian grain, so it is always graded on the CPU:
+pass a look with the tile grain.
+
+**Memory.** The textures for a 12 MP frame take about 110 MB of graphics memory,
+held while the service runs.
+
 ### Double exposure
 
 With the viewfinder's `2x` toggle on, two captures make one picture
@@ -190,11 +258,13 @@ The full procedure, from an empty `data/` folder to a verified deployment, is
 | SciPy | trainer only | Sparse matrices, the conjugate-gradient solver, isotonic regression |
 | requests, tqdm | `pifilm-fetch` only | Wikimedia Commons downloads with licence checks |
 | smbus2, gpiozero | Pi only, `--ups x728` | Reading the UPS fuel gauge over I2C and the power-loss pin |
+| `libEGL`, `libGLESv2` (through `ctypes`) | Pi only, `--grade-backend auto` | The GPU grade: a windowless context and one shader pass. System libraries, loaded when the grade worker starts, no Python package |
 | Paramiko | Mac only, deploy script | SSH to the Pi with a reject-unknown-hosts policy |
 | pytest, ruff, build | development | Tests, lint, wheel build |
 
-Not used: PyTorch, TensorFlow, scikit-learn, or any GPU. Nothing is downloaded
-at runtime and no data leaves the machine.
+Not used: PyTorch, TensorFlow or scikit-learn. The trainer uses no GPU; the Pi's
+GPU runs only the grade described above. Nothing is downloaded at runtime and no
+data leaves the machine.
 
 ## Dependencies by role
 

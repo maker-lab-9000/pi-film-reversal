@@ -3,6 +3,19 @@
 Date: 2026-10-13. Step 7 of `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`.
 Branch `feat/gpu-grade`, pull request into `pipeline-improvements`.
 
+## Amendment, 2026-10-13 (after the reference was measured against the CPU)
+
+"Within the tolerances above" for a `pifilm-process` regrade of a `gpu-1` record,
+and the reference's test tolerances of "at most 6 levels" and "at most 8", are too
+tight for saturated colours. A GPU-graded file is the more exact of the two. Against
+a CPU regrade it differs by about 0.2 to 0.6 levels on average and by a few levels at
+most on ordinary colours, and by 10 to 20 levels on strongly saturated areas where
+the look's LUT is steep, because the CPU path rounds colours to bytes before the
+LUT. Measured: at most 5 levels on a real photograph with the trained IMX477
+artifact on the Pi, and up to 20 on synthetic saturated frames with the bundled
+starter look. The self-test uses a 64 px tile and a 96 x 64 frame. The check command
+is `pifilm-gpu-check --artifacts DIR [--image FILE] [--runs N]`.
+
 ## Goal
 
 The background grade of a photograph (normalise, 3D LUT, grain) runs as one pass

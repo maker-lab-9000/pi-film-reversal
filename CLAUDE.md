@@ -50,6 +50,7 @@ python3.12 -m venv .venv
 .venv/bin/pifilm-process IN_DIR OUT_DIR [--artifacts DIR]          # batch regrade
 .venv/bin/pifilm-capture --fake --no-preview                       # capture loop w/o hardware
 .venv/bin/pifilm-battery                                           # print the X728 battery level (Pi only)
+.venv/bin/pifilm-gpu-check --artifacts DIR [--image FILE] [--runs N]   # GPU grade against its reference (Pi only)
 .venv/bin/pifilm-train --source data/source --target data/references --out artifacts/pifilm-v1
 .venv/bin/pifilm-fetch --category 'Category:...'                   # Wikimedia Commons corpus fetch
 
@@ -84,6 +85,11 @@ sudo python3 scripts/pi_photo_volume.py --apply
 `Pipeline.process()` in `pipeline.py` is the single grading path for captures, previews, and batch:
 **normalize → LUT → grain**, in that fixed order. Normalization runs first because the LUT was
 fitted on normalized input; grain runs last because it models developed film.
+`process(..., grader=, used=)` can hand the three steps to a GPU grader as one pass; the statistics
+stay on the CPU, so the audit fields are the same on both paths. The grader is asked first
+(`can_grade`), a `GpuError` falls back to the CPU for the same frame with the generator's state
+restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, and a GPU result is
+(H, W, 4) with an unused fourth byte. Without a grader nothing differs.
 
 - `normalize.py`: per-image white balance and exposure/levels normalization. The trainer applies the
   identical maths in float (`normalize_float`); the Pi uses 256-entry lookup tables (`normalize_u8`).
@@ -101,6 +107,17 @@ fitted on normalized input; grain runs last because it models developed film.
 - `artifacts.py`: an artifact is `pifilm.cube` + `params.json`. Loading verifies `lut_sha1` matches the
   cube on disk so a half-written pair cannot load. `publish()` stages then swaps the directory with
   `os.replace`. `Artifacts.default()` resolves the packaged `pifilm/data/`; `--artifacts DIR` overrides.
+- `gpu/`: the grade as one pass on the Pi 4's GPU. `shader.py` is the GLSL and `SHADER_VERSION`
+  (`BACKEND` is `"gpu-1"`; any change that can move pixels raises it). `reference.py` is the same
+  pass in NumPy, the definition the tests and the self-test hold the GPU to. `grader.py` is
+  `GpuGrader`: a self-test at set-up (a 96 x 64 frame against the reference, at most 1 level),
+  one thread only (another thread is told it cannot grade), every failure a `GpuError`, three in
+  a row switch it off. `egl.py` is the only file that loads `libEGL`/`libGLESv2`, through
+  `ctypes`, inside functions, so the package imports on a Mac. `check.py` is `pifilm-gpu-check`.
+  Only `two_scale_tile` grain (or none), EV 0 and frames up to 4096 wide go to the GPU. A GPU
+  grade is not byte-identical to the CPU's: a few levels on ordinary colours, 10 to 20 on strongly
+  saturated ones (the CPU rounds to bytes before the LUT). Design:
+  `docs/superpowers/specs/2026-10-13-gpu-grading-design.md`.
 - `color.py`: sRGB ↔ linear ↔ Oklab/Oklch. All trainer statistics are computed in Oklab.
 - `imageio.py`: the only place pixels enter. Applies EXIF orientation and converts embedded ICC
   profiles to sRGB. Do not load images elsewhere with raw `Image.open`.
@@ -146,7 +163,13 @@ fitted on normalized input; grain runs last because it models developed film.
   `_ignore_sigterm`, so a later SIGTERM cannot break into it. A stop finishes the photographs
   taken in this run; recovered grades not yet started keep their entries for the next start,
   as does anything a power cut or a kill interrupts. Just after a restart with many unfinished
-  grades the recovered ones go first, and a fourth new shot waits for them. Each record also carries `stage_ms`, the
+  grades the recovered ones go first, and a fourth new shot waits for them.
+  `--grade-backend auto` (the default; `cpu` is the other choice) lets the grade worker open a
+  `GpuGrader` on its own thread before its first job and close it after its last; a session
+  grading inline never opens one, and the quick grade and a shot a closing queue refused stay on
+  the CPU. A photograph the GPU fails on is graded on the CPU in the same call and logged as
+  `gpu grade failed (...)`. Every record of a graded photograph has `pipeline_backend`
+  (`"gpu-1"` or `"cpu"`): after `stage_ms` in an inline record, last in a background one. Each record also carries `stage_ms`, the
   milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, LUT,
   grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`
   is the plan those numbers feed.
@@ -158,7 +181,9 @@ fitted on normalized input; grain runs last because it models developed film.
   queue makes the next capture wait), and the pending entries: atomically written JSON files
   that let the next start finish a grade a power cut interrupted. A failed grade is logged by its entry's name; an entry that fails twice is
   renamed `*.failed` (a second log line says so). `close()` finishes the running job and
-  those accepted by `submit`, and drops the recovery backlog not yet started. No camera, pipeline or display in it.
+  those accepted by `submit`, and drops the recovery backlog not yet started. `on_start` and
+  `on_stop` run on the worker thread before the first job and after the last (the GPU grader is
+  opened and closed there); one that raises is logged. No camera, pipeline or display in it.
 - `controller.py`: `CaptureController` serializes captures on one worker thread, one active job at
   a time, idempotent by `request_id`. Shared by the local SPACE key, the LCD, the GPIO shutter
   button and the remote API. `ControllerSnapshot.pending_grades` is read live from the session
@@ -177,6 +202,9 @@ fitted on normalized input; grain runs last because it models developed film.
   capture folder, refuses an output dir equal to or inside the input. When the folder has a
   `captures.jsonl`, each frame is graded with its logged `ev_comp` and `grain_seed`, so the same
   artifact reproduces the Pi's graded file pixel for pixel (`--ignore-log` grades at EV 0).
+  It always grades on the CPU, so a record the Pi graded on its GPU (`pipeline_backend` starting
+  `gpu`) is reproduced closely, not byte for byte; the tool prints one note per run when it
+  regrades such records.
 
 ### Display (`pifilm/display/`)
 

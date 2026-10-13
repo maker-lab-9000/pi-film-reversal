@@ -575,6 +575,24 @@ Not yet run on hardware. The branch is `feat/background-grade`; the design is
 | 6 | `--grade inline`: behaves as before this change | |
 | 7 | Ten minutes of ordinary use: no preview stall, and the live view is acceptable | |
 
+#### GPU grading
+
+Not yet run on hardware. The branch is `feat/gpu-grade`; the design is
+[2026-10-13-gpu-grading-design.md](superpowers/specs/2026-10-13-gpu-grading-design.md).
+Use a look with the tile grain (`two_scale_tile`): the bundled starter has Gaussian
+grain and is always graded on the CPU. Run `pip install -e .` again in the Pi's venv
+first, so that `pifilm-gpu-check` exists.
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | The service starts with the display on. The journal has `gpu grading on (..., self-test passed)` | |
+| 2 | `pifilm-gpu-check --artifacts DIR --image FILE` on a real photograph: within 1 level of the reference, and timings near the spike's (upload 142 ms, shader 239 ms, read-back 180 ms) | |
+| 3 | Ten photographs: every record has `pipeline_backend: gpu-1`; `stage_ms` shows the grade near 0.7 s (`normalize` plus `gpu`); the graded files look right at 100 %, grain included | |
+| 4 | A double exposure and a Stick shot work as before | |
+| 5 | `--grade-backend cpu`: records have `pipeline_backend: cpu`, and the timings are as before | |
+| 6 | `pifilm-process` on today's folder: it runs, and prints the note about the records graded on the GPU | |
+| 7 | Ten minutes of ordinary use: no preview stall, and the live view is no worse than now | |
+
 ## 8. Troubleshooting
 
 Every line below is printed by `pifilm-capture` as
