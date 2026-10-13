@@ -26,6 +26,7 @@ pifilm-capture = "pifilm.capture.app:main"
 pifilm-process = "pifilm.capture.batch:main"
 pifilm-preset = "pifilm.preset:main"
 pifilm-battery = "pifilm.capture.power:main"
+pifilm-gpu-check = "pifilm.gpu.check:main"
 
 [tool.setuptools.packages.find]
 include = ["pifilm*"]
