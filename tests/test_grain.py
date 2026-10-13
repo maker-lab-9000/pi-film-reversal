@@ -295,3 +295,46 @@ def test_warm_builds_the_tile_only_for_the_tile_model():
     add_grain(np.full((300, 400, 3), 128, np.uint8), _tile_params(),
               rng=np.random.default_rng(1))
     assert grain._tile.cache_info().misses == 1
+
+
+@pytest.mark.parametrize("seed", [0, 1, 9, 1234, 2**40 + 7])
+def test_tile_placement_makes_the_draws_add_grain_makes(seed):
+    """The GPU pass places the tile from the same seed, so the three draws are
+    one function. The old draws are kept inline here: same calls, same order."""
+    from pifilm.grain import tile_placement
+
+    params = _tile_params()
+    old = np.random.default_rng(seed)
+    oy, ox = (int(v) for v in old.integers(0, params.tile_px, 2))
+    orientation = int(old.integers(0, 8))
+
+    rng = np.random.default_rng(seed)
+    placement = tile_placement(params, rng)
+    assert placement == (oy, ox, orientation)
+    assert all(type(v) is int for v in placement)
+    # Nothing more was drawn: both generators are in the same state.
+    assert rng.bit_generator.state == old.bit_generator.state
+
+
+@pytest.mark.parametrize("seed", [0, 5, 77])
+def test_add_grain_places_the_tile_where_tile_placement_says(seed):
+    """Byte for byte what the tile branch did before the draws were factored out."""
+    import cv2
+
+    from pifilm.grain import _oriented, grain_tile, place_tile, tile_placement
+
+    params = _tile_params(strength=0.1)
+    img = np.random.default_rng(seed + 100).integers(0, 256, (200, 330, 3), dtype=np.uint8)
+    got = add_grain(img, params, rng=np.random.default_rng(seed))
+
+    oy, ox, orientation = tile_placement(params, np.random.default_rng(seed))
+    tile = grain_tile(params, 330 / params.frame_width_mm)
+    noise = place_tile(_oriented(tile, orientation), (200, 330), oy, ox)
+    ycc = cv2.cvtColor(img, cv2.COLOR_RGB2YCrCb)
+    y = ycc[..., 0]
+    levels = np.arange(256, dtype=np.float32) / 255.0
+    envelope = np.interp(levels, params.envelope_luma, params.envelope_rel).astype(np.float32)
+    gain = (255.0 * params.strength * envelope).astype(np.float32)
+    cv2.multiply(noise, cv2.LUT(y, gain), dst=noise)
+    ycc[..., 0] = cv2.add(noise, y, dtype=cv2.CV_8U)
+    assert np.array_equal(got, cv2.cvtColor(ycc, cv2.COLOR_YCrCb2RGB))
