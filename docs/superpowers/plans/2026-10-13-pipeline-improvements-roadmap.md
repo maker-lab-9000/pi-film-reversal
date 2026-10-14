@@ -163,6 +163,8 @@ No change to defaults until the owner has chosen from a gallery.
   exposure placement from `Lux`, `ExposureTime` and `AnalogueGain` in the record
   instead, and compare on existing captures (night, snow-like bright scenes,
   manual exposures) with `pifilm-process`.
+  Done 2026-10-14, no change: the owner kept the deployed look after a gallery of
+  144 photographs ([write-up](../../experiments/2026-10-14-exposure-from-lux.md)).
 - **Adaptive contrast off.** libcamera's `rpi.contrast` enhancement is
   scene-dependent, which one global LUT cannot follow. Experiment: capture pairs
   with it on and off, grade both, compare. It changes what the LUT is fed, so a
