@@ -202,6 +202,12 @@ def read_dng(data: bytes) -> RawFrame:
             raise RawError(f"black level deltas (tag {tag}) are not read")
     black = float(blacks.pop())
     white = float(_one(fields, 50717))
+    # A rational with a zero denominator reads as NaN, and every comparison with
+    # NaN is false, so it would slip past the checks below without this one.
+    if not (np.isfinite(black) and np.isfinite(white)):
+        raise RawError(f"black level {black:g} or white level {white:g} is not finite")
+    if black >= white:
+        raise RawError(f"black level {black:g} is not below the white level {white:g}")
 
     offsets, counts = fields[273], fields[279]
     if len(offsets) != 1 or len(counts) != 1:
@@ -285,6 +291,8 @@ def _floats(values, size: int, what: str) -> np.ndarray:
         array = np.asarray(values, dtype=np.float64)
     except (TypeError, ValueError) as exc:
         raise RawError(f"{what} holds a value that is not a number") from exc
+    if array.ndim != 1:
+        raise RawError(f"{what} is not a flat list of numbers")
     if not np.all(np.isfinite(array)):
         raise RawError(f"{what} holds a value that is not finite")
     return array
@@ -353,6 +361,8 @@ def tuning_tables(tuning: dict) -> RawTuning:
 
 def _interpolate(tables: tuple[tuple[float, np.ndarray], ...], ct: float) -> np.ndarray:
     """Linear in ct between the two neighbours; the end table outside the range."""
+    if not np.isfinite(ct):
+        raise RawError(f"colour temperature {ct} is not a finite number")
     if ct <= tables[0][0]:
         return tables[0][1].copy()
     if ct >= tables[-1][0]:

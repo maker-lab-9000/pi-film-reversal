@@ -42,7 +42,8 @@ def _encode(typ: int, values, endian: str) -> bytes:
         code = "I" if typ == RATIONAL else "i"
         parts = []
         for v in values:
-            parts += [round(v * 1_000_000), 1_000_000]
+            # NaN is written as 0/0, the zero denominator a broken file would have.
+            parts += [0, 0] if v != v else [round(v * 1_000_000), 1_000_000]
         return struct.pack(f"{endian}{2 * len(values)}{code}", *parts)
     raise ValueError(f"type {typ}")
 

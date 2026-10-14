@@ -82,8 +82,31 @@ def test_refuses_not_tiff():
 
 def test_refuses_truncated():
     data = make_dng(_bayer())
-    with pytest.raises(RawError):
+    with pytest.raises(RawError, match="IFD of .* entries runs past the end"):
         read_dng(data[:20])
+
+
+def test_refuses_strip_past_end():
+    _refused("strip at 1000000 .* runs past the end", tags={273: (LONG, [10**6])})
+
+
+def test_refuses_tag_data_past_end():
+    # The black levels and AsShotNeutral are stored after the strip, at the end.
+    data = make_dng(_bayer())
+    with pytest.raises(RawError, match="tag .* runs past the end"):
+        read_dng(data[:-4])
+
+
+def test_refuses_odd_width_at_12_bits():
+    _refused("width 3 is odd", bayer=_bayer(shape=(2, 3)))
+
+
+def test_refuses_nan_white_level():
+    _refused("white level", tags={50717: (RATIONAL, [float("nan")])})
+
+
+def test_refuses_black_at_or_above_white():
+    _refused("black level 300 .* white level 200", black=(300,), white=200, bayer=_bayer(high=200))
 
 
 @pytest.mark.parametrize("tag, name", [(33421, "CFARepeatPatternDim"), (33422, "CFAPattern")])
@@ -271,3 +294,19 @@ def test_single_calibration_is_used_everywhere():
     t = tuning_tables(small_tuning({"rpi.ccm": {"ccms": [{"ct": 4000, "ccm": ccm}]}}))
     for ct in (1000, 4000, 9000):
         np.testing.assert_array_equal(ccm_at(t, ct), np.diag([1.0, 2.0, 3.0]))
+
+
+def test_tuning_refuses_nested_list():
+    ccm = [[1.0, 0, 0], [0, 1, 0], [0, 0, 1]]
+    bad = small_tuning({"rpi.ccm": {"ccms": [{"ct": 3000, "ccm": ccm + [[0, 0, 0]] * 6}]}})
+    with pytest.raises(RawError, match="not a flat list"):
+        tuning_tables(bad)
+
+
+@pytest.mark.parametrize("ct", [float("nan"), float("inf")])
+def test_interpolation_refuses_bad_ct(ct):
+    t = tuning_tables(small_tuning())
+    with pytest.raises(RawError, match="colour temperature"):
+        ccm_at(t, ct)
+    with pytest.raises(RawError, match="colour temperature"):
+        alsc_at(t, ct)
