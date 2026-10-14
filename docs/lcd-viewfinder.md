@@ -616,16 +616,16 @@ first, so that `pifilm-gpu-check` exists.
 
 #### Tuning check
 
-Not yet run on hardware. The branch is `feat/tuning-hash`; the design is
+Passed on the Pi 4 with the IMX477 on 2026-10-14 (PR #63). The design is
 [2026-10-14-tuning-identity-design.md](superpowers/specs/2026-10-14-tuning-identity-design.md).
 Run `pip install -e .` again in the Pi's venv first, so that `pifilm-tuning` exists.
 
 | Step | Check | Result |
 | --- | --- | --- |
-| 1 | `pifilm-tuning --tuning-file imx477.json` prints a fingerprint and the file | Not yet run |
-| 2 | `pifilm-tuning --tuning-file imx477.json --stamp <the service's artifacts>`, run as `george` (not with `sudo`), then restart the service with `sudo systemctl restart pifilm-capture.service`: the journal says `tuning: matches the look`; records carry `tuning_sha1` and `tuning_matches: true`; no tag on the screen | Not yet run |
-| 3 | Copy `imx477.json`, change one value (for example a `rpi.ccm` coefficient) and run the service by hand with `--tuning-file` naming the copy by its absolute path (for example `/home/george/imx477-test.json`; Picamera2 searches only its tuning directories for a bare name): the journal says `DIFFERS`, the amber `TUNING` tag shows, records say `tuning_matches: false`, and photographs are still taken and graded | Not yet run |
-| 4 | Back to the unit's own command: the tag is gone | Not yet run |
+| 1 | `pifilm-tuning --tuning-file imx477.json` prints a fingerprint and the file | Pass |
+| 2 | `pifilm-tuning --tuning-file imx477.json --stamp <the service's artifacts>`, run as `george` (not with `sudo`), then restart the service with `sudo systemctl restart pifilm-capture.service`: the journal says `tuning: matches the look`; records carry `tuning_sha1` and `tuning_matches: true`; no tag on the screen | Pass |
+| 3 | Stamp the look with a wrong fingerprint (`pifilm-tuning --sha1 0000000000000000000000000000000000000000 --stamp <dir>`) and restart: the journal says `DIFFERS`, the amber `TUNING` tag shows, records say `tuning_matches: false`, and photographs are still taken and graded. (An edited copy of `imx477.json` passed to `--tuning-file` by its absolute path tests the same thing from the camera's side.) | Pass |
+| 4 | Stamp the right fingerprint again and restart: the tag is gone | Pass |
 
 ## 8. Troubleshooting
 

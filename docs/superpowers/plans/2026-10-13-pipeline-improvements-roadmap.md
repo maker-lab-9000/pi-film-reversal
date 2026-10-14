@@ -143,7 +143,7 @@ capture record and in the artifact a look was trained against; warn (or refuse,
 owner's choice) when they differ. This turns the known issue "a libcamera update
 could silently retune a deployed trained LUT" into a check.
 
-Built (2026-10-14), not yet run on the Pi. The owner chose warn only. The design is
+Built and passed on the Pi (2026-10-14, PR #63). The owner chose warn only. The design is
 [2026-10-14-tuning-identity-design.md](../specs/2026-10-14-tuning-identity-design.md),
 the plan [2026-10-14-tuning-identity.md](2026-10-14-tuning-identity.md). The Pi
 fingerprints its tuning at open (`pifilm/tuning.py`) and records it as `tuning_sha1`;
