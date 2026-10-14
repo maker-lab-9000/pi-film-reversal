@@ -1,7 +1,20 @@
+import dataclasses
+
 import numpy as np
 import pytest
 
-from pifilm.raw import RawError, RawFrame, alsc_at, ccm_at, read_dng, tuning_tables
+from pifilm._cv2 import require_cv2
+from pifilm.raw import (
+    TONE_CURVES,
+    RawError,
+    RawFrame,
+    RawTuning,
+    alsc_at,
+    ccm_at,
+    develop,
+    read_dng,
+    tuning_tables,
+)
 from tests.raw_fakes import LONG, RATIONAL, SHORT, make_dng, small_tuning
 
 PATTERNS = ["BGGR", "RGGB", "GRBG", "GBRG"]
@@ -310,3 +323,226 @@ def test_interpolation_refuses_bad_ct(ct):
         ccm_at(t, ct)
     with pytest.raises(RawError, match="colour temperature"):
         alsc_at(t, ct)
+
+
+# --- develop -------------------------------------------------------------
+
+BLACK, WHITE = 256.0, 4095.0
+_SITES = ((0, 0), (0, 1), (1, 0), (1, 1))
+
+
+def _mosaic(rgb: np.ndarray, cfa: str) -> RawFrame:
+    """A raw frame whose sites sample ``rgb`` (linear, 0..1) through ``cfa``."""
+    h, w, _ = rgb.shape
+    plane = np.empty((h, w))
+    for (r, c), colour in zip(_SITES, cfa, strict=True):
+        plane[r::2, c::2] = rgb[r::2, c::2, "RGB".index(colour)]
+    bayer = np.rint(BLACK + np.clip(plane, 0, 1) * (WHITE - BLACK)).astype(np.uint16)
+    return RawFrame(bayer=bayer, cfa=cfa, black=BLACK, white=WHITE, as_shot_neutral=None)
+
+
+def _flat_tuning(ccm=None, luminance=None, curve=((0.0, 0.0), (1.0, 1.0))) -> RawTuning:
+    """Identity lens shading and colour matrix, a linear tone curve."""
+    ones = np.ones((12, 16))
+    return RawTuning(
+        black_level=4096.0,
+        ccms=((4000.0, np.eye(3) if ccm is None else np.asarray(ccm, dtype=float)),),
+        alsc_cr=((4000.0, ones),),
+        alsc_cb=((4000.0, ones),),
+        luminance=ones if luminance is None else luminance,
+        gamma_curve=np.asarray(curve, dtype=float),
+    )
+
+
+PATCHES = {"red": (1, 0, 0), "green": (0, 1, 0), "blue": (0, 0, 1), "grey": (0.5, 0.5, 0.5)}
+
+
+def _patch_frame(size=32):
+    """Four flat patches, two by two: red, green / blue, grey."""
+    rgb = np.zeros((2 * size, 2 * size, 3))
+    for i, colour in enumerate(PATCHES.values()):
+        r, c = divmod(i, 2)
+        rgb[r * size : (r + 1) * size, c * size : (c + 1) * size] = colour
+    return rgb
+
+
+def _interior(out, i, size=32, margin=6):
+    r, c = divmod(i, 2)
+    rows = slice(r * size + margin, (r + 1) * size - margin)
+    cols = slice(c * size + margin, (c + 1) * size - margin)
+    return out[rows, cols]
+
+
+@pytest.mark.parametrize("cfa", PATTERNS)
+def test_demosaic_code_for_each_cfa(cfa):
+    out = develop(_mosaic(_patch_frame(), cfa), _flat_tuning(), colour_gains=(1.0, 1.0),
+                  colour_temperature=4000)
+    assert out.dtype == np.uint8 and out.shape == (64, 64, 3)
+    for i, (name, colour) in enumerate(PATCHES.items()):
+        want = np.rint(np.array(colour) * 255)
+        got = _interior(out, i).reshape(-1, 3).astype(int)
+        assert np.abs(got - want).max() <= 2, (cfa, name, got.min(0), got.max(0))
+
+
+def test_white_balance_makes_grey_neutral():
+    gains = (3.14, 1.59)
+    raw = np.full((32, 32, 3), 0.4)
+    raw[..., 0] /= gains[0]
+    raw[..., 2] /= gains[1]
+    out = develop(_mosaic(raw, "BGGR"), _flat_tuning(), colour_gains=gains, colour_temperature=4000)
+    centre = out[8:-8, 8:-8].reshape(-1, 3).astype(int)
+    assert np.abs(centre - 102).max() <= 1
+
+
+def test_clipped_highlight_stays_white():
+    ccm = [2.0, -0.5, -0.5, -0.5, 2.0, -0.5, -0.5, -0.5, 2.0]
+    frame = _mosaic(np.ones((32, 32, 3)), "BGGR")
+    assert np.all(frame.bayer == WHITE)
+    out = develop(frame, _flat_tuning(ccm=np.reshape(ccm, (3, 3))), colour_gains=(3.1, 1.6),
+                  colour_temperature=4000)
+    assert out.min() > 250
+
+
+def _corner_ratio(out):
+    grey = out.astype(float).mean(axis=2)
+    centre = grey[28:36, 40:48].mean()
+    corner = grey[:4, :4].mean()
+    return centre / corner
+
+
+def test_lens_shading_flattens_vignetting():
+    cv2 = require_cv2()
+
+    yy, xx = np.mgrid[0:12, 0:16]
+    radius = np.hypot((yy - 5.5) / 5.5, (xx - 7.5) / 7.5)
+    lum = 1.0 + 0.6 * radius**2
+    # A flat grey scene seen through the lens: darker towards the corners.
+    falloff = cv2.resize(1.0 / lum, (88, 64), interpolation=cv2.INTER_LINEAR)
+    frame = _mosaic(np.repeat((0.3 * falloff)[..., None], 3, axis=2), "BGGR")
+    args = {"colour_gains": (1.0, 1.0), "colour_temperature": 4000}
+    without = _corner_ratio(develop(frame, _flat_tuning(), **args))
+    with_lut = _corner_ratio(develop(frame, _flat_tuning(luminance=lum), **args))
+    assert without > 1.3
+    assert abs(with_lut - 1.0) < 0.05
+    assert abs(with_lut - 1.0) < abs(without - 1.0)
+
+
+def _with_corner(value: float) -> np.ndarray:
+    """A grid at ``value`` with its bottom-right cell at 1, the minimum."""
+    grid = np.full((12, 16), value)
+    grid[11, 15] = 1.0
+    return grid
+
+
+def test_lens_shading_colour_grids_apply_to_their_sites():
+    flat = np.full((32, 32, 3), 0.25)
+    tuning = dataclasses.replace(
+        _flat_tuning(),
+        alsc_cr=((4000.0, _with_corner(2.0)),),
+        alsc_cb=((4000.0, _with_corner(3.0)),),
+    )
+    out = develop(_mosaic(flat, "RGGB"), tuning, colour_gains=(1.0, 1.0), colour_temperature=4000)
+    centre = out[8:-8, 8:-8].reshape(-1, 3).astype(int)
+    assert np.abs(centre - [128, 64, 191]).max() <= 1
+
+
+def test_lens_shading_colour_grids_are_divided_by_their_minimum():
+    # A flat Cr or Cb table is all colour and no shading, as libcamera reads it.
+    flat = np.full((32, 32, 3), 0.25)
+    tuning = dataclasses.replace(
+        _flat_tuning(),
+        alsc_cr=((4000.0, np.full((12, 16), 2.9)),),
+        alsc_cb=((4000.0, np.full((12, 16), 1.5)),),
+    )
+    args = {"colour_gains": (1.0, 1.0), "colour_temperature": 4000}
+    out = develop(_mosaic(flat, "BGGR"), tuning, **args)
+    np.testing.assert_array_equal(out, develop(_mosaic(flat, "BGGR"), _flat_tuning(), **args))
+
+
+def test_develop_uses_ccm_at():
+    tuning = tuning_tables(small_tuning())
+    frame = _mosaic(np.random.default_rng(3).uniform(0.05, 0.6, size=(32, 48, 3)), "BGGR")
+    args = {"colour_gains": (1.5, 1.2), "tone": "isp"}
+    got = develop(frame, tuning, colour_temperature=4000, **args)
+    midpoint = (tuning.ccms[0][1] + tuning.ccms[1][1]) / 2
+    by_hand = dataclasses.replace(tuning, ccms=((4000.0, midpoint),))
+    want = develop(frame, by_hand, colour_temperature=4000, **args)
+    np.testing.assert_array_equal(got, want)
+    other = develop(frame, tuning, colour_temperature=3000, **args)
+    assert not np.array_equal(got, other)
+
+
+def _ramp_frame():
+    ramp = np.linspace(0.0, 1.0, 256)
+    rgb = np.repeat(np.repeat(ramp[None, :, None], 8, axis=0), 3, axis=2)
+    return _mosaic(rgb, "BGGR")
+
+
+def test_tone_curves():
+    assert TONE_CURVES == ("isp", "soft-1", "soft-1.5")
+    curve = tuning_tables(small_tuning()).gamma_curve
+    tuning = dataclasses.replace(_flat_tuning(), gamma_curve=curve)
+    args = {"colour_gains": (1.0, 1.0), "colour_temperature": 4000}
+    frame = _ramp_frame()
+    isp = develop(frame, tuning, tone="isp", **args)[4, :, 1].astype(int)
+    soft = develop(frame, tuning, tone="soft-1", **args)[4, :, 1].astype(int)
+    softer = develop(frame, tuning, tone="soft-1.5", **args)[4, :, 1].astype(int)
+    for row in (isp, soft, softer):
+        # The exact ends are tested on _tone: here the edge column's demosaic
+        # borrows from its neighbour, which the soft curves lift.
+        assert row[-1] >= 252
+        assert np.all(np.diff(row[2:-2]) >= 0)
+    assert np.all(soft[4:64] > isp[4:64])
+    assert np.all(softer[4:64] >= soft[4:64])
+
+
+def test_soft_tone_function():
+    from pifilm.raw import _tone
+
+    curve = np.array([[0.0, 0.0], [1.0, 1.0]])
+    x = np.array([0.0, 0.25, 0.5, 1.0], dtype=np.float32)
+    np.testing.assert_allclose(_tone(x, curve, "soft-1"), [0.0, 0.4, 2 / 3, 1.0], rtol=1e-6)
+    np.testing.assert_allclose(_tone(x, curve, "isp"), x)
+    gamma = tuning_tables(small_tuning()).gamma_curve
+    ends = np.array([0.0, 1.0], dtype=np.float32)
+    for tone in TONE_CURVES:
+        assert _tone(ends, gamma, tone).tolist() == [0.0, 1.0]
+
+
+@pytest.mark.parametrize("name", ["linear", "soft-", "soft-x", "soft-nan", "soft--1", "SOFT-1"])
+def test_unknown_tone_raises(name):
+    with pytest.raises(ValueError, match="tone"):
+        develop(_ramp_frame(), _flat_tuning(), colour_gains=(1.0, 1.0), colour_temperature=4000,
+                tone=name)
+
+
+@pytest.mark.parametrize("gains", [(0.0, 1.0), (1.0, float("nan")), (-1.0, 2.0)])
+def test_bad_colour_gains_raise(gains):
+    with pytest.raises(RawError, match="colour gains"):
+        develop(_ramp_frame(), _flat_tuning(), colour_gains=gains, colour_temperature=4000)
+
+
+def test_develop_is_deterministic():
+    tuning = tuning_tables(small_tuning())
+    frame = _mosaic(np.random.default_rng(5).uniform(0, 1, size=(40, 56, 3)), "GRBG")
+    args = {"colour_gains": (2.0, 1.4), "colour_temperature": 4500, "tone": "soft-1"}
+    assert develop(frame, tuning, **args).tobytes() == develop(frame, tuning, **args).tobytes()
+
+
+@pytest.mark.parametrize("tone", TONE_CURVES)
+def test_as_float_rounds_to_the_uint8_output(tone):
+    tuning = tuning_tables(small_tuning())
+    frame = _mosaic(np.random.default_rng(6).uniform(0, 1, size=(40, 56, 3)), "BGGR")
+    args = {"colour_gains": (2.0, 1.4), "colour_temperature": 4500, "tone": tone}
+    as_u8 = develop(frame, tuning, **args)
+    as_f = develop(frame, tuning, as_float=True, **args)
+    assert as_f.dtype == np.float32 and as_f.shape == as_u8.shape
+    assert as_f.min() >= 0.0 and as_f.max() <= 1.0
+    np.testing.assert_array_equal(np.rint(as_f * np.float32(255)).astype(np.uint8), as_u8)
+
+
+def test_develop_does_not_change_its_input():
+    frame = _mosaic(_patch_frame(), "BGGR")
+    before = frame.bayer.copy()
+    develop(frame, _flat_tuning(), colour_gains=(2.0, 2.0), colour_temperature=4000)
+    np.testing.assert_array_equal(frame.bayer, before)
