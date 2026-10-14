@@ -97,7 +97,7 @@ Save: original JPEG + raw DNG
     ↓
 The screen shows a quick preview. The camera is ready for the next photo.
     ↓ in the background, up to three photos waiting
-Grade: normalize → 3D LUT → grain
+Grade: normalize → 3D LUT → grain (on the Pi's graphics chip, about 0.7 s)
     ↓
 Save: graded JPEG + one line in captures.jsonl
 ```
@@ -109,6 +109,8 @@ The grading has three steps, always in this order:
 - **Normalize** — fixes exposure and levels, so every photo starts from the same place.
 - **3D LUT** — the look. A colour table that maps every colour to a new one.
 - **Grain** — film-like noise, added last. Either a simple grain, or one measured from Ilford HP5 scans.
+
+The Pi does the grading on its graphics chip. It checks the chip at every start. If the chip fails, or the look uses the older grain, the Pi grades on its processor instead. That is slower, but the photo is the same within a few levels.
 
 A double exposure adds the two frames first, then grades the result once.
 
