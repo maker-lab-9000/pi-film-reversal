@@ -181,9 +181,6 @@ def install_picamera(monkeypatch):
         with_analogue_gain_mode=False,
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
-        # The automatic tuning branch reads this variable; a developer's own
-        # environment must not decide what these tests fingerprint.
-        monkeypatch.delenv("LIBCAMERA_RPI_TUNING_FILE", raising=False)
 
         class FakePicamera2:
             @staticmethod
@@ -411,6 +408,18 @@ def test_automatic_tuning_is_fingerprinted_from_the_sensor_default(install_picam
     expected = fingerprint({"loaded-from": "imx477.json"})
     assert camera.stream_info.to_dict()["tuning_sha1"] == expected
     assert camera.tuning.label == "auto:imx477"
+    camera.close()
+
+
+def test_automatic_tuning_ignores_the_environment_variable(install_picamera, monkeypatch,
+                                                           tmp_path):
+    # Picamera2 clears LIBCAMERA_RPI_TUNING_FILE when it opens without a tuning.
+    path = tmp_path / "other.json"
+    path.write_text('{"other": 1}')
+    monkeypatch.setenv("LIBCAMERA_RPI_TUNING_FILE", str(path))
+    install_picamera(model="imx477")
+    camera = Picamera2Camera()
+    assert camera.stream_info.tuning_sha1 == fingerprint({"loaded-from": "imx477.json"})
     camera.close()
 
 

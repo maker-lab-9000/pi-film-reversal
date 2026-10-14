@@ -15,14 +15,17 @@ file or reordering its keys is not a change, and any changed value is.
 
 **Which tuning.** With ``--tuning-file NAME`` it is the very dict the camera is
 opened with (``loaded``), not a second read that could find another file on the
-search path. Without it, libcamera uses ``LIBCAMERA_RPI_TUNING_FILE`` when set,
-else the sensor's own default file, so this resolves the same way. A failure in
-that automatic branch is a reason, never an exception: the camera opens anyway.
-A failure loading a given name propagates, because the camera could not open
-with it either.
+search path. Without it, the camera runs with the sensor's own default file,
+``<model>.json`` from libcamera's tuning directories, so that is what is loaded
+and fingerprinted. ``LIBCAMERA_RPI_TUNING_FILE`` is ignored on purpose:
+Picamera2 (0.3.x) removes it from the environment when it opens a camera
+without a tuning, so the camera never uses it, and honouring it here would make
+``pifilm-tuning`` and the service disagree. A failure in the automatic branch
+is a reason, never an exception: the camera opens anyway. A failure loading a
+given name propagates, because the camera could not open with it either.
 
-Nothing here imports Picamera2; the loader and the environment are passed in,
-so this runs and tests on a Mac.
+Nothing here imports Picamera2; the loader is passed in, so this runs and tests
+on a Mac.
 """
 
 from __future__ import annotations
@@ -30,13 +33,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 
 from .artifacts import ArtifactsError, validate_tuning_sha1
-
-ENV_VAR = "LIBCAMERA_RPI_TUNING_FILE"
 
 
 def fingerprint(obj: object) -> str:
@@ -75,8 +75,7 @@ def _phrase(exc: BaseException) -> str:
 
 
 def resolve(tuning_file: str | None, model: str, *,
-            load: Callable[[str], dict], environ: Mapping[str, str],
-            loaded: dict | None = None) -> Resolved:
+            load: Callable[[str], dict], loaded: dict | None = None) -> Resolved:
     """Fingerprint the tuning the camera uses (see the module docstring for the order)."""
     if tuning_file is not None:
         tuning = loaded if loaded is not None else load(tuning_file)
@@ -84,21 +83,11 @@ def resolve(tuning_file: str | None, model: str, *,
                         sha1=fingerprint(tuning), reason=None)
 
     label = f"auto:{model}"
-    env_path = environ.get(ENV_VAR)
-    if env_path:
-        source = env_path
-        try:
-            tuning = json.loads(Path(env_path).read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return Resolved(label, source, None, f"{ENV_VAR} names {env_path}, which is missing")
-        except (OSError, ValueError) as exc:
-            return Resolved(label, source, None, f"cannot read {env_path}: {_phrase(exc)}")
-    else:
-        source = f"{model.lower()}.json"
-        try:
-            tuning = load(source)
-        except Exception as exc:  # any loader failure: the camera still opens
-            return Resolved(label, source, None, f"cannot load {source}: {_phrase(exc)}")
+    source = f"{model.lower()}.json"
+    try:
+        tuning = load(source)
+    except Exception as exc:  # any loader failure: the camera still opens
+        return Resolved(label, source, None, f"cannot load {source}: {_phrase(exc)}")
     try:
         sha1 = fingerprint(tuning)
     except (TypeError, ValueError) as exc:

@@ -18,8 +18,7 @@ Picamera2. Picamera2 is imported only when a tuning is resolved.
 from __future__ import annotations
 
 import argparse
-import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 
 from ..artifacts import ArtifactsError, stamp_tuning
 from ..tuning import resolve, sha1_argument
@@ -33,8 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "capture service usually holds it), so without --tuning-file the "
                     "sensor model comes from --model.")
     parser.add_argument("--tuning-file", metavar="NAME",
-                        help="the tuning file the service runs with (its --tuning-file), "
-                             "a name Picamera2 finds or a path")
+                        help="the tuning file the service runs with (its --tuning-file): "
+                             "a name in libcamera's tuning directories, or an absolute path")
     parser.add_argument("--model", default="imx477",
                         help="sensor model for the automatic case, without --tuning-file "
                              "(default: imx477); the camera is not asked")
@@ -53,8 +52,7 @@ def _picamera2_loader() -> Callable[[str], dict]:
 
 
 def main(argv: list[str] | None = None, *, out: Callable[[str], None] = print,
-         load: Callable[[str], dict] | None = None,
-         environ: Mapping[str, str] | None = None) -> int:
+         load: Callable[[str], dict] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.sha1 is not None:
         sha1, source = args.sha1, "--sha1"
@@ -67,8 +65,7 @@ def main(argv: list[str] | None = None, *, out: Callable[[str], None] = print,
                     "without it")
                 return 1
         try:
-            resolved = resolve(args.tuning_file, args.model, load=load,
-                               environ=os.environ if environ is None else environ)
+            resolved = resolve(args.tuning_file, args.model, load=load)
         except Exception as exc:
             # Only a given tuning file raises here; the automatic case returns a reason.
             if args.tuning_file is None:

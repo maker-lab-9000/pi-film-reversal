@@ -18,11 +18,11 @@ The tuning in use is also fingerprinted at open (``pifilm.tuning``), so a look
 trained under one tuning can be checked against the camera's and a libcamera
 update that replaced the file does not go unnoticed. A given name is hashed
 from the very dict the camera is opened with; the automatic case hashes the
-file libcamera would pick (``LIBCAMERA_RPI_TUNING_FILE``, else
-``<model>.json``) while the camera is still opened without a tuning, exactly
-as before. The fingerprint never stops the camera: one that cannot be taken is
-one ``tuning: cannot fingerprint ...`` line and a record without
-``tuning_sha1``.
+sensor's default ``<model>.json`` while the camera is still opened without a
+tuning, exactly as before. ``LIBCAMERA_RPI_TUNING_FILE`` plays no part:
+Picamera2 removes it from the environment when it opens without a tuning.
+The fingerprint never stops the camera: one that cannot be taken is one
+``tuning: cannot fingerprint ...`` line and a record without ``tuning_sha1``.
 
 Not every sensor has a focus motor: the IMX477 has a fixed C/CS mount and its
 libcamera control set has no ``AfMode``. Autofocus controls are therefore applied
@@ -94,7 +94,6 @@ import contextlib
 import copy
 import math
 import numbers
-import os
 import sys
 import tempfile
 import threading
@@ -903,7 +902,7 @@ def _fingerprint_tuning(
     """
     try:
         resolved = resolve_tuning(
-            tuning_file, model, load=load, environ=os.environ, loaded=loaded,
+            tuning_file, model, load=load, loaded=loaded,
         )
     except Exception as exc:  # the fingerprint must never stop the camera
         text = str(exc).strip()
