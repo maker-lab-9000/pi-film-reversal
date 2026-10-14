@@ -11,6 +11,7 @@ from pifilm.artifacts import (
     Artifacts,
     ArtifactsError,
     publish,
+    stamp_tuning,
     write_artifact,
 )
 from pifilm.grain import GrainParams
@@ -303,3 +304,90 @@ def test_tile_grain_in_a_version_3_file_is_refused(tmp_path):
     p.write_text(json.dumps(data))
     with pytest.raises(ArtifactsError, match="version 4"):
         Artifacts.load(tmp_path / "a")
+
+
+# tuning_sha1: the fingerprint of the libcamera tuning the look was trained under
+
+TUNING_SHA1 = "0123456789abcdef0123456789abcdef01234567"
+
+
+def test_an_artifact_without_tuning_sha1_loads_as_none(staged):
+    assert "tuning_sha1" not in json.loads((staged / "params.json").read_text())
+    assert Artifacts.load(staged).tuning_sha1 is None
+
+
+def test_tuning_sha1_round_trips_through_write_artifact(tmp_path):
+    d = write_artifact(tmp_path / "a", LUT3D.identity(9), NormalizeParams(), GrainParams(),
+                       tuning_sha1=TUNING_SHA1)
+    assert json.loads((d / "params.json").read_text())["tuning_sha1"] == TUNING_SHA1
+    assert Artifacts.load(d).tuning_sha1 == TUNING_SHA1
+
+
+@pytest.mark.parametrize("value", [TUNING_SHA1.upper(), TUNING_SHA1[:39], 12345, None])
+def test_an_invalid_tuning_sha1_is_refused(staged, value):
+    path = staged / "params.json"
+    data = json.loads(path.read_text())
+    data["tuning_sha1"] = value
+    path.write_text(json.dumps(data))
+    with pytest.raises(ArtifactsError, match=r"params\.json.*tuning_sha1"):
+        Artifacts.load(staged)
+
+
+@pytest.mark.parametrize("value", [TUNING_SHA1.upper(), "x" * 40])
+def test_write_artifact_refuses_an_invalid_tuning_sha1(tmp_path, value):
+    with pytest.raises(ArtifactsError, match="tuning_sha1"):
+        write_artifact(tmp_path / "a", LUT3D.identity(9), NormalizeParams(), GrainParams(),
+                       tuning_sha1=value)
+
+
+def test_tuning_sha1_changes_no_other_identity(tmp_path):
+    from pifilm.pipeline import Pipeline
+
+    lut = LUT3D.identity(9)
+    plain = Artifacts.load(write_artifact(tmp_path / "p", lut, NormalizeParams(), GrainParams()))
+    tagged = Artifacts.load(write_artifact(tmp_path / "t", lut, NormalizeParams(), GrainParams(),
+                                           tuning_sha1=TUNING_SHA1))
+    assert plain.lut_sha1 == tagged.lut_sha1
+    assert Pipeline(plain).normalize_sha1 == Pipeline(tagged).normalize_sha1
+
+
+def test_stamp_tuning_keeps_every_other_key_in_order(staged):
+    path = staged / "params.json"
+    before = json.loads(path.read_text())
+    cube = (staged / "pifilm.cube").read_bytes()
+    assert stamp_tuning(staged, TUNING_SHA1) == path
+    after = json.loads(path.read_text())
+    assert list(after) == [*before, "tuning_sha1"]
+    assert {k: v for k, v in after.items() if k != "tuning_sha1"} == before
+    assert Artifacts.load(staged).tuning_sha1 == TUNING_SHA1
+    assert (staged / "pifilm.cube").read_bytes() == cube
+
+
+def test_stamp_tuning_replaces_an_earlier_stamp_in_place(staged):
+    stamp_tuning(staged, TUNING_SHA1)
+    order = list(json.loads((staged / "params.json").read_text()))
+    stamp_tuning(staged, "f" * 40)
+    assert list(json.loads((staged / "params.json").read_text())) == order
+    assert Artifacts.load(staged).tuning_sha1 == "f" * 40
+
+
+def test_stamp_tuning_refuses_an_invalid_sha1_and_leaves_params_untouched(staged):
+    before = (staged / "params.json").read_bytes()
+    with pytest.raises(ArtifactsError, match="tuning_sha1"):
+        stamp_tuning(staged, TUNING_SHA1.upper())
+    assert (staged / "params.json").read_bytes() == before
+
+
+def test_stamp_tuning_leaves_the_old_params_and_no_temp_file_when_replace_fails(
+        staged, monkeypatch):
+    before = (staged / "params.json").read_bytes()
+    names = sorted(p.name for p in staged.iterdir())
+
+    def fail(src, dst):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.raises(ArtifactsError, match="disk gone"):
+        stamp_tuning(staged, TUNING_SHA1)
+    assert (staged / "params.json").read_bytes() == before
+    assert sorted(p.name for p in staged.iterdir()) == names
