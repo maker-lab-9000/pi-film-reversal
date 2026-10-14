@@ -1240,6 +1240,7 @@ def test_native_capture_session_saves_full_size_outputs_metadata_and_thumbnail(
     assert record["sensor_mode"] == "4608x2592 SBGGR10_CSI2P"
     assert record["bit_depth"] == 10
     assert record["tuning_file"] == "delivered-variant.json"
+    assert record["tuning_sha1"] == fingerprint({"loaded-from": "delivered-variant.json"})
     assert record["camera_metadata"] == {"FrameDuration": 40_000}
     assert record["dng"] == result.original.name.replace("_original.jpg", ".dng")
     assert record["dng"] == dng_names[0]

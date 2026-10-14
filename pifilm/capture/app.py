@@ -148,6 +148,22 @@ Every record of a graded photograph says what graded it: ``pipeline_backend`` is
 field, so it comes last of the new ones: after ``stage_ms`` in an inline record,
 at the end of a background one. A GPU grade is not the CPU grade byte for byte
 (see ``pifilm.pipeline``), and this field is how ``pifilm-process`` knows.
+
+The tuning check
+----------------
+A trained look is fitted to the colours of one libcamera tuning file, and an OS
+update can replace that file without any error. So when a session starts, with
+the camera open and the look loaded, it compares the fingerprint the look was
+stamped with (``tuning_sha1`` in ``params.json``) against the one the camera
+reports (``Picamera2Camera.tuning``; see ``pifilm.tuning``) and logs one line:
+matches, DIFFERS, or cannot check. Warn only: a camera that will not shoot after
+an update in the field is worse than colours that can be regraded from the kept
+originals. A look without a fingerprint, or a camera without a tuning (V4L2,
+``--fake``), checks nothing and logs nothing. When both fingerprints are known,
+every record gains ``tuning_matches`` right after the camera fields, and
+``tuning_mismatch`` (always present, False unless they differ) is what the
+viewfinder reads. A background shot stores the field in its pending entry, so a
+grade recovered at a later start says what the run that took it saw.
 """
 
 from __future__ import annotations
@@ -184,6 +200,7 @@ from ..double import COMPOSITE_METHOD, composite
 from ..gpu.grader import GpuGrader
 from ..imageio import load_rgb, save_jpeg
 from ..pipeline import Pipeline
+from ..tuning import check as check_tuning
 from .button import (
     MAX_PIN,
     MIN_PIN,
@@ -413,6 +430,14 @@ class CaptureSession:
         self.pipeline = pipeline
         self.out_root = Path(out_root).expanduser()
         self._log = log
+        # The tuning check (see the module docstring): once, before anything else
+        # this start logs or grades. Warn only; the camera works either way.
+        look = getattr(getattr(pipeline, "artifacts", None), "tuning_sha1", None)
+        matches, line = check_tuning(look, getattr(camera, "tuning", None))
+        if line is not None:
+            self._say(line)
+        self._tuning_fields: dict = {} if matches is None else {"tuning_matches": matches}
+        self.tuning_mismatch = matches is False
         self._now = now or datetime.now
         self._seed_rng = seed_rng or np.random.default_rng()
         self._package_version = package_version
@@ -553,6 +578,7 @@ class CaptureSession:
             "params_version": PARAMS_VERSION,
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
+            **self._tuning_fields,
             "pipeline_ms": round(pipeline_ms, 1),
             "shutter_to_saved_ms": round(shutter_to_saved_ms, 1),
             "stage_ms": stages,
@@ -585,6 +611,7 @@ class CaptureSession:
             "params_version": PARAMS_VERSION,
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
+            **self._tuning_fields,
             **({"camera_metadata": frame.metadata} if frame.metadata else {}),
             **({"dng": dng_name} if dng_name else {}),
         }
@@ -812,6 +839,7 @@ class CaptureSession:
             "colour_temperature_k": wb_k,
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
+            **self._tuning_fields,
             **({"camera_metadata": frame.metadata} if frame.metadata else {}),
             **({"dng": dng_name} if dng_name else {}),
         }
