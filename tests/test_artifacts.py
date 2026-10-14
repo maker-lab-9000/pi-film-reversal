@@ -391,3 +391,33 @@ def test_stamp_tuning_leaves_the_old_params_and_no_temp_file_when_replace_fails(
         stamp_tuning(staged, TUNING_SHA1)
     assert (staged / "params.json").read_bytes() == before
     assert sorted(p.name for p in staged.iterdir()) == names
+
+
+def test_stamp_tuning_refuses_a_mixed_artifact_and_leaves_params_untouched(staged):
+    data = json.loads((staged / "params.json").read_text())
+    data["lut_sha1"] = "0" * 40
+    (staged / "params.json").write_text(json.dumps(data))
+    before = (staged / "params.json").read_bytes()
+    with pytest.raises(ArtifactsError, match="lut_sha1"):
+        stamp_tuning(staged, TUNING_SHA1)
+    assert (staged / "params.json").read_bytes() == before
+
+
+def test_stamp_tuning_keeps_the_file_mode(staged):
+    os.chmod(staged / "params.json", 0o644)
+    stamp_tuning(staged, TUNING_SHA1)
+    assert (staged / "params.json").stat().st_mode & 0o777 == 0o644
+
+
+def test_stamp_tuning_reports_a_temp_file_it_cannot_create(staged, monkeypatch):
+    import tempfile
+
+    before = (staged / "params.json").read_bytes()
+
+    def fail(*args, **kwargs):
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(tempfile, "mkstemp", fail)
+    with pytest.raises(ArtifactsError, match="read-only"):
+        stamp_tuning(staged, TUNING_SHA1)
+    assert (staged / "params.json").read_bytes() == before

@@ -257,12 +257,16 @@ def stamp_tuning(dir_path: str | Path, sha1: str) -> Path:
     Every other key is kept, in its order (an earlier stamp is replaced where it
     stands). The new file is written beside the old one, fsynced and moved over
     it with ``os.replace``, so a reader, or a failure part way, sees the whole
-    old file or the whole new one. The artifact is then loaded to confirm. The
-    ``.cube`` is not touched, so ``lut_sha1`` still holds.
+    old file or the whole new one. The artifact is loaded before (an already
+    broken one is refused untouched) and after, to confirm. The file's mode is
+    kept. The ``.cube`` is not touched, so ``lut_sha1`` still holds.
     """
     path = Path(dir_path)
     params_path = path / "params.json"
     validate_tuning_sha1(sha1, params_path)
+    # Refuse an artifact that is already unloadable (a mixed lut_sha1, say) before
+    # anything is written, so a failed stamp leaves params.json as it was.
+    Artifacts.load(path)
     try:
         raw = json.loads(params_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -271,12 +275,18 @@ def stamp_tuning(dir_path: str | Path, sha1: str) -> Path:
         raise ArtifactsError(f"{params_path}: top level must be a JSON object")
     raw["tuning_sha1"] = sha1
 
-    fd, tmp_name = tempfile.mkstemp(prefix=".params.", suffix=".json.tmp", dir=path)
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=".params.", suffix=".json.tmp", dir=path)
+    except OSError as exc:
+        raise ArtifactsError(f"could not stamp {params_path}: {exc}") from exc
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(json.dumps(raw, indent=2) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        # mkstemp makes the file 0600 and os.replace would carry that onto
+        # params.json; keep the mode the artifact had.
+        shutil.copymode(params_path, tmp_name)
         os.replace(tmp_name, params_path)
     except OSError as exc:
         try:
