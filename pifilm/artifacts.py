@@ -71,7 +71,7 @@ def _require_object(value: object, name: str, path: Path) -> dict:
     return value
 
 
-def validate_tuning_sha1(value: object, path: Path) -> str:
+def validate_tuning_sha1(value: object, path: Path | str) -> str:
     """The one check of ``tuning_sha1``, for loading, writing and stamping."""
     if not isinstance(value, str) or not _TUNING_SHA1.fullmatch(value):
         raise ArtifactsError(

@@ -160,3 +160,125 @@ def test_a_different_fingerprint_differs():
 
 def test_the_module_imports_no_picamera2():
     assert "picamera2" not in vars(tuning)
+
+
+# pifilm-tuning
+
+
+@pytest.fixture
+def artifact(tmp_path):
+    from pifilm.artifacts import write_artifact
+    from pifilm.grain import GrainParams
+    from pifilm.lut import LUT3D
+    from pifilm.normalize import NormalizeParams
+
+    return write_artifact(tmp_path / "look", LUT3D.identity(9), NormalizeParams(), GrainParams())
+
+
+def _run(argv, **kwargs):
+    from pifilm.capture.tuningcli import main
+
+    lines = []
+    code = main(argv, out=lines.append, **kwargs)
+    return code, lines
+
+
+def test_cli_stamps_a_given_sha1(artifact):
+    from pifilm.artifacts import Artifacts
+
+    code, lines = _run(["--sha1", LOOK, "--stamp", str(artifact)], load=_no_load, environ={})
+    assert code == 0
+    assert lines[0].endswith(f": {LOOK}")
+    assert lines[-1] == f"stamped {artifact / 'params.json'}"
+    assert Artifacts.load(artifact).tuning_sha1 == LOOK
+
+
+def test_cli_resolves_a_given_tuning_file_through_the_loader():
+    calls = []
+
+    def load(name):
+        calls.append(name)
+        return TUNING
+
+    code, lines = _run(["--tuning-file", "imx477.json"], load=load, environ={})
+    assert code == 0
+    assert calls == ["imx477.json"]
+    assert lines == [f"tuning imx477.json: {fingerprint(TUNING)}"]
+
+
+def test_cli_auto_uses_the_model_default_file():
+    calls = []
+
+    def load(name):
+        calls.append(name)
+        return TUNING
+
+    code, lines = _run([], load=load, environ={})
+    assert code == 0
+    assert calls == ["imx477.json"]
+    code, _ = _run(["--model", "imx708"], load=load, environ={})
+    assert calls[-1] == "imx708.json"
+
+
+def test_cli_exits_1_when_the_tuning_cannot_be_fingerprinted(artifact):
+    def load(name):
+        raise RuntimeError("not found")
+
+    before = (artifact / "params.json").read_bytes()
+    code, lines = _run(["--stamp", str(artifact)], load=load, environ={})
+    assert code == 1
+    assert lines[-1].startswith("error: ") and "not found" in lines[-1]
+    assert (artifact / "params.json").read_bytes() == before
+
+
+def test_cli_exits_1_when_a_given_tuning_file_cannot_be_loaded():
+    def load(name):
+        raise FileNotFoundError(name)
+
+    code, lines = _run(["--tuning-file", "nope.json"], load=load, environ={})
+    assert code == 1
+    assert lines[-1].startswith("error: ")
+
+
+def test_cli_exits_1_when_stamping_fails(tmp_path):
+    code, lines = _run(["--sha1", LOOK, "--stamp", str(tmp_path / "missing")],
+                       load=_no_load, environ={})
+    assert code == 1
+    assert lines[-1].startswith("error: ")
+
+
+@pytest.mark.parametrize("value", [LOOK.upper(), LOOK[:39], "g" * 40])
+def test_cli_refuses_a_bad_sha1(value, capsys):
+    with pytest.raises(SystemExit) as exc:
+        _run(["--sha1", value], load=_no_load, environ={})
+    assert exc.value.code != 0
+    assert "--sha1" in capsys.readouterr().err
+
+
+def test_cli_without_picamera2_and_without_sha1_exits_1(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_picamera2(name, *args, **kwargs):
+        if name == "picamera2" or name.startswith("picamera2."):
+            raise ImportError("No module named 'picamera2'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_picamera2)
+    code, lines = _run([], environ={})
+    assert code == 1
+    assert lines[-1].startswith("error: ") and "Picamera2" in lines[-1]
+
+
+def test_cli_help_says_the_camera_is_not_opened(capsys):
+    with pytest.raises(SystemExit):
+        _run(["--help"])
+    assert "--model" in capsys.readouterr().out
+
+
+def test_the_command_is_installed(repo_root):
+    import tomllib
+
+    scripts = tomllib.loads((repo_root / "pyproject.toml").read_text())["project"]["scripts"]
+    assert scripts["pifilm-tuning"] == "pifilm.capture.tuningcli:main"
