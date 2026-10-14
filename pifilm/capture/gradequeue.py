@@ -42,6 +42,13 @@ their entries are still on disk, so nothing is lost by leaving the ones not yet
 started for the next start. What was accepted through ``submit`` in this run is
 different: its frame exists only in memory here, so ``close`` finishes it.
 
+Why the worker has ``on_start`` and ``on_stop``: some of what a grade uses belongs
+to one thread for its whole life (the GPU grader's graphics context can be used
+and released only by the thread that made it). ``on_start`` runs on the worker
+before its first job, the backlog included, and ``on_stop`` on the worker after
+its last. Neither may cost a photograph: one that raises is logged, and the jobs
+run all the same.
+
 Entry files are written to a temporary file and moved into place, so a reader
 sees the old entry, the new one, or none, never half of one. Temporary files
 start with a dot and end ``.tmp``, so ``read_entries`` never takes one for an
@@ -227,12 +234,16 @@ class GradeQueue:
         depth: int = 3,
         backlog: Iterable[GradeJob] = (),
         log: Callable[[str], None] = print,
+        on_start: Callable[[], None] | None = None,
+        on_stop: Callable[[], None] | None = None,
     ) -> None:
         if depth < 1:
             raise ValueError(f"depth must be at least 1, got {depth}")
         self._run_job = run
         self._depth = depth
         self._log = log
+        self._on_start = on_start
+        self._on_stop = on_stop
         # One condition guards everything below. It is notified when a slot
         # frees (for submit), when a job arrives (for the worker) and on close
         # (for both), so every waiter rechecks its own predicate.
@@ -293,14 +304,25 @@ class GradeQueue:
 
     def _work(self) -> None:
         try:
+            self._hook(self._on_start, "start-up")
             while self._work_one():
                 pass
         finally:
             # However the worker ends, nobody may be left waiting for a slot it
-            # will never free.
+            # will never free. Before ``on_stop``, so a slow one holds up nobody.
             with self._cond:
                 self._closed = True
                 self._cond.notify_all()
+            self._hook(self._on_stop, "shutdown")
+
+    def _hook(self, hook: Callable[[], None] | None, what: str) -> None:
+        """Run ``on_start`` or ``on_stop``. A failure is logged, never raised."""
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception as exc:
+            self._say(f"grade worker {what} failed: {exc}")
 
     def _work_one(self) -> bool:
         """Run the next job; ``False`` when the queue is closed and empty."""

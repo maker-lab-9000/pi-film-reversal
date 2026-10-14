@@ -113,7 +113,41 @@ shutter to measure from: it carries ``recovered: true`` instead of the two
 shutter timings, and it was made from the saved JPEG, not the frame in memory.
 
 ``background=False`` is the code as it was before any of this: no queue, no
-state directory, no new record fields.
+state directory, and none of these record fields. (Its records do carry
+``pipeline_backend``, always ``"cpu"``; see below.)
+
+Grading on the GPU
+------------------
+With ``grade_backend="auto"`` (``--grade-backend auto``, the command's default) and
+grading behind the shutter, the grade worker opens a ``GpuGrader`` before its
+first job and hands it to ``Pipeline.process`` with every full-resolution grade.
+It is opened and closed on the worker (the queue's ``on_start`` and ``on_stop``)
+because a graphics context belongs to the thread that made it. Opening never
+fails the start: without a GPU, or with a look the pass does not cover, it logs
+one line and the worker grades on the CPU as before.
+
+Opening can do something worse than fail: it can hang, inside the driver, with
+no time limit, on the only grade worker. Then no grade ever runs, the fourth
+shot waits for a place that never frees, the stop waits for systemd's kill, and
+the next start would do it all again. So the worker writes a marker file,
+``gpu-opening``, before it opens the GPU and removes it when the open returns,
+with a grader or without. A start that finds the marker does not open the GPU:
+it logs one line naming the file and grades on the CPU, and the marker stays
+until a person deletes it. The marker sits beside the state directory, not in
+it, so it is never taken for a pending entry. Where it cannot be written there
+is no protection and the open goes ahead.
+
+Everything else stays on the CPU: the quick grade, the live preview, a session
+grading inline, and the one shot a closing queue refuses, which is graded on the
+capture's thread (the grader says no to any thread but its own). A photograph the
+GPU fails on is graded on the CPU in the same call, from the same seed, and one
+line in the log names it; it is never lost and never waits for another start.
+
+Every record of a graded photograph says what graded it: ``pipeline_backend`` is
+``"gpu-1"`` (the number is the shader's version) or ``"cpu"``. It is the newest
+field, so it comes last of the new ones: after ``stage_ms`` in an inline record,
+at the end of a background one. A GPU grade is not the CPU grade byte for byte
+(see ``pifilm.pipeline``), and this field is how ``pifilm-process`` knows.
 """
 
 from __future__ import annotations
@@ -147,6 +181,7 @@ from ..artifacts import PARAMS_VERSION, Artifacts, ArtifactsError
 from ..display import DisplayError
 from ..display.viewfinder import ViewfinderLoop
 from ..double import COMPOSITE_METHOD, composite
+from ..gpu.grader import GpuGrader
 from ..imageio import load_rgb, save_jpeg
 from ..pipeline import Pipeline
 from .button import (
@@ -191,6 +226,10 @@ QUICK_KEEP = 16
 # ``_GradeWork.ready``). The capture side says so within microseconds of handing
 # the job over; the ceiling is for a capture ended by an interrupt before it could.
 READY_WAIT_S = 5.0
+# The file that says a start is, or was, in the middle of opening the GPU (see
+# "Grading on the GPU" in the module docstring). Beside the state directory.
+GPU_MARKER = "gpu-opening"
+GRADE_BACKENDS = ("auto", "cpu")
 
 
 @dataclass
@@ -364,7 +403,12 @@ class CaptureSession:
         state_dir: Path | None = None,
         queue_depth: int = 3,
         log: Callable[[str], None] = print,
+        grade_backend: str = "cpu",
     ) -> None:
+        if grade_backend not in GRADE_BACKENDS:
+            raise ValueError(
+                f"grade_backend must be one of {GRADE_BACKENDS}, got {grade_backend!r}"
+            )
         self.camera = camera
         self.pipeline = pipeline
         self.out_root = Path(out_root).expanduser()
@@ -382,10 +426,16 @@ class CaptureSession:
         # Grading behind the shutter (see the module docstring). Without a queue
         # every shot is graded inline and the state directory is never touched.
         self._queue: GradeQueue | None = None
+        # The GPU grader (see the module docstring). Made, used and closed on the
+        # grade worker; None on every other path and whenever there is no GPU.
+        self._grader: GpuGrader | None = None
         if background:
             self._state_dir = Path(state_dir) if state_dir is not None else default_state_dir()
+            gpu = grade_backend == "auto"
             self._queue = GradeQueue(
                 self._run_grade, depth=queue_depth, backlog=self._unfinished(), log=log,
+                on_start=self._open_grader if gpu else None,
+                on_stop=self._close_grader if gpu else None,
             )
         # Off the start-up path: a shot taken before it finishes just builds the
         # same thing itself.
@@ -395,6 +445,40 @@ class CaptureSession:
                 target=pipeline.warm, args=((still_size[1], still_size[0]),),
                 name="pifilm-warm", daemon=True,
             ).start()
+
+    def _open_grader(self) -> None:
+        """On the grade worker, before its first job. ``open`` logs its one line
+        (on, or off and why) and returns None when the CPU is to grade."""
+        marker = self._state_dir.parent / GPU_MARKER
+        try:
+            left_behind = marker.exists()
+        except OSError:
+            left_behind = False
+        if left_behind:
+            self._say("gpu grading off: the last start did not finish opening the GPU; "
+                      f"delete {marker} to try again")
+            return
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("pifilm-capture was opening the GPU for grading. If this file "
+                              "is still here after a start, that open never returned.\n")
+        except OSError:
+            pass  # no marker, no protection; the open is still worth trying
+        try:
+            self._grader = GpuGrader.open(self.pipeline.artifacts, log=self._say)
+        finally:
+            # Whatever it returned, it returned: the next start may try again.
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _close_grader(self) -> None:
+        """On the grade worker, after its last job: the thread that may release
+        the graphics context."""
+        grader, self._grader = self._grader, None
+        if grader is not None:
+            grader.close()
 
     def _allocate(self, suffix: str) -> tuple[Path, str, datetime]:
         t = self._now()
@@ -472,6 +556,7 @@ class CaptureSession:
             "pipeline_ms": round(pipeline_ms, 1),
             "shutter_to_saved_ms": round(shutter_to_saved_ms, 1),
             "stage_ms": stages,
+            "pipeline_backend": "cpu",
             **({"camera_metadata": frame.metadata} if frame.metadata else {}),
             **({"dng": dng_name} if dng_name else {}),
         }
@@ -625,9 +710,17 @@ class CaptureSession:
                 rgb = composite(frames[0], frames[1])
         else:
             rgb = frames[0]
+        # Offered only when there is one, so the call without a GPU is the call
+        # there always was. On the capture thread (a refused shot) the grader
+        # says no by thread and the CPU grades.
+        used: dict = {}
+        gpu = {"grader": self._grader, "used": used} if self._grader is not None else {}
         graded, info = self.pipeline.process(
-            rgb, rng=np.random.default_rng(work.seed), ev=work.ev, timings=stages,
+            rgb, rng=np.random.default_rng(work.seed), ev=work.ev, timings=stages, **gpu,
         )
+        if "gpu_error" in used:
+            self._say(f"gpu grade failed ({work.graded}): {used['gpu_error']}; "
+                      "graded on the CPU")
         pipeline_ms = (time.perf_counter() - t0) * 1000.0
         with _stage(stages, "save_graded"):
             # Synced inside the stage: "saved" means on the disk, and the entry
@@ -661,6 +754,7 @@ class CaptureSession:
         record["grade"] = "background"
         if recovered:
             record["recovered"] = True
+        record["pipeline_backend"] = used.get("backend", "cpu")
         self._append_record(day_dir, record, durable=True)
         remove_entry(job.entry)
 
@@ -785,6 +879,7 @@ class CaptureSession:
             "pipeline_ms": round(pipeline_ms, 1),
             "shutter_to_saved_ms": round((time.perf_counter() - shutter) * 1000.0, 1),
             "stage_ms": stages,
+            "pipeline_backend": "cpu",
             "double": {
                 "index": 2, "of": 2, "method": COMPOSITE_METHOD,
                 "originals": [pending.original, self._relative(original)],
@@ -1623,6 +1718,12 @@ def _main(argv: list[str] | None) -> int:
              "is free, as before (default: background)",
     )
     parser.add_argument(
+        "--grade-backend", choices=GRADE_BACKENDS, default="auto",
+        help="'auto' grades the full-resolution file on the Pi's GPU when it can (a "
+             "background grade, a look with the tile grain, a working GPU) and on the CPU "
+             "otherwise; 'cpu' always grades on the CPU, as before (default: auto)",
+    )
+    parser.add_argument(
         "--state-dir", type=Path, default=None, metavar="PATH",
         help="where unfinished background grades are kept so a restart can finish them "
              "(default: $XDG_STATE_HOME/pifilm/pending, or ~/.local/state/pifilm/pending)",
@@ -1724,6 +1825,7 @@ def _main(argv: list[str] | None) -> int:
         save_dng=not args.no_dng,
         background=args.grade == "background",
         state_dir=args.state_dir,
+        grade_backend=args.grade_backend,
     )
     controller: CaptureController | None = None
     remote: RemoteCaptureServer | None = None

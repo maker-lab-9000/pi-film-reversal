@@ -216,3 +216,57 @@ def test_main_reports_logged_frames_and_accepts_ignore_log(tmp_path, capsys):
     assert "1 from captures.jsonl (1 with EV)" in capsys.readouterr().out
     assert main([str(d), str(tmp_path / "out2"), "--ignore-log"]) == 0
     assert "captures.jsonl" not in capsys.readouterr().out
+
+
+# --- records the Pi graded on its GPU ---------------------------------------
+
+GPU_NOTE = "on its GPU"
+
+
+def test_a_gpu_graded_record_is_noted_once_and_changes_no_file(tmp_path, capsys):
+    """The regrade is the CPU's. For a record the Pi graded on its GPU that is
+    close to the Pi's file, not the same bytes, and the tool has to say so."""
+    records = [
+        {"original": "120001_original.jpg", "ev_comp": 0.0, "grain_seed": 5},
+        {"original": "120002_original.jpg", "ev_comp": 0.0, "grain_seed": 6},
+    ]
+    for name in ("cpu", "gpu", "old"):
+        (tmp_path / name).mkdir()
+    cpu = _logged_dir(tmp_path / "cpu", [{**r, "pipeline_backend": "cpu"} for r in records])
+    gpu = _logged_dir(tmp_path / "gpu", [{**r, "pipeline_backend": "gpu-1"} for r in records])
+    old = _logged_dir(tmp_path / "old", records)
+
+    assert main([str(gpu), str(tmp_path / "out-gpu")]) == 0
+    out = capsys.readouterr().out
+    assert out.count(GPU_NOTE) == 1 and "not byte for byte" in out
+    assert "2 of these" in out
+    for folder, dest in ((cpu, "out-cpu"), (old, "out-old")):
+        assert main([str(folder), str(tmp_path / dest)]) == 0
+        assert GPU_NOTE not in capsys.readouterr().out
+    for name in ("120001_original_graded.jpg", "120002_original_graded.jpg"):
+        want = (tmp_path / "out-old" / name).read_bytes()
+        assert (tmp_path / "out-gpu" / name).read_bytes() == want
+        assert (tmp_path / "out-cpu" / name).read_bytes() == want
+
+
+def test_the_gpu_note_counts_only_what_was_regraded_from_the_log(tmp_path, capsys):
+    d = _logged_dir(tmp_path, [
+        {"original": "120001_original.jpg", "grain_seed": 5, "pipeline_backend": "gpu-1"},
+        {"original": "120002_original.jpg", "grain_seed": 6, "pipeline_backend": "cpu"},
+        {"original": "gone_original.jpg", "grain_seed": 7, "pipeline_backend": "gpu-1"},
+    ])
+    (d / "gone_original.jpg").unlink()
+    result = process_dir(d, tmp_path / "out")
+    assert result.gpu_graded == 1 and result.from_log == 2
+    assert process_dir(d, tmp_path / "ignored", use_log=False).gpu_graded == 0
+    assert main([str(d), str(tmp_path / "out2"), "--ignore-log"]) == 0
+    assert GPU_NOTE not in capsys.readouterr().out
+
+
+def test_a_backend_that_is_not_text_is_not_a_gpu_record(tmp_path):
+    d = _logged_dir(tmp_path, [
+        {"original": "120001_original.jpg", "grain_seed": 5, "pipeline_backend": 1},
+        {"original": "120002_original.jpg", "grain_seed": 6, "pipeline_backend": None},
+    ])
+    log, bad = load_capture_log(d)
+    assert bad == 0 and not any(entry.gpu for entry in log.values())

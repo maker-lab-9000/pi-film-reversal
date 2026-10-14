@@ -184,6 +184,28 @@ live view running beside it: shutter to saved 4.8 to 6.4 s.
 
 ### 7. GPU grading
 
+Second spike, 2026-10-13 (`scripts/experiments/gpu_pass_spike.py`, branch
+`spike/gpu-pass`): the whole grade in one pass takes about 665 ms on the Pi against
+1,728 ms on the CPU, within 5 levels of the CPU's result. With the camera already
+free after 1.8 to 2.0 s (background grading, measured the same day), this shortens
+the background job by about a second. Design:
+[2026-10-13-gpu-grading-design.md](../specs/2026-10-13-gpu-grading-design.md).
+
+Built (2026-10-13, not yet run on the Pi): the plan is
+[2026-10-13-gpu-grading.md](2026-10-13-gpu-grading.md). The pass, its NumPy
+reference, the EGL device and the grader are in `pifilm/gpu/`. The grade worker
+opens the grader on its own thread; `--grade-backend cpu` switches it off; records
+carry `pipeline_backend`; `pifilm-gpu-check` is the hardware check. The hardware
+acceptance table is in `docs/lcd-viewfinder.md`, section 7. Not built, by design:
+dithering, tetrahedral interpolation and tiles for frames wider than 4096 (the
+IMX708 is graded on the CPU). The grain does land in the same place as NumPy's for
+the same `grain_seed`, because both paths place the same tile.
+
+One number in the design was corrected after the reference was measured: a GPU grade
+is not always within 6 to 8 levels of the CPU regrade. On strongly saturated areas
+it is 10 to 20 levels away, because the CPU rounds to bytes before a steep part of
+the LUT. The GPU's file is the more exact one.
+
 Wanted by the owner (2026-10-13). Built from step 2's measurements, with its own
 design document: where the context lives, what is done on the GPU (normalise,
 LUT, grain), the fallback to the CPU path, how memory is kept clear of the

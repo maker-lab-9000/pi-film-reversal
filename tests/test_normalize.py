@@ -461,3 +461,41 @@ def test_u8_and_float_paths_agree_on_the_damped_gamma():
     _, g_u8 = normalize_u8((img * 255).round().astype(np.uint8), LIFT)
     assert g_u8.levels["gamma"] == pytest.approx(g_float.levels["gamma"], abs=0.03)
     assert g_u8.levels["lift_weight"] == pytest.approx(g_float.levels["lift_weight"], abs=0.05)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"levels": False},
+    {"levels": True, "levels_tone": "luma"},
+    {"levels": True, "levels_tone": "channel"},
+    {"white_balance": False, "levels": True},
+])
+@pytest.mark.parametrize("shape", [(48, 64), (700, 900)])
+def test_stats_gains_are_the_gains_inside_normalize_u8(kwargs, shape):
+    """The GPU pass takes its tables from these gains, so they must be the ones
+    the CPU path would have applied, from the same strided subsample."""
+    from pifilm.normalize import stats_gains
+
+    p = NormalizeParams(**kwargs)
+    img_u8 = (_gradient_image(*shape) * 255).round().astype(np.uint8)
+    out, inside = normalize_u8(img_u8, p)
+    alone = stats_gains(img_u8, p)
+    assert np.array_equal(alone.combined, inside.combined)
+    assert np.array_equal(alone.wb, inside.wb) and alone.exposure == inside.exposure
+    assert alone.levels == inside.levels and alone.clamped == inside.clamped
+
+    # normalize_u8 as it was before the statistics were factored out.
+    h, w = shape
+    step = max(1, int(np.ceil(np.sqrt(h * w / 300_000))))
+    old = compute_gains(img_u8[::step, ::step].astype(np.float32) / 255.0, p)
+    assert np.array_equal(old.combined, inside.combined) and old.levels == inside.levels
+    assert step == (1 if shape == (48, 64) else 2)
+
+
+def test_stats_gains_honours_max_stats_pixels():
+    from pifilm.normalize import stats_gains
+
+    p = NormalizeParams(levels=True)
+    img_u8 = np.random.default_rng(4).integers(0, 256, (120, 160, 3), dtype=np.uint8)
+    _, inside = normalize_u8(img_u8, p, max_stats_pixels=1000)
+    assert stats_gains(img_u8, p, max_stats_pixels=1000).levels == inside.levels
+    assert stats_gains(img_u8, p).levels != inside.levels

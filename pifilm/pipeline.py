@@ -27,6 +27,19 @@ very dark frame - re-applying alone darkened such a frame twice. Before the
 LUT is where film takes exposure: the negative is exposed differently and
 developed the same. The value is recorded as ``ev_comp`` so a regrade can
 reproduce it.
+
+The GPU. ``process`` can be handed a grader (``pifilm.gpu.grader``), which does
+normalise, LUT and grain as one pass on the Pi's GPU. The statistics stay here,
+on the CPU, from the same subsample (``stats_gains``), so the audit fields are
+the same whichever path graded; only the pixels differ, by the CPU's rounding
+between its stages. The grader is asked first whether it can take the frame
+(``can_grade``: a compensated exposure, a frame too wide, another thread are
+all ordinary reasons to say no, and none is logged). If it then fails, the same
+frame is graded on the CPU at once. The grader had already drawn the grain's
+placement from the generator by then, so the generator is put back to where it
+was before the attempt: the CPU grade of a failed GPU attempt is byte for byte
+the grade there would have been with no GPU, and the shot's seed still
+reproduces its grain.
 """
 
 from __future__ import annotations
@@ -39,8 +52,10 @@ import numpy as np
 
 from .artifacts import Artifacts
 from .color import linear_to_srgb, srgb_to_linear
+from .gpu.grader import GpuError
+from .gpu.shader import BACKEND
 from .grain import add_grain, warm
-from .normalize import normalize_u8
+from .normalize import Gains, normalize_u8, stats_gains
 
 
 def _lap(timings: dict | None, stage: str, started: float) -> float:
@@ -72,17 +87,55 @@ class Pipeline:
         rng: np.random.Generator | None = None,
         ev: float = 0.0,
         timings: dict | None = None,
+        grader=None,
+        used: dict | None = None,
     ) -> tuple[np.ndarray, dict]:
         """Grade one frame. ``timings``, when given, is filled with the milliseconds
         each stage took (``normalize``, ``lut``, and ``grain`` when it ran). It is
         an out-parameter and not part of the returned audit dict, because that dict
-        is what a regrade is reproduced from and a duration is not reproducible."""
+        is what a regrade is reproduced from and a duration is not reproducible.
+
+        ``grader``, when given and able to take this frame, grades it on the GPU
+        (see the module docstring); the stages are then ``normalize`` (the
+        statistics), ``gpu`` (the whole pass) and the grader's ``gpu_upload``,
+        ``gpu_shader`` and ``gpu_readback``. ``used``, when given, is another
+        out-parameter: ``used["backend"]`` says what graded the frame (``"gpu-1"``
+        or ``"cpu"``), and ``used["gpu_error"]`` is there when the GPU was tried
+        and failed, for the caller to log.
+
+        The image returned is ``(H, W, 3)``, or ``(H, W, 4)`` with an unused
+        fourth byte when the GPU graded it (``save_jpeg`` takes either). Without
+        a grader nothing here differs from before there was one."""
         if rgb_u8.dtype != np.uint8 or rgb_u8.ndim != 3 or rgb_u8.shape[2] != 3:
             raise ValueError(
                 f"process() expects an RGB uint8 array of shape (H, W, 3); "
                 f"got dtype {rgb_u8.dtype} shape {rgb_u8.shape}"
             )
         ev = float(ev)
+        with_grain = bool(grain and self.artifacts.grain.enabled)
+        if used is not None:
+            used["backend"] = "cpu"
+        if grader is not None and grader.can_grade(rgb_u8.shape, ev=ev, grain=with_grain):
+            # The generator as the caller gave it, for the CPU if the GPU fails.
+            state = rng.bit_generator.state if rng is not None else None
+            gpu_timings: dict = {}
+            try:
+                started = time.perf_counter()
+                gains = stats_gains(rgb_u8, self.artifacts.normalize)
+                started = _lap(gpu_timings, "normalize", started)
+                graded = grader.grade(rgb_u8, gains, rng, grain=with_grain, timings=gpu_timings)
+                _lap(gpu_timings, "gpu", started)
+            except GpuError as exc:
+                if rng is not None:
+                    rng.bit_generator.state = state
+                if used is not None:
+                    used["gpu_error"] = str(exc)
+            else:
+                if timings is not None:
+                    timings.update(gpu_timings)
+                if used is not None:
+                    used["backend"] = BACKEND
+                return graded, self._audit(gains, ev)
         started = time.perf_counter()
         if ev != 0.0:
             rgb_u8 = _ev_table(-ev)[rgb_u8]
@@ -92,10 +145,15 @@ class Pipeline:
         started = _lap(timings, "normalize", started)
         graded = self.artifacts.lut.apply_pillow(normalised, self._filter)
         started = _lap(timings, "lut", started)
-        if grain and self.artifacts.grain.enabled:
+        if with_grain:
             graded = add_grain(graded, self.artifacts.grain, rng)
             _lap(timings, "grain", started)
-        return graded, {
+        return graded, self._audit(gains, ev)
+
+    def _audit(self, gains: Gains, ev: float) -> dict:
+        """The record's audit fields. The same for the same gains, whichever
+        path graded."""
+        return {
             "wb_gains": [round(float(g), 4) for g in gains.wb],
             "exposure_gain": round(float(gains.exposure), 4),
             "levels": (

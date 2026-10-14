@@ -201,10 +201,22 @@ def _apply_tile(y: np.ndarray, gain: np.ndarray, params: GrainParams,
     tile placed by ``rng``. OpenCV's arithmetic does the multiply and the
     rounding, saturating add in two threaded passes."""
     tile = grain_tile(params, max(y.shape) / params.frame_width_mm)
-    oy, ox = (int(v) for v in rng.integers(0, params.tile_px, 2))
-    noise = place_tile(_oriented(tile, int(rng.integers(0, 8))), y.shape, oy, ox)
+    oy, ox, orientation = tile_placement(params, rng)
+    noise = place_tile(_oriented(tile, orientation), y.shape, oy, ox)
     cv2.multiply(noise, cv2.LUT(y, gain.astype(np.float32)), dst=noise)
     return cv2.add(noise, y, dtype=cv2.CV_8U)
+
+
+def tile_placement(params: GrainParams, rng: np.random.Generator) -> tuple[int, int, int]:
+    """``(oy, ox, orientation)`` for one shot: the same three draws, in the same
+    order, that ``add_grain`` makes for the ``two_scale_tile`` model.
+
+    It is its own function because the GPU pass (``pifilm.gpu``) places the tile
+    too, and a shot's seed must put the grain in the same place on both paths.
+    Any change to these calls, or to their order, moves the grain of every
+    recorded seed."""
+    oy, ox = (int(v) for v in rng.integers(0, params.tile_px, 2))
+    return oy, ox, int(rng.integers(0, 8))
 
 
 def _oriented(tile: np.ndarray, orientation: int) -> np.ndarray:
