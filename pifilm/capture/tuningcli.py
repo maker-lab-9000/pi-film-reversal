@@ -69,8 +69,12 @@ def main(argv: list[str] | None = None, *, out: Callable[[str], None] = print,
         try:
             resolved = resolve(args.tuning_file, args.model, load=load,
                                environ=os.environ if environ is None else environ)
-        except Exception as exc:  # a given tuning file that will not load
-            out(f"error: cannot load tuning file {args.tuning_file!r}: {exc}")
+        except Exception as exc:
+            # Only a given tuning file raises here; the automatic case returns a reason.
+            if args.tuning_file is None:
+                out(f"error: {exc}")
+            else:
+                out(f"error: cannot load tuning file {args.tuning_file!r}: {exc}")
             return 1
         if resolved.sha1 is None:
             out(f"error: cannot fingerprint the tuning in use ({resolved.reason})")

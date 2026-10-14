@@ -282,3 +282,12 @@ def test_the_command_is_installed(repo_root):
 
     scripts = tomllib.loads((repo_root / "pyproject.toml").read_text())["project"]["scripts"]
     assert scripts["pifilm-tuning"] == "pifilm.capture.tuningcli:main"
+
+
+def test_cli_given_tuning_file_error_names_it():
+    def load(name):
+        raise FileNotFoundError("gone")
+
+    code, lines = _run(["--tuning-file", "nope.json"], load=load, environ={})
+    assert code == 1
+    assert lines == ["error: cannot load tuning file 'nope.json': gone"]
