@@ -399,7 +399,10 @@ under (for example `imx477.json`). Otherwise a future libcamera or OS
 update could silently change the default tuning and shift colour science out
 from under a LUT that was fitted against the old one.
 
-Then stamp the look with that tuning's fingerprint, on the Pi, after deploying:
+Then stamp the look with that tuning's fingerprint, on the Pi, after deploying.
+After updating the Pi's checkout, run `pip install -e .` again in the Pi's venv
+first, so that `pifilm-tuning` exists. Run the stamp as yourself (`george`, the
+service user), not with `sudo`; only the restart needs `sudo`:
 
 ```sh
 cd ~/repos/pi-film-reversal
@@ -415,6 +418,16 @@ the same `--tuning-file` the service runs with. The journal should then say
 `tuning: matches the look (<12 hex>)`, and from then on the service warns if the
 tuning ever differs (see
 [known issues](known-issues.md#a-libcamera-update-could-silently-retune-a-deployed-trained-lut)).
+
+Stamp the Mac's copy of the look too, with the fingerprint the Pi printed:
+
+```sh
+.venv/bin/pifilm-tuning --sha1 <the printed hex> --stamp artifacts/pifilm-2026-09-v1
+```
+
+Otherwise the next `rsync` from the Mac overwrites the Pi's stamped `params.json`
+with the unstamped one, and the check goes quiet with no warning. If you skip
+this, stamp the Pi again after every redeploy.
 
 If you know the fingerprint when you train, `pifilm-train --tuning-sha1 HEX`
 writes it into the new artifact directly. Take it from `tuning_sha1` in a

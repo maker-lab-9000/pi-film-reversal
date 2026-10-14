@@ -114,7 +114,8 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   Older builds ignore it, so no params version change.
 - `tuning.py`: the tuning fingerprint (SHA-1 of the parsed JSON with sorted keys and no
   whitespace), `resolve` (the dict the camera is opened with for `--tuning-file`, else
-  `LIBCAMERA_RPI_TUNING_FILE`, else `<model>.json`; a failure there is a reason, not an error)
+  `<model>.json`; a failure there is a reason, not an error; `LIBCAMERA_RPI_TUNING_FILE` is
+  ignored because Picamera2 clears it when it opens without a tuning)
   and `check` (the `tuning:` log line). No Picamera2 import; `pifilm-tuning` is
   `capture/tuningcli.py`.
 - `gpu/`: the grade as one pass on the Pi 4's GPU. `shader.py` is the GLSL and `SHADER_VERSION`

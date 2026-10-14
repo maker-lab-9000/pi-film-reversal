@@ -122,8 +122,9 @@ new fields above. They do have `pipeline_backend`, always `cpu` (see
 
 A trained look is fitted to frames taken under one libcamera tuning file, and it
 grades as intended only under that tuning. Every record from the Pi camera names
-the tuning (`tuning_file`) and carries its fingerprint (`tuning_sha1`, the SHA-1 of
-the file's parsed JSON). A look can be stamped with the fingerprint it was trained
+the tuning (`tuning_file`). From this build on it also carries its fingerprint
+(`tuning_sha1`, the SHA-1 of the file's parsed JSON) when the tuning could be
+fingerprinted. A look can be stamped with the fingerprint it was trained
 under (`tuning_sha1` in `params.json`, written by `pifilm-tuning --stamp` or
 `pifilm-train --tuning-sha1`). At start-up the service compares the two and writes
 one `tuning:` line to the journal. When the check ran, every record says whether

@@ -280,9 +280,10 @@ compares the two and writes one line to the journal:
 Nothing is checked, and no line is written, for a look without a fingerprint
 (the bundled starter, or a trained look not yet stamped) or for a USB camera.
 The service never refuses to start over this: photographs are still taken and
-graded, and the originals are kept, so they can be regraded later. Every record
-from the Pi camera carries `tuning_sha1`, and when the check ran also
-`tuning_matches` (`true` or `false`).
+graded, and the originals are kept, so they can be regraded later. From this
+build on, every record from the Pi camera carries `tuning_sha1` when the tuning
+could be fingerprinted, and when the check ran also `tuning_matches` (`true` or
+`false`).
 
 **What to do.** When you deploy a trained look, pin `--tuning-file` to the file
 the corpus was captured under and stamp the look on the Pi (see
@@ -292,6 +293,11 @@ the corpus was captured under and stamp the look on the Pi (see
 pifilm-tuning --tuning-file imx477.json --stamp <the service's artifacts dir>
 sudo systemctl restart pifilm-capture.service
 ```
+
+Run the stamp as the service user, not with `sudo`; only the restart needs it.
+Stamp the Mac's copy of the look as well (`pifilm-tuning --sha1 <hex> --stamp
+<dir>`), or a later `rsync` from the Mac puts back the unstamped `params.json`
+and the check goes quiet.
 
 If the tag shows after an update, the tuning file changed under the look.
 Either put the old tuning file back and name it with `--tuning-file`, or retrain

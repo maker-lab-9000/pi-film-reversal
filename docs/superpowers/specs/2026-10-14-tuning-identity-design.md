@@ -1,5 +1,12 @@
 # Tuning-file identity: design
 
+Amended 2026-10-14 (whole-branch review): item 2 of "Which tuning is fingerprinted"
+is dropped. Picamera2 0.3.x removes `LIBCAMERA_RPI_TUNING_FILE` from the environment
+when it opens a camera without a tuning, so the camera never uses it, and honouring it
+would make `pifilm-tuning` and the service disagree. Without `--tuning-file` the
+fingerprint is of `Picamera2.load_tuning_file(f"{model.lower()}.json")` only, and the
+variable is ignored.
+
 Date: 2026-10-14. Step 4 of `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`.
 Branch `feat/tuning-hash`, pull request into `pipeline-improvements`. Approved by the
 owner in conversation on 2026-10-14: warn only, never refuse to start.
