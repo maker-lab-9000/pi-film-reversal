@@ -13,7 +13,13 @@ real capture folder, which holds ``<time>_original.jpg`` next to
   logged grain seed. A regrade that ignored ``captures.jsonl`` undid every
   deliberate EV and drew new grain, so when the folder has that log, each
   frame is graded with its logged ``ev_comp`` and ``grain_seed``: the same
-  artifact then reproduces the Pi's file, up to the re-encoded original.
+  artifact then reproduces the Pi's file, up to the re-encoded original. A USB
+  camera's original is the camera's own JPEG, which is what the Pi graded, so
+  that regrade is exact. The Pi camera's original is a quality-95 JPEG of the
+  frame, and the Pi graded the frame itself, so the regrade starts from a
+  slightly different picture: about 1 to 2 levels on average, more where the
+  look's LUT is steep (measured 2026-10-14 on sixteen IMX477 photographs, GPU
+  graded: mean 0.7 to 2.1, at most 18 to 27).
   Double-exposure frames are regraded singly, with their own EV and fresh
   grain, because their logged seed belongs to the composite.
 * **A file the Pi graded on its GPU.** The regrade here is always the CPU's.
@@ -21,8 +27,8 @@ real capture folder, which holds ``<time>_original.jpg`` next to
   one-pass shader, which does not round between its stages as the CPU does,
   so the regraded file is close to the Pi's and not the same bytes (see
   ``pifilm.pipeline``). The tool says so once per run. Records graded on the
-  CPU, and records from before the field existed, still reproduce pixel for
-  pixel.
+  CPU, and records from before the field existed, reproduce as closely as the
+  original allows (exactly for a USB camera, above).
 * **Clobbering.** ``a.jpg`` and ``a.png`` would produce the same output
   name, and re-running would silently overwrite. Same-stem inputs get their
   extension folded into the output name, existing outputs are skipped unless
@@ -246,8 +252,8 @@ def main(argv: list[str] | None = None) -> int:
     if result.gpu_graded:
         print(
             f"Note: the Pi graded {result.gpu_graded} of these on its GPU, and this regrade "
-            "is the CPU's. Those files match the Pi's within a few levels (more on strongly "
-            "saturated colours), not byte for byte."
+            "is the CPU's. Those files match the Pi's within a few levels on average (more "
+            "on strongly saturated colours), not byte for byte."
         )
     return 0
 

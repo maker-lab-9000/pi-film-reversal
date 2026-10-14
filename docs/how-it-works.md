@@ -169,8 +169,14 @@ or `cpu`. The number is the shader's version and rises with any change that can
 move pixels. A GPU grade adds the stages `gpu`, `gpu_upload`, `gpu_shader` and
 `gpu_readback` to `stage_ms` and has no `lut` or `grain` stage.
 
-**Reproducibility.** `pifilm-process` regrades on the CPU. A record marked `cpu`
-still reproduces pixel for pixel. A record marked `gpu-1` does not: the GPU's file is
+**Reproducibility.** `pifilm-process` regrades on the CPU, from the saved original.
+For a USB camera that original is the camera's own JPEG, the very picture the Pi
+graded, and a record marked `cpu` reproduces pixel for pixel. For the Pi camera the
+original is a quality-95 JPEG of the frame the Pi graded, so even a `cpu` record
+regrades about 1 to 2 levels from the Pi's file on average, more where the LUT is
+steep. Measured on 2026-10-14 on sixteen IMX477 photographs graded on the GPU, all
+effects together: 0.7 to 2.1 levels on average, at most 18 to 27, no difference
+visible. A record marked `gpu-1` cannot be byte for byte in any case: the GPU's file is
 the more exact of the two, because the CPU rounds colours to bytes before the LUT.
 Against a CPU regrade it differs by about 0.2 to 0.6 levels on average and by a few
 levels at most on ordinary colours. On strongly saturated areas, where the look's
