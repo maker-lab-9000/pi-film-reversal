@@ -206,7 +206,9 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
 - `batch.py`: `pifilm-process`. Skips `*_graded.*`, defaults to only `_original`/`_ungraded` files in a
   capture folder, refuses an output dir equal to or inside the input. When the folder has a
   `captures.jsonl`, each frame is graded with its logged `ev_comp` and `grain_seed`, so the same
-  artifact reproduces the Pi's graded file pixel for pixel (`--ignore-log` grades at EV 0).
+  artifact reproduces the Pi's graded file (`--ignore-log` grades at EV 0): pixel for pixel
+  for a USB camera, whose original is the camera's own JPEG; closely for the Pi camera, whose
+  original is a quality-95 JPEG of the frame the Pi graded (1 to 2 levels on average).
   It always grades on the CPU, so a record the Pi graded on its GPU (`pipeline_backend` starting
   `gpu`) is reproduced closely, not byte for byte; the tool prints one note per run when it
   regrades such records.

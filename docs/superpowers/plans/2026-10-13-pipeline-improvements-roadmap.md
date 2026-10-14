@@ -13,8 +13,9 @@ review of the capture and grading pipeline.
   an experiment until the owner has judged a gallery (looks are decided from many
   rendered examples, not from metrics).
 - Every step that changes pixels gets a new version marker, so photographs taken
-  before it still regrade exactly as they were (`pifilm-process` reproduces the
-  Pi's graded file from `captures.jsonl`).
+  before it still regrade as they were (`pifilm-process` reproduces the Pi's
+  graded file from `captures.jsonl`: exactly for a USB camera, within JPEG
+  rounding of the original for the Pi camera).
 
 ## Where things stand (measured)
 
@@ -191,7 +192,7 @@ free after 1.8 to 2.0 s (background grading, measured the same day), this shorte
 the background job by about a second. Design:
 [2026-10-13-gpu-grading-design.md](../specs/2026-10-13-gpu-grading-design.md).
 
-Built (2026-10-13, not yet run on the Pi): the plan is
+Built (2026-10-13): the plan is
 [2026-10-13-gpu-grading.md](2026-10-13-gpu-grading.md). The pass, its NumPy
 reference, the EGL device and the grader are in `pifilm/gpu/`. The grade worker
 opens the grader on its own thread; `--grade-backend cpu` switches it off; records
@@ -200,6 +201,17 @@ acceptance table is in `docs/lcd-viewfinder.md`, section 7. Not built, by design
 dithering, tetrahedral interpolation and tiles for frames wider than 4096 (the
 IMX708 is graded on the CPU). The grain does land in the same place as NumPy's for
 the same `grain_seed`, because both paths place the same tile.
+
+On the Pi, 2026-10-14 (PR #60, merged): every record `gpu-1`, the self-test passed at
+every start. Grade 0.79 to 0.85 s (normalise 0.12, GPU 0.67 to 0.70: upload 215,
+shader 250, read-back 183 ms) against 1.4 to 2.1 s on the CPU behind the shutter.
+Shutter to saved 4.2 to 5.6 s; shutter to ready unchanged at 1.83 to 2.03 s. What is
+left of the background job is mostly the SD card (syncing the original and DNG 0.85
+to 1.6 s, the graded file 0.6 to 1.8 s). One preview stall during the test, the known
+one, contained by the restart. Regraded with `pifilm-process` and compared with the
+Pi's files: 0.7 to 2.1 levels on average, at most 18 to 27, nothing visible. That
+includes the regrade starting from the quality-95 original rather than the frame the
+Pi graded, so the Pi camera's photographs never regraded exactly, GPU or not.
 
 One number in the design was corrected after the reference was measured: a GPU grade
 is not always within 6 to 8 levels of the CPU regrade. On strongly saturated areas
