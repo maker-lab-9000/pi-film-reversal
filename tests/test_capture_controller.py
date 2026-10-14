@@ -411,3 +411,46 @@ def test_close_still_closes_the_camera_when_the_grades_will_not_close():
     controller = CaptureController(session)
     controller.close()
     assert session.events == ["grades", "camera"]
+
+
+def test_snapshot_carries_the_sessions_tuning_mismatch():
+    session = GradingSession()
+    session.tuning_mismatch = True
+    controller = CaptureController(session)
+    try:
+        assert controller.snapshot().tuning_mismatch is True
+        session.tuning_mismatch = False
+        assert controller.snapshot().tuning_mismatch is False
+    finally:
+        controller.close()
+
+
+def test_a_session_without_tuning_mismatch_reports_false():
+    controller = CaptureController(_Session())
+    try:
+        assert controller.snapshot().tuning_mismatch is False
+    finally:
+        controller.close()
+
+
+def test_unusable_tuning_mismatch_reports_false():
+    """Read on every frame like the developing count; it must never raise there."""
+
+    class Raising(GradingSession):
+        @property
+        def tuning_mismatch(self):
+            raise RuntimeError("no session state")
+
+    controller = CaptureController(Raising())
+    try:
+        assert controller.snapshot().tuning_mismatch is False
+    finally:
+        controller.close()
+    odd = GradingSession()
+    controller = CaptureController(odd)
+    try:
+        for value in ("yes", 1, None):
+            odd.tuning_mismatch = value
+            assert controller.snapshot().tuning_mismatch is False
+    finally:
+        controller.close()

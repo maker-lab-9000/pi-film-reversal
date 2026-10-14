@@ -806,6 +806,50 @@ def test_live_view_draws_no_count_for_a_controller_that_reports_none(controller,
     assert states[-1].developing == 0
 
 
+class _TuningController:
+    """A controller whose snapshot says the camera's tuning differs from the look's."""
+
+    def __init__(self, ctl, mismatch):
+        self._ctl, self.mismatch = ctl, mismatch
+
+    def __getattr__(self, name):
+        return getattr(self._ctl, name)
+
+    def snapshot(self):
+        return dataclasses.replace(self._ctl.snapshot(), tuning_mismatch=self.mismatch)
+
+
+def test_live_view_passes_the_tuning_mismatch_from_the_snapshot(controller, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    tuning = _TuningController(ctl, True)
+    loop, touch, display, clock = _loop(camera, tuning)
+    loop.step()
+    assert states[-1].tuning_mismatch is True
+    tuning.mismatch = False
+    loop.step()
+    assert states[-1].tuning_mismatch is False
+
+
+def test_live_view_draws_no_tuning_tag_for_a_controller_that_reports_none(
+        controller, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+
+    class Old:
+        def __getattr__(self, name):
+            return getattr(ctl, name)
+
+        def snapshot(self):
+            snap = ctl.snapshot()
+            return SimpleNamespace(**{k: v for k, v in vars(snap).items()
+                                      if k != "tuning_mismatch"})
+
+    loop, touch, display, clock = _loop(camera, Old())
+    loop.step()
+    assert states[-1].tuning_mismatch is False
+
+
 def test_live_view_draws_the_badge_from_the_snapshot(controller, monkeypatch):
     camera, ctl = controller
     states = _spy_states(monkeypatch)

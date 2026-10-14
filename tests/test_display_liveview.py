@@ -381,9 +381,11 @@ def test_no_photographs_developing_draws_nothing(scale):
                 _pixels(zero, scale=scale, battery_percent=battery))
 
 
-def test_developing_is_the_last_field_and_defaults_to_zero():
+def test_developing_and_the_tuning_flag_are_the_last_fields_with_off_defaults():
+    # New fields go on the end, so an older positional construction keeps its meaning.
     assert LiveState(cells=_cells()).developing == 0
-    assert list(LiveState.__dataclass_fields__)[-1] == "developing"
+    assert LiveState(cells=_cells()).tuning_mismatch is False
+    assert list(LiveState.__dataclass_fields__)[-2:] == ["developing", "tuning_mismatch"]
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -443,6 +445,58 @@ def test_the_developing_count_is_drawn_without_a_battery_or_a_2x_mark(scale):
     # Where the battery tag would start, clear of the place of the 2x mark.
     assert DOUBLE_BOX[2] < count[0] and count[2] < 60
     assert DOUBLE_BOX[1] <= count[1] and count[3] <= DOUBLE_BOX[3]
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_no_tuning_mismatch_draws_nothing(scale):
+    for double in (None, (True, 1)):
+        for battery in (None, 100):
+            for developing in (0, 9):
+                as_before = LiveState(cells=_cells(), selected=1, pressed=None, double=double,
+                                      developing=developing)
+                off = LiveState(cells=_cells(), selected=1, pressed=None, double=double,
+                                developing=developing, tuning_mismatch=False)
+                assert np.array_equal(
+                    _pixels(as_before, scale=scale, battery_percent=battery),
+                    _pixels(off, scale=scale, battery_percent=battery))
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("developing", [0, 9, 99])
+@pytest.mark.parametrize("battery, on_ac", [(None, None), (5, False), (100, True)])
+@pytest.mark.parametrize("double", [None, (True, 1)])
+def test_the_tuning_tag_is_last_in_the_tag_row_and_inside_its_box(
+        scale, developing, battery, on_ac, double):
+    reading = dict(battery_percent=battery, external_power=on_ac)
+    plain = _pixels(_state(double=double, developing=developing), scale=scale, **reading)
+    tagged = _pixels(_state(double=double, developing=developing, tuning_mismatch=True),
+                     scale=scale, **reading)
+    tag = _changed_box(plain, tagged, scale)
+    assert _near(_crop(tagged, tag, scale), AMBER, 60).any()
+    # Past everything else in the row, which it leaves as it was.
+    row = (_changed_box(_pixels(_state(double=None), scale=scale, battery_percent=None),
+                        plain, scale)
+           if double is not None or battery is not None or developing else None)
+    if row is not None:
+        assert row[2] <= tag[0] <= row[2] + 5
+    else:
+        assert DOUBLE_BOX[2] < tag[0]
+    # On the battery tag's line and no taller.
+    assert DOUBLE_BOX[1] <= tag[1] and tag[3] <= DOUBLE_BOX[3]
+    # Drawn whole: it ends short of the tile's right edge, which would clip it.
+    assert tag[2] < liveview._TAGS_BOX[2] - 1
+    # Clear of every control. Without a battery tag it starts where the developing count
+    # would, which the 2x toggle's grown hit region reaches by one unit, as it does the count.
+    for x in range(math.floor(tag[0] * scale), math.ceil(tag[2] * scale)):
+        for y in range(math.floor(tag[1] * scale), math.ceil(tag[3] * scale)):
+            assert hit(x, y, scale) in (Action.NONE, Action.DOUBLE_TOGGLE)
+
+
+def test_the_tag_box_clears_the_shutter_button_and_the_keys():
+    x1 = liveview._TAGS_BOX[2]
+    assert x1 < SHUTTER_CENTRE[0] - SHUTTER_HIT_RADIUS
+    assert x1 <= liveview._CONTROLS_BOX[0]
+    assert liveview._TAGS_BOX[3] <= liveview.FOCUS_TRACK[1]
 
 
 @pytest.mark.parametrize("scale", [1, 2])
