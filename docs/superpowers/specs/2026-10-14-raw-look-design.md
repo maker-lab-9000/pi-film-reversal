@@ -94,6 +94,26 @@ OpenCV is probably 0.5 to 1.5 s on top of today's background grade. It is behind
 the shutter, so the wait between photographs does not change; the graded file
 comes later. Measured in phase 3 before anything is wired in.
 
+## Found in phase 1 (2026-10-14)
+
+- The developer, run with the ISP's own tone curve, matches the camera's JPEG on
+  154 photographs: colour within 1 to 2 levels on average, no cast in any light,
+  no lens-shading difference. The steps were checked against libcamera's source
+  (`alsc.cpp`, `ccm.cpp`, `contrast.cpp`, `vc4.cpp`).
+- 8 bits hold what the raw has for pushes of 2 stops either way in these scenes:
+  sensor noise, not quantisation, limits the shadows. A float path is not needed
+  yet.
+- Night shadows are noisier than the camera's JPEG (no denoise).
+- **Time on the Pi is an open question.** On the Mac a 12 MP develop takes 1.4 to
+  1.9 s, most of it the tone curve's interpolation and the colour matrix; the Pi 4
+  is likely several times slower (perhaps 7 to 15 s). Phase 3 measures it; a
+  lookup-table tone and `cv2.transform` for the matrix roughly halve it.
+- **Full-field sensor modes only.** libcamera resamples the lens-shading tables for
+  cropped modes and mirrors them for flips; the developer does not. pifilm
+  captures at the full field with no flip today; phase 4 must refuse anything else.
+- Bit-identical output on the Mac and the Pi is not guaranteed (floating-point
+  libraries differ in the last bit); phase 3 states a tolerance.
+
 ## Phases, each with a gate
 
 1. **Developer and a base gallery (Mac).** `pifilm/raw.py` with tests; a gallery of
