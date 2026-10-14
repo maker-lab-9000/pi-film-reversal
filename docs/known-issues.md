@@ -89,7 +89,7 @@ faster, which closes the camera-servicing gap that trips the watchdog. Raising
 
 **Status:** **cause unknown; contained 2026-10-10.** The freeze no longer hangs
 the process: it is logged with Picamera2's state and the service restarts
-itself. Seen once.
+itself. Seen twice.
 
 **First seen:** 2026-10-10, Raspberry Pi 4 + IMX477, `python3-picamera2`
 0.3.37-1, `python3-libcamera` 0.7.2+rpt20260817-1, the DSI viewfinder with the
@@ -149,6 +149,37 @@ the stall cannot be produced on demand.
 Only the LCD viewfinder has this exit. In the headless Stick-only mode a
 stalled still fails that one capture with the same message and the process
 keeps running.
+
+### Second occurrence
+
+2026-10-13, about 18:38, during the GPU grading test (PR #60): the same three
+`no preview frame within 5.0 s (started=True completed=0 ...)` lines, then the
+exit and a restart by systemd, which worked. It came about 7 s after the
+viewfinder restarted the live view for a white-balance change; no grade was
+running. The GPU's self-test had passed at that start and at the three before
+and after it. Whether GPU grading or the live-view restart makes the stall more
+likely is not known from two occurrences.
+
+### To do: keep the journal across reboots
+
+Not done yet (the owner's choice, 2026-10-14: wait until it happens more often).
+Raspberry Pi OS keeps the journal in memory, so a reboot loses every stall
+logged before it, and there is no history to say whether stalls are becoming
+more frequent. The fix, on the Pi:
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nStorage=persistent\nSystemMaxUse=200M\n' \
+  | sudo tee /etc/systemd/journald.conf.d/persistent.conf
+sudo systemctl restart systemd-journald
+```
+
+Then stalls per day, across reboots:
+
+```bash
+journalctl -u pifilm-capture.service -o short-iso --no-pager \
+  | grep "stopped delivering frames" | cut -c1-10 | uniq -c
+```
 
 ### If it happens again
 
