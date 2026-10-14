@@ -122,7 +122,7 @@ def develop(frame: RawFrame, tuning: RawTuning, *, colour_gains: tuple[float, fl
 **Behaviour (in this order, each step a small private function so it can be tested alone):**
 
 1. To float32 linear: `(bayer - black) / (white - black)`, clipped to 0..1.
-2. Lens shading on the Bayer plane: upsample the (12, 16) grids bilinearly to (H, W) (`cv2.resize` with `INTER_LINEAR` is acceptable; grid cell centres at the frame's 16 x 12 equal divisions); multiply red sites by `cr * lum`, blue sites by `cb * lum`, green sites by `lum`.
+2. Lens shading on the Bayer plane: upsample the (12, 16) grids bilinearly to (H, W) (`cv2.resize` with `INTER_LINEAR` is acceptable; grid cell centres at the frame's 16 x 12 equal divisions); multiply red sites by `cr * lum`, blue sites by `cb * lum`, green sites by `lum`. (Amended 2026-10-14 after Task 2: the Cr and Cb tables include the light's colour, so each is divided by its own minimum first, as libcamera's `alsc.cpp` does; applied raw they turned the picture magenta.)
 3. White balance on the Bayer plane: red sites x `colour_gains[0]`, blue sites x `colour_gains[1]`, then clip to 1.0 (so a clipped highlight stays neutral; say so in a comment).
 4. Demosaic: scale to uint16 (x 65535, rounded), `cv2.cvtColor` with the Bayer code that is correct for the frame's CFA, to RGB, back to float32. Prove the code with a test (below), and keep the table from CFA string to OpenCV code in one place with a comment on OpenCV's naming.
 5. Colour matrix: `ccm_at(tuning, colour_temperature)` applied per pixel (`rgb @ ccm.T`), clipped to 0..1. Work in row bands if needed to keep memory to a few full-frame arrays.
