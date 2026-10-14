@@ -21,15 +21,8 @@ import argparse
 import os
 from collections.abc import Callable, Mapping
 
-from ..artifacts import ArtifactsError, stamp_tuning, validate_tuning_sha1
-from ..tuning import resolve
-
-
-def _sha1_arg(text: str) -> str:
-    try:
-        return validate_tuning_sha1(text, "--sha1")
-    except ArtifactsError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
+from ..artifacts import ArtifactsError, stamp_tuning
+from ..tuning import resolve, sha1_argument
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default="imx477",
                         help="sensor model for the automatic case, without --tuning-file "
                              "(default: imx477); the camera is not asked")
-    parser.add_argument("--sha1", type=_sha1_arg, metavar="HEX",
+    parser.add_argument("--sha1", type=sha1_argument, metavar="HEX",
                         help="use this fingerprint instead of resolving one (no Picamera2 "
                              "needed, so it works on the Mac)")
     parser.add_argument("--stamp", metavar="DIR",

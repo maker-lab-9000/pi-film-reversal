@@ -27,11 +27,14 @@ so this runs and tests on a Mac.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from .artifacts import ArtifactsError, validate_tuning_sha1
 
 ENV_VAR = "LIBCAMERA_RPI_TUNING_FILE"
 
@@ -40,6 +43,15 @@ def fingerprint(obj: object) -> str:
     """Forty lowercase hex digits identifying a parsed tuning."""
     text = json.dumps(obj, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def sha1_argument(text: str) -> str:
+    """An argparse ``type`` for a ``tuning_sha1`` given on a command line, checked
+    exactly as the artifact loader checks the field."""
+    try:
+        return validate_tuning_sha1(text, "the value")
+    except ArtifactsError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def short(sha1: str) -> str:
