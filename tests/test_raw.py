@@ -39,6 +39,7 @@ def test_round_trip(bits, cfa):
     assert frame.cfa == cfa
     assert frame.black == 256.0
     assert frame.white == 4095.0
+    assert frame.bits == bits
     assert frame.as_shot_neutral == pytest.approx((0.3186, 1.0, 0.6277))
 
 
@@ -331,14 +332,16 @@ BLACK, WHITE = 256.0, 4095.0
 _SITES = ((0, 0), (0, 1), (1, 0), (1, 1))
 
 
-def _mosaic(rgb: np.ndarray, cfa: str) -> RawFrame:
+def _mosaic(rgb: np.ndarray, cfa: str, neutral=None) -> RawFrame:
     """A raw frame whose sites sample ``rgb`` (linear, 0..1) through ``cfa``."""
     h, w, _ = rgb.shape
     plane = np.empty((h, w))
     for (r, c), colour in zip(_SITES, cfa, strict=True):
         plane[r::2, c::2] = rgb[r::2, c::2, "RGB".index(colour)]
     bayer = np.rint(BLACK + np.clip(plane, 0, 1) * (WHITE - BLACK)).astype(np.uint16)
-    return RawFrame(bayer=bayer, cfa=cfa, black=BLACK, white=WHITE, as_shot_neutral=None)
+    return RawFrame(
+        bayer=bayer, cfa=cfa, black=BLACK, white=WHITE, as_shot_neutral=neutral, bits=12
+    )
 
 
 def _flat_tuning(ccm=None, luminance=None, curve=((0.0, 0.0), (1.0, 1.0))) -> RawTuning:
@@ -546,3 +549,120 @@ def test_develop_does_not_change_its_input():
     before = frame.bayer.copy()
     develop(frame, _flat_tuning(), colour_gains=(2.0, 2.0), colour_temperature=4000)
     np.testing.assert_array_equal(frame.bayer, before)
+
+
+
+# --- review fixes: refused tags, digital gain, consistency checks ---------
+
+
+@pytest.mark.parametrize(
+    "tag, value, match",
+    [
+        (50712, (SHORT, list(range(16))), "LinearizationTable"),
+        (50829, (LONG, [8, 8, 6, 8]), "ActiveArea"),
+        (274, (SHORT, [6]), "orientation 6"),
+        (50719, (LONG, [2, 0]), "DefaultCrop"),
+        (50720, (LONG, [4, 6]), "DefaultCrop"),
+    ],
+)
+def test_refuses_tags_the_developer_ignores(tag, value, match):
+    _refused(match, tags={tag: value})
+
+
+def test_accepts_orientation_one_and_a_full_frame_crop():
+    bayer = _bayer()
+    tags = {274: (SHORT, [1]), 50719: (LONG, [0, 0]), 50720: (LONG, [8, 6])}
+    np.testing.assert_array_equal(read_dng(make_dng(bayer, tags=tags)).bayer, bayer)
+
+
+def _grey_out(frame, **kwargs):
+    args = {"colour_gains": (1.0, 1.0), "colour_temperature": 4000, **kwargs}
+    return develop(frame, _flat_tuning(), as_float=True, **args)[8:-8, 8:-8]
+
+
+def test_digital_gain_scales_every_site():
+    frame = _mosaic(np.full((32, 32, 3), 0.2), "BGGR")
+    once = _grey_out(frame)
+    twice = _grey_out(frame, digital_gain=2.0)
+    np.testing.assert_allclose(twice, 2 * once, atol=1e-3)
+
+
+def test_digital_gain_past_one_clips_neutral():
+    frame = _mosaic(np.full((32, 32, 3), 0.6), "BGGR")
+    out = _grey_out(frame, digital_gain=2.0, colour_gains=(1.5, 1.2))
+    np.testing.assert_array_equal(out, 1.0)
+
+
+@pytest.mark.parametrize("gain", [0.0, -1.0, float("nan"), float("inf")])
+def test_bad_digital_gain_raises(gain):
+    with pytest.raises(RawError, match="digital gain"):
+        develop(_ramp_frame(), _flat_tuning(), colour_gains=(1.0, 1.0), colour_temperature=4000,
+                digital_gain=gain)
+
+
+def test_as_shot_neutral_must_match_the_gains():
+    frame = _mosaic(np.full((16, 16, 3), 0.2), "BGGR", neutral=(1 / 3.139, 1.0, 1 / 1.593))
+    develop(frame, _flat_tuning(), colour_gains=(3.139, 1.593), colour_temperature=4000)
+    develop(frame, _flat_tuning(), colour_gains=(3.139 * 1.004, 1.593), colour_temperature=4000)
+    with pytest.raises(RawError, match="AsShotNeutral"):
+        develop(frame, _flat_tuning(), colour_gains=(3.2, 1.593), colour_temperature=4000)
+    with pytest.raises(RawError, match="AsShotNeutral"):
+        develop(frame, _flat_tuning(), colour_gains=(3.139, 1.55), colour_temperature=4000)
+
+
+def test_tuning_black_level_must_match_the_frame():
+    frame = _mosaic(np.full((16, 16, 3), 0.2), "BGGR")
+    other = dataclasses.replace(_flat_tuning(), black_level=4096.0 + 16)
+    develop(frame, other, colour_gains=(1.0, 1.0), colour_temperature=4000)  # 1 unit at 12 bits
+    off = dataclasses.replace(_flat_tuning(), black_level=4096.0 + 32)  # 2 units
+    with pytest.raises(RawError, match="black level"):
+        develop(frame, off, colour_gains=(1.0, 1.0), colour_temperature=4000)
+    wrong = dataclasses.replace(_flat_tuning(), black_level=1024.0)  # 64 at 12 bits
+    with pytest.raises(RawError, match="black level"):
+        develop(frame, wrong, colour_gains=(1.0, 1.0), colour_temperature=4000)
+    unknown = dataclasses.replace(frame, bits=None)
+    develop(unknown, wrong, colour_gains=(1.0, 1.0), colour_temperature=4000)
+
+
+def test_asymmetric_shading_grid_lands_on_its_side():
+    # Left eight columns of cells at 1, right eight at 2; a mirrored or shifted
+    # grid would put the gain on the wrong side.
+    lum = np.ones((12, 16))
+    lum[:, 8:] = 2.0
+    frame = _mosaic(np.full((32, 64, 3), 0.25), "BGGR")
+    out = develop(frame, _flat_tuning(luminance=lum), colour_gains=(1.0, 1.0),
+                  colour_temperature=4000)
+    # Cells are 4 px wide; centres of cells 7 and 8 are at x = 29.5 and 33.5.
+    assert np.all(out[8:-8, 4:26] == 64)
+    assert np.all(out[8:-8, 38:60] == 128)
+    assert 64 < out[16, 31, 1] < 128
+
+
+def test_develop_takes_alsc_at_the_colour_temperature():
+    base = _flat_tuning()
+    tuning = dataclasses.replace(
+        base,
+        alsc_cr=((3000.0, _with_corner(2.0)), (5000.0, _with_corner(4.0))),
+        alsc_cb=((3000.0, _with_corner(3.0)), (5000.0, _with_corner(1.5))),
+    )
+    cr, cb = alsc_at(tuning, 4000)
+    by_hand = dataclasses.replace(base, alsc_cr=((4000.0, cr),), alsc_cb=((4000.0, cb),))
+    frame = _mosaic(np.full((32, 32, 3), 0.1), "BGGR")
+    args = {"colour_gains": (1.0, 1.0), "as_float": True}
+    got = develop(frame, tuning, colour_temperature=4000, **args)
+    np.testing.assert_array_equal(got, develop(frame, by_hand, colour_temperature=4000, **args))
+    assert not np.array_equal(got, develop(frame, tuning, colour_temperature=3000, **args))
+    np.testing.assert_allclose(got[16, 8], [0.3, 0.1, 0.225], atol=2e-3)
+
+
+def test_clipped_corner_with_luminance_gain_stays_white():
+    lum = np.ones((12, 16))
+    lum[:3, :4] = 1.6
+    rgb = np.full((48, 64, 3), 0.2)
+    rgb[:8, :8] = 1.0  # at the white level in all channels
+    frame = _mosaic(rgb, "BGGR")
+    ccm = np.reshape([2.0, -0.5, -0.5, -0.5, 2.0, -0.5, -0.5, -0.5, 2.0], (3, 3))
+    out = develop(frame, _flat_tuning(ccm=ccm, luminance=lum), colour_gains=(3.1, 1.6),
+                  colour_temperature=4000)
+    corner = out[:6, :6].reshape(-1, 3)
+    assert corner.min() > 250

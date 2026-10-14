@@ -56,6 +56,7 @@ by 12 rows over the whole frame, stored row by row.
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 
@@ -75,6 +76,7 @@ class RawFrame:
     black: float  # one black level (refused when the four differ)
     white: float
     as_shot_neutral: tuple[float, float, float] | None
+    bits: int | None = None  # bits per sample in the file; None when not known
 
 
 # TIFF field types: (struct code, bytes per value).
@@ -109,6 +111,11 @@ _TAG_NAMES = {
 }
 _AS_SHOT_NEUTRAL = 50728
 _TILE_TAGS = (322, 323, 324, 325)
+# Tags that would change what the samples mean, which this reader does not
+# apply: a linearisation curve, an active area smaller than the frame.
+_UNREAD_TAGS = {50712: "LinearizationTable", 50829: "ActiveArea"}
+_ORIENTATION = 274
+_DEFAULT_CROP = (50719, 50720)  # origin, size
 _BLACK_DELTAS = (50715, 50716)
 _CFA_COLOURS = "RGB"
 _PATTERNS = ("BGGR", "RGGB", "GRBG", "GBRG")
@@ -173,6 +180,11 @@ def read_dng(data: bytes) -> RawFrame:
         raise RawError(f"missing DNG tags: {', '.join(missing)}")
     if any(tag in fields for tag in _TILE_TAGS):
         raise RawError("tiled image; Picamera2 writes one strip")
+    for tag, name in _UNREAD_TAGS.items():
+        if tag in fields:
+            raise RawError(f"{name} (tag {tag}) is not applied by this reader")
+    if _ORIENTATION in fields and tuple(fields[_ORIENTATION]) != (1,):
+        raise RawError(f"orientation {fields[_ORIENTATION][0]}; only 1 (as stored) is read")
 
     compression = _one(fields, 259)
     if compression != 1:
@@ -215,6 +227,12 @@ def read_dng(data: bytes) -> RawFrame:
     if len(offsets) != 1 or len(counts) != 1:
         raise RawError(f"{len(offsets)} strips; Picamera2 writes one")
     width, height = int(_one(fields, 256)), int(_one(fields, 257))
+    origin, size = (tuple(fields.get(tag, ())) for tag in _DEFAULT_CROP)
+    if (origin and origin != (0, 0)) or (size and size != (width, height)):
+        raise RawError(
+            f"DefaultCrop origin {origin or '-'} size {size or '-'}; only the full "
+            f"{width} x {height} frame is read"
+        )
     if bits == 12 and width % 2:
         raise RawError(f"width {width} is odd; 12-bit rows must pack whole pixel pairs")
     expected = width * height * bits // 8
@@ -243,7 +261,9 @@ def read_dng(data: bytes) -> RawFrame:
         if len(values) != 3:
             raise RawError(f"AsShotNeutral has {len(values)} values, expected 3")
         neutral = tuple(float(v) for v in values)
-    return RawFrame(bayer=bayer, cfa=cfa, black=black, white=white, as_shot_neutral=neutral)
+    return RawFrame(
+        bayer=bayer, cfa=cfa, black=black, white=white, as_shot_neutral=neutral, bits=int(bits)
+    )
 
 
 _GRID = (12, 16)  # rows, columns of the lens-shading tables
@@ -459,8 +479,16 @@ def _shade(plane: np.ndarray, cfa: str, cr: np.ndarray, cb: np.ndarray, lum: np.
     plane *= gain
 
 
-def _white_balance(plane: np.ndarray, cfa: str, gains: tuple[float, float]) -> None:
-    """The shot's ColourGains in place, then a clip to 1.
+def _white_balance(
+    plane: np.ndarray, cfa: str, gains: tuple[float, float], digital_gain: float = 1.0
+) -> None:
+    """The shot's digital gain and ColourGains in place, then a clip to 1.
+
+    The digital gain is AGC's: the ISP multiplies every site by it after the
+    sensor's samples (``applyDG`` in libcamera's vc4 IPA), so the DNG does not
+    carry it. It is 1.000 to 1.043 on the training photographs. It comes
+    before the clip like the colour gains, so a site it pushes past 1 clips
+    with the rest.
 
     The clip is what keeps a clipped highlight white. A pixel at the white
     level is 1 in all three channels; the red and blue gains (about 3 and 1.6
@@ -470,6 +498,8 @@ def _white_balance(plane: np.ndarray, cfa: str, gains: tuple[float, float]) -> N
     matrix whose rows sum to 1 keeps it there.
     """
     red, blue = gains
+    if digital_gain != 1.0:
+        plane *= np.float32(digital_gain)
     for colour, gain in (("R", red), ("B", blue)):
         for r, c in _sites(cfa, colour):
             plane[r::2, c::2] *= np.float32(gain)
@@ -536,13 +566,31 @@ def develop(
     colour_temperature: float,
     tone: str = "isp",
     as_float: bool = False,
+    digital_gain: float = 1.0,
 ) -> np.ndarray:
     """(H, W, 3) uint8 sRGB. colour_gains is the record's ColourGains (red, blue).
 
-    The steps run in the ISP's order: black level, lens shading, white
-    balance, demosaic, colour matrix, tone curve. The lens-shading grids and
-    the colour matrix are taken at ``colour_temperature`` (the record's
-    ColourTemperature), as the ISP chose them for the shot.
+    The steps run in the ISP's order: black level, lens shading, digital gain
+    and white balance, demosaic, colour matrix, tone curve. The lens-shading
+    grids and the colour matrix are taken at ``colour_temperature`` (the
+    record's ColourTemperature), as the ISP chose them for the shot;
+    ``digital_gain`` is the record's DigitalGain.
+
+    Two checks catch a frame paired with the wrong inputs. When the DNG has an
+    AsShotNeutral, its reciprocal (relative to green) must be the given red and
+    blue gains within 0.5 %: Picamera2 writes it from the same ColourGains, so
+    a mismatch means the DNG and the record are not the same shot. When the
+    frame's bit depth is known to be 12, the tuning's black level (in 16-bit
+    units) scaled to 12 bits must be the frame's within 1 unit: another
+    sensor's tuning fails here.
+
+    Limits. Full-field sensor modes only: the lens-shading grids are stretched
+    over the whole frame, where libcamera resamples them for a cropped mode
+    and mirrors them for a flipped one; neither is done here. The ISP lays its
+    grid in 128-pixel cells over 4096 x 3072 (a little past the 4056 x 3040
+    frame) and stores the gains as u4.10 fixed point; the stretched grid and
+    float gains differ from that by much less than a level, a known and
+    negligible difference.
 
     With ``as_float`` the picture is returned as float32 in 0..1 after the
     tone curve, before rounding: ``np.rint(x * 255)`` of it is the uint8
@@ -559,12 +607,31 @@ def develop(
         raise RawError(f"colour gains {tuple(colour_gains)} must be two positive numbers")
     if frame.cfa not in _OPENCV_BAYER:
         raise RawError(f"CFA pattern {frame.cfa!r} is not one of {', '.join(_PATTERNS)}")
+    digital_gain = float(digital_gain)
+    if not (np.isfinite(digital_gain) and digital_gain > 0):
+        raise RawError(f"digital gain {digital_gain} must be a positive number")
+    if frame.as_shot_neutral is not None:
+        n_r, n_g, n_b = frame.as_shot_neutral
+        for name, neutral, gain in (("red", n_r, gains[0]), ("blue", n_b, gains[1])):
+            implied = n_g / neutral if neutral > 0 else math.inf
+            if not abs(implied / gain - 1.0) <= 0.005:
+                raise RawError(
+                    f"AsShotNeutral implies a {name} gain of {implied:.4f}, the record "
+                    f"{gain:.4f}: is the DNG paired with the right record?"
+                )
+    if frame.bits == 12:
+        expected = tuning.black_level / 16.0
+        if abs(expected - frame.black) > 1.0:
+            raise RawError(
+                f"tuning black level {tuning.black_level:g} is {expected:g} at 12 bits, "
+                f"the frame's {frame.black:g}: a tuning file for another sensor?"
+            )
     ccm = ccm_at(tuning, colour_temperature)
     cr, cb = alsc_at(tuning, colour_temperature)
 
     plane = _linear(frame)
     _shade(plane, frame.cfa, cr, cb, tuning.luminance)
-    _white_balance(plane, frame.cfa, gains)
+    _white_balance(plane, frame.cfa, gains, digital_gain)
     rgb16 = _demosaic(plane, frame.cfa)
     del plane
 
