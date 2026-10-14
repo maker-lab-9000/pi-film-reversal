@@ -392,12 +392,35 @@ edit pointing back at `pifilm/data`.
 
 **Pin the tuning file for a trained look.** The Picamera2 backend defaults to
 libcamera's automatic tuning for the detected sensor (`tuning_file:
-auto:<model>` in `captures.jsonl`), which is what the deployed systemd unit
+auto:<model>` in `captures.jsonl`), which is what the example systemd unit
 uses. Once you deploy a **trained** LUT, add `--tuning-file` to the unit's
 `ExecStart` naming the exact tuning file the source corpus was captured
-under (for example `imx708_wide.json`). Otherwise a future libcamera or OS
+under (for example `imx477.json`). Otherwise a future libcamera or OS
 update could silently change the default tuning and shift colour science out
 from under a LUT that was fitted against the old one.
+
+Then stamp the look with that tuning's fingerprint, on the Pi, after deploying:
+
+```sh
+cd ~/repos/pi-film-reversal
+.venv/bin/pifilm-tuning --tuning-file imx477.json --stamp artifacts/pifilm-2026-09-v1
+sudo systemctl restart pifilm-capture.service
+journalctl -u pifilm-capture.service -b | grep 'tuning:'
+```
+
+`pifilm-tuning` prints `tuning <file>: <fingerprint>`, writes it into the look's
+`params.json` as `tuning_sha1` and loads the look again to confirm (`stamped
+<path>`). Only `params.json` changes; the `.cube` and `lut_sha1` do not. Give it
+the same `--tuning-file` the service runs with. The journal should then say
+`tuning: matches the look (<12 hex>)`, and from then on the service warns if the
+tuning ever differs (see
+[known issues](known-issues.md#a-libcamera-update-could-silently-retune-a-deployed-trained-lut)).
+
+If you know the fingerprint when you train, `pifilm-train --tuning-sha1 HEX`
+writes it into the new artifact directly. Take it from `tuning_sha1` in a
+`captures.jsonl` record of the source frames, or from `pifilm-tuning` on the Pi.
+On the Mac, `pifilm-tuning --sha1 HEX --stamp DIR` stamps a look without
+Picamera2.
 
 ## 9. Step 8: write it down
 

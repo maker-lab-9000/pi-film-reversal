@@ -251,24 +251,52 @@ that took live changes after a photo.
 
 ## A libcamera update could silently retune a deployed trained LUT
 
-**Status:** understood, mitigated by a documented deployment step, not enforced
-in code.
+**Status:** checked at start-up, warn only (step 4 of the
+[pipeline roadmap](superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md)).
+The check works only for a look stamped with its tuning's fingerprint.
 
-**Description:** the Picamera2 backend defaults `--tuning-file` to `None`,
-meaning libcamera's own automatic tuning choice for the detected sensor
-(recorded as `tuning_file: auto:<model>` in `captures.jsonl`); the example
-systemd unit runs with this default. A trained LUT is fitted against whatever
-colour science its source corpus was captured under. If the automatic tuning
-file libcamera picks ever changes — an OS or libcamera package update, or a
-sensor firmware/variant change read differently — a deployment running the
-default would start feeding a **different** colour response through an
-unchanged LUT, with no error and no changed `lut_sha1` to flag it.
+**Description:** a trained LUT is fitted against the colour science its source
+corpus was captured under, which is one libcamera tuning file. If that file
+changes (an OS or libcamera package update, or a sensor read differently), the
+camera feeds a different colour response through an unchanged LUT. There is no
+error and no changed `lut_sha1`. The Picamera2 backend defaults `--tuning-file`
+to libcamera's automatic choice for the detected sensor (`tuning_file:
+auto:<model>` in `captures.jsonl`); the example systemd unit runs with this
+default.
 
-**Mitigation:** when deploying a trained (not the bundled starter) LUT, pin
-`--tuning-file` to the exact file the corpus was captured under (see
-[docs/training.md](training.md), Step 7). This is a documentation-only
-safeguard; nothing currently checks that a running service's tuning file
-matches what a deployed artifact was trained against.
+**The check.** The Pi fingerprints the tuning it opens the camera with: the
+SHA-1 of the file's parsed JSON, so a change of whitespace or key order does not
+count and any changed value does. A look can carry the fingerprint it was
+trained under, as `tuning_sha1` in its `params.json`. At start-up the service
+compares the two and writes one line to the journal:
+
+- `tuning: matches the look (<12 hex>)`: nothing to do.
+- `tuning: DIFFERS from the look: camera <12 hex> (<tuning file>), look <12 hex>; colours may be off`:
+  the amber `TUNING` tag shows on the viewfinder for the whole run (see
+  [docs/lcd-viewfinder.md](lcd-viewfinder.md#tuning-warning)).
+- `tuning: cannot check the look's tuning (<reason>)`: the camera's tuning
+  could not be read, so nothing was compared.
+
+Nothing is checked, and no line is written, for a look without a fingerprint
+(the bundled starter, or a trained look not yet stamped) or for a USB camera.
+The service never refuses to start over this: photographs are still taken and
+graded, and the originals are kept, so they can be regraded later. Every record
+from the Pi camera carries `tuning_sha1`, and when the check ran also
+`tuning_matches` (`true` or `false`).
+
+**What to do.** When you deploy a trained look, pin `--tuning-file` to the file
+the corpus was captured under and stamp the look on the Pi (see
+[docs/training.md](training.md), Step 7):
+
+```sh
+pifilm-tuning --tuning-file imx477.json --stamp <the service's artifacts dir>
+sudo systemctl restart pifilm-capture.service
+```
+
+If the tag shows after an update, the tuning file changed under the look.
+Either put the old tuning file back and name it with `--tuning-file`, or retrain
+the look on frames taken under the new tuning. Stamping the look again with the
+new fingerprint only hides the warning; it does not make the colours right.
 
 ## Capture records written before 2026-09-19 cannot be told apart by `lut_sha1`
 

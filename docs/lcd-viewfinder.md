@@ -174,6 +174,7 @@ message screens keep the default font.
 | `2x` toggle (outlined tag, top left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
 | Battery tag (outlined, top left, right of `2x`) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | Developing count (amber number on a dark patch, right of the battery tag) | How many photographs are still being graded behind the shutter; see [Developing count](#developing-count). Absent at zero and with `--grade inline` | — |
+| `TUNING` tag (amber word on a dark patch, last in the top-left row) | The camera's libcamera tuning differs from the one the look was trained under; see [Tuning warning](#tuning-warning). Absent otherwise | — |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Review screen | Full-screen quick grade (the frame reduced by a whole factor to about 1,000 pixels on the long side, four times each way for the IMX477, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
@@ -210,6 +211,26 @@ grade that is running and the ones waiting. It disappears at zero.
 
 The review screen and the Stick show the quick grade, not the final file: it is
 reduced and has no grain, and its tone can differ slightly from the graded file.
+
+### Tuning warning
+
+A trained look is fitted to the colours of one libcamera tuning file. At start-up
+the service compares the fingerprint of the tuning the camera opened with against
+the one stamped in the look. When they differ, an amber `TUNING` tag shows at the
+end of the top-left row, after the battery tag and the developing count. It stays
+for the whole run, because the tuning cannot change while the service runs.
+
+- The camera still works. Photographs are taken and graded as usual, but their
+  colours may be off, and their records say `tuning_matches: false`.
+- The journal has the line `tuning: DIFFERS from the look: ...`, naming the
+  tuning file in use.
+- The usual cause is an OS or libcamera update, or a `--tuning-file` that is not
+  the one the look was trained under. What to do is in
+  [known issues](known-issues.md#a-libcamera-update-could-silently-retune-a-deployed-trained-lut).
+
+There is no tag when they match, when the look has no fingerprint (the bundled
+starter, or a trained look not yet stamped with `pifilm-tuning --stamp`), or with
+a USB camera.
 
 ### Idle dimming
 
@@ -592,6 +613,19 @@ first, so that `pifilm-gpu-check` exists.
 | 5 | `--grade-backend cpu`: records have `pipeline_backend: cpu`, and the timings are as before | |
 | 6 | `pifilm-process` on today's folder: it runs, and prints the note about the records graded on the GPU | |
 | 7 | Ten minutes of ordinary use: no preview stall, and the live view is no worse than now | |
+
+#### Tuning check
+
+Not yet run on hardware. The branch is `feat/tuning-hash`; the design is
+[2026-10-14-tuning-identity-design.md](superpowers/specs/2026-10-14-tuning-identity-design.md).
+Run `pip install -e .` again in the Pi's venv first, so that `pifilm-tuning` exists.
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | `pifilm-tuning --tuning-file imx477.json` prints a fingerprint and the file | Not yet run |
+| 2 | `pifilm-tuning --tuning-file imx477.json --stamp <the service's artifacts>`, then restart the service: the journal says `tuning: matches the look`; records carry `tuning_sha1` and `tuning_matches: true`; no tag on the screen | Not yet run |
+| 3 | Copy `imx477.json`, change one value (for example a `rpi.ccm` coefficient) and run the service by hand with `--tuning-file` naming the copy: the journal says `DIFFERS`, the amber `TUNING` tag shows, records say `tuning_matches: false`, and photographs are still taken and graded | Not yet run |
+| 4 | Back to the unit's own command: the tag is gone | Not yet run |
 
 ## 8. Troubleshooting
 
