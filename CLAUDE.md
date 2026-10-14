@@ -51,6 +51,7 @@ python3.12 -m venv .venv
 .venv/bin/pifilm-capture --fake --no-preview                       # capture loop w/o hardware
 .venv/bin/pifilm-battery                                           # print the X728 battery level (Pi only)
 .venv/bin/pifilm-gpu-check --artifacts DIR [--image FILE] [--runs N]   # GPU grade against its reference (Pi only)
+.venv/bin/pifilm-tuning [--tuning-file NAME] [--stamp DIR]          # tuning fingerprint; stamp a look (Pi; --sha1 HEX on the Mac)
 .venv/bin/pifilm-train --source data/source --target data/references --out artifacts/pifilm-v1
 .venv/bin/pifilm-fetch --category 'Category:...'                   # Wikimedia Commons corpus fetch
 
@@ -107,6 +108,16 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
 - `artifacts.py`: an artifact is `pifilm.cube` + `params.json`. Loading verifies `lut_sha1` matches the
   cube on disk so a half-written pair cannot load. `publish()` stages then swaps the directory with
   `os.replace`. `Artifacts.default()` resolves the packaged `pifilm/data/`; `--artifacts DIR` overrides.
+  An optional top-level `tuning_sha1` (forty lowercase hex, validated; `Artifacts.tuning_sha1`) is
+  the libcamera tuning the look was trained under; `stamp_tuning` writes it into `params.json`
+  (temp file + `os.replace`, other keys and the file mode kept, loaded before and after).
+  Older builds ignore it, so no params version change.
+- `tuning.py`: the tuning fingerprint (SHA-1 of the parsed JSON with sorted keys and no
+  whitespace), `resolve` (the dict the camera is opened with for `--tuning-file`, else
+  `<model>.json`; a failure there is a reason, not an error; `LIBCAMERA_RPI_TUNING_FILE` is
+  ignored because Picamera2 clears it when it opens without a tuning)
+  and `check` (the `tuning:` log line). No Picamera2 import; `pifilm-tuning` is
+  `capture/tuningcli.py`.
 - `gpu/`: the grade as one pass on the Pi 4's GPU. `shader.py` is the GLSL and `SHADER_VERSION`
   (`BACKEND` is `"gpu-1"`; any change that can move pixels raises it). `reference.py` is the same
   pass in NumPy, the definition the tests and the self-test hold the GPU to. `grader.py` is
@@ -141,6 +152,8 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   exposure compensation: `ExposureValue` is sent as 0.0 so `ev_comp` stays in records. Every read waits a bounded time
   for its frame and raises `CameraStalled` (see `docs/known-issues.md`); three stalled preview
   reads end the viewfinder and the process exits 1 for a systemd restart.
+  The tuning is fingerprinted at open (`tuning` property; `tuning_sha1` after `tuning_file` in
+  records); one that cannot be is one `tuning: cannot fingerprint ...` line, and the camera opens.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
   captures-only display (`--show-captures`, shows TV colour bars while processing), and headless
   terminal. `--display waveshare35dsi` (or `waveshare28`) runs the LCD viewfinder instead of any
@@ -177,7 +190,11 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   (`"gpu-1"` or `"cpu"`): after `stage_ms` in an inline record, last in a background one. Each record also carries `stage_ms`, the
   milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, LUT,
   grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`
-  is the plan those numbers feed.
+  is the plan those numbers feed. At start-up the session checks the camera's tuning
+  fingerprint against the look's `tuning_sha1` (warn only, never refuses to start): one
+  `tuning:` line, `tuning_matches` right after the camera fields in every record when both
+  have a fingerprint (a recovered grade keeps the capture run's value), and
+  `CaptureSession.tuning_mismatch` (True only when they differ) for the viewfinder's tag.
 - Double exposure: `CaptureSession` owns the mode and pending first frame; `pifilm/double.py`
   adds the two ungraded frames in linear light (one stop down each), and the composite is
   graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card in a temp dir
@@ -228,7 +245,8 @@ what the camera is metering). `liveview.py` draws the live screen, an SLR-finder
 strip of three selectable cells (SHUTTER, ISO, WB) with one `+`/`-` pair, shutter button at the
 top right, meter dots, `2x`, battery, the developing count (an amber number right of the
 battery tag: `LiveState.developing`, from the snapshot's `pending_grades` at every frame,
-absent at zero) and focus gauge, from cached anti-aliased tiles in the
+absent at zero), an amber `TUNING` tag last in that row (`LiveState.tuning_mismatch`, from the
+snapshot's `tuning_mismatch`) and focus gauge, from cached anti-aliased tiles in the
 bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
 holds only the review, processing and message screens. Both work in 320×240 base units at an
 integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine

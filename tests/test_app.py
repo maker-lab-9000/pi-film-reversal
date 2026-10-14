@@ -33,6 +33,7 @@ from pifilm.imageio import load_rgb, save_jpeg
 from pifilm.lut import LUT3D
 from pifilm.normalize import NormalizeParams
 from pifilm.pipeline import Pipeline
+from pifilm.tuning import Resolved
 from tests.gpu_fakes import FakeDevice, tile_artifacts
 
 
@@ -3546,3 +3547,148 @@ def test_a_frame_wider_than_the_largest_texture_goes_to_the_cpu_quietly(tmp_path
         assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"], frame)
     assert len(device.runs) == 1  # the self-test only
     assert session.test_log == ["gpu grading on (Fake GPU, self-test passed)"]
+
+
+# The tuning check (pifilm.tuning): once at start-up, warn only.
+
+_LOOK_TUNING = "1" * 40
+_OTHER_TUNING = "2" * 40
+
+
+class _TunedCamera(FakeCamera):
+    """A FakeCamera that, like Picamera2Camera, reports the tuning it opened with."""
+
+    def __init__(self, sha1, frames=None, label="imx477.json"):
+        super().__init__(frames or [synthetic_frame(90, 160)])
+        self.tuning = Resolved(label=label, source=label, sha1=sha1,
+                               reason=None if sha1 else "cannot load imx477.json")
+
+
+def _tuned_pipeline(tmp_path, sha1=_LOOK_TUNING):
+    d = tmp_path / "tuned-art"
+    write_artifact(d, LUT3D.identity(9), NormalizeParams(), GrainParams(), tuning_sha1=sha1)
+    return Pipeline(Artifacts.load(d))
+
+
+def _tuned_session(tmp_path, camera, pipeline, **kwargs):
+    log = []
+    session = CaptureSession(camera, pipeline, tmp_path / "shots",
+                             seed_rng=np.random.default_rng(0), log=log.append, **kwargs)
+    session.test_log = log
+    return session
+
+
+def test_a_matching_tuning_is_one_line_and_marks_every_record(tmp_path):
+    session = _tuned_session(tmp_path, _TunedCamera(_LOOK_TUNING), _tuned_pipeline(tmp_path))
+    assert session.test_log == [f"tuning: matches the look ({_LOOK_TUNING[:12]})"]
+    assert session.tuning_mismatch is False
+    result = session.capture()
+    assert result.record["tuning_matches"] is True
+    (record,) = _lines(session.out_root)
+    assert record["tuning_matches"] is True
+
+
+def test_a_different_tuning_warns_and_the_photograph_is_still_graded(tmp_path):
+    session = _tuned_session(tmp_path, _TunedCamera(_OTHER_TUNING), _tuned_pipeline(tmp_path))
+    assert session.test_log == [
+        f"tuning: DIFFERS from the look: camera {_OTHER_TUNING[:12]} (imx477.json), "
+        f"look {_LOOK_TUNING[:12]}; colours may be off"
+    ]
+    assert session.tuning_mismatch is True
+    result = session.capture()
+    assert result.pifilm.exists() and result.original.exists()
+    (record,) = _lines(session.out_root)
+    assert record["tuning_matches"] is False
+
+
+def test_tuning_matches_sits_right_after_the_camera_fields(tmp_path):
+    camera = _TunedCamera(_LOOK_TUNING)
+    camera._info = StreamInfo(
+        width=160, height=90, fps=1.0, fourcc="RGB888", raw_mjpeg=False,
+        tuning_file="imx477.json", tuning_sha1=_LOOK_TUNING,
+    )
+    session = _tuned_session(tmp_path, camera, _tuned_pipeline(tmp_path))
+    keys = list(session.capture().record)
+    assert keys.index("tuning_matches") == keys.index("tuning_sha1") + 1
+
+
+def test_a_look_without_a_fingerprint_checks_nothing(tmp_path, pipeline):
+    session = _tuned_session(tmp_path, _TunedCamera(_LOOK_TUNING), pipeline)
+    assert session.test_log == []
+    assert session.tuning_mismatch is False
+    assert "tuning_matches" not in session.capture().record
+
+
+def test_a_camera_without_a_tuning_checks_nothing(tmp_path):
+    session = _tuned_session(tmp_path, FakeCamera([synthetic_frame(90, 160)]),
+                             _tuned_pipeline(tmp_path))
+    assert session.test_log == []
+    assert session.tuning_mismatch is False
+    assert "tuning_matches" not in session.capture().record
+
+
+def test_a_tuning_that_could_not_be_fingerprinted_says_it_cannot_check(tmp_path):
+    session = _tuned_session(tmp_path, _TunedCamera(None), _tuned_pipeline(tmp_path))
+    assert session.test_log == [
+        "tuning: cannot check the look's tuning (cannot load imx477.json)"
+    ]
+    assert session.tuning_mismatch is False
+    assert "tuning_matches" not in session.capture().record
+
+
+def test_every_session_has_a_tuning_mismatch_flag(tmp_path, pipeline):
+    assert _session(tmp_path, pipeline).tuning_mismatch is False
+
+
+def test_a_background_record_carries_tuning_matches(tmp_path):
+    session = _tuned_session(tmp_path, _TunedCamera(_OTHER_TUNING), _tuned_pipeline(tmp_path),
+                             background=True, state_dir=tmp_path / "state")
+    result = session.capture()
+    assert result.record["tuning_matches"] is False
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    assert record["tuning_matches"] is False
+    assert record["grade"] == "background"
+
+
+def test_a_recovered_grade_keeps_the_tuning_of_the_run_that_shot_it(tmp_path):
+    tuned = _tuned_pipeline(tmp_path)
+    held = _HeldPipeline(tuned)
+    held.artifacts = tuned.artifacts
+    first = _tuned_session(tmp_path, _TunedCamera(_LOOK_TUNING), held,
+                           background=True, state_dir=tmp_path / "state")
+    result = first.capture()
+    held.wait_entered()
+    ((path, payload),) = read_entries(tmp_path / "state")
+    assert payload["record"]["tuning_matches"] is True  # stored at capture time
+    text = path.read_text()
+    held.release()
+    assert first.close_grades(timeout=5)
+    # Put the shot back as a power cut would have left it.
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+
+    again = _tuned_session(tmp_path, _TunedCamera(_OTHER_TUNING), tuned,
+                           background=True, state_dir=tmp_path / "state")
+    assert again.tuning_mismatch is True
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    (recovered,) = _lines(again.out_root)
+    assert recovered["recovered"] is True
+    assert recovered["tuning_matches"] is True
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_a_double_exposure_carries_tuning_matches(tmp_path, background):
+    frames = [synthetic_frame(90, 160), synthetic_frame(90, 160)[:, ::-1].copy()]
+    kwargs = {"background": True, "state_dir": tmp_path / "state"} if background else {}
+    session = _tuned_session(tmp_path, _TunedCamera(_LOOK_TUNING, frames),
+                             _tuned_pipeline(tmp_path), **kwargs)
+    session.set_double_exposure(True)
+    session.capture()
+    session.capture()
+    assert session.close_grades(timeout=5)
+    records = _lines(session.out_root)
+    assert [r["double"]["index"] for r in records] == [1, 2]
+    assert [r["tuning_matches"] for r in records] == [True, True]

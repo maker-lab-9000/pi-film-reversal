@@ -143,6 +143,16 @@ capture record and in the artifact a look was trained against; warn (or refuse,
 owner's choice) when they differ. This turns the known issue "a libcamera update
 could silently retune a deployed trained LUT" into a check.
 
+Built (2026-10-14), not yet run on the Pi. The owner chose warn only. The design is
+[2026-10-14-tuning-identity-design.md](../specs/2026-10-14-tuning-identity-design.md),
+the plan [2026-10-14-tuning-identity.md](2026-10-14-tuning-identity.md). The Pi
+fingerprints its tuning at open (`pifilm/tuning.py`) and records it as `tuning_sha1`;
+a look carries an optional `tuning_sha1`, written by `pifilm-tuning --stamp` or
+`pifilm-train --tuning-sha1`; at start-up a difference is one journal line,
+`tuning_matches: false` in every record and an amber `TUNING` tag on the viewfinder.
+The deployed `imx477-2026-09-v4-dark` look has no fingerprint yet: it is stamped in
+the hardware acceptance (`docs/lcd-viewfinder.md`, section 7).
+
 ### 5. Look experiments (offline, gallery-judged)
 
 No change to defaults until the owner has chosen from a gallery.

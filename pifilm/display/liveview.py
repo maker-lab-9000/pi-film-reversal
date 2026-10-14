@@ -31,7 +31,7 @@ it changes between frames, so the screen is assembled from small tiles:
 - static tiles, cached with ``functools.lru_cache`` and keyed by exactly what
   they show: the strip background, one tile per cell, the shutter and ``+``/``-``
   keys (keyed by which is pressed), and the ``2x`` and battery tags with the
-  count of photographs still developing;
+  count of photographs still developing and the ``TUNING`` warning;
 - dynamic tiles: the lit meter dot and the lux/clip text (cached too, they repeat)
   and the focus gauge (drawn every frame; it is 7 units wide).
 
@@ -101,6 +101,12 @@ DEVELOPING_GAP = 3
 DEVELOPING_PADDING = 3  # each side of the number
 DEVELOPING_MAX = 99
 DEVELOPING_FILL = (0, 0, 0, 190)
+# The camera's libcamera tuning is not the one the look was trained under: amber
+# TUNING on the same dark patch as the count, last in the row. No outline either,
+# since it is a warning and not a key, and the battery tag's padding, since it is a
+# word like the battery's. It is the widest thing the row can end with, which is
+# what sets the right edge of ``_TAGS_BOX``.
+TUNING_LABEL = "TUNING"
 FOCUS_TRACK = (6, 22, 9, 198)
 FOCUS_TICK_X = (4, 11)
 FOCUS_TICK_HEIGHT = 1.5
@@ -129,7 +135,9 @@ SUPERSAMPLE = 2
 _STRIP_BOX = (0, BAR_TOP, WIDTH, HEIGHT)
 _CELL_BOX = (CELL_HIT_X0, BAR_TOP, CELL_HIT_X0 + CELL_PITCH, HEIGHT)  # cell 0
 _CONTROLS_BOX = (256, 8, 318, 188)
-_TAGS_BOX = (0, 0, 112, 22)
+# Wide enough for "AC 100%", a two-digit count and TUNING (they end at 115.5 units
+# at scale 1, 114 at scale 2), and well short of the shutter's hit circle at 253.
+_TAGS_BOX = (0, 0, 124, 22)
 _METER_TEXT_BOX = (192, 209, WIDTH, 221)
 _FOCUS_BOX = (FOCUS_TICK_X[0], FOCUS_TRACK[1], FOCUS_TICK_X[1], FOCUS_TRACK[3])
 
@@ -166,6 +174,7 @@ class LiveState:
     pressed: Action | None = None            # PLUS, MINUS or SHUTTER while lit
     double: tuple[bool, int] | None = None   # (enabled, exposures taken); None hides the 2x toggle
     developing: int = 0                      # photographs still being graded; 0 draws nothing
+    tuning_mismatch: bool = False            # camera tuning differs from the look's; draws TUNING
 
 
 @lru_cache(maxsize=4)
@@ -393,12 +402,14 @@ def _controls_tile(pressed: Action | None, scale: int) -> Image.Image:
 
 @lru_cache(maxsize=32)
 def _tags_tile(double: tuple[bool, int] | None, battery: str | None, scale: int,
-               developing: int = 0) -> Image.Image:
-    """The 2x double-exposure toggle, the battery tag and the developing count, top left.
+               developing: int = 0, tuning: bool = False) -> Image.Image:
+    """The 2x double-exposure toggle, the battery tag, the developing count and the
+    TUNING warning, top left.
 
-    One tile for the three because the count's place depends on the battery text's
-    width. ``developing`` is already limited to ``DEVELOPING_MAX`` by the caller, so
-    the cache holds few of these.
+    One tile for all of them because the count's place depends on the battery text's
+    width, and the warning's on both. ``developing`` is already limited to
+    ``DEVELOPING_MAX`` by the caller, so the cache (keyed by every argument) holds
+    few of these.
     """
     canvas = _Canvas(_TAGS_BOX, scale)
     font = canvas.font(SEMIBOLD, TAG_SIZE)
@@ -435,6 +446,13 @@ def _tags_tile(double: tuple[bool, int] | None, battery: str | None, scale: int,
         canvas.pill(box, TAG_RADIUS, fill=DEVELOPING_FILL)
         canvas.text(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), label, font, AMBER,
                     anchor="mm")
+        left = math.ceil(box[2]) + DEVELOPING_GAP
+    if tuning:
+        box = (left, DOUBLE_BOX[1],
+               left + canvas.text_width(TUNING_LABEL, font) + 2 * TAG_PADDING, DOUBLE_BOX[3])
+        canvas.pill(box, TAG_RADIUS, fill=DEVELOPING_FILL)
+        canvas.text(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), TUNING_LABEL, font,
+                    AMBER, anchor="mm")
     return canvas.finish()
 
 
@@ -511,8 +529,9 @@ def render_live(
     if reading.battery_percent is not None:
         battery = f"{'AC ' if reading.external_power else ''}{reading.battery_percent}%"
     developing = max(0, min(DEVELOPING_MAX, state.developing))
-    if state.double is not None or battery is not None or developing:
-        paste(_tags_tile(state.double, battery, scale, developing), *_TAGS_BOX[:2])
+    tuning = bool(state.tuning_mismatch)
+    if state.double is not None or battery is not None or developing or tuning:
+        paste(_tags_tile(state.double, battery, scale, developing, tuning), *_TAGS_BOX[:2])
     if reading.focus is not None:
         paste(_focus_tile(reading.focus, reading.focus_peak, scale), *_FOCUS_BOX[:2])
     return img

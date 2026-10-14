@@ -52,6 +52,7 @@ from ..highlight import protect_highlights
 from ..imageio import list_images
 from ..lut import LUT3D
 from ..normalize import NormalizeParams
+from ..tuning import sha1_argument
 from .dataset import CorpusTooSmall, PixelPool, SampleConfig, build_corpus
 from .evaluate import check_gates, evaluate
 from .lutfit import enforce_grey_axis, enforce_monotone, fit_lut
@@ -193,6 +194,7 @@ def train(
     source_gamma_min: float | None = None,
     source_gamma_max: float | None = None,
     source_max_stretch: float | None = None,
+    tuning_sha1: str | None = None,
     command: str = "",
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict, list]:
@@ -291,7 +293,8 @@ def train(
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".pifilm-staging-", dir=out_dir.parent))
     try:
-        write_artifact(staging, result.lut, source_normalize, grain or GrainParams(), training)
+        write_artifact(staging, result.lut, source_normalize, grain or GrainParams(), training,
+                       tuning_sha1=tuning_sha1)
         say("writing report")
         write_report(staging / "report", result.lut, metrics, gates, source, target,
                      source_normalize, target_normalize, sample_cfg)
@@ -395,6 +398,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="mark the source as stand-in photos, not U20CAM shots")
     parser.add_argument("--allow-small", action="store_true",
                         help="proceed with a corpus below the recommended minimum")
+    parser.add_argument(
+        "--tuning-sha1", type=sha1_argument, default=None, metavar="HEX",
+        help="fingerprint of the libcamera tuning the source photographs were taken "
+             "under (pifilm-tuning prints it on the Pi); written into the artifact so the "
+             "Pi can warn when its tuning differs. Default: none",
+    )
     return parser
 
 
@@ -445,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
             source_white_balance=args.source_white_balance,
             source_lift_highlight_ref=args.source_lift_highlight_ref,
             source_gamma_min=args.source_gamma_min, source_gamma_max=args.source_gamma_max,
-            source_max_stretch=args.source_max_stretch,
+            source_max_stretch=args.source_max_stretch, tuning_sha1=args.tuning_sha1,
             command=" ".join(["pifilm-train", *(argv or sys.argv[1:])]), progress=print,
         )
     # Deliberately narrow: a ValueError from inside the fit (a diverging LUT, say) is a

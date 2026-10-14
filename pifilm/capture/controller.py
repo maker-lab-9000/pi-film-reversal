@@ -55,6 +55,10 @@ class ControllerSnapshot:
     # session when the snapshot is taken (not when a job finishes): the number
     # falls while no capture is running, and a display has to see it reach zero.
     pending_grades: int = 0
+    # The camera's libcamera tuning differs from the one the look was trained under
+    # (``CaptureSession.tuning_mismatch``), read from the session like the count.
+    # The viewfinder shows an amber TUNING tag while it is True.
+    tuning_mismatch: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,7 @@ class CaptureController:
         # Read outside the lock: the session answers from its grade queue's own
         # lock, and nothing here needs the two numbers to be from one instant.
         pending_grades = self._read_pending_grades()
+        tuning_mismatch = self._read_tuning_mismatch()
         with self._lock:
             active = (
                 self._jobs[self._active_request_id]
@@ -135,6 +140,7 @@ class CaptureController:
                 self._double[0],
                 self._double[1],
                 pending_grades,
+                tuning_mismatch,
             )
 
     def close(self) -> None:
@@ -201,6 +207,17 @@ class CaptureController:
         if isinstance(value, bool) or not isinstance(value, int):
             return 0
         return max(0, value)
+
+    def _read_tuning_mismatch(self) -> bool:
+        """The session's ``tuning_mismatch``; False when it has none to give.
+
+        Read on every frame, like ``_read_pending_grades``: a session without it,
+        one that raises, or anything but ``True`` reads as no warning.
+        """
+        try:
+            return getattr(self._session, "tuning_mismatch", False) is True
+        except Exception:
+            return False
 
     def _read_double(self) -> tuple[bool, int]:
         """The session's (mode, count), or the last value seen if it cannot be read.

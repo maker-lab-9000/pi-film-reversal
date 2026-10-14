@@ -66,6 +66,7 @@ class StreamInfo:
     sensor_mode: str | None = None
     bit_depth: int | None = None
     tuning_file: str | None = None
+    tuning_sha1: str | None = None  # fingerprint of the tuning in use (pifilm.tuning)
     autofocus: str | None = None
 
     def to_dict(self) -> dict:
@@ -82,6 +83,8 @@ class StreamInfo:
             values["bit_depth"] = int(self.bit_depth)
         if self.tuning_file is not None:
             values["tuning_file"] = self.tuning_file
+        if self.tuning_sha1 is not None:
+            values["tuning_sha1"] = self.tuning_sha1
         if self.autofocus is not None:
             values["autofocus"] = self.autofocus
         return values

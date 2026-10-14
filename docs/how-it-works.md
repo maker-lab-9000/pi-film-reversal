@@ -115,7 +115,23 @@ being graded and three waiting).
 
 `--grade inline` restores the earlier order: the full grade is saved before the
 camera is free, there is no queue and no pending entry, and records have none of the
-new fields above. They do have `pipeline_backend`, always `cpu` (see the next section).
+new fields above. They do have `pipeline_backend`, always `cpu` (see
+[Grading on the GPU](#grading-on-the-gpu)).
+
+### The tuning check
+
+A trained look is fitted to frames taken under one libcamera tuning file, and it
+grades as intended only under that tuning. Every record from the Pi camera names
+the tuning (`tuning_file`). From this build on it also carries its fingerprint
+(`tuning_sha1`, the SHA-1 of the file's parsed JSON) when the tuning could be
+fingerprinted. A look can be stamped with the fingerprint it was trained
+under (`tuning_sha1` in `params.json`, written by `pifilm-tuning --stamp` or
+`pifilm-train --tuning-sha1`). At start-up the service compares the two and writes
+one `tuning:` line to the journal. When the check ran, every record says whether
+they agreed (`tuning_matches`), and when they differ the viewfinder shows an amber
+`TUNING` tag. It only warns: photographs are still taken and graded. A grade
+recovered at a later start keeps the values of the run that took the photograph.
+See [known issues](known-issues.md#a-libcamera-update-could-silently-retune-a-deployed-trained-lut).
 
 ### Grading on the GPU
 

@@ -427,3 +427,39 @@ def test_strength_above_one_extrapolates_the_learned_look():
         lut = fit(PixelPool(src, 1), PixelPool(tgt, 1), cfg).lut
         dev[s] = np.abs(lut.table - ident).mean()
     assert dev[1.4] > dev[1.0] * 1.15, dev
+
+
+TUNING_SHA1 = "0123456789abcdef0123456789abcdef01234567"
+
+
+def test_main_writes_tuning_sha1_into_the_artifact(tmp_path):
+    _image_dir(tmp_path / "src", 8, 0)
+    _image_dir(tmp_path / "tgt", 8, 1, transform=lambda im: im**1.3)
+    code = main(["--source", str(tmp_path / "src"), "--target", str(tmp_path / "tgt"),
+                 "--out", str(tmp_path / "o"), "--lut-size", "9", "--iterations", "5",
+                 "--max-side", "64", "--allow-small", "--tuning-sha1", TUNING_SHA1])
+    assert code in (0, 3)
+    assert json.loads((tmp_path / "o" / "params.json").read_text())["tuning_sha1"] == TUNING_SHA1
+    assert Artifacts.load(tmp_path / "o").tuning_sha1 == TUNING_SHA1
+
+
+def test_train_without_tuning_sha1_writes_none(tmp_path):
+    _image_dir(tmp_path / "src", 8, 0)
+    _image_dir(tmp_path / "tgt", 8, 1, transform=lambda im: im**1.3)
+    train(tmp_path / "src", tmp_path / "tgt", tmp_path / "o", FitConfig(lut_size=9, iterations=5),
+          SampleConfig(crop_frac=0.0, max_side=64, pixels_per_image=500, val_fraction=0.25),
+          None, allow_small=True)
+    assert "tuning_sha1" not in json.loads((tmp_path / "o" / "params.json").read_text())
+
+
+@pytest.mark.parametrize("value", [TUNING_SHA1.upper(), TUNING_SHA1[:39], "z" * 40])
+def test_train_cli_rejects_a_bad_tuning_sha1(value, capsys):
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(["--source", "s", "--tuning-sha1", value])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--tuning-sha1" in err and "lowercase hex" in err
+
+
+def test_train_cli_tuning_sha1_defaults_to_none():
+    assert build_parser().parse_args(["--source", "s"]).tuning_sha1 is None
