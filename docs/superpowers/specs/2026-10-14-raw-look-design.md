@@ -1,9 +1,8 @@
-# A look trained on the DNG: design (draft for the owner)
+# A look trained on the DNG: design
 
 Date: 2026-10-14. Asked for by the owner: work from the raw file, which keeps more
 detail in shadows and highlights than the camera's JPEG, with a look retrained for
-it. Status: **draft, awaiting the owner's approval.** The task-by-task
-implementation plan follows once this is agreed.
+it. Status: **concluded 2026-10-14 after phase 2: no visible gain, not pursued.** See [the write-up](../../experiments/2026-10-14-raw-look.md); the Pi no longer saves DNGs.
 
 This reverses an entry in the roadmap's "Considered and not planned" ("Grading from
 the raw stream ... means rebuilding demosaic, lens shading, white balance, colour
