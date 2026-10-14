@@ -236,3 +236,139 @@ def read_dng(data: bytes) -> RawFrame:
             raise RawError(f"AsShotNeutral has {len(values)} values, expected 3")
         neutral = tuple(float(v) for v in values)
     return RawFrame(bayer=bayer, cfa=cfa, black=black, white=white, as_shot_neutral=neutral)
+
+
+_GRID = (12, 16)  # rows, columns of the lens-shading tables
+
+
+@dataclass(frozen=True)
+class RawTuning:
+    """The tables of a libcamera tuning file that the developer uses."""
+
+    black_level: float  # at 16 bits, as in the file
+    ccms: tuple[tuple[float, np.ndarray], ...]  # (ct, 3x3) sorted by ct
+    alsc_cr: tuple[tuple[float, np.ndarray], ...]  # (ct, (12, 16)) sorted by ct
+    alsc_cb: tuple[tuple[float, np.ndarray], ...]
+    luminance: np.ndarray  # (12, 16), luminance_lut with luminance_strength applied
+    gamma_curve: np.ndarray  # (33, 2) in 0..1, x then y
+
+
+def _blocks(tuning: dict) -> dict:
+    """The algorithm blocks by name: version 2 lists them, version 1 has them at the top."""
+    if not isinstance(tuning, dict):
+        raise RawError(f"tuning is a {type(tuning).__name__}, expected a dict")
+    algorithms = tuning.get("algorithms")
+    if algorithms is None:
+        return tuning
+    if not isinstance(algorithms, list):
+        raise RawError("tuning 'algorithms' is not a list")
+    blocks: dict = {}
+    for entry in algorithms:
+        if isinstance(entry, dict):
+            blocks.update(entry)
+    return blocks
+
+
+def _block(blocks: dict, name: str) -> dict:
+    block = blocks.get(name)
+    if not isinstance(block, dict):
+        raise RawError(f"tuning has no {name} block")
+    return block
+
+
+def _floats(values, size: int, what: str) -> np.ndarray:
+    if not isinstance(values, list | tuple):
+        raise RawError(f"{what} is missing or not a list")
+    if len(values) != size:
+        raise RawError(f"{what} has {len(values)} values, expected {size}")
+    try:
+        array = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise RawError(f"{what} holds a value that is not a number") from exc
+    if not np.all(np.isfinite(array)):
+        raise RawError(f"{what} holds a value that is not finite")
+    return array
+
+
+def _frozen(array: np.ndarray) -> np.ndarray:
+    array.setflags(write=False)
+    return array
+
+
+def _calibrations(entries, key: str, size: int, shape: tuple, what: str):
+    """``[{"ct": K, key: [...]}, ...]`` as ((ct, table), ...) sorted by ct."""
+    if not isinstance(entries, list) or not entries:
+        raise RawError(f"{what} has no calibrations")
+    tables = []
+    for entry in entries:
+        if not isinstance(entry, dict) or "ct" not in entry:
+            raise RawError(f"{what} has an entry without a ct")
+        ct = float(_floats([entry["ct"]], 1, f"{what} ct")[0])
+        table = _floats(entry.get(key), size, f"{what} {key} at {ct:g} K")
+        tables.append((ct, _frozen(table.reshape(shape))))
+    tables.sort(key=lambda pair: pair[0])
+    cts = [ct for ct, _ in tables]
+    for a, b in zip(cts, cts[1:], strict=False):
+        if a == b:
+            raise RawError(f"{what} has two calibrations at {a:g} K")
+    return tuple(tables)
+
+
+def tuning_tables(tuning: dict) -> RawTuning:
+    """The developer's tables from a parsed tuning file; RawError when one is missing
+    or malformed."""
+    blocks = _blocks(tuning)
+
+    black = _block(blocks, "rpi.black_level").get("black_level")
+    black_level = float(_floats([black], 1, "rpi.black_level black_level")[0])
+
+    ccms = _calibrations(_block(blocks, "rpi.ccm").get("ccms"), "ccm", 9, (3, 3), "rpi.ccm")
+
+    alsc = _block(blocks, "rpi.alsc")
+    cells = _GRID[0] * _GRID[1]
+    alsc_cr = _calibrations(alsc.get("calibrations_Cr"), "table", cells, _GRID, "rpi.alsc Cr")
+    alsc_cb = _calibrations(alsc.get("calibrations_Cb"), "table", cells, _GRID, "rpi.alsc Cb")
+    lut = _floats(alsc.get("luminance_lut"), cells, "rpi.alsc luminance_lut").reshape(_GRID)
+    strength = float(_floats([alsc.get("luminance_strength", 1.0)], 1, "luminance_strength")[0])
+    # libcamera alsc.cpp: lambda * ((luminanceLut[i] - 1) * luminanceStrength + 1).
+    luminance = 1.0 + (lut - 1.0) * strength
+
+    curve = _block(blocks, "rpi.contrast").get("gamma_curve")
+    if not isinstance(curve, list) or len(curve) < 4 or len(curve) % 2:
+        size = len(curve) if isinstance(curve, list) else "no"
+        raise RawError(f"rpi.contrast gamma_curve has {size} values, expected (x, y) pairs")
+    gamma = _floats(curve, len(curve), "rpi.contrast gamma_curve").reshape(-1, 2) / 65535.0
+    if np.any(np.diff(gamma[:, 0]) <= 0):
+        raise RawError("rpi.contrast gamma_curve x values are not increasing")
+
+    return RawTuning(
+        black_level=black_level,
+        ccms=ccms,
+        alsc_cr=alsc_cr,
+        alsc_cb=alsc_cb,
+        luminance=_frozen(luminance),
+        gamma_curve=_frozen(gamma),
+    )
+
+
+def _interpolate(tables: tuple[tuple[float, np.ndarray], ...], ct: float) -> np.ndarray:
+    """Linear in ct between the two neighbours; the end table outside the range."""
+    if ct <= tables[0][0]:
+        return tables[0][1].copy()
+    if ct >= tables[-1][0]:
+        return tables[-1][1].copy()
+    for (ct0, t0), (ct1, t1) in zip(tables, tables[1:], strict=False):
+        if ct <= ct1:
+            w = (ct - ct0) / (ct1 - ct0)
+            return (1.0 - w) * t0 + w * t1
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def ccm_at(t: RawTuning, ct: float) -> np.ndarray:
+    """The 3 x 3 colour matrix at colour temperature ``ct`` (K), clamped at the ends."""
+    return _interpolate(t.ccms, float(ct))
+
+
+def alsc_at(t: RawTuning, ct: float) -> tuple[np.ndarray, np.ndarray]:
+    """The (cr, cb) lens-shading grids at colour temperature ``ct`` (K), clamped at the ends."""
+    return _interpolate(t.alsc_cr, float(ct)), _interpolate(t.alsc_cb, float(ct))
