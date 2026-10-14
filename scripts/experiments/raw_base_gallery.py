@@ -14,7 +14,8 @@ Two checks come with the pictures:
   tables, same order, without the ISP's adaptive contrast, denoise, sharpening
   and adaptive lens shading. Per channel, the mean absolute and the mean signed
   difference against the JPEG (a cast shows as a signed mean), and the
-  difference in centre-to-corner brightness (a lens-shading error shows there),
+  difference in centre-to-corner brightness and in corner-minus-centre
+  log(R/G) and log(B/G) (a lens-shading error, of brightness or of colour, shows there),
   over all photographs and per Lux bin.
 * Does 8 bits hold what the raw has? For the 6 darkest and the 6 brightest
   scenes by Lux, a 600 x 400 crop of the full-size ``soft-1.5`` development
@@ -106,6 +107,31 @@ def centre_to_corner(rgb_u8: np.ndarray) -> float:
     return float(centre / max(corners, 1e-6))
 
 
+def colour_shading(rgb_u8: np.ndarray) -> tuple[float, float]:
+    """Corner minus centre of log(R/G) and log(B/G), in linear light.
+
+    A colour lens-shading error (a red or blue tint growing towards the
+    corners) shows here, where the brightness ratio above cannot see it.
+    """
+    cv2 = require_cv2()
+    h, w = rgb_u8.shape[:2]
+    small = cv2.resize(rgb_u8, (w // 8, h // 8), interpolation=cv2.INTER_AREA)
+    lin = srgb_to_linear(small.astype(np.float32) / 255)
+    sh, sw = lin.shape[:2]
+    ch, cw = sh // 5, sw // 5
+    kh, kw = sh // 10, sw // 10
+    centre = lin[(sh - ch) // 2 : (sh + ch) // 2, (sw - cw) // 2 : (sw + cw) // 2]
+    corners = [lin[:kh, :kw], lin[:kh, -kw:], lin[-kh:, :kw], lin[-kh:, -kw:]]
+
+    def log_ratios(region: np.ndarray) -> np.ndarray:
+        r, g, b = (max(float(v), 1e-6) for v in region.reshape(-1, 3).mean(axis=0))
+        return np.array([math.log(r / g), math.log(b / g)])
+
+    corner = np.mean([log_ratios(c) for c in corners], axis=0)
+    d = corner - log_ratios(centre)
+    return float(d[0]), float(d[1])
+
+
 def shrink(rgb_u8: np.ndarray, long_edge: int) -> np.ndarray:
     cv2 = require_cv2()
     h, w = rgb_u8.shape[:2]
@@ -156,6 +182,7 @@ def collect(folders: list[Path], held_out: Path | None, photos: Path | None) -> 
                     "gain": md.get("AnalogueGain"),
                     "colour_gains": tuple(md["ColourGains"]),
                     "ct": float(md["ColourTemperature"]),
+                    "digital_gain": float(md.get("DigitalGain", 1.0)),
                     "held_out": is_held_out,
                 }
             )
@@ -181,6 +208,7 @@ def _develop(s: dict, tuning_path: str, tone: str, as_float: bool = False) -> np
         colour_temperature=s["ct"],
         tone=tone,
         as_float=as_float,
+        digital_gain=s["digital_gain"],
     )
 
 
@@ -203,6 +231,12 @@ def develop_shot(s: dict, tuning_path: str, out: Path, long_edge: int) -> dict:
             result["signed"] = diff.reshape(-1, 3).mean(axis=0).tolist()
             result["absolute"] = np.abs(diff).reshape(-1, 3).mean(axis=0).tolist()
             result["shading"] = {"isp": centre_to_corner(rgb), "camera": centre_to_corner(ref)}
+            isp_c, cam_c = colour_shading(rgb), colour_shading(ref)
+            result["colour_shading"] = {
+                "isp": isp_c,
+                "camera": cam_c,
+                "isp_minus_camera": [isp_c[0] - cam_c[0], isp_c[1] - cam_c[1]],
+            }
             result["same_size"] = camera.shape == rgb.shape
             del diff
     return result
@@ -268,11 +302,13 @@ def aggregate(results: list[tuple[dict, dict]]) -> dict:
         signed = np.mean([r["signed"] for _, r in items], axis=0)
         absolute = np.mean([r["absolute"] for _, r in items], axis=0)
         shading = np.mean([r["shading"]["isp"] - r["shading"]["camera"] for _, r in items])
+        colour = np.mean([r["colour_shading"]["isp_minus_camera"] for _, r in items], axis=0)
         return {
             "n": len(items),
             "signed_rgb": [round(float(v), 2) for v in signed],
             "absolute_rgb": [round(float(v), 2) for v in absolute],
             "centre_to_corner_isp_minus_camera": round(float(shading), 3),
+            "colour_shading_isp_minus_camera": [round(float(v), 4) for v in colour],
         }
 
     out = {"all": block(results)}
@@ -340,7 +376,19 @@ def main() -> int:
         pushed = [(s, sh, f.result()) for (s, sh), f in zip(ends, push_futures, strict=True)]
 
     validation = aggregate(results)
-    print(json.dumps(validation, indent=1))
+    print(
+        "isp minus camera: signed R/G/B | absolute R/G/B | brightness shading | log(R/G) log(B/G)"
+    )
+    for k, v in validation.items():
+        print(
+            f"{k:45s} n={v['n']:3d}  "
+            + " ".join(f"{x:+5.1f}" for x in v["signed_rgb"])
+            + " | "
+            + " ".join(f"{x:4.1f}" for x in v["absolute_rgb"])
+            + f" | {v['centre_to_corner_isp_minus_camera']:+.3f} | "
+            + " ".join(f"{x:+.3f}" for x in v["colour_shading_isp_minus_camera"]),
+            flush=True,
+        )
     for s, _shadow, p in pushed:
         print(
             f"push {p['stops']:+.0f}  {s['lux']:8.1f} lux  {s['stem']:28s} green levels "
@@ -404,7 +452,9 @@ def main() -> int:
         f"<tr><td>{html.escape(k)}</td><td>{v['n']}</td>"
         f"<td>{' / '.join(f'{x:+.1f}' for x in v['signed_rgb'])}</td>"
         f"<td>{' / '.join(f'{x:.1f}' for x in v['absolute_rgb'])}</td>"
-        f"<td>{v['centre_to_corner_isp_minus_camera']:+.3f}</td></tr>"
+        f"<td>{v['centre_to_corner_isp_minus_camera']:+.3f}</td>"
+        f"<td>{' / '.join(f'{x:+.3f}' for x in v['colour_shading_isp_minus_camera'])}"
+        "</td></tr>"
         for k, v in validation.items()
     )
     page = f"""<!doctype html><html><head><meta charset="utf-8">
@@ -431,7 +481,8 @@ Under each: the median linear luminance and the share of pixels with a channel a
 picture for the larger file.</p>
 <h2>isp against the camera's JPEG (levels, R / G / B)</h2>
 <table><tr><th>photographs</th><th>n</th><th>signed mean</th><th>mean absolute</th>
-<th>centre to corner, isp minus camera</th></tr>{rows_html}</table>
+<th>centre to corner, isp minus camera</th>
+<th>corner minus centre log(R/G) / log(B/G), isp minus camera</th></tr>{rows_html}</table>
 <h2>Does 8 bits hold what the raw has?</h2>
 <p>The {PUSHED_PER_END} darkest and {PUSHED_PER_END} brightest scenes by Lux: a full-resolution
 {CROP[1]} x {CROP[0]} crop of the <b>{CROP_TONE}</b> development, pushed after development, once
@@ -451,7 +502,18 @@ artefacts.</p>
                 "lux": s["lux"],
                 "held_out": s["held_out"],
                 "colour_temperature": s["ct"],
-                **{k: r[k] for k in ("stats", "signed", "absolute", "shading", "same_size")},
+                **{
+                    k: r[k]
+                    for k in (
+                        "stats",
+                        "signed",
+                        "absolute",
+                        "shading",
+                        "colour_shading",
+                        "same_size",
+                    )
+                },
+                "digital_gain": s["digital_gain"],
             }
             for s, r in results
         ],
