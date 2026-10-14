@@ -18,6 +18,7 @@ from pifilm.grain import GrainParams
 from pifilm.lut import LUT3D
 from pifilm.normalize import NormalizeParams
 from pifilm.pipeline import Pipeline
+from pifilm.tuning import fingerprint
 
 NATIVE_SIZE = (4608, 2592)
 RAW_FORMAT = "SBGGR10_CSI2P"
@@ -180,6 +181,9 @@ def install_picamera(monkeypatch):
         with_analogue_gain_mode=False,
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
+        # The automatic tuning branch reads this variable; a developer's own
+        # environment must not decide what these tests fingerprint.
+        monkeypatch.delenv("LIBCAMERA_RPI_TUNING_FILE", raising=False)
 
         class FakePicamera2:
             @staticmethod
@@ -372,6 +376,7 @@ def test_constructor_uses_explicit_native_still_configuration(install_picamera):
         "sensor_mode": "4608x2592 SBGGR10_CSI2P",
         "bit_depth": 10,
         "tuning_file": "delivered-lens.json",
+        "tuning_sha1": fingerprint({"loaded-from": "delivered-lens.json"}),
         "autofocus": "continuous",
     }
     camera.close()
@@ -380,9 +385,62 @@ def test_constructor_uses_explicit_native_still_configuration(install_picamera):
 def test_default_tuning_is_libcameras_automatic_choice(install_picamera):
     state = install_picamera(model="imx477")
     camera = Picamera2Camera()
-    assert state.loaded_tuning == []
+    # The camera is still opened without a tuning, so libcamera chooses; the
+    # sensor's default file is loaded only to fingerprint it.
     assert state.instance.tuning is None
+    assert state.loaded_tuning == ["imx477.json"]
     assert camera.stream_info.tuning_file == "auto:imx477"
+    camera.close()
+
+
+def test_explicit_tuning_fingerprints_the_dict_the_camera_opened_with(install_picamera):
+    state = install_picamera(model="imx477")
+    camera = Picamera2Camera("imx477.json")
+    assert state.loaded_tuning == ["imx477.json"]  # loaded once, not re-read
+    expected = fingerprint(state.instance.tuning)
+    assert camera.stream_info.to_dict()["tuning_sha1"] == expected
+    assert camera.stream_info.tuning_sha1 == expected
+    assert camera.tuning.sha1 == expected
+    assert camera.tuning.label == "imx477.json"
+    camera.close()
+
+
+def test_automatic_tuning_is_fingerprinted_from_the_sensor_default(install_picamera):
+    install_picamera(model="imx477")
+    camera = Picamera2Camera()
+    expected = fingerprint({"loaded-from": "imx477.json"})
+    assert camera.stream_info.to_dict()["tuning_sha1"] == expected
+    assert camera.tuning.label == "auto:imx477"
+    camera.close()
+
+
+def test_automatic_tuning_that_cannot_load_still_opens_the_camera(install_picamera, capsys):
+    state = install_picamera(model="imx477", tuning_error=OSError("no such file"))
+    camera = Picamera2Camera()
+    assert state.instance.start_count == 1
+    assert "tuning_sha1" not in camera.stream_info.to_dict()
+    assert camera.tuning.sha1 is None
+    err = capsys.readouterr().err
+    assert "tuning: cannot fingerprint the tuning in use (" in err
+    assert "no such file" in err
+    camera.close()
+
+
+def test_unexpected_resolve_failure_does_not_stop_the_camera(
+    install_picamera, monkeypatch, capsys,
+):
+    import pifilm.capture.picamera as picamera_module
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("resolver exploded")
+
+    monkeypatch.setattr(picamera_module, "resolve_tuning", broken)
+    state = install_picamera(model="imx477")
+    camera = Picamera2Camera()
+    assert state.instance.start_count == 1
+    assert "tuning_sha1" not in camera.stream_info.to_dict()
+    assert camera.tuning.sha1 is None
+    assert "tuning: cannot fingerprint the tuning in use (" in capsys.readouterr().err
     camera.close()
 
 

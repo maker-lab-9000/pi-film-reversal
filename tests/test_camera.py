@@ -432,3 +432,19 @@ def test_fake_camera_records_the_shutter():
     assert camera.shutter_us == 4000
     camera.set_shutter(None)
     assert camera.shutter_us is None
+
+
+def test_stream_info_to_dict_puts_tuning_sha1_right_after_tuning_file():
+    info = StreamInfo(
+        width=4056, height=3040, fps=10.0, fourcc="RGB888", raw_mjpeg=False,
+        tuning_file="imx477.json", tuning_sha1="a" * 40, autofocus="none",
+    )
+    values = info.to_dict()
+    keys = list(values)
+    assert keys.index("tuning_sha1") == keys.index("tuning_file") + 1
+    assert values["tuning_sha1"] == "a" * 40
+
+
+def test_stream_info_to_dict_omits_tuning_sha1_when_unknown():
+    info = StreamInfo(width=1, height=1, fps=1.0, fourcc="MJPG", raw_mjpeg=True)
+    assert "tuning_sha1" not in info.to_dict()
