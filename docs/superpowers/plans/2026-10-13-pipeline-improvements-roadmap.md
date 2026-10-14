@@ -169,6 +169,8 @@ No change to defaults until the owner has chosen from a gallery.
   scene-dependent, which one global LUT cannot follow. Experiment: capture pairs
   with it on and off, grade both, compare. It changes what the LUT is fed, so a
   retrain may follow.
+  Done 2026-10-14, no change: it moves the IMX477's pictures by 1 to 4 levels
+  ([write-up](../../experiments/2026-10-14-adaptive-contrast.md)).
 
 ### 6. Background grading
 
