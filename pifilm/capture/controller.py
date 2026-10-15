@@ -63,6 +63,10 @@ class ControllerSnapshot:
     # with photos first (``CaptureSession.disk_warning``), read like the count.
     # The viewfinder shows an amber tag for each; empty when none is low.
     disk_warning: tuple[tuple[str, int], ...] = ()
+    # The Pi's IPv4 addresses as ``(label, address)``, ETH before WLAN
+    # (``CaptureSession.network``), read like the count. The viewfinder shows them
+    # at the bottom left of the picture; empty when neither interface has one.
+    network: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,7 @@ class CaptureController:
         pending_grades = self._read_pending_grades()
         tuning_mismatch = self._read_tuning_mismatch()
         disk_warning = self._read_disk_warning()
+        network = self._read_network()
         with self._lock:
             active = (
                 self._jobs[self._active_request_id]
@@ -147,6 +152,7 @@ class CaptureController:
                 pending_grades,
                 tuning_mismatch,
                 disk_warning,
+                network,
             )
 
     def close(self) -> None:
@@ -240,6 +246,24 @@ class CaptureController:
         for item in value:
             if not (isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
                     and isinstance(item[1], int) and not isinstance(item[1], bool)):
+                return ()
+        return value
+
+    def _read_network(self) -> tuple[tuple[str, str], ...]:
+        """The session's ``network``; empty when it has none to give.
+
+        Read on every frame, like ``_read_disk_warning``: a session without it, one
+        that raises, or anything but a tuple of ``(str, str)`` pairs reads as none.
+        """
+        try:
+            value = getattr(self._session, "network", ())
+        except Exception:
+            return ()
+        if not isinstance(value, tuple):
+            return ()
+        for item in value:
+            if not (isinstance(item, tuple) and len(item) == 2
+                    and all(isinstance(part, str) for part in item)):
                 return ()
         return value
 

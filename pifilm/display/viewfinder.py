@@ -1117,6 +1117,8 @@ class ViewfinderLoop:
                 tuning_mismatch=getattr(snap, "tuning_mismatch", False) is True,
                 # Changes at most once a minute; read like the count all the same.
                 disk_warning=getattr(snap, "disk_warning", ()),
+                # Changes only with a cable or a network; read like the count all the same.
+                network=getattr(snap, "network", ()),
             ),
             scale=self._scale,
         ))

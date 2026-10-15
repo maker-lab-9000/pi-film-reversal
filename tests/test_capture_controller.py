@@ -478,10 +478,10 @@ def test_a_session_without_disk_warning_reports_none():
         controller.close()
 
 
-def test_disk_warning_is_the_last_snapshot_field_and_defaults_to_empty():
+def test_disk_warning_comes_before_network_and_defaults_to_empty():
     from dataclasses import fields
 
-    assert [f.name for f in fields(ControllerSnapshot)][-1] == "disk_warning"
+    assert [f.name for f in fields(ControllerSnapshot)][-2] == "disk_warning"
     assert ControllerSnapshot(None, None, False).disk_warning == ()
 
 
@@ -509,5 +509,60 @@ def test_a_raising_disk_warning_reports_none():
     controller = CaptureController(Raising())
     try:
         assert controller.snapshot().disk_warning == ()
+    finally:
+        controller.close()
+
+
+def test_snapshot_carries_the_sessions_network_addresses():
+    session = GradingSession()
+    session.network = (("ETH", "192.168.1.20"), ("WLAN", "10.42.0.1"))
+    controller = CaptureController(session)
+    try:
+        assert controller.snapshot().network == (("ETH", "192.168.1.20"), ("WLAN", "10.42.0.1"))
+        session.network = ()
+        assert controller.snapshot().network == ()
+    finally:
+        controller.close()
+
+
+def test_a_session_without_network_reports_none():
+    controller = CaptureController(_Session())
+    try:
+        assert controller.snapshot().network == ()
+    finally:
+        controller.close()
+
+
+def test_network_is_the_last_snapshot_field_and_defaults_to_empty():
+    from dataclasses import fields
+
+    assert [f.name for f in fields(ControllerSnapshot)][-1] == "network"
+    assert ControllerSnapshot(None, None, False).network == ()
+
+
+@pytest.mark.parametrize("value", [
+    None, "ETH 192.168.1.20", [("ETH", "192.168.1.20")], (("ETH", 7),),
+    (("ETH",),), ((7, "192.168.1.20"),), (("ETH", "192.168.1.20", 1),),
+])
+def test_unusable_network_reports_none(value):
+    """Read on every frame like the developing count; anything odd reads as none."""
+    session = GradingSession()
+    session.network = value
+    controller = CaptureController(session)
+    try:
+        assert controller.snapshot().network == ()
+    finally:
+        controller.close()
+
+
+def test_a_raising_network_reports_none():
+    class Raising(GradingSession):
+        @property
+        def network(self):
+            raise RuntimeError("no session state")
+
+    controller = CaptureController(Raising())
+    try:
+        assert controller.snapshot().network == ()
     finally:
         controller.close()

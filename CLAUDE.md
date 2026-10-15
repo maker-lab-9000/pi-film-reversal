@@ -208,7 +208,11 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   `disk.py`'s `DiskMonitor` (a `pifilm-disk` thread, every 60 s, started for every loop beside
   the UPS poller) checks df's Use% of the photo folder and `/` against `--disk-warn-percent`
   (default 90), logs `disk:` lines on each crossing and feeds `CaptureSession.disk_warning`
-  (`(label, percent)` pairs, `PHOTOS` then `SD`; warn only).
+  (`(label, percent)` pairs, `PHOTOS` then `SD`; warn only). `network.py`'s `NetworkMonitor`
+  (a `pifilm-network` thread, every 10 s, started beside the disk monitor) reads the IPv4
+  address of `eth0` and `wlan0` while sysfs reports them up (`SIOCGIFADDR` ioctl; the hotspot's
+  address counts), logs `network:` lines on each change and feeds `CaptureSession.network`
+  (`(label, address)` pairs, `ETH` then `WLAN`).
 - Double exposure: `CaptureSession` owns the mode and pending first frame; `pifilm/double.py`
   adds the two ungraded frames in linear light (one stop down each), and the composite is
   graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card in a temp dir
@@ -261,7 +265,9 @@ top right, meter dots, `2x`, battery, the developing count (an amber number righ
 battery tag: `LiveState.developing`, from the snapshot's `pending_grades` at every frame,
 absent at zero), an amber `TUNING` tag last in that row (`LiveState.tuning_mismatch`, from the
 snapshot's `tuning_mismatch`), amber `PHOTOS NN%`/`SD NN%` tags in their own tile between that
-row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning`) and focus gauge, from cached anti-aliased tiles in the
+row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning`), white
+`ETH`/`WLAN` address tags in their own tile at the bottom left of the picture above the strip
+(`LiveState.network`, from the snapshot's `network`; drawn only, not hit-tested) and focus gauge, from cached anti-aliased tiles in the
 bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
 holds only the review, processing and message screens. Both work in 320×240 base units at an
 integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine
