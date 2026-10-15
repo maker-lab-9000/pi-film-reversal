@@ -3767,3 +3767,47 @@ def test_disk_warn_percent_outside_1_to_100_is_refused(tmp_path, monkeypatch, ca
         _disk_main(monkeypatch, tmp_path, "--disk-warn-percent", value)
     assert exc.value.code == 2
     assert "--disk-warn-percent" in capsys.readouterr().err
+
+
+# The network addresses (pifilm.capture.network): the session holds them, main runs it.
+
+
+def test_a_session_without_a_network_monitor_has_no_addresses(tmp_path, pipeline):
+    assert _session(tmp_path, pipeline).network == ()
+
+
+def test_the_sessions_network_monitor_logs_through_it(tmp_path, pipeline):
+    session = _tuned_session(tmp_path, FakeCamera([synthetic_frame(90, 160)]), pipeline)
+    monitor = session.watch_network(read=lambda: (("WLAN", "10.42.0.1"),))
+    assert session.network == ()  # nothing read until it runs
+    monitor.poll_once()
+    assert session.network == (("WLAN", "10.42.0.1"),)
+    assert session.test_log[-1] == "network: wlan0 10.42.0.1"
+    monitor.close()
+
+
+def test_main_runs_the_network_monitor_and_stops_it(tmp_path, monkeypatch):
+    from pifilm.capture import app
+
+    made = []
+
+    class FakeNetwork:
+        def __init__(self):
+            self.started = self.closed = False
+
+        def start(self):
+            self.started = True
+
+        def close(self):
+            self.closed = True
+
+    def watch_network(self):
+        made.append(FakeNetwork())
+        return made[-1]
+
+    monkeypatch.setattr(app.CaptureSession, "watch_network", watch_network)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    code = app.main(["--fake", "--no-preview", "--out", str(tmp_path)])
+    assert code == 2  # no terminal; the clean-up still runs
+    (network,) = made
+    assert network.started and network.closed

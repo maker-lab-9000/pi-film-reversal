@@ -173,6 +173,13 @@ the UPS poller: the viewfinder shows its warning, and its log lines (through the
 session's log, like ``tuning:``) are as useful headless. ``disk_warning`` is what
 the controller's snapshot carries to the viewfinder. Warn only: a shot is never
 refused for space.
+
+The network addresses
+---------------------
+Beside it ``main`` has the session make a ``NetworkMonitor``
+(``pifilm.capture.network``) for every loop, for the same reasons: the viewfinder
+shows the Pi's ``eth0`` and ``wlan0`` addresses, and the ``network:`` lines say in
+the journal which address it had when. ``network`` is what the snapshot carries.
 """
 
 from __future__ import annotations
@@ -232,6 +239,7 @@ from .gradequeue import (
     report_failure,
     write_entry,
 )
+from .network import Addresses, NetworkMonitor
 from .picamera import COLOUR_TEMPERATURE_RANGE_K, Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
 from .remote import RemoteCaptureServer
@@ -451,6 +459,9 @@ class CaptureSession:
         # The disk-space check (see "The disk-space warning" in the module
         # docstring); None until ``watch_disk`` makes one.
         self._disk: DiskMonitor | None = None
+        # The network addresses (see "The network addresses"); None until
+        # ``watch_network`` makes a monitor.
+        self._network: NetworkMonitor | None = None
         self._now = now or datetime.now
         self._seed_rng = seed_rng or np.random.default_rng()
         self._package_version = package_version
@@ -836,6 +847,22 @@ class CaptureSession:
         """``(label, percent)`` for each filesystem at or above the threshold, photos
         first; empty when none is, or when nothing watches the disk. Never touches it."""
         return self._disk.warning if self._disk is not None else ()
+
+    def watch_network(self, **kwargs) -> NetworkMonitor:
+        """A monitor of the eth0 and wlan0 addresses, logging through the session.
+
+        Not started: the caller starts and closes it, as ``main`` does the disk monitor.
+        ``kwargs`` go to ``NetworkMonitor`` (tests pass a fake ``read``).
+        """
+        self._network = NetworkMonitor(log=self._say, **kwargs)
+        return self._network
+
+    @property
+    def network(self) -> Addresses:
+        """``(label, address)`` for each of eth0 and wlan0 that is up with an IPv4
+        address, ETH first; empty when neither is, or when nothing watches. Never
+        touches the network."""
+        return self._network.addresses if self._network is not None else ()
 
     @property
     def pending_grades(self) -> int:
@@ -1904,6 +1931,7 @@ def _main(argv: list[str] | None) -> int:
     remote: RemoteCaptureServer | None = None
     button: ShutterButton | None = None
     disk: DiskMonitor | None = None
+    network: NetworkMonitor | None = None
     if display_pair is not None:
         controller = CaptureController(session)
     try:
@@ -1916,6 +1944,10 @@ def _main(argv: list[str] | None) -> int:
         if callable(watch_disk):
             disk = watch_disk(args.disk_warn_percent)
             disk.start()
+        watch_network = getattr(session, "watch_network", None)
+        if callable(watch_network):
+            network = watch_network()
+            network.start()
         if args.shutter_gpio is not None:
             try:
                 button = open_shutter_button(args.shutter_gpio)
@@ -2023,6 +2055,8 @@ def _main(argv: list[str] | None) -> int:
             power.close()
         if disk is not None:
             disk.close()
+        if network is not None:
+            network.close()
         if remote is not None:
             remote.close()
         if controller is not None:
