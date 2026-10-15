@@ -1,5 +1,6 @@
 import dataclasses
 import importlib
+import json
 import sys
 import threading
 import time
@@ -13,6 +14,7 @@ from pifilm.capture.app import CaptureSession
 from pifilm.capture.camera import FakeCamera, synthetic_frame
 from pifilm.capture.controller import CaptureController
 from pifilm.capture.errors import CameraError, CameraStalled
+from pifilm.capture.settings import Settings, SettingsControl
 from pifilm.display import DisplayError, viewfinder
 from pifilm.display.cst3530 import TouchPoint
 from pifilm.display.liveview import (
@@ -20,12 +22,14 @@ from pifilm.display.liveview import (
     CELL_HIT_X0,
     CELL_PITCH,
     DOUBLE_BOX,
+    MENU_CENTRE,
     MINUS_CENTRE,
     PLUS_CENTRE,
     SHUTTER_CENTRE,
     Action,
     Cell,
 )
+from pifilm.display.menu import ROW_HEIGHT, ROW_X0, ROW_Y0
 from pifilm.display.viewfinder import (
     CAMERA_STALL_LIMIT,
     ISO_CELL,
@@ -3142,3 +3146,357 @@ def test_live_view_draws_no_disk_tag_for_a_controller_that_reports_none(
     loop, touch, display, clock = _loop(camera, Old())
     loop.step()
     assert states[-1].disk_warning == ()
+
+
+# -- the settings menu ----------------------------------------------------------
+
+ALL_ROWS = ("save_dng", "ae_constraint", "ae_metering")
+UNIT = Settings(save_dng=True, ae_constraint="normal", ae_metering="centre")
+
+
+def _spy_menu(monkeypatch):
+    """Record the rows of every menu page drawn, still drawing it."""
+    pages = []
+    real = viewfinder.render_menu
+
+    def spy(rows, **kwargs):
+        pages.append((tuple(rows), kwargs))
+        return real(rows, **kwargs)
+
+    monkeypatch.setattr(viewfinder, "render_menu", spy)
+    return pages
+
+
+def _settings(tmp_path, applied=None, overrides=None, log=None):
+    control = SettingsControl(tmp_path / "state" / "settings.json", UNIT, overrides or {},
+                              log=log or (lambda *a: None))
+    if applied is not None:
+        for key in ALL_ROWS:
+            control.register(key, lambda value, key=key: applied.append((key, value)))
+    return control
+
+
+class FakeUpload:
+    def __init__(self, text="READY"):
+        self.text, self.starts = text, 0
+
+    def start(self):
+        self.starts += 1
+        return True
+
+    def status(self):
+        return self.text
+
+
+def _row_xy(index):
+    return (ROW_X0 + 40, ROW_Y0 + index * ROW_HEIGHT + ROW_HEIGHT // 2)
+
+
+def _values_by_key(page):
+    return {row.key: row.value for row in page[0]}
+
+
+def _open_menu(loop, touch, clock):
+    loop.step()
+    _tap(loop, touch, clock, MENU_CENTRE)
+    assert loop.state == "MENU"
+
+
+def _menu_loop(camera, ctl, tmp_path, **kw):
+    kw.setdefault("settings", _settings(tmp_path))
+    kw.setdefault("menu_rows", ALL_ROWS)
+    return _loop(camera, ctl, **kw)
+
+
+def test_menu_key_opens_the_menu_and_done_returns_to_live(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+    _open_menu(loop, touch, clock)
+    assert pages and display.images[-1] is viewfinder.render_menu(
+        pages[-1][0], scale=1, done_pressed=False)
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    assert loop.state == "LIVE"
+    loop.step()
+    assert display.images[-1].size == (320, 240)
+
+
+def test_the_menu_is_only_redrawn_when_its_rows_change(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    upload = FakeUpload("READY")
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, upload=upload)
+    _open_menu(loop, touch, clock)
+    before = len(display.images)
+    for _ in range(3):
+        clock.t += 0.1
+        loop.step()
+    assert len(display.images) == before
+    upload.text = "UPLOADING 0:01"
+    loop.step()
+    assert len(display.images) == before + 1
+    assert _values_by_key(pages[-1])["upload"] == "UPLOADING 0:01"
+
+
+def test_a_shot_finished_in_the_menu_never_opens_review(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    calls = _record_renderers(monkeypatch)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+    _open_menu(loop, touch, clock)
+    ctl.submit("from-the-gpio-button")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    loop.step()
+    assert loop.state == "MENU"
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    loop.step()
+    assert loop.state == "LIVE"
+    assert calls["review"] == [] and calls["message"] == []
+
+
+def test_an_active_job_in_the_menu_shows_no_colour_bars(tmp_path, monkeypatch):
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        bars = _spy_processing(monkeypatch)
+        loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+        _open_menu(loop, touch, clock)
+        ctl.submit("from-the-stick")
+        _until(lambda: session.started.is_set())
+        for _ in range(3):
+            loop.step()
+        assert bars["n"] == 0
+        assert loop.state == "MENU"
+    finally:
+        session.release.set()
+        ctl.close()
+
+
+def test_the_menu_key_does_nothing_while_a_job_runs(tmp_path):
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+        ctl.submit("slow")
+        _until(lambda: session.started.is_set())
+        _tap(loop, touch, clock, MENU_CENTRE)
+        assert loop.state == "LIVE"
+    finally:
+        session.release.set()
+        ctl.close()
+
+
+@pytest.mark.parametrize("index, key, values", [
+    (0, "save_dng", [False, True]),
+    (1, "ae_constraint", ["highlight", "shadows", "normal"]),
+    (2, "ae_metering", ["spot", "matrix", "centre"]),
+])
+def test_a_setting_row_steps_to_its_next_value_and_is_saved(
+        controller, tmp_path, monkeypatch, index, key, values):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    applied = []
+    control = _settings(tmp_path, applied)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control)
+    _open_menu(loop, touch, clock)
+    for value in values:
+        _tap(loop, touch, clock, _row_xy(index))
+        assert applied[-1] == (key, value)
+        assert getattr(control.current, key) == value
+    assert [v for k, v in applied] == values
+    assert _values_by_key(pages[-1])[key] == {True: "ON", False: "OFF"}.get(
+        values[-1], str(values[-1]).upper())
+    # The first value differs from the unit's flag, so it was written to the file.
+    _tap(loop, touch, clock, _row_xy(index))
+    saved = json.loads((tmp_path / "state" / "settings.json").read_text())
+    assert saved[key] == values[0]
+
+
+def test_a_refused_setting_keeps_its_value(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    control = _settings(tmp_path)
+
+    def refuse(value):
+        raise RuntimeError("camera said no")
+
+    control.register("ae_metering", refuse)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control)
+    _open_menu(loop, touch, clock)
+    _tap(loop, touch, clock, _row_xy(2))
+    loop.step()
+    assert control.current.ae_metering == "centre"
+    assert _values_by_key(pages[-1])["ae_metering"] == "CENTRE"
+
+
+def test_the_upload_row_starts_an_upload_and_shows_its_status(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    upload = FakeUpload("LAST 12:04 OK")
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, upload=upload)
+    _open_menu(loop, touch, clock)
+    rows = pages[-1][0]
+    assert [row.key for row in rows] == [
+        "save_dng", "ae_constraint", "ae_metering", "upload", "eth", "wlan", "look", "reset"]
+    assert [row.label for row in rows] == [
+        "SAVE DNG", "AE CONSTRAINT", "AE METERING", "UPLOAD", "ETH", "WLAN", "LOOK", "RESET"]
+    assert _values_by_key(pages[-1])["upload"] == "LAST 12:04 OK"
+    _tap(loop, touch, clock, _row_xy(3))
+    assert upload.starts == 1
+
+
+def test_reset_needs_a_second_tap_within_three_seconds(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    control = _settings(tmp_path, overrides={"ae_metering": "spot"})
+    resets = []
+    real_reset = control.reset
+    monkeypatch.setattr(control, "reset", lambda: (resets.append(1), real_reset()))
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control)
+    _open_menu(loop, touch, clock)
+    reset = len(pages[-1][0]) - 1
+    assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
+    _tap(loop, touch, clock, _row_xy(reset))
+    assert _values_by_key(pages[-1])["reset"] == "TAP AGAIN"
+    # Too late: the arming has run out, so this tap only arms it again.
+    clock.t += 3.1
+    loop.step()
+    assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
+    _tap(loop, touch, clock, _row_xy(reset))
+    assert resets == []
+    assert _values_by_key(pages[-1])["reset"] == "TAP AGAIN"
+    clock.t += 1.0
+    _tap(loop, touch, clock, _row_xy(reset))
+    assert resets == [1]
+    assert control.current == UNIT
+    assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
+
+
+def test_leaving_the_menu_disarms_the_reset(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+    _open_menu(loop, touch, clock)
+    _tap(loop, touch, clock, _row_xy(len(pages[-1][0]) - 1))
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    _open_menu(loop, touch, clock)
+    assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
+
+
+def test_rows_are_left_out_when_their_part_is_missing(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path))
+    _open_menu(loop, touch, clock)
+    assert [row.key for row in pages[-1][0]] == ["eth", "wlan", "look", "reset"]
+    loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path),
+                                        menu_rows=("ae_metering",))
+    _open_menu(loop, touch, clock)
+    assert [row.key for row in pages[-1][0]] == ["ae_metering", "eth", "wlan", "look", "reset"]
+    loop, touch, display, clock = _loop(camera, ctl, menu_rows=ALL_ROWS, upload=FakeUpload())
+    _open_menu(loop, touch, clock)
+    assert [row.key for row in pages[-1][0]] == ["upload", "eth", "wlan", "look"]
+
+
+class _NetworkController:
+    def __init__(self, ctl, network):
+        self._ctl, self.network = ctl, network
+
+    def __getattr__(self, name):
+        return getattr(self._ctl, name)
+
+    def snapshot(self):
+        return dataclasses.replace(self._ctl.snapshot(), network=self.network)
+
+
+def test_the_network_and_look_rows_are_read_only(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    net = _NetworkController(ctl, (("ETH", "192.168.1.20"),))
+    loop, touch, display, clock = _menu_loop(camera, net, tmp_path, look="imx477-v4")
+    _open_menu(loop, touch, clock)
+    values = _values_by_key(pages[-1])
+    assert values["eth"] == "192.168.1.20" and values["wlan"] == "-"
+    assert values["look"] == "imx477-v4"
+    assert not any(row.active for row in pages[-1][0]
+                   if row.key in ("eth", "wlan", "look"))
+    net.network = (("ETH", "192.168.1.20"), ("WLAN", "10.42.0.1"))
+    loop.step()
+    assert _values_by_key(pages[-1])["wlan"] == "10.42.0.1"
+    drawn = len(pages)
+    _tap(loop, touch, clock, _row_xy(3))  # ETH: nothing happens
+    assert loop.state == "MENU" and len(pages) == drawn
+
+
+def test_the_look_row_names_the_bundled_starter(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+    _open_menu(loop, touch, clock)
+    assert _values_by_key(pages[-1])["look"] == "starter (bundled)"
+
+
+def test_no_frames_are_read_in_the_menu(controller, tmp_path):
+    camera, ctl = controller
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+    _open_menu(loop, touch, clock)
+    reads = _count_reads(camera)
+    for _ in range(5):
+        clock.t += 0.1
+        loop.step()
+    assert reads["n"] == 0
+
+
+def test_the_frame_thread_is_not_asked_for_frames_in_the_menu(controller, tmp_path):
+    camera, ctl = controller
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+    want = threading.Event()
+    loop._want_frames = want
+    loop.step()
+    assert want.is_set()
+    _tap(loop, touch, clock, MENU_CENTRE)
+    loop.step()
+    assert loop.state == "MENU" and not want.is_set()
+
+
+def test_a_dark_screen_in_the_menu_draws_nothing_and_redraws_on_wake(controller, tmp_path):
+    camera, ctl = controller
+    loop, touch, display, clock = _idle_loop(camera, ctl, settings=_settings(tmp_path),
+                                             menu_rows=ALL_ROWS)
+    _open_menu(loop, touch, clock)
+    clock.t = 400.0
+    loop.step()
+    assert display.levels[-1] == 0
+    before = len(display.images)
+    for _ in range(5):
+        clock.t += 0.1
+        loop.step()
+    assert len(display.images) == before
+    # The tap that wakes it changes nothing, but the page comes back.
+    _tap(loop, touch, clock, _row_xy(0))
+    assert loop._settings.current.save_dng is True
+    assert loop.state == "MENU"
+    assert len(display.images) == before + 1
+
+
+def test_a_menu_page_the_display_refused_is_pushed_again(controller, tmp_path):
+    camera, ctl = controller
+
+    class FailsOnce(FakeDisplay):
+        fail_next = False
+
+        def show(self, image):
+            if self.fail_next:
+                self.fail_next = False
+                raise DisplayError("spi")
+            super().show(image)
+
+    display = FailsOnce()
+    loop, touch, _, clock = _menu_loop(camera, ctl, tmp_path, display=display)
+    loop.step()
+    touch.tap(*MENU_CENTRE)
+    loop.step()
+    display.fail_next = True
+    clock.t += 0.1
+    loop.step()  # up -> MENU, the page is refused
+    assert loop.state == "MENU"
+    before = len(display.images)
+    loop.step()
+    assert len(display.images) == before + 1
