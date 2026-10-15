@@ -14,8 +14,9 @@ WorkingDirectory=/home/george/repos/pi-film-reversal
 Environment=PYTHONUNBUFFERED=1
 # Reads NEXTCLOUD_* from the project .env (gitignored, mode 600). The script is
 # a quiet no-op unless the Pi is on the home network (eth0 then wlan0 has a
-# routable IPv4) and Nextcloud answers a TCP connect, so the timer can fire it on any boot. rclone copy only ever adds or
-# updates; it never deletes a remote file. The password is obscured and passed
+# routable IPv4) and Nextcloud answers a TCP connect, so the timer can fire it
+# on any boot. rclone copy only ever adds or updates; it never deletes a remote
+# file. The password is obscured and passed
 # to rclone via RCLONE_CONFIG_* env vars, never on the command line.
 ExecStart=/home/george/repos/pi-film-reversal/.venv/bin/python /home/george/repos/pi-film-reversal/scripts/nextcloud_sync.py --apply --env /home/george/repos/pi-film-reversal/.env
 

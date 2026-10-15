@@ -392,8 +392,8 @@ ten files.
 
 To keep an off-device archive of every capture, push `~/Pictures/pifilm` to a
 Nextcloud folder over WebDAV. It runs from the Pi only when it is on the home
-network (wired or Wi-Fi), copies (never deletes) so an SD-card cleanup cannot erase the archive, and
-keeps the Nextcloud password out of every command line. Fill the `NEXTCLOUD_*`
+network (wired or Wi-Fi), copies (never deletes) so an SD-card cleanup cannot
+erase the archive, and keeps the Nextcloud password out of every command line. Fill the `NEXTCLOUD_*`
 keys in `.env`, `sudo apt install rclone`, and enable the timer. Full steps,
 including the app-password setup and how to test with a dry run, are in
 [docs/nextcloud-sync.md](nextcloud-sync.md).
