@@ -68,6 +68,13 @@ findmnt ~/Pictures/pifilm
 df -h ~/Pictures/pifilm /
 ```
 
+You do not have to remember to look: `pifilm-capture` checks this volume and `/`
+once a minute, and the LCD viewfinder shows an amber `PHOTOS 92%` or `SD 91%` tag
+while either is 90 % full or more (`--disk-warn-percent N` changes the threshold).
+The journal says `disk: photos 92% full (2.4 GB free)` when it happens. Photographs
+are still taken. See
+[Disk-space warning](lcd-viewfinder.md#disk-space-warning).
+
 To grow it later, with capture and sync stopped:
 
 ```sh
