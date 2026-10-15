@@ -233,23 +233,37 @@ class _Canvas:
     def font(self, name: str, size: float) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         return _font(name, _half_up(size * self._k))
 
+    def _pixels(self, box: tuple[float, float, float, float]) -> tuple[int, int, int, int] | None:
+        """``_box``, or None when the box covers no whole pixel.
+
+        A box thinner than half a pixel rounds both edges to the same row or
+        column, and the inclusive far corner then lies before the near one, which
+        Pillow refuses with a ValueError. Seen on the Pi on 2026-10-15: a sharpness
+        score just above zero gave the focus gauge such a fill, and the error ended
+        the service. Such a box has nothing to draw.
+        """
+        px = self._box(box)
+        return px if px[2] >= px[0] and px[3] >= px[1] else None
+
     def rect(self, box: tuple[float, float, float, float], fill: tuple[int, ...]) -> None:
-        self._draw.rectangle(self._box(box), fill=fill)
+        if (px := self._pixels(box)) is not None:
+            self._draw.rectangle(px, fill=fill)
 
     def pill(self, box: tuple[float, float, float, float], radius: float,
              fill: tuple[int, ...], outline: tuple[int, ...] | None = None,
              width: float = 0.0) -> None:
-        self._draw.rounded_rectangle(
-            self._box(box), radius=_half_up(radius * self._k), fill=fill, outline=outline,
-            width=self._width(width) if outline else 0)
+        if (px := self._pixels(box)) is not None:
+            self._draw.rounded_rectangle(
+                px, radius=_half_up(radius * self._k), fill=fill, outline=outline,
+                width=self._width(width) if outline else 0)
 
     def disc(self, centre: tuple[float, float], radius: float,
              fill: tuple[int, ...] | None = None, outline: tuple[int, ...] | None = None,
              width: float = 0.0) -> None:
         cx, cy = centre
-        self._draw.ellipse(
-            self._box((cx - radius, cy - radius, cx + radius, cy + radius)),
-            fill=fill, outline=outline, width=self._width(width) if outline else 0)
+        if (px := self._pixels((cx - radius, cy - radius, cx + radius, cy + radius))) is not None:
+            self._draw.ellipse(
+                px, fill=fill, outline=outline, width=self._width(width) if outline else 0)
 
     def text_width(self, text: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
                    tracking: float = 0.0) -> float:
