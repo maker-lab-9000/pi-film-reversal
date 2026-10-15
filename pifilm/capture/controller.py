@@ -59,6 +59,10 @@ class ControllerSnapshot:
     # (``CaptureSession.tuning_mismatch``), read from the session like the count.
     # The viewfinder shows an amber TUNING tag while it is True.
     tuning_mismatch: bool = False
+    # Filesystems at or above the disk warning's threshold, as ``(label, percent)``
+    # with photos first (``CaptureSession.disk_warning``), read like the count.
+    # The viewfinder shows an amber tag for each; empty when none is low.
+    disk_warning: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,7 @@ class CaptureController:
         # lock, and nothing here needs the two numbers to be from one instant.
         pending_grades = self._read_pending_grades()
         tuning_mismatch = self._read_tuning_mismatch()
+        disk_warning = self._read_disk_warning()
         with self._lock:
             active = (
                 self._jobs[self._active_request_id]
@@ -141,6 +146,7 @@ class CaptureController:
                 self._double[1],
                 pending_grades,
                 tuning_mismatch,
+                disk_warning,
             )
 
     def close(self) -> None:
@@ -218,6 +224,24 @@ class CaptureController:
             return getattr(self._session, "tuning_mismatch", False) is True
         except Exception:
             return False
+
+    def _read_disk_warning(self) -> tuple[tuple[str, int], ...]:
+        """The session's ``disk_warning``; empty when it has none to give.
+
+        Read on every frame, like ``_read_pending_grades``: a session without it, one
+        that raises, or anything but a tuple of ``(str, int)`` pairs reads as none.
+        """
+        try:
+            value = getattr(self._session, "disk_warning", ())
+        except Exception:
+            return ()
+        if not isinstance(value, tuple):
+            return ()
+        for item in value:
+            if not (isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+                    and isinstance(item[1], int) and not isinstance(item[1], bool)):
+                return ()
+        return value
 
     def _read_double(self) -> tuple[bool, int]:
         """The session's (mode, count), or the last value seen if it cannot be read.
