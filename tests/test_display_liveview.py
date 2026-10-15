@@ -586,3 +586,24 @@ def test_the_bundled_fonts_are_packaged_and_load(name):
 def test_a_missing_font_file_falls_back_to_the_default_font():
     font = liveview._font("NoSuchFont.ttf", 14)
     assert font.getlength("400") > 0
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("focus", [1e-6, 1e-4, 0.001, 0.0019])
+def test_a_focus_score_too_small_for_one_pixel_draws_an_empty_gauge(focus, scale):
+    # Seen on the Pi 2026-10-15: a sharpness score just above zero made the fill
+    # less than half a pixel tall, both edges rounded to the same row, the
+    # inclusive far corner then sat above the near one and Pillow raised
+    # "y1 must be greater than or equal to y0", which ended the service.
+    tile = liveview._focus_tile(focus, focus, scale)
+    empty = liveview._focus_tile(0.0, None, scale)
+    assert tile.size == empty.size
+
+
+@pytest.mark.parametrize("box", [(10, 10, 10, 20), (10, 10, 20, 10), (10, 10.1, 20, 10.2),
+                                 (10.3, 10, 10.4, 20)])
+def test_canvas_shapes_that_round_to_no_pixels_draw_nothing(box):
+    canvas = liveview._Canvas((0, 0, 40, 40), 1)
+    canvas.rect(box, (255, 255, 255, 255))
+    canvas.pill(box, 2, (255, 255, 255, 255))
+    assert canvas.finish().getbbox() is None
