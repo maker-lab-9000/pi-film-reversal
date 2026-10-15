@@ -1,5 +1,13 @@
 # Settings menu on the viewfinder: design
 
+Amended 2026-10-15, during implementation, at the owner's request: the `ROTATE` row
+is dropped ("leave the display flip option out, not important"). The menu remembers
+three settings, not four: `save_dng`, `ae_constraint` and `ae_metering`. There is no
+`set_rotate` on the displays or touch readers, `settings.json` has no `rotate` key,
+and rotation stays `--display-rotate` in the unit. Read every mention of rotation
+below as removed (the `ROTATE` row, "Applying each setting: Rotation", the
+`set_rotate` code and tests, and acceptance step 2).
+
 Date: 2026-10-15. Branch `feat/settings-menu`, pull request into `main`.
 The design was approved in conversation on 2026-10-15: a `MENU` key on the live
 view, Wi-Fi switching left out of this round, and the look's name shown.

@@ -1,5 +1,26 @@
 # Settings Menu Implementation Plan
 
+> **Amended 2026-10-15 (owner): rotation is out.** See the spec's amendment note.
+> - Task 2 is amended by Task 2b below: `rotate`, `ROTATIONS` and every rotation
+>   test leave `pifilm/capture/settings.py`; `KEYS` is
+>   `("save_dng", "ae_constraint", "ae_metering")` and `Settings` has those three
+>   fields.
+> - Task 5 is cancelled (no `set_rotate` anywhere).
+> - Task 7: no `rotate` row key. Task 8: no `rotate` row, no rotation applier, no
+>   forced redraw after rotation. Task 9: no `rotate` default, no
+>   `args.display_rotate` override, no rotate applier in `_run_viewfinder`; the
+>   tests about rotation are dropped. The summary log line's example becomes
+>   `settings: dng off, ae-constraint shadows (saved in the menu; the unit says dng on, ae-constraint highlight)`.
+>
+> ### Task 2b: rotation leaves the settings
+> **Files:** `pifilm/capture/settings.py`, `tests/test_settings.py`.
+> Remove `rotate` from `Settings`, `KEYS`, validation, the summary line and the
+> docstring; remove `ROTATIONS`; update or remove every test that uses `rotate`,
+> keeping equivalent coverage with the remaining keys (for example, a wrong-type
+> value is now `save_dng: 1` or `ae_constraint: 3`). A `rotate` key in an existing
+> file is an unknown key: one `settings: ignoring rotate in <path>` line. Commit
+> `capture: the settings without rotation`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A `MENU` key on the LCD live view opens a settings page. On that page you
