@@ -3,10 +3,10 @@ Description=Periodic pi-film-reversal photo sync to Nextcloud
 
 [Timer]
 # A few minutes after boot, then every 15 minutes. Each run is a no-op unless
-# the Pi is on the wired LAN, so a frequent schedule is cheap.
+# the Pi is on the home network, so a frequent schedule is cheap.
 OnBootSec=3min
 OnUnitActiveSec=15min
-# Catch up on a run missed while the Pi was off the wired LAN or powered down.
+# Catch up on a run missed while the Pi was off the home network or powered down.
 Persistent=true
 
 [Install]

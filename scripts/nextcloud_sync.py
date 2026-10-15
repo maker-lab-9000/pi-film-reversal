@@ -6,10 +6,16 @@ backend -- the closest thing to rsync that a Nextcloud HTTP endpoint speaks.
 ``rclone copy`` only ever adds or updates; it never deletes a remote file, so
 cleaning the SD card cannot erase the cloud archive.
 
-Two guards keep it a quiet no-op off the wired LAN, so a systemd timer can fire
-it every few minutes and it does nothing until the Pi is plugged into the home
-network: it runs only when ``eth0`` holds a real home-LAN IPv4 (not a
-169.254.x link-local address) and the Nextcloud host answers a TCP connect.
+Two guards keep it a quiet no-op off the home network, so a systemd timer can
+fire it every few minutes and it does nothing until the Pi is on the home LAN,
+wired or Wi-Fi. First, ``eth0`` then ``wlan0`` (the ``--iface`` list, in order)
+is checked for a routable IPv4 (not a 169.254.x link-local address); the first
+interface that has one is chosen. Second, the Nextcloud host must answer a TCP
+connect. Only that first interface is named; the connect itself follows the
+routing table, so trying the second interface on a failure would test the same
+route. Hotspot mode needs no special case: ``wlan0`` then holds 10.42.0.1, a
+routable address, but Nextcloud is not reachable from the hotspot, so the
+second guard skips the run.
 
 The Nextcloud password never reaches a command line, a process listing, or an
 rclone config file on disk. It is obscured with ``rclone obscure`` (plaintext
@@ -26,7 +32,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -37,7 +43,7 @@ from firmware.sticks3.scripts.generate_config import parse_env_file
 REMOTE_NAME = "nextcloud"
 DEFAULT_TARGET_DIR = "MartinParr"
 DEFAULT_SOURCE_DIR = "~/Pictures/pifilm"
-DEFAULT_IFACE = "eth0"
+DEFAULT_IFACES = ("eth0", "wlan0")
 DEFAULT_MIN_AGE = "30s"
 
 
@@ -97,7 +103,7 @@ def _iface_ipv4s(iface: str, run: Callable = subprocess.run) -> list[str]:
     return [tokens[i + 1].split("/")[0] for i, tok in enumerate(tokens) if tok == "inet"]
 
 
-def home_lan_ipv4(iface: str = DEFAULT_IFACE, run: Callable = subprocess.run) -> str | None:
+def home_lan_ipv4(iface: str, run: Callable = subprocess.run) -> str | None:
     """The interface's first routable IPv4, or None if it only has link-local."""
     for candidate in _iface_ipv4s(iface, run=run):
         try:
@@ -109,8 +115,15 @@ def home_lan_ipv4(iface: str = DEFAULT_IFACE, run: Callable = subprocess.run) ->
     return None
 
 
-def ethernet_ready(iface: str = DEFAULT_IFACE, run: Callable = subprocess.run) -> bool:
-    return home_lan_ipv4(iface, run=run) is not None
+def first_home_lan_ipv4(
+    ifaces: Sequence[str], run: Callable = subprocess.run
+) -> tuple[str, str] | None:
+    """The first interface in ``ifaces`` with a routable IPv4, and that address."""
+    for iface in ifaces:
+        ipv4 = home_lan_ipv4(iface, run=run)
+        if ipv4 is not None:
+            return iface, ipv4
+    return None
 
 
 def nextcloud_reachable(
@@ -180,7 +193,7 @@ def run_sync(
     cfg: NextcloudConfig,
     *,
     apply: bool,
-    iface: str = DEFAULT_IFACE,
+    ifaces: Sequence[str] = DEFAULT_IFACES,
     rclone: str = "rclone",
     min_age: str = DEFAULT_MIN_AGE,
     run: Callable = subprocess.run,
@@ -188,14 +201,16 @@ def run_sync(
     which: Callable = shutil.which,
     log: Callable = print,
 ) -> int:
-    ipv4 = home_lan_ipv4(iface, run=run)
-    if ipv4 is None:
-        log(f"{iface} has no home-LAN IPv4; skipping Nextcloud sync")
+    chosen = first_home_lan_ipv4(ifaces, run=run)
+    if chosen is None:
+        log(f"no network on {' or '.join(ifaces)}; skipping Nextcloud sync")
         return 0
+    iface, ipv4 = chosen
     host, port = cfg.host_port()
     if not nextcloud_reachable(host, port, connect=connect):
         log(f"Nextcloud {host}:{port} not reachable over {iface} ({ipv4}); skipping")
         return 0
+    log(f"Nextcloud reachable over {iface} ({ipv4})")
     if which(rclone) is None:
         log(f"error: {rclone} not found; install it with: sudo apt install rclone")
         return 3
@@ -223,8 +238,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--iface",
-        default=DEFAULT_IFACE,
-        help=f"wired interface to gate on (default: {DEFAULT_IFACE})",
+        action="append",
+        dest="ifaces",
+        default=None,
+        help=(
+            "interface to gate on; repeat to try several in order, the first with a "
+            f"routable IPv4 wins (default: {' then '.join(DEFAULT_IFACES)})"
+        ),
     )
     parser.add_argument("--rclone", default="rclone", help="rclone binary (default: rclone)")
     args = parser.parse_args(argv)
@@ -233,7 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    return run_sync(cfg, apply=args.apply, iface=args.iface, rclone=args.rclone)
+    ifaces = args.ifaces or list(DEFAULT_IFACES)
+    return run_sync(cfg, apply=args.apply, ifaces=ifaces, rclone=args.rclone)
 
 
 if __name__ == "__main__":

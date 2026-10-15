@@ -1,6 +1,6 @@
 [Unit]
 Description=Sync pi-film-reversal photos to Nextcloud over WebDAV
-# The script gates on eth0 anyway, so it is safe to run before the LAN is up;
+# The script gates on eth0/wlan0 anyway, so it is safe to run before the LAN is up;
 # these hints just avoid firing during early boot.
 After=network-online.target
 Wants=network-online.target
@@ -13,9 +13,10 @@ WorkingDirectory=/home/george/repos/pi-film-reversal
 # summary line never reaches the journal.
 Environment=PYTHONUNBUFFERED=1
 # Reads NEXTCLOUD_* from the project .env (gitignored, mode 600). The script is
-# a quiet no-op unless eth0 has a home-LAN IPv4 and Nextcloud answers a TCP
-# connect, so the timer can fire it on any boot. rclone copy only ever adds or
-# updates; it never deletes a remote file. The password is obscured and passed
+# a quiet no-op unless the Pi is on the home network (eth0 then wlan0 has a
+# routable IPv4) and Nextcloud answers a TCP connect, so the timer can fire it
+# on any boot. rclone copy only ever adds or updates; it never deletes a remote
+# file. The password is obscured and passed
 # to rclone via RCLONE_CONFIG_* env vars, never on the command line.
 ExecStart=/home/george/repos/pi-film-reversal/.venv/bin/python /home/george/repos/pi-film-reversal/scripts/nextcloud_sync.py --apply --env /home/george/repos/pi-film-reversal/.env
 
