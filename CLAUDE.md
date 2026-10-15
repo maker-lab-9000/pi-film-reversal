@@ -75,6 +75,11 @@ sudo .venv/bin/python scripts/pi_hotspot.py --env .env --apply
 # Pi photo volume (run ON the Pi; dry run prints the steps)
 python3 scripts/pi_photo_volume.py
 sudo python3 scripts/pi_photo_volume.py --apply
+
+# Pi journal kept across reboots, and the capture service's restarts (run ON the Pi)
+python3 scripts/pi_journal.py              # dry run
+sudo python3 scripts/pi_journal.py --apply
+python3 scripts/pi_journal.py --report     # starts, stalls, error exits per boot
 ```
 
 `pifilm-train` exit code 3 means an artifact was written but a quality gate failed.
