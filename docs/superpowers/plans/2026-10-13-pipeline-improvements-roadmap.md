@@ -266,6 +266,8 @@ live view from the same shader would be new.
   the ISP's own tone curve), but it means rebuilding demosaic, lens shading,
   white balance, colour matrix and denoise, and retraining every look, including
   the approved `imx477-2026-09-v4-dark`.
+  Tried 2026-10-14 all the same, as far as a look trained on developed DNGs: no
+  visible gain ([write-up](../../experiments/2026-10-14-raw-look.md)).
 - **A per-sensor input LUT plus a shared look LUT.** Only pays off with one look
   across two sensors.
 - **A log shaper and tetrahedral interpolation.** For linear input; the LUT input

@@ -129,6 +129,11 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   grade is not byte-identical to the CPU's: a few levels on ordinary colours, 10 to 20 on strongly
   saturated ones (the CPU rounds to bytes before the LUT). Design:
   `docs/superpowers/specs/2026-10-13-gpu-grading-design.md`.
+- `raw.py`: reads a Picamera2 DNG and develops it with the camera's own libcamera tuning file
+  (black level, lens shading, digital gain and white balance, OpenCV demosaic, colour matrix,
+  tone curve). Offline only: a look trained on developed DNGs showed no visible gain
+  (`docs/experiments/2026-10-14-raw-look.md`), so capture does not use it and the example unit
+  passes `--no-dng`. Full-field sensor modes only.
 - `color.py`: sRGB ↔ linear ↔ Oklab/Oklch. All trainer statistics are computed in Oklab.
 - `imageio.py`: the only place pixels enter. Applies EXIF orientation and converts embedded ICC
   profiles to sRGB. Do not load images elsewhere with raw `Image.open`.
