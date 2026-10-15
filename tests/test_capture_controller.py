@@ -5,8 +5,10 @@ import time
 from dataclasses import dataclass
 from unittest.mock import Mock
 
+import pytest
+
 from pifilm.capture.camera import CameraError
-from pifilm.capture.controller import CaptureController
+from pifilm.capture.controller import CaptureController, ControllerSnapshot
 
 
 @dataclass
@@ -452,5 +454,60 @@ def test_unusable_tuning_mismatch_reports_false():
         for value in ("yes", 1, None):
             odd.tuning_mismatch = value
             assert controller.snapshot().tuning_mismatch is False
+    finally:
+        controller.close()
+
+
+def test_snapshot_carries_the_sessions_disk_warning():
+    session = GradingSession()
+    session.disk_warning = (("PHOTOS", 92), ("SD", 91))
+    controller = CaptureController(session)
+    try:
+        assert controller.snapshot().disk_warning == (("PHOTOS", 92), ("SD", 91))
+        session.disk_warning = ()
+        assert controller.snapshot().disk_warning == ()
+    finally:
+        controller.close()
+
+
+def test_a_session_without_disk_warning_reports_none():
+    controller = CaptureController(_Session())
+    try:
+        assert controller.snapshot().disk_warning == ()
+    finally:
+        controller.close()
+
+
+def test_disk_warning_is_the_last_snapshot_field_and_defaults_to_empty():
+    from dataclasses import fields
+
+    assert [f.name for f in fields(ControllerSnapshot)][-1] == "disk_warning"
+    assert ControllerSnapshot(None, None, False).disk_warning == ()
+
+
+@pytest.mark.parametrize("value", [
+    None, "PHOTOS 92%", [("PHOTOS", 92)], (("PHOTOS", "92"),), (("PHOTOS", True),),
+    (("PHOTOS",),), ((7, 92),), (("PHOTOS", 92, 1),),
+])
+def test_unusable_disk_warning_reports_none(value):
+    """Read on every frame like the developing count; anything odd reads as none."""
+    session = GradingSession()
+    session.disk_warning = value
+    controller = CaptureController(session)
+    try:
+        assert controller.snapshot().disk_warning == ()
+    finally:
+        controller.close()
+
+
+def test_a_raising_disk_warning_reports_none():
+    class Raising(GradingSession):
+        @property
+        def disk_warning(self):
+            raise RuntimeError("no session state")
+
+    controller = CaptureController(Raising())
+    try:
+        assert controller.snapshot().disk_warning == ()
     finally:
         controller.close()

@@ -3692,3 +3692,78 @@ def test_a_double_exposure_carries_tuning_matches(tmp_path, background):
     records = _lines(session.out_root)
     assert [r["double"]["index"] for r in records] == [1, 2]
     assert [r["tuning_matches"] for r in records] == [True, True]
+
+
+# The disk-space warning (pifilm.capture.disk): the session holds it, main runs it.
+
+
+def _full_vfs(percent):
+    blocks = 1_000_000
+    free = blocks - blocks * percent // 100
+    return SimpleNamespace(f_blocks=blocks, f_bfree=free, f_bavail=free, f_frsize=4096)
+
+
+def test_a_session_without_a_disk_monitor_has_no_disk_warning(tmp_path, pipeline):
+    assert _session(tmp_path, pipeline).disk_warning == ()
+
+
+def test_the_sessions_disk_monitor_watches_its_photo_folder_and_logs_through_it(
+        tmp_path, pipeline):
+    session = _tuned_session(tmp_path, FakeCamera([synthetic_frame(90, 160)]), pipeline)
+    session.out_root.mkdir(parents=True)
+    devices = {str(session.out_root): 2, "/": 1}
+    full = {str(session.out_root): 93, "/": 50}
+    monitor = session.watch_disk(
+        90, statvfs=lambda p: _full_vfs(full[str(p)]),
+        stat=lambda p: SimpleNamespace(st_dev=devices[str(p)]))
+    assert session.disk_warning == ()  # nothing measured until it runs
+    monitor.poll_once()
+    assert session.disk_warning == (("PHOTOS", 93),)
+    assert session.test_log[-1].startswith("disk: photos 93% full (")
+    monitor.close()
+
+
+def _disk_main(monkeypatch, tmp_path, *extra):
+    from pifilm.capture import app
+
+    made = []
+
+    class FakeDisk:
+        def __init__(self, threshold):
+            self.threshold = threshold
+            self.started = self.closed = False
+
+        def start(self):
+            self.started = True
+
+        def close(self):
+            self.closed = True
+
+    def watch_disk(self, threshold):
+        made.append(FakeDisk(threshold))
+        return made[-1]
+
+    monkeypatch.setattr(app.CaptureSession, "watch_disk", watch_disk)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    code = app.main(["--fake", "--no-preview", "--out", str(tmp_path), *extra])
+    return code, made
+
+
+def test_main_runs_the_disk_monitor_at_90_percent_and_stops_it(tmp_path, monkeypatch):
+    code, made = _disk_main(monkeypatch, tmp_path)
+    assert code == 2  # no terminal; the clean-up still runs
+    (disk,) = made
+    assert disk.threshold == 90 and disk.started and disk.closed
+
+
+def test_disk_warn_percent_sets_the_threshold(tmp_path, monkeypatch):
+    _, made = _disk_main(monkeypatch, tmp_path, "--disk-warn-percent", "40")
+    assert made[0].threshold == 40
+
+
+@pytest.mark.parametrize("value", ["0", "101", "-5", "abc", "90.5"])
+def test_disk_warn_percent_outside_1_to_100_is_refused(tmp_path, monkeypatch, capsys, value):
+    with pytest.raises(SystemExit) as exc:
+        _disk_main(monkeypatch, tmp_path, "--disk-warn-percent", value)
+    assert exc.value.code == 2
+    assert "--disk-warn-percent" in capsys.readouterr().err

@@ -164,6 +164,15 @@ every record gains ``tuning_matches`` right after the camera fields, and
 ``tuning_mismatch`` (always present, False unless they differ) is what the
 viewfinder reads. A background shot stores the field in its pending entry, so a
 grade recovered at a later start says what the run that took it saw.
+
+The disk-space warning
+----------------------
+``main`` has the session make a ``DiskMonitor`` (``pifilm.capture.disk``) over
+the photo folder and ``/`` and runs it for every loop, started and closed beside
+the UPS poller: the viewfinder shows its warning, and its log lines (through the
+session's log, like ``tuning:``) are as useful headless. ``disk_warning`` is what
+the controller's snapshot carries to the viewfinder. Warn only: a shot is never
+refused for space.
 """
 
 from __future__ import annotations
@@ -212,6 +221,7 @@ from .button import (
 )
 from .camera import Camera, CameraError, FakeCamera, Frame, V4L2Camera
 from .controller import CaptureController, JobSnapshot
+from .disk import DEFAULT_WARN_PERCENT, DiskMonitor, DiskWarning, watched_paths
 from .errors import CameraStalled
 from .gradequeue import (
     GradeJob,
@@ -438,6 +448,9 @@ class CaptureSession:
             self._say(line)
         self._tuning_fields: dict = {} if matches is None else {"tuning_matches": matches}
         self.tuning_mismatch = matches is False
+        # The disk-space check (see "The disk-space warning" in the module
+        # docstring); None until ``watch_disk`` makes one.
+        self._disk: DiskMonitor | None = None
         self._now = now or datetime.now
         self._seed_rng = seed_rng or np.random.default_rng()
         self._package_version = package_version
@@ -807,6 +820,22 @@ class CaptureSession:
             self._log(message)
         except Exception:
             pass  # a closed stdout must not cost a photograph
+
+    def watch_disk(self, threshold: int = DEFAULT_WARN_PERCENT, **kwargs) -> DiskMonitor:
+        """A disk monitor for the photo folder and ``/``, logging through the session.
+
+        Not started: the caller starts and closes it, as ``main`` does the UPS poller.
+        ``kwargs`` go to ``DiskMonitor`` (tests pass fake ``statvfs`` and ``stat``).
+        """
+        self._disk = DiskMonitor(watched_paths(self.out_root), threshold, log=self._say,
+                                 **kwargs)
+        return self._disk
+
+    @property
+    def disk_warning(self) -> DiskWarning:
+        """``(label, percent)`` for each filesystem at or above the threshold, photos
+        first; empty when none is, or when nothing watches the disk. Never touches it."""
+        return self._disk.warning if self._disk is not None else ()
 
     @property
     def pending_grades(self) -> int:
@@ -1592,6 +1621,16 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     return _serve_until_interrupt()
 
 
+def _disk_percent(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole percent") from None
+    if not 1 <= value <= 100:
+        raise argparse.ArgumentTypeError(f"{value} is not from 1 to 100")
+    return value
+
+
 def _gpio_pin(text: str) -> int:
     """An argparse type: a BCM pin number the shutter button may use."""
     try:
@@ -1756,6 +1795,12 @@ def _main(argv: list[str] | None) -> int:
         help="where unfinished background grades are kept so a restart can finish them "
              "(default: $XDG_STATE_HOME/pifilm/pending, or ~/.local/state/pifilm/pending)",
     )
+    parser.add_argument(
+        "--disk-warn-percent", type=_disk_percent, default=DEFAULT_WARN_PERCENT, metavar="N",
+        help="warn (a log line, and an amber PHOTOS or SD tag on the LCD) while the photo "
+             f"folder's filesystem or / is N%% full or more, 1-100 (default: "
+             f"{DEFAULT_WARN_PERCENT}); photographs are still taken",
+    )
     args = parser.parse_args(argv)
 
     if args.shutter_gpio is not None:
@@ -1858,12 +1903,19 @@ def _main(argv: list[str] | None) -> int:
     controller: CaptureController | None = None
     remote: RemoteCaptureServer | None = None
     button: ShutterButton | None = None
+    disk: DiskMonitor | None = None
     if display_pair is not None:
         controller = CaptureController(session)
     try:
         if power is not None:
             power.start()
             print(f"Reading the {args.ups} UPS every 10 s.")
+        # For every loop, not only the viewfinder: the log lines help headless too.
+        # Looked up like ``close_grades`` below, so a session without it runs unwatched.
+        watch_disk = getattr(session, "watch_disk", None)
+        if callable(watch_disk):
+            disk = watch_disk(args.disk_warn_percent)
+            disk.start()
         if args.shutter_gpio is not None:
             try:
                 button = open_shutter_button(args.shutter_gpio)
@@ -1969,6 +2021,8 @@ def _main(argv: list[str] | None) -> int:
                 )
         if power is not None:
             power.close()
+        if disk is not None:
+            disk.close()
         if remote is not None:
             remote.close()
         if controller is not None:

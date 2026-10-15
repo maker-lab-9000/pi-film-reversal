@@ -31,7 +31,8 @@ it changes between frames, so the screen is assembled from small tiles:
 - static tiles, cached with ``functools.lru_cache`` and keyed by exactly what
   they show: the strip background, one tile per cell, the shutter and ``+``/``-``
   keys (keyed by which is pressed), and the ``2x`` and battery tags with the
-  count of photographs still developing and the ``TUNING`` warning;
+  count of photographs still developing and the ``TUNING`` warning, and the
+  ``PHOTOS``/``SD`` disk-space tags (a tile of their own, keyed by the warning);
 - dynamic tiles: the lit meter dot and the lux/clip text (cached too, they repeat)
   and the focus gauge (drawn every frame; it is 7 units wide).
 
@@ -107,6 +108,11 @@ DEVELOPING_FILL = (0, 0, 0, 190)
 # word like the battery's. It is the widest thing the row can end with, which is
 # what sets the right edge of ``_TAGS_BOX``.
 TUNING_LABEL = "TUNING"
+# A filesystem at or above the disk warning's threshold (``pifilm.capture.disk``):
+# amber "PHOTOS 92%" / "SD 91%" on the same dark patch as TUNING, in a tile of its
+# own past the tag row and short of the shutter's hit circle, photos first. Its own
+# tile, at a fixed place, so it never moves the row and the row never moves it.
+DISK_X0 = 127
 FOCUS_TRACK = (6, 22, 9, 198)
 FOCUS_TICK_X = (4, 11)
 FOCUS_TICK_HEIGHT = 1.5
@@ -138,6 +144,10 @@ _CONTROLS_BOX = (256, 8, 318, 188)
 # Wide enough for "AC 100%", a two-digit count and TUNING (they end at 115.5 units
 # at scale 1, 114 at scale 2), and well short of the shutter's hit circle at 253.
 _TAGS_BOX = (0, 0, 124, 22)
+# From the tag box's end to the last whole unit before the shutter's hit circle
+# (centre 287, radius 34: its leftmost point is x 253). "PHOTOS 100%" and "SD 100%"
+# together end at about 207 units (see the tests), so there is room to spare.
+_DISK_BOX = (_TAGS_BOX[2], 0, 252, _TAGS_BOX[3])
 _METER_TEXT_BOX = (192, 209, WIDTH, 221)
 _FOCUS_BOX = (FOCUS_TICK_X[0], FOCUS_TRACK[1], FOCUS_TICK_X[1], FOCUS_TRACK[3])
 
@@ -175,6 +185,7 @@ class LiveState:
     double: tuple[bool, int] | None = None   # (enabled, exposures taken); None hides the 2x toggle
     developing: int = 0                      # photographs still being graded; 0 draws nothing
     tuning_mismatch: bool = False            # camera tuning differs from the look's; draws TUNING
+    disk_warning: tuple[tuple[str, int], ...] = ()  # (label, percent) per low filesystem
 
 
 @lru_cache(maxsize=4)
@@ -470,6 +481,29 @@ def _tags_tile(double: tuple[bool, int] | None, battery: str | None, scale: int,
     return canvas.finish()
 
 
+@lru_cache(maxsize=16)
+def _disk_tile(warning: tuple[tuple[str, int], ...], scale: int) -> Image.Image:
+    """One amber tag per filesystem low on space, left to right from ``DISK_X0``.
+
+    Styled as the TUNING tag: amber text, the battery tag's padding, the count's
+    dark patch, no outline (a warning, not a key). Keyed by the warning itself;
+    a percentage changes at most once a minute, so the cache holds few of these.
+    """
+    canvas = _Canvas(_DISK_BOX, scale)
+    font = canvas.font(SEMIBOLD, TAG_SIZE)
+    left = float(DISK_X0)
+    for label, percent in warning:
+        text = f"{label} {percent}%"
+        box = (left, DOUBLE_BOX[1],
+               min(left + canvas.text_width(text, font) + 2 * TAG_PADDING, _DISK_BOX[2] - 1),
+               DOUBLE_BOX[3])
+        canvas.pill(box, TAG_RADIUS, fill=DEVELOPING_FILL)
+        canvas.text(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), text, font, AMBER,
+                    anchor="mm")
+        left = math.ceil(box[2]) + DEVELOPING_GAP
+    return canvas.finish()
+
+
 @lru_cache(maxsize=32)
 def _lit_dot_tile(index: int, scale: int) -> tuple[Image.Image, tuple[int, int]]:
     """The amber dot for one meter position, and where its tile goes (base units).
@@ -546,6 +580,9 @@ def render_live(
     tuning = bool(state.tuning_mismatch)
     if state.double is not None or battery is not None or developing or tuning:
         paste(_tags_tile(state.double, battery, scale, developing, tuning), *_TAGS_BOX[:2])
+    if state.disk_warning:
+        disk = tuple((str(label), int(percent)) for label, percent in state.disk_warning)
+        paste(_disk_tile(disk, scale), *_DISK_BOX[:2])
     if reading.focus is not None:
         paste(_focus_tile(reading.focus, reading.focus_peak, scale), *_FOCUS_BOX[:2])
     return img

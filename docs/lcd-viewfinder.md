@@ -175,6 +175,7 @@ message screens keep the default font.
 | Battery tag (outlined, top left, right of `2x`) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
 | Developing count (amber number on a dark patch, right of the battery tag) | How many photographs are still being graded behind the shutter; see [Developing count](#developing-count). Absent at zero and with `--grade inline` | — |
 | `TUNING` tag (amber word on a dark patch, last in the top-left row) | The camera's libcamera tuning differs from the one the look was trained under; see [Tuning warning](#tuning-warning). Absent otherwise | — |
+| `PHOTOS NN%` / `SD NN%` tags (amber on a dark patch, top, between the top-left row and the shutter button) | The photo volume or the system SD card is at or above `--disk-warn-percent` (90 by default); see [Disk-space warning](#disk-space-warning). Absent otherwise | — |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Review screen | Full-screen quick grade (the frame reduced by a whole factor to about 1,000 pixels on the long side, four times each way for the IMX477, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
@@ -231,6 +232,28 @@ for the whole run, because the tuning cannot change while the service runs.
 There is no tag when they match, when the look has no fingerprint (the bundled
 starter, or a trained look not yet stamped with `pifilm-tuning --stamp`), or with
 a USB camera.
+
+### Disk-space warning
+
+The service checks two filesystems once a minute (and once at start-up): the photo
+folder (`--out`, normally the [photo volume](photo-volume.md)) and the system SD
+card at `/`. When either is at or above `--disk-warn-percent` (90 by default, 1 to
+100), an amber tag shows at the top of the screen, after the top-left row and short
+of the shutter button: `PHOTOS 92%`, `SD 91%`, or both, photos first.
+
+- The percentage is the one `df -h` prints as Use%, rounded up the same way, so
+  `df -h ~/Pictures/pifilm /` over SSH shows the same numbers.
+- Photographs are still taken. The tag is a reminder to move photographs off the
+  Pi or to grow the volume ([Check and grow](photo-volume.md#check-and-grow)).
+- The journal has one line when a filesystem crosses the threshold, for example
+  `disk: photos 92% full (2.4 GB free)`, and one when it drops below it again,
+  `disk: photos back to 85% full (4.5 GB free)`. GB here is df's G (2^30 bytes).
+- When the photo folder is on the root filesystem (no separate volume), there is
+  one filesystem and one tag, `PHOTOS`.
+- A path that cannot be measured is left out after one `disk: cannot measure ...`
+  line, and tried again at the next check.
+
+The check runs with every display mode, headless too, for the journal lines.
 
 ### Idle dimming
 
@@ -626,6 +649,24 @@ Run `pip install -e .` again in the Pi's venv first, so that `pifilm-tuning` exi
 | 2 | `pifilm-tuning --tuning-file imx477.json --stamp <the service's artifacts>`, run as `george` (not with `sudo`), then restart the service with `sudo systemctl restart pifilm-capture.service`: the journal says `tuning: matches the look`; records carry `tuning_sha1` and `tuning_matches: true`; no tag on the screen | Pass |
 | 3 | Stamp the look with a wrong fingerprint (`pifilm-tuning --sha1 0000000000000000000000000000000000000000 --stamp <dir>`) and restart: the journal says `DIFFERS`, the amber `TUNING` tag shows, records say `tuning_matches: false`, and photographs are still taken and graded. (An edited copy of `imx477.json` passed to `--tuning-file` by its absolute path tests the same thing from the camera's side.) | Pass |
 | 4 | Stamp the right fingerprint again and restart: the tag is gone | Pass |
+
+#### Disk-space warning
+
+Not yet run on hardware. With the photo volume about 50 % full and the SD card
+about 70 % (`df -h ~/Pictures/pifilm /` says what they are), stop the service with
+`sudo systemctl stop pifilm-capture` and run by hand from the project directory:
+
+```sh
+.venv/bin/pifilm-capture --camera picamera2 --display waveshare35dsi --no-preview \
+    --out ~/Pictures/pifilm --disk-warn-percent 40
+```
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | Within a second of the live view, amber `PHOTOS 50%` and `SD 70%` tags show between the top-left row and the shutter button (the numbers are whatever `df -h` says) | |
+| 2 | The terminal has `disk: photos 50% full (... GB free)` and `disk: sd 70% full (... GB free)`, once each, and no more over two minutes | |
+| 3 | A photograph is taken as usual with the tags showing, and a tap on the tags does nothing | |
+| 4 | Ctrl-C, then run again without `--disk-warn-percent` (90): no tag and no `disk:` line. `sudo systemctl start pifilm-capture` afterwards | |
 
 ## 8. Troubleshooting
 
