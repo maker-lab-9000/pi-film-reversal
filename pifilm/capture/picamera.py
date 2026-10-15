@@ -240,6 +240,13 @@ class Picamera2Camera:
         self.shutter_us: int | None = None
         self.iso: int | None = None
         self.max_gain: float | None = None
+        # The auto-exposure modes in force, changed live by ``set_ae_constraint``
+        # and ``set_ae_metering``; each is refused unless its flag (set at open:
+        # the camera lists the control and libcamera has its enum) is True.
+        self.ae_constraint = ae_constraint
+        self.ae_metering = ae_metering
+        self.ae_constraint_supported = False
+        self.ae_metering_supported = False
         self._shutter_mode = "legacy"
         self._iso_mode = "legacy"
         self._frame_limits: dict[str, tuple[int, int] | None] = {"still": None, "preview": None}
@@ -314,6 +321,12 @@ class Picamera2Camera:
                 + ("AnalogueGainMode" if self._iso_mode == "mode"
                    else "AnalogueGain (legacy libcamera)"),
                 file=sys.stderr,
+            )
+            self.ae_constraint_supported = _ae_supported(
+                camera.camera_controls, "AeConstraintMode", _ae_constraint_value, "normal",
+            )
+            self.ae_metering_supported = _ae_supported(
+                camera.camera_controls, "AeMeteringMode", _ae_metering_value, "centre",
             )
             gain = camera.camera_controls.get("AnalogueGain")
             if isinstance(gain, (tuple, list)) and len(gain) >= 2:
@@ -632,6 +645,58 @@ class Picamera2Camera:
                     # AnalogueGainMode=Auto on every configure.
                     _drop_config_control(config, "AnalogueGain")
         self.iso = iso
+
+    def set_ae_constraint(self, name: str) -> None:
+        """Change the auto-exposure constraint mode while the camera runs.
+
+        Like ``set_iso``: the control goes to the running camera and into both
+        configurations, and nothing changes if it is refused, cannot be built, or
+        this camera or libcamera has no ``AeConstraintMode``.
+        """
+        if name not in _AE_CONSTRAINTS:
+            raise CameraError(
+                f"Unknown ae_constraint {name!r}; expected one of {_AE_CONSTRAINTS}"
+            )
+        self._set_ae_mode("AeConstraintMode", _ae_constraint_value, name,
+                          self.ae_constraint_supported, "the AE constraint mode")
+        self.ae_constraint = name
+
+    def set_ae_metering(self, name: str) -> None:
+        """Change the auto-exposure metering mode while the camera runs.
+
+        The same contract as ``set_ae_constraint``, for ``AeMeteringMode``.
+        """
+        if name not in _AE_METERING:
+            raise CameraError(
+                f"Unknown ae_metering {name!r}; expected one of {_AE_METERING}"
+            )
+        self._set_ae_mode("AeMeteringMode", _ae_metering_value, name,
+                          self.ae_metering_supported, "the AE metering mode")
+        self.ae_metering = name
+
+    def _set_ae_mode(
+        self, control: str, lookup: Any, name: str, supported: bool, what: str,
+    ) -> None:
+        camera = self._camera
+        if camera is None:
+            raise CameraError(f"Cannot set {what} on a closed Picamera2 camera")
+        if not supported:
+            raise CameraError(f"Cannot set {what}: this camera or libcamera has no {control}")
+        with self._config_lock:
+            try:
+                # Built inside the try: the enum is looked up lazily and a
+                # failure there must be a CameraError.
+                controls = {control: lookup(name)}
+                camera.set_controls(controls)
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to set {what}: {exc}") from exc
+            for config in (self._still_config, self._preview_config):
+                _set_config_control(config, control, controls[control])
+
+    def set_save_dng(self, on: bool) -> None:
+        """Save a DNG with every later still, or stop. Read once per still, under
+        the request lock, so a change never splits one."""
+        self._save_dng = bool(on)
 
     def set_colour_temperature(self, kelvin: int | None) -> None:
         """Fix the white balance at ``kelvin``, or return to auto with ``None``.
@@ -1026,17 +1091,11 @@ def _camera_controls(
     # requested non-default: the user asked for highlight protection and would
     # otherwise believe they got it, so say so on stderr.
     try:
-        constraint_modes = {"normal": _lc.AeConstraintModeEnum.Normal,
-                            "highlight": _lc.AeConstraintModeEnum.Highlight,
-                            "shadows": _lc.AeConstraintModeEnum.Shadows}
-        cam_controls["AeConstraintMode"] = constraint_modes[ae_constraint]
+        cam_controls["AeConstraintMode"] = _ae_constraint_value(ae_constraint)
     except AttributeError:
         _warn_missing_ae_enum("AeConstraintMode", "--ae-constraint", ae_constraint, "normal")
     try:
-        metering_modes = {"centre": _lc.AeMeteringModeEnum.CentreWeighted,
-                          "spot": _lc.AeMeteringModeEnum.Spot,
-                          "matrix": _lc.AeMeteringModeEnum.Matrix}
-        cam_controls["AeMeteringMode"] = metering_modes[ae_metering]
+        cam_controls["AeMeteringMode"] = _ae_metering_value(ae_metering)
     except AttributeError:
         _warn_missing_ae_enum("AeMeteringMode", "--ae-metering", ae_metering, "centre")
     # 0.0 is neutral and nothing changes it any more (exposure compensation was
@@ -1051,6 +1110,41 @@ def _camera_controls(
     if ae_lock:
         cam_controls["AeEnable"] = False
     return cam_controls
+
+
+def _ae_constraint_value(name: str) -> Any:
+    """libcamera's ``AeConstraintModeEnum`` member for a validated ``name``.
+
+    ``AttributeError`` when this libcamera has no such enum.
+    """
+    from libcamera import controls as _lc
+
+    enum = _lc.AeConstraintModeEnum
+    return {"normal": enum.Normal, "highlight": enum.Highlight,
+            "shadows": enum.Shadows}[name]
+
+
+def _ae_metering_value(name: str) -> Any:
+    """libcamera's ``AeMeteringModeEnum`` member for a validated ``name``.
+
+    ``AttributeError`` when this libcamera has no such enum.
+    """
+    from libcamera import controls as _lc
+
+    enum = _lc.AeMeteringModeEnum
+    return {"centre": enum.CentreWeighted, "spot": enum.Spot,
+            "matrix": enum.Matrix}[name]
+
+
+def _ae_supported(camera_controls: Any, control: str, lookup: Any, probe: str) -> bool:
+    """True when the camera lists ``control`` and libcamera has its enum."""
+    if control not in camera_controls:
+        return False
+    try:
+        lookup(probe)
+    except AttributeError:
+        return False
+    return True
 
 
 def _cleanup_camera(camera: Any, *, stop: bool) -> None:

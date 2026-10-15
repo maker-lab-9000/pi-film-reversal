@@ -3811,3 +3811,22 @@ def test_main_runs_the_network_monitor_and_stops_it(tmp_path, monkeypatch):
     assert code == 2  # no terminal; the clean-up still runs
     (network,) = made
     assert network.started and network.closed
+
+
+def test_session_save_dng_reaches_the_camera(tmp_path, pipeline):
+    camera = FakeCamera([synthetic_frame(90, 160)])
+    calls = []
+    camera.set_save_dng = calls.append
+    session = _session(tmp_path, pipeline, camera=camera)
+    assert session.save_dng is True
+    session.save_dng = False
+    assert session.save_dng is False
+    assert calls == [False]
+
+
+def test_session_save_dng_tolerates_a_camera_without_the_setter(tmp_path, pipeline):
+    camera = FakeCamera([synthetic_frame(90, 160)])
+    assert not hasattr(camera, "set_save_dng")
+    session = _session(tmp_path, pipeline, camera=camera)
+    session.save_dng = False
+    assert session.save_dng is False

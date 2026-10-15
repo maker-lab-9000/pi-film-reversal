@@ -541,6 +541,20 @@ class CaptureSession:
         return day_dir, stem, t
 
     @property
+    def save_dng(self) -> bool:
+        """Whether a still's DNG is saved beside its original."""
+        return self._save_dng
+
+    @save_dng.setter
+    def save_dng(self, on: bool) -> None:
+        # The camera holds its own copy (it decides whether to extract the DNG at
+        # all), so the change goes there too when it has one.
+        self._save_dng = bool(on)
+        setter = getattr(self.camera, "set_save_dng", None)
+        if setter is not None:
+            setter(self._save_dng)
+
+    @property
     def double_state(self) -> tuple[bool, int]:
         """(mode on, exposures taken towards the current pair: 0 or 1)."""
         return self.double_exposure, (1 if self._pending is not None else 0)
