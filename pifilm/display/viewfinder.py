@@ -377,9 +377,12 @@ class ViewfinderLoop:
         # camera supports (``save_dng``, ``ae_constraint``, ``ae_metering``); the
         # caller decides, because only it knows the backend. The page last pushed,
         # as (rows, DONE pressed), or None to force the next push; and the time
-        # until which RESET is armed for its second tap.
+        # until which RESET is armed for its second tap. RESET needs setting rows
+        # too: without them (``--fake``) it would only delete the real camera's
+        # saved settings.
         self._settings, self._upload, self._look = settings, upload, look
         self._menu_optional = tuple(menu_rows or ())
+        self._menu_resettable = settings is not None and menu_rows is not None
         self._menu_shown: tuple[tuple[MenuRow, ...], bool] | None = None
         self._reset_until: float | None = None
 
@@ -1016,7 +1019,7 @@ class ViewfinderLoop:
         rows.append(MenuRow("eth", "ETH", network.get("ETH") or "-", False))
         rows.append(MenuRow("wlan", "WLAN", network.get("WLAN") or "-", False))
         rows.append(MenuRow("look", "LOOK", self._look or STARTER_LOOK, False))
-        if settings is not None:
+        if self._menu_resettable:
             rows.append(MenuRow("reset", "RESET",
                                 "TAP AGAIN" if self._reset_armed(now) else "TAP TWICE", True))
         return tuple(rows)

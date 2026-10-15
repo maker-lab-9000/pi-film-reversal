@@ -414,7 +414,7 @@ def _cell_tile(cell: Cell, selected: bool, scale: int) -> Image.Image:
     return canvas.finish()
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def _controls_tile(pressed: Action | None, scale: int) -> Image.Image:
     """The shutter button, the MENU key and the +/- keys; the pressed one is filled amber."""
     canvas = _Canvas(_CONTROLS_BOX, scale)

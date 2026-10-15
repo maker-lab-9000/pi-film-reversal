@@ -3383,7 +3383,13 @@ def test_leaving_the_menu_disarms_the_reset(controller, tmp_path, monkeypatch):
 def test_rows_are_left_out_when_their_part_is_missing(controller, tmp_path, monkeypatch):
     camera, ctl = controller
     pages = _spy_menu(monkeypatch)
+    # Settings but no setting rows (``--fake``): no RESET either, since it would only
+    # delete the real camera's saved settings.
     loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path))
+    _open_menu(loop, touch, clock)
+    assert [row.key for row in pages[-1][0]] == ["eth", "wlan", "look"]
+    loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path),
+                                        menu_rows=())
     _open_menu(loop, touch, clock)
     assert [row.key for row in pages[-1][0]] == ["eth", "wlan", "look", "reset"]
     loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path),

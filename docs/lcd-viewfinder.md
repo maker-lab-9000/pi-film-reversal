@@ -273,11 +273,11 @@ returns to the live view. Nothing in it needs sudo.
 | `ETH` | the Ethernet IPv4 address, or `-` | always | read-only |
 | `WLAN` | the Wi-Fi IPv4 address (the hotspot's own `10.42.0.1` included), or `-` | always | read-only |
 | `LOOK` | the `--artifacts` folder's name (for example `imx477-2026-09-v4-dark-hp5-tile`), cut with `...` if too wide; `starter (bundled)` for the bundled look | always | read-only |
-| `RESET` | `TAP TWICE` | always | see below |
+| `RESET` | `TAP TWICE` | a camera with setting rows (not `--fake`) | see below |
 
-A row the camera cannot use is left out and the rows below move up. Under
-`--fake` or with a USB camera only `UPLOAD`, the addresses, `LOOK` and `RESET`
-are there.
+A row the camera cannot use is left out and the rows below move up. A USB camera
+(V4L2) runs without the display, so it has no menu at all; under `--fake` only
+`UPLOAD`, the addresses and `LOOK` are there.
 
 **Remembered.** The three settings are written to `settings.json` beside the
 pending-grades directory (`~/.local/state/pifilm/settings.json` by default, the
@@ -309,8 +309,8 @@ the journal as `nextcloud: <line>`. A tap while a sync runs does nothing.
 | The sync failed | `FAILED (EXIT 4)` |
 
 A finished state stays until the next tap or restart. Stopping the service during
-an upload stops the sync (SIGTERM, then SIGKILL after 5 s); rclone copies each file
-whole, so the next run carries on.
+an upload stops the sync and its rclone (SIGTERM to the sync's process group, then
+SIGKILL after 5 s); rclone copies each file whole, so the next run carries on.
 
 **While the menu is open** the camera is not read, as for a review. The GPIO button
 and the Stick still take photographs; a shot finished then does not open the review,
