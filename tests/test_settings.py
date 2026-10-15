@@ -17,7 +17,7 @@ from pifilm.capture.settings import (
     save,
 )
 
-DEFAULTS = Settings(rotate=0, save_dng=True, ae_constraint="highlight", ae_metering="centre")
+DEFAULTS = Settings(save_dng=True, ae_constraint="highlight", ae_metering="centre")
 
 
 def _write(path, payload):
@@ -31,46 +31,31 @@ def test_load_without_a_file_gives_the_defaults(tmp_path):
     assert load(tmp_path / SETTINGS_FILE, DEFAULTS) == (DEFAULTS, {}, [])
 
 
-def test_load_a_valid_file_with_all_four_keys(tmp_path):
+def test_load_a_valid_file_with_all_three_keys(tmp_path):
     path = tmp_path / SETTINGS_FILE
     _write(
         path,
-        {
-            "version": 1,
-            "rotate": 180,
-            "save_dng": False,
-            "ae_constraint": "shadows",
-            "ae_metering": "spot",
-        },
+        {"version": 1, "save_dng": False, "ae_constraint": "shadows", "ae_metering": "spot"},
     )
     current, overrides, lines = load(path, DEFAULTS)
-    assert current == Settings(
-        rotate=180, save_dng=False, ae_constraint="shadows", ae_metering="spot"
-    )
-    assert overrides == {
-        "rotate": 180,
-        "save_dng": False,
-        "ae_constraint": "shadows",
-        "ae_metering": "spot",
-    }
+    assert current == Settings(save_dng=False, ae_constraint="shadows", ae_metering="spot")
+    assert overrides == {"save_dng": False, "ae_constraint": "shadows", "ae_metering": "spot"}
     assert lines == [
-        "settings: rotate 180, dng off, ae-constraint shadows, ae-metering spot "
-        "(saved in the menu; the unit says rotate 0, dng on, ae-constraint highlight, "
+        "settings: dng off, ae-constraint shadows, ae-metering spot "
+        "(saved in the menu; the unit says dng on, ae-constraint highlight, "
         "ae-metering centre)"
     ]
 
 
 def test_load_summary_line_names_only_the_differing_keys(tmp_path):
     path = tmp_path / SETTINGS_FILE
-    _write(path, {"version": 1, "rotate": 180, "ae_constraint": "shadows"})
+    _write(path, {"version": 1, "save_dng": False, "ae_constraint": "shadows"})
     current, overrides, lines = load(path, DEFAULTS)
-    assert current == Settings(
-        rotate=180, save_dng=True, ae_constraint="shadows", ae_metering="centre"
-    )
-    assert overrides == {"rotate": 180, "ae_constraint": "shadows"}
+    assert current == Settings(save_dng=False, ae_constraint="shadows", ae_metering="centre")
+    assert overrides == {"save_dng": False, "ae_constraint": "shadows"}
     assert lines == [
-        "settings: rotate 180, ae-constraint shadows (saved in the menu; the unit says "
-        "rotate 0, ae-constraint highlight)"
+        "settings: dng off, ae-constraint shadows (saved in the menu; the unit says "
+        "dng on, ae-constraint highlight)"
     ]
 
 
@@ -78,9 +63,7 @@ def test_load_partial_keys(tmp_path):
     path = tmp_path / SETTINGS_FILE
     _write(path, {"version": 1, "ae_metering": "matrix"})
     current, overrides, lines = load(path, DEFAULTS)
-    assert current == Settings(
-        rotate=0, save_dng=True, ae_constraint="highlight", ae_metering="matrix"
-    )
+    assert current == Settings(save_dng=True, ae_constraint="highlight", ae_metering="matrix")
     assert overrides == {"ae_metering": "matrix"}
     assert lines == [
         "settings: ae-metering matrix (saved in the menu; the unit says ae-metering centre)"
@@ -90,13 +73,13 @@ def test_load_partial_keys(tmp_path):
 @pytest.mark.parametrize(
     ("key", "value"),
     [
-        ("rotate", 90),
-        ("rotate", True),
-        ("rotate", "180"),
-        ("rotate", 180.0),
         ("save_dng", "yes"),
         ("save_dng", 0),
+        ("save_dng", 1),
+        ("save_dng", None),
         ("ae_constraint", "bright"),
+        ("ae_constraint", 3),
+        ("ae_constraint", True),
         ("ae_metering", "average"),
         ("ae_metering", None),
     ],
@@ -116,12 +99,20 @@ def test_load_ignores_an_invalid_value_and_keeps_the_others(tmp_path, key, value
 
 def test_load_ignores_an_unknown_key(tmp_path):
     path = tmp_path / SETTINGS_FILE
-    _write(path, {"version": 1, "brightness": 3, "rotate": 180})
+    _write(path, {"version": 1, "brightness": 3, "save_dng": False})
     current, overrides, lines = load(path, DEFAULTS)
-    assert current.rotate == 180
-    assert overrides == {"rotate": 180}
+    assert current.save_dng is False
+    assert overrides == {"save_dng": False}
     assert lines[0] == f"settings: ignoring brightness in {path}"
     assert len(lines) == 2
+
+
+def test_load_ignores_a_rotate_key_left_by_an_older_build(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    _write(path, {"version": 1, "rotate": 180})
+    current, overrides, lines = load(path, DEFAULTS)
+    assert (current, overrides) == (DEFAULTS, {})
+    assert lines == [f"settings: ignoring rotate in {path}"]
 
 
 @pytest.mark.parametrize(
@@ -129,9 +120,9 @@ def test_load_ignores_an_unknown_key(tmp_path):
     [
         ("{not json", "not JSON"),
         ("[1, 2]", "not an object"),
-        (json.dumps({"version": 2, "rotate": 180}), "version"),
-        (json.dumps({"rotate": 180}), "version"),
-        (json.dumps({"version": True, "rotate": 180}), "version"),
+        (json.dumps({"version": 2, "save_dng": False}), "version"),
+        (json.dumps({"save_dng": False}), "version"),
+        (json.dumps({"version": True, "save_dng": False}), "version"),
     ],
 )
 def test_load_ignores_a_bad_file_and_leaves_it(tmp_path, content, reason_part):
@@ -157,10 +148,10 @@ def test_load_ignores_a_directory_at_the_path(tmp_path):
 
 def test_load_an_override_equal_to_its_default_gives_no_summary(tmp_path):
     path = tmp_path / SETTINGS_FILE
-    _write(path, {"version": 1, "rotate": 0, "save_dng": True})
+    _write(path, {"version": 1, "ae_metering": "centre", "save_dng": True})
     current, overrides, lines = load(path, DEFAULTS)
     assert current == DEFAULTS
-    assert overrides == {"rotate": 0, "save_dng": True}
+    assert overrides == {"ae_metering": "centre", "save_dng": True}
     assert lines == []
 
 
@@ -169,15 +160,15 @@ def test_load_an_override_equal_to_its_default_gives_no_summary(tmp_path):
 
 def test_save_round_trips_through_load(tmp_path):
     path = tmp_path / SETTINGS_FILE
-    save(path, {"rotate": 180, "save_dng": False})
+    save(path, {"ae_constraint": "shadows", "save_dng": False})
     assert json.loads(path.read_text(encoding="utf-8")) == {
         "version": VERSION,
-        "rotate": 180,
+        "ae_constraint": "shadows",
         "save_dng": False,
     }
     current, overrides, _ = load(path, DEFAULTS)
-    assert overrides == {"rotate": 180, "save_dng": False}
-    assert current.rotate == 180 and current.save_dng is False
+    assert overrides == {"ae_constraint": "shadows", "save_dng": False}
+    assert current.ae_constraint == "shadows" and current.save_dng is False
 
 
 def test_save_creates_the_parent_directory(tmp_path):
@@ -188,7 +179,7 @@ def test_save_creates_the_parent_directory(tmp_path):
 
 def test_save_is_atomic(tmp_path, monkeypatch):
     path = tmp_path / SETTINGS_FILE
-    save(path, {"rotate": 180})
+    save(path, {"save_dng": False})
     before = path.read_bytes()
 
     def broken_replace(src, dst):
@@ -196,7 +187,7 @@ def test_save_is_atomic(tmp_path, monkeypatch):
 
     monkeypatch.setattr(settings_mod.os, "replace", broken_replace)
     with pytest.raises(OSError):
-        save(path, {"rotate": 0})
+        save(path, {"save_dng": True})
     assert path.read_bytes() == before
     assert sorted(p.name for p in tmp_path.iterdir()) == [SETTINGS_FILE]
 
@@ -212,10 +203,8 @@ def _control(tmp_path, overrides=None):
 
 
 def test_control_current_reflects_the_overrides(tmp_path):
-    control, _, _ = _control(tmp_path, {"rotate": 180})
-    assert control.current == Settings(
-        rotate=180, save_dng=True, ae_constraint="highlight", ae_metering="centre"
-    )
+    control, _, _ = _control(tmp_path, {"ae_metering": "spot"})
+    assert control.current == Settings(save_dng=True, ae_constraint="highlight", ae_metering="spot")
 
 
 def test_set_calls_the_applier_then_saves(tmp_path):
@@ -225,11 +214,11 @@ def test_set_calls_the_applier_then_saves(tmp_path):
     def applier(value):
         calls.append((value, path.exists()))
 
-    control.register("rotate", applier)
-    assert control.set("rotate", 180) is True
-    assert calls == [(180, False)]
-    assert control.current.rotate == 180
-    assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1, "rotate": 180}
+    control.register("save_dng", applier)
+    assert control.set("save_dng", False) is True
+    assert calls == [(False, False)]
+    assert control.current.save_dng is False
+    assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1, "save_dng": False}
     assert lines == []
 
 
@@ -262,19 +251,19 @@ def test_set_with_a_save_failure_keeps_the_change(tmp_path, monkeypatch):
         raise OSError("disk full")
 
     monkeypatch.setattr(settings_mod, "save", broken_save)
-    assert control.set("rotate", 180) is True
-    assert control.current.rotate == 180
+    assert control.set("ae_constraint", "normal") is True
+    assert control.current.ae_constraint == "normal"
     assert lines == ["settings: cannot save (disk full)"]
     assert not path.exists()
 
 
 def test_set_back_to_the_default_removes_the_key(tmp_path):
     control, path, _ = _control(tmp_path)
-    control.set("rotate", 180)
+    control.set("ae_metering", "matrix")
     control.set("save_dng", False)
-    control.set("rotate", 0)
+    control.set("ae_metering", "centre")
     assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1, "save_dng": False}
-    assert control.current.rotate == 0
+    assert control.current.ae_metering == "centre"
 
 
 def test_set_the_same_value_applies_and_saves_again(tmp_path):
@@ -290,11 +279,12 @@ def test_set_the_same_value_applies_and_saves_again(tmp_path):
 @pytest.mark.parametrize(
     ("key", "value"),
     [
-        ("rotate", 90),
-        ("rotate", True),
         ("save_dng", "yes"),
+        ("save_dng", 1),
+        ("ae_constraint", 3),
         ("ae_metering", "average"),
         ("brightness", 3),
+        ("rotate", 180),
     ],
 )
 def test_set_an_invalid_key_or_value_raises(tmp_path, key, value):
@@ -313,7 +303,7 @@ def test_register_an_unknown_key_raises(tmp_path):
 
 def test_reset_applies_only_the_differing_keys_and_deletes_the_file(tmp_path):
     path = tmp_path / SETTINGS_FILE
-    overrides = {"rotate": 180, "ae_metering": "centre"}
+    overrides = {"ae_constraint": "shadows", "ae_metering": "centre"}
     save(path, overrides)
     lines: list[str] = []
     control = SettingsControl(path, DEFAULTS, overrides, log=lines.append)
@@ -321,7 +311,7 @@ def test_reset_applies_only_the_differing_keys_and_deletes_the_file(tmp_path):
     for key in settings_mod.KEYS:
         control.register(key, lambda value, key=key: calls.append((key, value)))
     control.reset()
-    assert calls == [("rotate", 0)]
+    assert calls == [("ae_constraint", "highlight")]
     assert control.current == DEFAULTS
     assert not path.exists()
     assert lines == ["settings: reset to the unit's flags"]
@@ -329,20 +319,20 @@ def test_reset_applies_only_the_differing_keys_and_deletes_the_file(tmp_path):
 
 def test_reset_keeps_a_key_whose_applier_raises(tmp_path):
     path = tmp_path / SETTINGS_FILE
-    overrides = {"rotate": 180, "save_dng": False}
+    overrides = {"ae_metering": "spot", "save_dng": False}
     save(path, overrides)
     lines: list[str] = []
     control = SettingsControl(path, DEFAULTS, overrides, log=lines.append)
 
     def broken(value):
-        raise RuntimeError("no display")
+        raise RuntimeError("camera busy")
 
-    control.register("rotate", broken)
+    control.register("ae_metering", broken)
     control.reset()
-    assert control.current.rotate == 180
+    assert control.current.ae_metering == "spot"
     assert control.current.save_dng is True
     assert lines == [
-        "settings: cannot apply rotate 0 (no display)",
+        "settings: cannot apply ae_metering centre (camera busy)",
         "settings: reset to the unit's flags",
     ]
     assert not path.exists()
@@ -359,7 +349,7 @@ def test_reset_logs_a_file_that_cannot_be_deleted(tmp_path):
     lines: list[str] = []
     path = tmp_path / SETTINGS_FILE
     path.mkdir()  # unlink of a directory raises an OSError other than not-found
-    control = SettingsControl(path, DEFAULTS, {"rotate": 180}, log=lines.append)
+    control = SettingsControl(path, DEFAULTS, {"save_dng": False}, log=lines.append)
     control.reset()
     assert control.current == DEFAULTS
     assert len(lines) == 2
@@ -374,7 +364,7 @@ def test_settings_file_name_is_settings_json():
 
 def test_load_survives_an_unreadable_state_directory(tmp_path, monkeypatch):
     path = tmp_path / SETTINGS_FILE
-    _write(path, {"version": 1, "rotate": 180})
+    _write(path, {"version": 1, "save_dng": False})
 
     def denied(self, *args, **kwargs):
         raise PermissionError(13, "Permission denied", str(self))
