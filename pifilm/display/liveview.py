@@ -115,12 +115,6 @@ TUNING_LABEL = "TUNING"
 # own past the tag row and short of the shutter's hit circle, photos first. Its own
 # tile, at a fixed place, so it never moves the row and the row never moves it.
 DISK_X0 = 127
-# The Pi's IPv4 addresses (``pifilm.capture.network``): "ETH 192.168.1.20" and
-# "WLAN 10.42.0.1" on the same dark patch, ETH first, in a tile of their own at the
-# bottom left of the picture, just above the strip and right of the focus gauge.
-# White, not amber: information, not a warning. Drawn only, never hit-tested: its
-# lowest units lie in the band where taps on the cells are accepted, and a tap
-# there still selects the cell under it.
 FOCUS_TRACK = (6, 22, 9, 198)
 FOCUS_TICK_X = (4, 11)
 FOCUS_TICK_HEIGHT = 1.5
@@ -157,6 +151,13 @@ _TAGS_BOX = (0, 0, 124, 22)
 # together end at about 207 units (see the tests), so there is room to spare.
 _DISK_BOX = (_TAGS_BOX[2], 0, 252, _TAGS_BOX[3])
 _METER_TEXT_BOX = (192, 209, WIDTH, 221)
+# The Pi's IPv4 addresses (``pifilm.capture.network``): "ETH 192.168.1.20" and
+# "WLAN 10.42.0.1" on the same dark patch, ETH first, in a tile of their own at the
+# bottom left of the picture, just above the strip and right of the focus gauge.
+# White, not amber: information, not a warning. Drawn only, never hit-tested: its
+# lowest units lie in the band where taps on the cells are accepted, and a tap
+# there still selects the cell under it.
+#
 # From just right of the focus gauge's ticks (x 4 to 11) to well short of the meter
 # text (x 192), and from 196 to one unit above the strip (208): as tall as the
 # battery tag's pill (11 units). "ETH 255.255.255.255" and "WLAN 255.255.255.255"

@@ -704,6 +704,18 @@ def test_network_is_the_last_field_and_empty_by_default():
 
 
 @pytest.mark.parametrize("scale", [1, 2])
+def test_no_network_never_builds_the_tile(scale, monkeypatch):
+    # The byte-identical guarantee: without an address the tile is not drawn at all.
+    def refuse(*args):
+        raise AssertionError("network tile drawn without an address")
+    monkeypatch.setattr(liveview, "_network_tile", refuse)
+    for disk in ((), WIDEST_DISK):
+        state = LiveState(cells=_cells(), selected=1, double=(True, 1), developing=9,
+                          tuning_mismatch=True, disk_warning=disk)
+        _pixels(state, scale=scale, battery_percent=100, focus=0.5, focus_peak=0.5)
+
+
+@pytest.mark.parametrize("scale", [1, 2])
 def test_no_network_draws_nothing(scale):
     for double in (None, (True, 1)):
         for battery in (None, 100):
