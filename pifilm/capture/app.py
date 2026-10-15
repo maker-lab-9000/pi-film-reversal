@@ -180,6 +180,22 @@ Beside it ``main`` has the session make a ``NetworkMonitor``
 (``pifilm.capture.network``) for every loop, for the same reasons: the viewfinder
 shows the Pi's ``eth0`` and ``wlan0`` addresses, and the ``network:`` lines say in
 the journal which address it had when. ``network`` is what the snapshot carries.
+
+The settings menu
+-----------------
+``main`` reads ``settings.json`` (``pifilm.capture.settings``) beside the state
+directory once the backend is known and before the panel or the camera is opened,
+so a saved value is in effect from the first frame: the unit's flags are the
+defaults, a value saved in the menu wins, and each ``settings:`` line says so in
+the journal. Only a real Picamera2 takes them (DNG saving and the two
+auto-exposure modes are its controls); under ``--fake`` or V4L2 the arguments
+stay as given, so a saved value can never trip the Picamera2-only check and stop
+the service starting. The ``SettingsControl`` gets one applier per row the
+backend can change, and the viewfinder gets the rows the camera supports (none of
+the auto-exposure ones under ``--ae-lock``, whose setters would change nothing),
+the look's name (the ``--artifacts`` folder) and, with ``--nextcloud-env`` and a
+panel, an ``Upload`` that ``main`` closes beside the network monitor. Only the
+viewfinder's loop thread sets or resets a setting; the control has no lock.
 """
 
 from __future__ import annotations
@@ -243,7 +259,10 @@ from .network import Addresses, NetworkMonitor
 from .picamera import COLOUR_TEMPERATURE_RANGE_K, Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
 from .remote import RemoteCaptureServer
+from .settings import SETTINGS_FILE, Settings, SettingsControl
+from .settings import load as load_settings
 from .thumbnail import render_exposure_card
+from .upload import Upload
 
 cv2 = require_cv2()
 
@@ -1611,7 +1630,11 @@ def _no_signal(*_: object) -> None:
     return None
 
 
-def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
+def _run_viewfinder(
+    camera, controller, display_pair, power, args, *,
+    settings: SettingsControl | None = None, upload: Upload | None = None,
+    look: str = "", menu_rows: tuple[str, ...] | None = None,
+) -> int:
     display, touch = display_pair
     stop = threading.Event()
     previous = signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -1621,6 +1644,10 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
         touch_debug=args.touch_debug,
         dim_after=args.display_dim_after,
         off_after=args.display_off_after,
+        settings=settings,
+        upload=upload,
+        look=look,
+        menu_rows=menu_rows,
     )
     print("LCD viewfinder running. Tap the shutter to capture; Ctrl-C to stop.")
     failure: DisplayError | None = None
@@ -1660,6 +1687,21 @@ def _run_viewfinder(camera, controller, display_pair, power, args) -> int:
     # Serving goes on, so a stop has to work again.
     signal.signal(signal.SIGTERM, previous)
     return _serve_until_interrupt()
+
+
+def _look_name(artifacts: Path | None) -> str:
+    """The ``LOOK`` row: the ``--artifacts`` folder's name, or "" for the starter.
+
+    The shipped unit names the bundled starter by its path (``.../pifilm/data``),
+    and ``data`` would say nothing on the screen, so that folder counts as no
+    ``--artifacts`` at all and the viewfinder shows its starter label.
+    """
+    if not artifacts:
+        return ""
+    path = Path(artifacts)
+    if path.name == "data" and path.parent.name == "pifilm":
+        return ""
+    return path.name
 
 
 def _disk_percent(text: str) -> int:
@@ -1837,6 +1879,12 @@ def _main(argv: list[str] | None) -> int:
              "(default: $XDG_STATE_HOME/pifilm/pending, or ~/.local/state/pifilm/pending)",
     )
     parser.add_argument(
+        "--nextcloud-env", type=Path, default=None, metavar="PATH",
+        help="the .env of the Nextcloud sync, for the settings menu's UPLOAD row; this "
+             "process never reads it and only hands the path to the sync it starts "
+             "(default: no UPLOAD row)",
+    )
+    parser.add_argument(
         "--disk-warn-percent", type=_disk_percent, default=DEFAULT_WARN_PERCENT, metavar="N",
         help="warn (a log line, and an amber PHOTOS or SD tag on the LCD) while the photo "
              f"folder's filesystem or / is N%% full or more, 1-100 (default: "
@@ -1897,6 +1945,22 @@ def _main(argv: list[str] | None) -> int:
         # Argument errors must precede any hardware side effect: the panel below
         # claims the panel (SPI, GPIO and I2C, or the DRM output) and may pulse a reset line.
         _reject_picamera2_only_flags(parser, args, reason="cannot be used with --fake")
+    # The menu's settings (see "The settings menu"): the unit's flags are the
+    # defaults, and what the menu saved wins over them. Only a real Picamera2
+    # takes them, so under --fake or V4L2 the arguments stay as given.
+    settings_path = (args.state_dir or default_state_dir()).parent / SETTINGS_FILE
+    settings_defaults = Settings(
+        save_dng=not args.no_dng,
+        ae_constraint=args.ae_constraint or "normal",
+        ae_metering=args.ae_metering or "centre",
+    )
+    effective, overrides, lines = load_settings(settings_path, settings_defaults)
+    for line in lines:
+        print(line)
+    if backend == "picamera2":
+        args.no_dng = not effective.save_dng
+        args.ae_constraint = effective.ae_constraint
+        args.ae_metering = effective.ae_metering
     display_pair = None
     if args.display != "none":
         try:
@@ -1941,6 +2005,23 @@ def _main(argv: list[str] | None) -> int:
         state_dir=args.state_dir,
         grade_backend=args.grade_backend,
     )
+    settings = SettingsControl(settings_path, settings_defaults, overrides, log=print)
+    menu_rows: tuple[str, ...] | None = None
+    if backend == "picamera2":
+        settings.register("save_dng", lambda on: setattr(session, "save_dng", on))
+        settings.register("ae_constraint", lambda name: camera.set_ae_constraint(name))
+        settings.register("ae_metering", lambda name: camera.set_ae_metering(name))
+        # Under --ae-lock the AE setters would succeed and change nothing.
+        exposure = getattr(camera, "exposure_adjustable", True) is not False
+        menu_rows = ("save_dng",) + (
+            ("ae_constraint",)
+            if exposure and getattr(camera, "ae_constraint_supported", False) else ()
+        ) + (
+            ("ae_metering",)
+            if exposure and getattr(camera, "ae_metering_supported", False) else ()
+        )
+    look = _look_name(args.artifacts)
+    upload: Upload | None = None
     controller: CaptureController | None = None
     remote: RemoteCaptureServer | None = None
     button: ShutterButton | None = None
@@ -1962,6 +2043,9 @@ def _main(argv: list[str] | None) -> int:
         if callable(watch_network):
             network = watch_network()
             network.start()
+        if args.nextcloud_env is not None and display_pair is not None:
+            upload = Upload(args.nextcloud_env.expanduser(), log=print)
+        menu = {"settings": settings, "upload": upload, "look": look, "menu_rows": menu_rows}
         if args.shutter_gpio is not None:
             try:
                 button = open_shutter_button(args.shutter_gpio)
@@ -1997,7 +2081,9 @@ def _main(argv: list[str] | None) -> int:
             try:
                 if display_pair is not None:
                     assert controller is not None
-                    return _run_viewfinder(camera, controller, display_pair, power, args)
+                    return _run_viewfinder(
+                        camera, controller, display_pair, power, args, **menu,
+                    )
                 if has_display() and (args.show_captures or not args.no_preview):
                     if sys.stdin.isatty():
                         with TerminalKeys() as keys:
@@ -2021,7 +2107,7 @@ def _main(argv: list[str] | None) -> int:
                 return 0
         if display_pair is not None:
             assert controller is not None
-            return _run_viewfinder(camera, controller, display_pair, power, args)
+            return _run_viewfinder(camera, controller, display_pair, power, args, **menu)
         if args.show_captures and has_display():
             if sys.stdin.isatty():
                 with TerminalKeys() as keys:
@@ -2071,6 +2157,8 @@ def _main(argv: list[str] | None) -> int:
             disk.close()
         if network is not None:
             network.close()
+        if upload is not None:
+            upload.close()
         if remote is not None:
             remote.close()
         if controller is not None:

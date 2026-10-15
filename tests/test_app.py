@@ -1506,7 +1506,7 @@ def test_remote_listener_and_display_share_one_controller(camera_cli, monkeypatc
         def close(self):
             return None
 
-    def viewfinder_double(camera, controller, display_pair, power, args):
+    def viewfinder_double(camera, controller, display_pair, power, args, **kwargs):
         seen["viewfinder_calls"] += 1
         seen["viewfinder_controller"] = controller
         return 0
@@ -3830,3 +3830,168 @@ def test_session_save_dng_tolerates_a_camera_without_the_setter(tmp_path, pipeli
     session = _session(tmp_path, pipeline, camera=camera)
     session.save_dng = False
     assert session.save_dng is False
+
+
+# The settings menu wired into ``main``.
+
+
+def _save_settings(**values):
+    """Write a settings.json beside the default state directory (XDG_STATE_HOME)."""
+    from pifilm.capture.gradequeue import default_state_dir
+    from pifilm.capture.settings import SETTINGS_FILE, save
+
+    path = default_state_dir().parent / SETTINGS_FILE
+    save(path, values)
+    return path
+
+
+class _MenuCamera(_CameraDouble):
+    """A Picamera2 double with the AE setters and what they support."""
+
+    def __init__(self, *, constraint=True, metering=True, adjustable=True):
+        super().__init__()
+        self.ae_constraint_supported = constraint
+        self.ae_metering_supported = metering
+        self.exposure_adjustable = adjustable
+        self.calls = []
+
+    def set_ae_constraint(self, name):
+        self.calls.append(("ae_constraint", name))
+
+    def set_ae_metering(self, name):
+        self.calls.append(("ae_metering", name))
+
+    def set_save_dng(self, on):
+        self.calls.append(("save_dng", on))
+
+
+def _menu_main(camera_cli, monkeypatch, tmp_path, camera, *extra):
+    """Run main on a Picamera2 double with a panel; return what ViewfinderLoop got."""
+    seen = {}
+    pair = (SimpleNamespace(close=lambda: None), SimpleNamespace(close=lambda: None))
+
+    def open_picamera(tuning_file, **kwargs):
+        seen["camera_kwargs"] = kwargs
+        return camera
+
+    class LoopDouble:
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+
+        def run(self, stop):
+            return None
+
+    monkeypatch.setattr(camera_cli, "Picamera2Camera", open_picamera, raising=False)
+    monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: pair)
+    monkeypatch.setattr(camera_cli, "ViewfinderLoop", LoopDouble)
+    argv = ["--camera", "picamera2", "--display", "waveshare28", "--no-preview",
+            "--out", str(tmp_path / "shots"), *extra]
+    assert camera_cli.main(argv) == 0
+    return seen
+
+
+def test_saved_ae_values_with_fake_do_not_trip_the_picamera2_only_check(
+    camera_cli, capsys,
+):
+    _save_settings(ae_constraint="shadows", ae_metering="spot")
+    assert camera_cli.main(["--fake", "--no-preview"]) == 0
+    out = capsys.readouterr()
+    assert "cannot be used with --fake" not in out.err
+
+
+def test_saved_values_reach_the_picamera2_constructor_and_the_session(
+    camera_cli, monkeypatch, tmp_path, capsys,
+):
+    _save_settings(ae_constraint="highlight", ae_metering="matrix", save_dng=False)
+    camera = _MenuCamera()
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, camera)
+    kwargs = seen["camera_kwargs"]
+    assert kwargs["ae_constraint"] == "highlight"
+    assert kwargs["ae_metering"] == "matrix"
+    assert kwargs["save_dng"] is False
+    assert seen["settings"].current.save_dng is False
+    out = capsys.readouterr().out
+    assert ("settings: dng off, ae-constraint highlight, ae-metering matrix "
+            "(saved in the menu; the unit says dng on, ae-constraint normal, "
+            "ae-metering centre)") in out
+
+
+def test_the_menu_appliers_reach_the_camera_and_the_session(camera_cli, monkeypatch, tmp_path):
+    camera = _MenuCamera()
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, camera)
+    control = seen["settings"]
+    assert control.set("ae_constraint", "shadows")
+    assert control.set("ae_metering", "spot")
+    assert control.set("save_dng", False)  # through the session, which tells the camera
+    assert camera.calls == [
+        ("ae_constraint", "shadows"), ("ae_metering", "spot"), ("save_dng", False),
+    ]
+    assert seen["menu_rows"] == ("save_dng", "ae_constraint", "ae_metering")
+
+
+def test_menu_rows_leave_out_what_the_camera_cannot_use(camera_cli, monkeypatch, tmp_path):
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera(constraint=False))
+    assert seen["menu_rows"] == ("save_dng", "ae_metering")
+
+
+def test_menu_rows_leave_out_the_ae_rows_under_ae_lock(camera_cli, monkeypatch, tmp_path):
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera(adjustable=False),
+                      "--ae-lock")
+    assert seen["menu_rows"] == ("save_dng",)
+
+
+def test_fake_has_no_optional_menu_rows_and_an_empty_look(tmp_path, monkeypatch):
+    kwargs = _viewfinder_kwargs(monkeypatch, tmp_path, [])
+    assert kwargs["menu_rows"] is None
+    assert kwargs["look"] == ""
+    assert kwargs["upload"] is None
+    assert kwargs["settings"] is not None
+
+
+def test_the_look_is_the_artifacts_folder_name(tmp_path, monkeypatch):
+    kwargs = _viewfinder_kwargs(
+        monkeypatch, tmp_path, ["--artifacts", str(tmp_path / "imx477-v4-dark")],
+    )
+    assert kwargs["look"] == "imx477-v4-dark"
+
+
+def test_the_bundled_starter_named_by_its_path_has_no_look_name(tmp_path, monkeypatch):
+    # The shipped unit passes --artifacts .../pifilm/data; the row must not say "data".
+    kwargs = _viewfinder_kwargs(
+        monkeypatch, tmp_path, ["--artifacts", str(tmp_path / "pifilm" / "data")],
+    )
+    assert kwargs["look"] == ""
+
+
+def test_nextcloud_env_with_a_display_makes_an_upload_closed_on_exit(tmp_path, monkeypatch):
+    from pifilm.capture import app
+
+    made = []
+
+    class FakeUpload:
+        def __init__(self, env_path, *, log=print):
+            self.env_path, self.closed = env_path, False
+            made.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(app, "Upload", FakeUpload)
+    kwargs = _viewfinder_kwargs(
+        monkeypatch, tmp_path, ["--nextcloud-env", str(tmp_path / "nc.env")],
+    )
+    (upload,) = made
+    assert kwargs["upload"] is upload
+    assert upload.env_path == tmp_path / "nc.env"
+    assert upload.closed
+
+
+def test_nextcloud_env_without_a_display_makes_no_upload(tmp_path, monkeypatch):
+    from pifilm.capture import app
+
+    made = []
+    monkeypatch.setattr(app, "Upload", lambda *a, **k: made.append(1))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    app.main(["--fake", "--no-preview", "--out", str(tmp_path),
+              "--nextcloud-env", str(tmp_path / "nc.env")])
+    assert made == []
