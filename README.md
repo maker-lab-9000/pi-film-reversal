@@ -229,7 +229,7 @@ Optional off-device backup: the Pi pushes everything under `~/Pictures/pifilm` t
 How it behaves:
 
 - **Copy, never delete** — only adds/updates on Nextcloud, so cleaning the Pi's SD card never removes the cloud copies.
-- **No-op off the wired LAN** — each run exits at once unless `eth0` has a home-LAN IP and Nextcloud answers a TCP connect, so a frequent timer is cheap.
+- **No-op off the home network** — each run exits at once unless `eth0` or `wlan0` (in that order) has a home-LAN IP and Nextcloud answers a TCP connect, so a frequent timer is cheap; hotspot mode skips because Nextcloud is unreachable from it.
 - **Incremental** — syncs the originals, `_graded.jpg`, `.dng` raws and `captures.jsonl`, skipping anything already uploaded.
 
 Scheduling is a **systemd timer, not cron**: `pifilm-nextcloud-sync.timer` runs the oneshot a few minutes after boot, then every 15 min (`OnUnitActiveSec=15min`, `Persistent=true`).

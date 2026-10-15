@@ -1,7 +1,7 @@
 # Nextcloud photo sync
 
 Push every capture under `~/Pictures/pifilm` to a folder on your Nextcloud over
-WebDAV, from the Pi, whenever it is on the wired home LAN. This is an optional
+WebDAV, from the Pi, whenever it is on the home network, wired or Wi-Fi. This is an optional
 off-device archive; it changes nothing about capture or grading.
 
 ## What it does, and what it does not
@@ -12,11 +12,23 @@ Nextcloud folder. Design choices, each deliberate:
 - **Copy, never mirror.** It uses `rclone copy`, which only adds or updates
   files on Nextcloud. Deleting a photo on the Pi (an SD-card cleanup) never
   deletes the cloud copy. There is no flag to make it delete.
-- **A quiet no-op off the wired LAN.** Each run first checks that `eth0` holds a
-  real home-LAN IPv4 (not a `169.254.x` link-local address) and that the
-  Nextcloud host answers a TCP connect. If either fails it logs one line and
-  exits 0. A systemd timer can therefore fire it every few minutes and it does
-  nothing until the Pi is plugged into the home network.
+- **A quiet no-op off the home network.** Each run first checks `eth0`, then
+  `wlan0`, for a routable IPv4 (not a `169.254.x` link-local address) and
+  takes the first that has one; then the Nextcloud host must answer a TCP
+  connect. If either fails it logs one line and exits 0. A systemd timer can
+  therefore fire it every few minutes and it does nothing until the Pi is on
+  the home network, by cable or by Wi-Fi. When it goes ahead it logs which
+  interface it chose, e.g. `Nextcloud reachable over wlan0 (192.168.178.56)`.
+  Only the first interface with an address is checked; the connect follows
+  the routing table either way. `--iface` overrides the list and can be
+  repeated (`--iface wlan0 --iface eth0`); one given replaces the default.
+- **Hotspot mode skips on its own.** When the Pi runs its own hotspot for the
+  Stick, `wlan0` holds `10.42.0.1`, which passes the address check, but
+  Nextcloud is not reachable from the hotspot, so the run logs the
+  "not reachable" line and exits 0. No special case is needed.
+- **It can upload while you shoot.** On Wi-Fi the Pi may be shooting while a
+  sync runs. rclone's `--bwlimit` would be the knob if an upload ever slowed
+  capture; it is not set today.
 - **The password never touches a command line.** It is read from `.env`,
   obscured with `rclone obscure` (plaintext on stdin), and handed to rclone
   through `RCLONE_CONFIG_*` environment variables. It never appears in an argv,
@@ -77,9 +89,10 @@ cd ~/repos/pi-film-reversal
 .venv/bin/python scripts/nextcloud_sync.py --env .env --apply  # real copy
 ```
 
-If the Pi is not on the wired LAN, both print a "skipping" line and exit — plug
-the Ethernet cable into the home router first (its address must be on the same
-`192.168.178.x` network as Nextcloud, not the link-local cable to the Mac).
+If the Pi is not on the home network, both print a "skipping" line and exit —
+plug the Ethernet cable into the home router or join the home Wi-Fi first (the
+address must be on the same `192.168.178.x` network as Nextcloud, not the
+link-local cable to the Mac or the Pi's own hotspot).
 
 ## Enable the timer
 
@@ -104,14 +117,17 @@ journalctl -u pifilm-nextcloud-sync.service -n 30     # the run's summary line
 
 The service runs as `george` with the repo as its working directory, so it
 reads the same `.env`. It fires a few minutes after boot and every 15 minutes
-after that; each run is a no-op unless the Pi is on the wired LAN, so the
+after that; each run is a no-op unless the Pi is on the home network, so the
 frequent schedule is cheap.
 
 ## Troubleshooting
 
-- **Every run says "skipping".** The Pi has no home-LAN IPv4 on `eth0`
-  (`ip -4 addr show dev eth0`) or Nextcloud is unreachable from it. Confirm the
-  Ethernet cable is in the home router and `ping 192.168.178.241` works.
+- **Every run says "skipping".** `no network on eth0 or wlan0` means neither
+  interface has a routable IPv4 (`ip -4 addr show dev eth0`,
+  `ip -4 addr show dev wlan0`). `not reachable over ...` names the interface
+  and address it chose: Nextcloud cannot be reached from there. Confirm the
+  Ethernet cable is in the home router or the Pi is on the home Wi-Fi (not its
+  hotspot, `10.42.0.1`) and `ping 192.168.178.241` works.
 - **401 / authentication errors.** Regenerate the app password and update
   `NEXTCLOUD_PASSWORD`; a login password with 2FA enabled will not work over
   WebDAV.
