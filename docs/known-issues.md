@@ -160,26 +160,31 @@ running. The GPU's self-test had passed at that start and at the three before
 and after it. Whether GPU grading or the live-view restart makes the stall more
 likely is not known from two occurrences.
 
-### To do: keep the journal across reboots
+### The journal is kept across reboots (2026-10-15)
 
-Not done yet (the owner's choice, 2026-10-14: wait until it happens more often).
-Raspberry Pi OS keeps the journal in memory, so a reboot loses every stall
-logged before it, and there is no history to say whether stalls are becoming
-more frequent. The fix, on the Pi:
-
-```bash
-sudo mkdir -p /etc/systemd/journald.conf.d
-printf '[Journal]\nStorage=persistent\nSystemMaxUse=200M\n' \
-  | sudo tee /etc/systemd/journald.conf.d/persistent.conf
-sudo systemctl restart systemd-journald
-```
-
-Then stalls per day, across reboots:
+Raspberry Pi OS keeps the journal in memory (`Storage=volatile` in
+`/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`), so a reboot or a
+power cut lost every stall logged before it. That happened on 2026-10-15: several
+restarts during outdoor use, and nothing left to read once the Pi had been switched
+off and on. `scripts/pi_journal.py` keeps it on the card instead (a drop-in that
+sorts after the OS's, capped at 200 MB and always leaving 1 GB free). Once, on the
+Pi:
 
 ```bash
-journalctl -u pifilm-capture.service -o short-iso --no-pager \
-  | grep "stopped delivering frames" | cut -c1-10 | uniq -c
+cd ~/repos/pi-film-reversal
+python3 scripts/pi_journal.py              # prints the plan, changes nothing
+sudo python3 scripts/pi_journal.py --apply
 ```
+
+After restarts, every boot's starts, stalls and error exits, the lines before each
+exit, and any undervoltage or out-of-memory message from the kernel (no sudo
+needed; the user is in `adm`):
+
+```bash
+python3 scripts/pi_journal.py --report
+```
+
+`sudo python3 scripts/pi_journal.py --undo --apply` goes back to memory only.
 
 ### If it happens again
 
