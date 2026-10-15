@@ -370,3 +370,40 @@ def test_reset_logs_a_file_that_cannot_be_deleted(tmp_path):
 def test_settings_file_name_is_settings_json():
     assert SETTINGS_FILE == "settings.json"
     assert os.path.basename(SETTINGS_FILE) == SETTINGS_FILE
+
+
+def test_load_survives_an_unreadable_state_directory(tmp_path, monkeypatch):
+    path = tmp_path / SETTINGS_FILE
+    _write(path, {"version": 1, "rotate": 180})
+
+    def denied(self, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(settings_mod.Path, "exists", denied)
+    monkeypatch.setattr(settings_mod.Path, "is_symlink", denied)
+    monkeypatch.setattr(settings_mod.Path, "read_text", denied)
+    current, overrides, lines = load(path, DEFAULTS)
+    assert (current, overrides) == (DEFAULTS, {})
+    assert len(lines) == 1
+    assert lines[0].startswith(f"settings: ignoring {path} (cannot read: ")
+    assert "Permission denied" in lines[0]
+
+
+def test_load_survives_deeply_nested_json(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    content = "[" * 100000 + "]" * 100000
+    path.write_text(content, encoding="utf-8")
+    current, overrides, lines = load(path, DEFAULTS)
+    assert (current, overrides) == (DEFAULTS, {})
+    assert lines == [f"settings: ignoring {path} (nested too deeply)"]
+    assert path.read_text(encoding="utf-8") == content
+
+
+def test_load_survives_a_file_where_the_state_directory_should_be(tmp_path):
+    parent = tmp_path / "pifilm"
+    parent.write_text("not a directory", encoding="utf-8")
+    path = parent / SETTINGS_FILE
+    current, overrides, lines = load(path, DEFAULTS)
+    assert (current, overrides) == (DEFAULTS, {})
+    assert len(lines) == 1
+    assert lines[0].startswith(f"settings: ignoring {path} (cannot read: ")

@@ -75,9 +75,17 @@ def _describe(key: str, value: object) -> str:
 
 
 def _read(path: Path) -> tuple[dict | None, str | None]:
-    """(the parsed object, None) or (None, the reason it is ignored)."""
+    """(the parsed object, None) or (None, the reason it is ignored).
+
+    A missing file is ``(None, None)``. Any other error reading it is a reason,
+    not an exception: an unreadable state directory (EACCES) must not stop the
+    camera starting, and neither may a file nested deeply enough to exhaust
+    the JSON parser's recursion.
+    """
     try:
         text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, None
     except OSError as exc:
         return None, f"cannot read: {exc}"
     except UnicodeDecodeError:
@@ -86,6 +94,8 @@ def _read(path: Path) -> tuple[dict | None, str | None]:
         data = json.loads(text)
     except ValueError:
         return None, "not JSON"
+    except RecursionError:
+        return None, "nested too deeply"
     if not isinstance(data, dict):
         return None, "not an object"
     version = data.get("version")
@@ -96,9 +106,9 @@ def _read(path: Path) -> tuple[dict | None, str | None]:
 
 def load(path: Path, defaults: Settings) -> tuple[Settings, dict[str, object], list[str]]:
     """(effective settings, the valid overrides read, log lines). Never raises."""
-    if not path.exists() and not path.is_symlink():
-        return defaults, {}, []
     data, reason = _read(path)
+    if data is None and reason is None:
+        return defaults, {}, []
     if data is None:
         return defaults, {}, [f"settings: ignoring {path} ({reason})"]
     lines: list[str] = []
