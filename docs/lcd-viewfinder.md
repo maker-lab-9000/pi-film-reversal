@@ -167,6 +167,7 @@ message screens keep the default font.
 | --- | --- | --- |
 | Live image | Full-screen letterboxed, ungraded ISP preview | — |
 | Strip cells `SHUTTER`, `ISO`, `WB` (bottom left, three columns) | Label, then the value. The selected cell is amber (label and value, with a white `AUTO` tag if automatic); the others are grey with a dim amber value. An automatic control shows `AUTO` beside its name and the live metered value (`1/125`, `400`, `5200K`); a fixed one shows only the value. A control the camera cannot change is drawn all grey | Selects the cell. `SHUTTER` is selected at start-up and the selection stays until another cell is tapped |
+| `MENU` key (right edge, between the shutter button and `+`) | An outlined pill in the keys' style; filled while a finger is on it. Absent while the colour bars show | Opens the [settings menu](#settings-menu). Its hit box (the pill grown by 3 units, y 78 to 98) stays clear of the shutter's and `+`'s hit circles, so no tap that worked before changes meaning |
 | `+` and `-` keys (right edge, below the shutter button) | Outlined amber circles; filled amber while a finger is on them | Steps the selected control; see [Manual controls](#manual-controls) |
 | Shutter button (top right, ring with a white disc) | Filled amber while a finger is on it | Submits a capture through the shared controller; the processing screen holds until it finishes. It is at the top and `+`/`-` are low on the same edge, 31 units apart between their hit circles, so a slip while stepping a value does not take a photo |
 | Exposure meter (strip, right) | 13 dots from −3 to +3 stops in half stops; the dot nearest the measured deviation from mid-grey is lit amber. Small grey text above it: `NNN LX   CLIP NN%` | — |
@@ -176,7 +177,6 @@ message screens keep the default font.
 | Developing count (amber number on a dark patch, right of the battery tag) | How many photographs are still being graded behind the shutter; see [Developing count](#developing-count). Absent at zero and with `--grade inline` | — |
 | `TUNING` tag (amber word on a dark patch, last in the top-left row) | The camera's libcamera tuning differs from the one the look was trained under; see [Tuning warning](#tuning-warning). Absent otherwise | — |
 | `PHOTOS NN%` / `SD NN%` tags (amber on a dark patch, top, between the top-left row and the shutter button) | The photo volume or the system SD card is at or above `--disk-warn-percent` (90 by default); see [Disk-space warning](#disk-space-warning). Absent otherwise | — |
-| `ETH ...` / `WLAN ...` tags (white on a dark patch, bottom left of the picture, just above the strip) | The Pi's IPv4 address on Ethernet and on Wi-Fi (the hotspot's own `10.42.0.1` included), Ethernet first; see [Network address](#network-address). Absent for an interface that is down or has no address, and nothing at all when neither has one | — (drawn only; a tap on its lowest units still selects the cell below) |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Review screen | Full-screen quick grade (the frame reduced by a whole factor to about 1,000 pixels on the long side, four times each way for the IMX477, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
@@ -256,25 +256,75 @@ of the shutter button: `PHOTOS 92%`, `SD 91%`, or both, photos first.
 
 The check runs with every display mode, headless too, for the journal lines.
 
-### Network address
+### Settings menu
 
-So the Pi can be found for SSH without a router's client list, the live view shows
-its IPv4 addresses at the bottom left of the picture, right of the focus gauge and
-just above the strip, for example `ETH 192.168.1.20   WLAN 192.168.178.56`:
+A tap on `MENU` opens a black page in the live view's fonts and colours, one setting
+per row: a grey label on the left, the value in white on the right. A tap anywhere
+on a row steps it to its next value, wrapping round; a dimmer label marks a row that
+only shows something and ignores taps. `DONE`, drawn where the shutter button is,
+returns to the live view. Nothing in it needs sudo.
 
-- Only `eth0` (`ETH`) and `wlan0` (`WLAN`), Ethernet first, IPv4 only. An interface
-  shows while the kernel reports it up (`/sys/class/net/<if>/operstate` is `up`)
-  and it has an address.
-- The Pi's own hotspot counts: with the hotspot on, `WLAN 10.42.0.1` is the address
-  the Stick and a phone on the hotspot reach the Pi on.
-- Neither connected: nothing is drawn.
-- White, not amber: it is information, not a warning.
-- The addresses are read at start-up and every 10 s, so a cable plugged in shows
-  within about 10 s. The journal has one line when an address appears or changes,
-  `network: wlan0 192.168.178.56`, and one when it goes, `network: eth0 gone`.
+| Row | Values | Shown when | Effect |
+| --- | --- | --- | --- |
+| `SAVE DNG` | `ON` / `OFF` | Picamera2 | from the next photograph |
+| `AE CONSTRAINT` | `NORMAL` / `HIGHLIGHT` / `SHADOWS` | the camera reports `AeConstraintMode`, and no `--ae-lock` | at once |
+| `AE METERING` | `CENTRE` / `SPOT` / `MATRIX` | the camera reports `AeMeteringMode`, and no `--ae-lock` | at once |
+| `UPLOAD` | see below | `--nextcloud-env` given | starts a Nextcloud sync |
+| `ETH` | the Ethernet IPv4 address, or `-` | always | read-only |
+| `WLAN` | the Wi-Fi IPv4 address (the hotspot's own `10.42.0.1` included), or `-` | always | read-only |
+| `LOOK` | the `--artifacts` folder's name (for example `imx477-2026-09-v4-dark-hp5-tile`), cut with `...` if too wide; `starter (bundled)` for the bundled look | always | read-only |
+| `RESET` | `TAP TWICE` | always | see below |
 
-The check runs with every display mode, headless too, for the journal lines. There
-is no option to turn it off.
+A row the camera cannot use is left out and the rows below move up. Under
+`--fake` or with a USB camera only `UPLOAD`, the addresses, `LOOK` and `RESET`
+are there.
+
+**Remembered.** The three settings are written to `settings.json` beside the
+pending-grades directory (`~/.local/state/pifilm/settings.json` by default, the
+parent of `--state-dir`) after every change, atomically, and read at the next
+start before the camera opens. A saved value wins over the unit's flag
+(`--no-dng`, `--ae-constraint`, `--ae-metering`), and the journal then says so in
+one line, for example
+`settings: ae-constraint shadows (saved in the menu; the unit says ae-constraint highlight)`.
+A file that cannot be read, is not JSON or has another version is ignored with one
+line and left in place; an unknown or invalid key is ignored with one line. Neither
+stops the service. Only these three settings are stored; every other flag, the
+screen's rotation included, still comes from the unit alone.
+
+**Reset.** The first tap on `RESET` changes it to `TAP AGAIN` for 3 s. A second tap
+in that time puts every setting back to what the unit's flags say (applied at once),
+deletes `settings.json` and logs `settings: reset to the unit's flags`.
+
+**Upload.** With `--nextcloud-env PATH` the `UPLOAD` row runs the
+[Nextcloud sync](nextcloud-sync.md#from-the-viewfinders-menu) once, as a child
+process; the service never reads that file itself. Each line the sync prints is in
+the journal as `nextcloud: <line>`. A tap while a sync runs does nothing.
+
+| State | Row value |
+| --- | --- |
+| No upload yet in this run | `TAP TO UPLOAD` |
+| Running | `UPLOADING 0:42` (elapsed time) |
+| Finished, files copied | `DONE 14:05` |
+| Finished, nothing done | `SKIPPED: NO NETWORK`, `SKIPPED: NO NEXTCLOUD`, `SKIPPED: BUSY` (another sync, such as the timer's, was running), or `SKIPPED` |
+| The sync failed | `FAILED (EXIT 4)` |
+
+A finished state stays until the next tap or restart. Stopping the service during
+an upload stops the sync (SIGTERM, then SIGKILL after 5 s); rclone copies each file
+whole, so the next run carries on.
+
+**While the menu is open** the camera is not read, as for a review. The GPIO button
+and the Stick still take photographs; a shot finished then does not open the review,
+and the menu stays. The developing count and the warnings return with the live view.
+Idle dimming and screen-off apply as in the live view, and a tap in the menu counts
+as activity.
+
+**The addresses.** The `ETH` and `WLAN` rows are how to find the Pi for SSH without
+a router's client list. They are read at start-up and every 10 s, so a cable plugged
+in shows within about 10 s; only `eth0` and `wlan0`, IPv4, an interface counting
+while the kernel reports it up and it has an address. The journal has one line when
+an address appears or changes, `network: wlan0 192.168.178.56`, and one when it
+goes, `network: eth0 gone`, in every display mode, headless too. The live view no
+longer shows them.
 
 ### Idle dimming
 
@@ -689,18 +739,21 @@ about 70 % (`df -h ~/Pictures/pifilm /` says what they are), stop the service wi
 | 3 | A photograph is taken as usual with the tags showing, and a tap on the tags does nothing | |
 | 4 | Ctrl-C, then run again without `--disk-warn-percent` (90): no tag and no `disk:` line. `sudo systemctl start pifilm-capture` afterwards | |
 
-#### Network address
+#### Settings menu
 
-Not yet run on hardware. With the service running and the panel in live view:
+Not yet run on hardware. The design is
+[2026-10-15-settings-menu-design.md](superpowers/specs/2026-10-15-settings-menu-design.md).
+With the service running with `--nextcloud-env` and the panel in live view:
 
 | Step | Check | Result |
 | --- | --- | --- |
-| 1 | With the Ethernet cable in and the hotspot on, `ETH <address>` and `WLAN 10.42.0.1` show at the bottom left, Ethernet first; the ETH address is the one `ip -4 addr show eth0` prints | |
-| 2 | Unplug the cable: within about 10 s only `WLAN 10.42.0.1` remains, in the place ETH had | |
-| 3 | Plug it back in: `ETH <address>` returns within about 10 s (DHCP may take a few seconds more) | |
-| 4 | Over SSH (on Ethernet) turn the hotspot off with `sudo nmcli connection down pifilm-ap`: `WLAN` goes within about 10 s and `ETH` stays. Then unplug the cable: nothing is drawn. Plug it back in and run `sudo nmcli connection up pifilm-ap` | |
-| 5 | A photograph is taken as usual with the tags showing | |
-| 6 | `journalctl -u pifilm-capture -b \| grep network:` has one `network: eth0 <address>` or `network: eth0 gone` line per change above, and `network: wlan0 10.42.0.1` | |
+| 1 | `MENU` opens the menu; `DONE` returns to the live view; the shutter, `+`, `-` and the cells work as before | Not yet run |
+| 2 | `SAVE DNG` off: the next photograph has no `.dng`; on: it has one. Restart the service: the setting is kept and the journal has the `settings:` line | Not yet run |
+| 3 | `AE CONSTRAINT` and `AE METERING`: the record's camera metadata shows the new mode after a change | Not yet run |
+| 4 | `UPLOAD` on home Wi-Fi: `UPLOADING`, then `DONE`; the files are on Nextcloud; `journalctl -u pifilm-capture \| grep nextcloud:` shows rclone's lines. In hotspot mode: `SKIPPED: NO NEXTCLOUD`. Started while the timer's run is going: `SKIPPED: BUSY` | Not yet run |
+| 5 | `ETH`/`WLAN` show the addresses (unplug the cable: `ETH` turns to `-` within about 10 s), and the live view no longer shows them. `LOOK` shows the deployed look's folder name, or `starter (bundled)` | Not yet run |
+| 6 | `RESET`, tapped twice: the unit's flags are back and `settings.json` is gone | Not yet run |
+| 7 | A GPIO button press while the menu is open takes a photograph, and the menu stays open | Not yet run |
 
 ## 8. Troubleshooting
 

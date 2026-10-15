@@ -19,7 +19,7 @@ Pi network, Pi service, Stick, optional training) and says which machine each st
 `docs/how-it-works.md` explains the colour model (capture pipeline, training steps, libraries, dependency-by-role table);
 `docs/nextcloud-sync.md` the optional Pi→Nextcloud photo archive; `docs/photo-volume.md` the fixed-size photo
 volume that keeps captures from filling the Pi's root filesystem; `docs/lcd-viewfinder.md` the optional
-Waveshare LCD viewfinder (the 3.5" DSI panel and the fallback 2.8" SPI panel: setup, screen layout,
+Waveshare LCD viewfinder (the 3.5" DSI panel and the fallback 2.8" SPI panel: setup, screen layout, settings menu,
 manual controls, meter, hardware acceptance); and
 `docs/known-issues.md` tracks understood-but-unfixed defects. The bundled LUT in `pifilm/data/` is a handcrafted,
 untrained starter preset (`trained: false`). Trained artifacts, training data, `data/`, `artifacts/`,
@@ -80,6 +80,9 @@ sudo python3 scripts/pi_photo_volume.py --apply
 python3 scripts/pi_journal.py              # dry run
 sudo python3 scripts/pi_journal.py --apply
 python3 scripts/pi_journal.py --report     # starts, stalls, error exits per boot
+
+# Nextcloud sync (run ON the Pi; dry run without --apply; the timer runs scripts/nextcloud_sync.py)
+.venv/bin/python -m pifilm.nextcloud --env .env [--apply]
 ```
 
 `pifilm-train` exit code 3 means an artifact was written but a quality gate failed.
@@ -144,6 +147,10 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   profiles to sRGB. Do not load images elsewhere with raw `Image.open`.
 - `_cv2.py`: the single `cv2` import site. Use `require_cv2()`; never `import cv2` directly.
   OpenCV is deliberately not a base dependency (Pi uses apt `python3-opencv` for GTK).
+- `nextcloud.py`: the Pi→Nextcloud sync (`python -m pifilm.nextcloud`; `scripts/nextcloud_sync.py`
+  is a wrapper the timer unit still runs), one at a time under a `flock` on
+  `nextcloud-sync.lock` in the state directory. `envfile.py` is its `.env` parser
+  (`firmware/sticks3/scripts/generate_config.py` keeps its own copy, as it runs without the package).
 
 ### Capture (`pifilm/capture/`)
 
@@ -212,7 +219,13 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   (a `pifilm-network` thread, every 10 s, started beside the disk monitor) reads the IPv4
   address of `eth0` and `wlan0` while sysfs reports them up (`SIOCGIFADDR` ioctl; the hotspot's
   address counts), logs `network:` lines on each change and feeds `CaptureSession.network`
-  (`(label, address)` pairs, `ETH` then `WLAN`).
+  (`(label, address)` pairs, `ETH` then `WLAN`), which the settings menu shows.
+- `settings.py`: the three settings the LCD menu changes (DNG saving, AE constraint, AE
+  metering), in `settings.json` beside the state directory; read at start-up before the camera
+  opens, a saved value wins over the unit's flag on Picamera2 only (one `settings:` line), and
+  `SettingsControl` applies, saves atomically and resets them. `upload.py`: `Upload`, the menu's
+  UPLOAD row, runs `python -m pifilm.nextcloud` as a child (`--nextcloud-env PATH`, never read
+  by the service; the token stripped from its environment) and reads its last line for the status.
 - Double exposure: `CaptureSession` owns the mode and pending first frame; `pifilm/double.py`
   adds the two ungraded frames in linear light (one stop down each), and the composite is
   graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card in a temp dir
@@ -265,12 +278,12 @@ top right, meter dots, `2x`, battery, the developing count (an amber number righ
 battery tag: `LiveState.developing`, from the snapshot's `pending_grades` at every frame,
 absent at zero), an amber `TUNING` tag last in that row (`LiveState.tuning_mismatch`, from the
 snapshot's `tuning_mismatch`), amber `PHOTOS NN%`/`SD NN%` tags in their own tile between that
-row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning`), white
-`ETH`/`WLAN` address tags in their own tile at the bottom left of the picture above the strip
-(`LiveState.network`, from the snapshot's `network`; drawn only, not hit-tested) and focus gauge, from cached anti-aliased tiles in the
+row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning`), a `MENU`
+key between the shutter and `+` that opens the settings menu, and focus gauge, from cached anti-aliased tiles in the
 bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
-holds only the review, processing and message screens. Both work in 320×240 base units at an
-integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine
+holds only the review, processing and message screens; `menu.py` draws the settings menu page
+(rows, `DONE` where the shutter is) and hit-tests it. Both work in 320×240 base units at an
+integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW/MENU state machine
 (it also lights `+`/`-`/shutter while a finger is on them) and takes the scale from the display's
 width. Under `run()` it reads preview frames on a `pifilm-frames` thread (touch is on `pifilm-touch`)
 and redraws the latest frame every step, so the controls stay responsive at a 1 s shutter;
