@@ -3098,3 +3098,47 @@ def test_a_step_that_changes_nothing_is_not_traced(controller):
     _tap(loop, touch, clock, PLUS_CENTRE)
     _live_frames(loop, clock, 20, dt=0.5)
     assert logs == []
+
+
+class _DiskController:
+    """A controller whose snapshot carries a disk-space warning."""
+
+    def __init__(self, ctl, warning):
+        self._ctl, self.warning = ctl, warning
+
+    def __getattr__(self, name):
+        return getattr(self._ctl, name)
+
+    def snapshot(self):
+        return dataclasses.replace(self._ctl.snapshot(), disk_warning=self.warning)
+
+
+def test_live_view_passes_the_disk_warning_from_the_snapshot(controller, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    disk = _DiskController(ctl, (("PHOTOS", 92), ("SD", 91)))
+    loop, touch, display, clock = _loop(camera, disk)
+    loop.step()
+    assert states[-1].disk_warning == (("PHOTOS", 92), ("SD", 91))
+    disk.warning = ()
+    loop.step()
+    assert states[-1].disk_warning == ()
+
+
+def test_live_view_draws_no_disk_tag_for_a_controller_that_reports_none(
+        controller, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+
+    class Old:
+        def __getattr__(self, name):
+            return getattr(ctl, name)
+
+        def snapshot(self):
+            snap = ctl.snapshot()
+            return SimpleNamespace(**{k: v for k, v in vars(snap).items()
+                                      if k != "disk_warning"})
+
+    loop, touch, display, clock = _loop(camera, Old())
+    loop.step()
+    assert states[-1].disk_warning == ()

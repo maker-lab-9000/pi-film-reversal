@@ -385,7 +385,7 @@ def test_developing_and_the_tuning_flag_are_the_last_fields_with_off_defaults():
     # New fields go on the end, so an older positional construction keeps its meaning.
     assert LiveState(cells=_cells()).developing == 0
     assert LiveState(cells=_cells()).tuning_mismatch is False
-    assert list(LiveState.__dataclass_fields__)[-2:] == ["developing", "tuning_mismatch"]
+    assert list(LiveState.__dataclass_fields__)[-3:-1] == ["developing", "tuning_mismatch"]
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -607,3 +607,87 @@ def test_canvas_shapes_that_round_to_no_pixels_draw_nothing(box):
     canvas.rect(box, (255, 255, 255, 255))
     canvas.pill(box, 2, (255, 255, 255, 255))
     assert canvas.finish().getbbox() is None
+
+
+# The disk-space warning: amber PHOTOS / SD tags between the tag row and the shutter.
+
+def test_the_disk_warning_is_the_last_field_and_empty_by_default():
+    assert LiveState(cells=_cells()).disk_warning == ()
+    assert list(LiveState.__dataclass_fields__)[-1] == "disk_warning"
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_no_disk_warning_draws_nothing(scale):
+    for double in (None, (True, 1)):
+        for battery in (None, 100):
+            for developing, tuning in ((0, False), (9, True)):
+                as_before = LiveState(cells=_cells(), selected=1, pressed=None, double=double,
+                                      developing=developing, tuning_mismatch=tuning)
+                empty = LiveState(cells=_cells(), selected=1, pressed=None, double=double,
+                                  developing=developing, tuning_mismatch=tuning,
+                                  disk_warning=())
+                assert np.array_equal(
+                    _pixels(as_before, scale=scale, battery_percent=battery),
+                    _pixels(empty, scale=scale, battery_percent=battery))
+
+
+def _assert_clear_of_every_control(box, scale):
+    for x in range(math.floor(box[0] * scale), math.ceil(box[2] * scale)):
+        for y in range(math.floor(box[1] * scale), math.ceil(box[3] * scale)):
+            assert hit(x, y, scale) is Action.NONE
+
+
+WIDEST_DISK = (("PHOTOS", 100), ("SD", 100))
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("warning", [(("PHOTOS", 92),), (("SD", 91),), WIDEST_DISK])
+def test_the_disk_tag_sits_between_the_tag_row_and_the_shutter(scale, warning):
+    # The fullest tag row there is, so the warning is shown beside it, not over it.
+    full_row = dict(double=(True, 1), developing=99, tuning_mismatch=True)
+    reading = dict(battery_percent=100, external_power=True)
+    plain = _pixels(_state(**full_row), scale=scale, **reading)
+    tagged = _pixels(_state(**full_row, disk_warning=warning), scale=scale, **reading)
+    tag = _changed_box(plain, tagged, scale)
+    assert _near(_crop(tagged, tag, scale), AMBER, 60).any()
+    row = _changed_box(_pixels(_state(double=None), scale=scale, battery_percent=None),
+                       plain, scale)
+    assert row[2] < tag[0]
+    assert liveview._TAGS_BOX[2] <= tag[0]
+    # On the battery tag's line and no taller.
+    assert DOUBLE_BOX[1] <= tag[1] and tag[3] <= DOUBLE_BOX[3]
+    # Drawn whole, inside its own tile, and short of the shutter's hit circle.
+    assert tag[2] < liveview._DISK_BOX[2] - 1
+    assert tag[2] < SHUTTER_CENTRE[0] - SHUTTER_HIT_RADIUS
+    _assert_clear_of_every_control(tag, scale)
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_two_disk_tags_are_photos_then_sd(scale):
+    plain = _pixels(scale=scale)
+    photos = _changed_box(plain, _pixels(_state(disk_warning=(("PHOTOS", 92),)), scale=scale),
+                          scale)
+    sd = _changed_box(plain, _pixels(_state(disk_warning=(("SD", 91),)), scale=scale), scale)
+    both_pixels = _pixels(_state(disk_warning=(("PHOTOS", 92), ("SD", 91))), scale=scale)
+    both = _changed_box(plain, both_pixels, scale)
+    # PHOTOS where it is alone, SD after it; the two do not touch.
+    assert both[0] == photos[0] and both[2] > photos[2] + (sd[2] - sd[0])
+    first = _crop(both_pixels, (0, 0, math.ceil(photos[2]), 22), scale)
+    assert np.array_equal(first, _crop(_pixels(_state(disk_warning=(("PHOTOS", 92),)),
+                                               scale=scale), (0, 0, math.ceil(photos[2]), 22),
+                                       scale))
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_disk_tag_shows_the_percent(scale):
+    a = _pixels(_state(disk_warning=(("SD", 91),)), scale=scale)
+    b = _pixels(_state(disk_warning=(("SD", 97),)), scale=scale)
+    assert not np.array_equal(a, b)
+
+
+def test_the_disk_box_clears_the_tag_row_the_shutter_and_the_keys():
+    x0, y0, x1, y1 = liveview._DISK_BOX
+    assert liveview._TAGS_BOX[2] <= x0
+    assert x1 < SHUTTER_CENTRE[0] - SHUTTER_HIT_RADIUS
+    assert x1 <= liveview._CONTROLS_BOX[0]
+    assert y1 <= liveview._TAGS_BOX[3]

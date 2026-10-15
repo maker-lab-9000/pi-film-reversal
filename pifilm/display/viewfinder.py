@@ -1115,6 +1115,8 @@ class ViewfinderLoop:
                 developing=getattr(snap, "pending_grades", 0),
                 # The tuning cannot change while the service runs; read like the count.
                 tuning_mismatch=getattr(snap, "tuning_mismatch", False) is True,
+                # Changes at most once a minute; read like the count all the same.
+                disk_warning=getattr(snap, "disk_warning", ()),
             ),
             scale=self._scale,
         ))
