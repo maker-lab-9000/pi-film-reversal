@@ -176,6 +176,7 @@ message screens keep the default font.
 | Developing count (amber number on a dark patch, right of the battery tag) | How many photographs are still being graded behind the shutter; see [Developing count](#developing-count). Absent at zero and with `--grade inline` | — |
 | `TUNING` tag (amber word on a dark patch, last in the top-left row) | The camera's libcamera tuning differs from the one the look was trained under; see [Tuning warning](#tuning-warning). Absent otherwise | — |
 | `PHOTOS NN%` / `SD NN%` tags (amber on a dark patch, top, between the top-left row and the shutter button) | The photo volume or the system SD card is at or above `--disk-warn-percent` (90 by default); see [Disk-space warning](#disk-space-warning). Absent otherwise | — |
+| `ETH ...` / `WLAN ...` tags (white on a dark patch, bottom left of the picture, just above the strip) | The Pi's IPv4 address on Ethernet and on Wi-Fi (the hotspot's own `10.42.0.1` included), Ethernet first; see [Network address](#network-address). Absent for an interface that is down or has no address, and nothing at all when neither has one | — (drawn only; a tap on its lowest units still selects the cell below) |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Review screen | Full-screen quick grade (the frame reduced by a whole factor to about 1,000 pixels on the long side, four times each way for the IMX477, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
@@ -254,6 +255,26 @@ of the shutter button: `PHOTOS 92%`, `SD 91%`, or both, photos first.
   line, and tried again at the next check.
 
 The check runs with every display mode, headless too, for the journal lines.
+
+### Network address
+
+So the Pi can be found for SSH without a router's client list, the live view shows
+its IPv4 addresses at the bottom left of the picture, right of the focus gauge and
+just above the strip, for example `ETH 192.168.1.20   WLAN 192.168.178.56`:
+
+- Only `eth0` (`ETH`) and `wlan0` (`WLAN`), Ethernet first, IPv4 only. An interface
+  shows while the kernel reports it up (`/sys/class/net/<if>/operstate` is `up`)
+  and it has an address.
+- The Pi's own hotspot counts: with the hotspot on, `WLAN 10.42.0.1` is the address
+  the Stick and a phone on the hotspot reach the Pi on.
+- Neither connected: nothing is drawn.
+- White, not amber: it is information, not a warning.
+- The addresses are read at start-up and every 10 s, so a cable plugged in shows
+  within about 10 s. The journal has one line when an address appears or changes,
+  `network: wlan0 192.168.178.56`, and one when it goes, `network: eth0 gone`.
+
+The check runs with every display mode, headless too, for the journal lines. There
+is no option to turn it off.
 
 ### Idle dimming
 
@@ -667,6 +688,19 @@ about 70 % (`df -h ~/Pictures/pifilm /` says what they are), stop the service wi
 | 2 | The terminal has `disk: photos 50% full (... GB free)` and `disk: sd 70% full (... GB free)`, once each, and no more over two minutes | |
 | 3 | A photograph is taken as usual with the tags showing, and a tap on the tags does nothing | |
 | 4 | Ctrl-C, then run again without `--disk-warn-percent` (90): no tag and no `disk:` line. `sudo systemctl start pifilm-capture` afterwards | |
+
+#### Network address
+
+Not yet run on hardware. With the service running and the panel in live view:
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | With the Ethernet cable in and the hotspot on, `ETH <address>` and `WLAN 10.42.0.1` show at the bottom left, Ethernet first; the ETH address is the one `ip -4 addr show eth0` prints | |
+| 2 | Unplug the cable: within about 10 s only `WLAN 10.42.0.1` remains, in the place ETH had | |
+| 3 | Plug it back in: `ETH <address>` returns within about 10 s (DHCP may take a few seconds more) | |
+| 4 | Over SSH (on Ethernet) turn the hotspot off with `sudo nmcli connection down pifilm-ap`: `WLAN` goes within about 10 s and `ETH` stays. Then unplug the cable: nothing is drawn. Plug it back in and run `sudo nmcli connection up pifilm-ap` | |
+| 5 | A photograph is taken as usual with the tags showing | |
+| 6 | `journalctl -u pifilm-capture -b \| grep network:` has one `network: eth0 <address>` or `network: eth0 gone` line per change above, and `network: wlan0 10.42.0.1` | |
 
 ## 8. Troubleshooting
 
