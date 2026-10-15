@@ -22,7 +22,10 @@ _FIRMWARE_KEYS = (
 
 
 def parse_env_file(path: str | Path) -> dict[str, str]:
-    """Parse a deliberately small dotenv format without evaluating any value."""
+    """Parse a deliberately small dotenv format without evaluating any value.
+
+    ``pifilm/envfile.py`` holds a copy for the package; keep the two in step.
+    """
     values: dict[str, str] = {}
     for line_number, raw_line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
         line = raw_line.strip()

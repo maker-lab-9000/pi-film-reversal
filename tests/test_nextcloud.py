@@ -7,12 +7,13 @@ password out of every argv. These tests pin those guarantees with injected
 subprocess/socket seams and no network.
 """
 
+import fcntl
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from scripts.nextcloud_sync import (
+from pifilm.nextcloud import (
     DEFAULT_IFACES,
     REMOTE_NAME,
     NextcloudConfig,
@@ -364,7 +365,9 @@ def test_run_sync_skip_line_names_a_single_interface():
 
 
 @pytest.fixture
-def env_file(tmp_path):
+def env_file(tmp_path, monkeypatch):
+    # The default lock lives under the state directory; keep it in the temp dir.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     path = tmp_path / "test.env"
     path.write_text("".join(f"{k}={v}\n" for k, v in ENV.items()))
     return path
@@ -377,7 +380,7 @@ def _capture_main(monkeypatch, argv):
         seen.update(kwargs)
         return 0
 
-    monkeypatch.setattr("scripts.nextcloud_sync.run_sync", fake_run_sync)
+    monkeypatch.setattr("pifilm.nextcloud.run_sync", fake_run_sync)
     assert main(argv) == 0
     return seen
 
@@ -397,3 +400,62 @@ def test_main_iface_is_repeatable_in_order(monkeypatch, env_file):
         monkeypatch, ["--env", str(env_file), "--iface", "wlan0", "--iface", "eth0"]
     )
     assert list(seen["ifaces"]) == ["wlan0", "eth0"]
+
+
+def test_wrapper_script_runs_the_package_main():
+    import pifilm.nextcloud
+    import scripts.nextcloud_sync
+
+    assert scripts.nextcloud_sync.main is pifilm.nextcloud.main
+
+
+# --- one sync at a time ---------------------------------------------------
+
+
+def _recording_run_sync(monkeypatch):
+    calls = []
+
+    def fake_run_sync(cfg, **kwargs):
+        calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr("pifilm.nextcloud.run_sync", fake_run_sync)
+    return calls
+
+
+def test_main_skips_when_another_sync_holds_the_lock(monkeypatch, env_file, tmp_path, capsys):
+    calls = _recording_run_sync(monkeypatch)
+    lock = tmp_path / "l"
+    with open(lock, "a") as other:
+        fcntl.flock(other, fcntl.LOCK_EX)
+        rc = main(["--env", str(env_file), "--lock", str(lock)])
+    assert rc == 0
+    assert calls == []
+    assert "another Nextcloud sync is running; skipping" in capsys.readouterr().out
+
+
+def test_main_runs_the_sync_and_frees_the_lock(monkeypatch, env_file, tmp_path):
+    calls = _recording_run_sync(monkeypatch)
+    lock = tmp_path / "l"
+    assert main(["--env", str(env_file), "--lock", str(lock)]) == 0
+    assert len(calls) == 1
+    with open(lock, "a") as other:
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_main_creates_the_lock_directories(monkeypatch, env_file, tmp_path):
+    calls = _recording_run_sync(monkeypatch)
+    lock = tmp_path / "a" / "b" / "nextcloud-sync.lock"
+    assert main(["--env", str(env_file), "--lock", str(lock)]) == 0
+    assert len(calls) == 1
+    assert lock.exists()
+
+
+def test_default_lock_is_under_the_state_directory(monkeypatch, tmp_path):
+    from pifilm.nextcloud import _default_lock
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    assert _default_lock() == tmp_path / "pifilm" / "nextcloud-sync.lock"
+    monkeypatch.delenv("XDG_STATE_HOME")
+    expected = Path.home() / ".local" / "state" / "pifilm" / "nextcloud-sync.lock"
+    assert _default_lock() == expected
