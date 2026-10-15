@@ -385,7 +385,7 @@ def test_developing_and_the_tuning_flag_are_the_last_fields_with_off_defaults():
     # New fields go on the end, so an older positional construction keeps its meaning.
     assert LiveState(cells=_cells()).developing == 0
     assert LiveState(cells=_cells()).tuning_mismatch is False
-    assert list(LiveState.__dataclass_fields__)[-3:-1] == ["developing", "tuning_mismatch"]
+    assert list(LiveState.__dataclass_fields__)[-4:-2] == ["developing", "tuning_mismatch"]
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -611,9 +611,9 @@ def test_canvas_shapes_that_round_to_no_pixels_draw_nothing(box):
 
 # The disk-space warning: amber PHOTOS / SD tags between the tag row and the shutter.
 
-def test_the_disk_warning_is_the_last_field_and_empty_by_default():
+def test_the_disk_warning_comes_before_network_and_is_empty_by_default():
     assert LiveState(cells=_cells()).disk_warning == ()
-    assert list(LiveState.__dataclass_fields__)[-1] == "disk_warning"
+    assert list(LiveState.__dataclass_fields__)[-2] == "disk_warning"
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -691,3 +691,99 @@ def test_the_disk_box_clears_the_tag_row_the_shutter_and_the_keys():
     assert x1 < SHUTTER_CENTRE[0] - SHUTTER_HIT_RADIUS
     assert x1 <= liveview._CONTROLS_BOX[0]
     assert y1 <= liveview._TAGS_BOX[3]
+
+
+# The network addresses: ETH / WLAN at the bottom left of the picture, white.
+
+WIDEST_NETWORK = (("ETH", "255.255.255.255"), ("WLAN", "255.255.255.255"))
+
+
+def test_network_is_the_last_field_and_empty_by_default():
+    assert LiveState(cells=_cells()).network == ()
+    assert list(LiveState.__dataclass_fields__)[-1] == "network"
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_no_network_draws_nothing(scale):
+    for double in (None, (True, 1)):
+        for battery in (None, 100):
+            for disk in ((), WIDEST_DISK):
+                as_before = LiveState(cells=_cells(), selected=1, double=double,
+                                      developing=9, tuning_mismatch=True, disk_warning=disk)
+                empty = LiveState(cells=_cells(), selected=1, double=double,
+                                  developing=9, tuning_mismatch=True, disk_warning=disk,
+                                  network=())
+                for focus in (None, 0.5):
+                    reading = dict(battery_percent=battery, focus=focus, focus_peak=focus)
+                    assert np.array_equal(_pixels(as_before, scale=scale, **reading),
+                                          _pixels(empty, scale=scale, **reading))
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("network", [
+    (("ETH", "192.168.1.20"),), (("WLAN", "10.42.0.1"),),
+    (("ETH", "192.168.1.20"), ("WLAN", "192.168.178.56")), WIDEST_NETWORK,
+])
+def test_the_network_tag_sits_above_the_strip_right_of_the_focus_gauge(scale, network):
+    reading = dict(focus=0.6, focus_peak=0.9)
+    plain = _pixels(scale=scale, **reading)
+    tagged = _pixels(_state(network=network), scale=scale, **reading)
+    tag = _changed_box(plain, tagged, scale)
+    # White text, not amber: information, not a warning.
+    ink = _crop(tagged, tag, scale)
+    assert _near(ink, WHITE, 40).any()
+    assert not _near(ink, AMBER, 60).any()
+    # Inside its own box: right of the focus gauge, above the strip, short of the box's
+    # right edge (drawn whole), and touching no control.
+    box = liveview._NETWORK_BOX
+    assert box[0] <= tag[0] and liveview.FOCUS_TICK_X[1] < tag[0]
+    assert box[1] <= tag[1] and tag[3] <= box[3] <= BAR_TOP
+    assert tag[2] < box[2] - 1
+    for x in range(math.floor(tag[0] * scale), math.ceil(tag[2] * scale)):
+        for y in range(math.floor(tag[1] * scale), math.ceil(tag[3] * scale)):
+            if y // scale < CELL_HIT_TOP:  # the cells' taps may land on it; it is drawn only
+                assert hit(x, y, scale) is Action.NONE
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_widest_addresses_fit_the_box(scale):
+    canvas = liveview._Canvas(liveview._NETWORK_BOX, scale)
+    font = canvas.font(liveview.SEMIBOLD, liveview.TAG_SIZE)
+    end = float(liveview._NETWORK_BOX[0])
+    for label, address in WIDEST_NETWORK:
+        end = math.ceil(end + canvas.text_width(f"{label} {address}", font)
+                        + 2 * liveview.TAG_PADDING) + liveview.DEVELOPING_GAP
+    assert end - liveview.DEVELOPING_GAP < liveview._NETWORK_BOX[2] - 1
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_two_network_tags_are_eth_then_wlan(scale):
+    plain = _pixels(scale=scale)
+    eth_only = _pixels(_state(network=(("ETH", "192.168.1.20"),)), scale=scale)
+    eth = _changed_box(plain, eth_only, scale)
+    wlan = _changed_box(plain, _pixels(_state(network=(("WLAN", "10.42.0.1"),)),
+                                       scale=scale), scale)
+    both_pixels = _pixels(_state(network=(("ETH", "192.168.1.20"), ("WLAN", "10.42.0.1"))),
+                          scale=scale)
+    both = _changed_box(plain, both_pixels, scale)
+    # WLAN alone starts where ETH does; with both, ETH first and WLAN after it.
+    assert wlan[0] == eth[0]
+    assert both[0] == eth[0] and both[2] > eth[2] + (wlan[2] - wlan[0])
+    left = (0, 190, math.ceil(eth[2]), BAR_TOP)
+    assert np.array_equal(_crop(both_pixels, left, scale), _crop(eth_only, left, scale))
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_network_tag_shows_the_address(scale):
+    a = _pixels(_state(network=(("WLAN", "10.42.0.1"),)), scale=scale)
+    b = _pixels(_state(network=(("WLAN", "10.42.0.7"),)), scale=scale)
+    assert not np.array_equal(a, b)
+
+
+def test_the_network_box_clears_the_focus_gauge_the_strip_and_the_meter_text():
+    x0, y0, x1, y1 = liveview._NETWORK_BOX
+    assert all(isinstance(v, int) for v in liveview._NETWORK_BOX)
+    assert liveview._FOCUS_BOX[2] < x0
+    assert y1 <= BAR_TOP
+    assert x1 <= liveview._METER_TEXT_BOX[0]
+    assert x1 <= liveview._CONTROLS_BOX[0]

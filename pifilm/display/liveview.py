@@ -32,7 +32,9 @@ it changes between frames, so the screen is assembled from small tiles:
   they show: the strip background, one tile per cell, the shutter and ``+``/``-``
   keys (keyed by which is pressed), and the ``2x`` and battery tags with the
   count of photographs still developing and the ``TUNING`` warning, and the
-  ``PHOTOS``/``SD`` disk-space tags (a tile of their own, keyed by the warning);
+  ``PHOTOS``/``SD`` disk-space tags (a tile of their own, keyed by the warning),
+  and the ``ETH``/``WLAN`` network addresses (a tile of their own at the bottom
+  left, keyed by the addresses);
 - dynamic tiles: the lit meter dot and the lux/clip text (cached too, they repeat)
   and the focus gauge (drawn every frame; it is 7 units wide).
 
@@ -113,6 +115,12 @@ TUNING_LABEL = "TUNING"
 # own past the tag row and short of the shutter's hit circle, photos first. Its own
 # tile, at a fixed place, so it never moves the row and the row never moves it.
 DISK_X0 = 127
+# The Pi's IPv4 addresses (``pifilm.capture.network``): "ETH 192.168.1.20" and
+# "WLAN 10.42.0.1" on the same dark patch, ETH first, in a tile of their own at the
+# bottom left of the picture, just above the strip and right of the focus gauge.
+# White, not amber: information, not a warning. Drawn only, never hit-tested: its
+# lowest units lie in the band where taps on the cells are accepted, and a tap
+# there still selects the cell under it.
 FOCUS_TRACK = (6, 22, 9, 198)
 FOCUS_TICK_X = (4, 11)
 FOCUS_TICK_HEIGHT = 1.5
@@ -149,6 +157,12 @@ _TAGS_BOX = (0, 0, 124, 22)
 # together end at about 207 units (see the tests), so there is room to spare.
 _DISK_BOX = (_TAGS_BOX[2], 0, 252, _TAGS_BOX[3])
 _METER_TEXT_BOX = (192, 209, WIDTH, 221)
+# From just right of the focus gauge's ticks (x 4 to 11) to well short of the meter
+# text (x 192), and from 196 to one unit above the strip (208): as tall as the
+# battery tag's pill (11 units). "ETH 255.255.255.255" and "WLAN 255.255.255.255"
+# together end at 148 units at scale 1 (140 at scale 2), so 168 leaves room for a
+# plainer fallback font.
+_NETWORK_BOX = (14, 196, 168, BAR_TOP - 1)
 _FOCUS_BOX = (FOCUS_TICK_X[0], FOCUS_TRACK[1], FOCUS_TICK_X[1], FOCUS_TRACK[3])
 
 
@@ -186,6 +200,7 @@ class LiveState:
     developing: int = 0                      # photographs still being graded; 0 draws nothing
     tuning_mismatch: bool = False            # camera tuning differs from the look's; draws TUNING
     disk_warning: tuple[tuple[str, int], ...] = ()  # (label, percent) per low filesystem
+    network: tuple[tuple[str, str], ...] = ()  # (label, IPv4 address), ETH before WLAN
 
 
 @lru_cache(maxsize=4)
@@ -504,6 +519,31 @@ def _disk_tile(warning: tuple[tuple[str, int], ...], scale: int) -> Image.Image:
     return canvas.finish()
 
 
+@lru_cache(maxsize=16)
+def _network_tile(network: tuple[tuple[str, str], ...], scale: int) -> Image.Image:
+    """One white tag per connected interface, ``ETH 192.168.1.20``, left to right.
+
+    The disk tags' shape (the battery tag's padding, the count's dark patch, no
+    outline) in white, filling the box's height. Keyed by the addresses, which
+    change only when a cable or a network does.
+    """
+    canvas = _Canvas(_NETWORK_BOX, scale)
+    font = canvas.font(SEMIBOLD, TAG_SIZE)
+    top, bottom = _NETWORK_BOX[1], _NETWORK_BOX[3]
+    left = float(_NETWORK_BOX[0])
+    for label, address in network:
+        text = f"{label} {address}"
+        box = (left, top,
+               min(left + canvas.text_width(text, font) + 2 * TAG_PADDING,
+                   _NETWORK_BOX[2] - 1),
+               bottom)
+        canvas.pill(box, TAG_RADIUS, fill=DEVELOPING_FILL)
+        canvas.text(((box[0] + box[2]) / 2, (top + bottom) / 2), text, font, WHITE,
+                    anchor="mm")
+        left = math.ceil(box[2]) + DEVELOPING_GAP
+    return canvas.finish()
+
+
 @lru_cache(maxsize=32)
 def _lit_dot_tile(index: int, scale: int) -> tuple[Image.Image, tuple[int, int]]:
     """The amber dot for one meter position, and where its tile goes (base units).
@@ -583,6 +623,9 @@ def render_live(
     if state.disk_warning:
         disk = tuple((str(label), int(percent)) for label, percent in state.disk_warning)
         paste(_disk_tile(disk, scale), *_DISK_BOX[:2])
+    if state.network:
+        network = tuple((str(label), str(address)) for label, address in state.network)
+        paste(_network_tile(network, scale), *_NETWORK_BOX[:2])
     if reading.focus is not None:
         paste(_focus_tile(reading.focus, reading.focus_peak, scale), *_FOCUS_BOX[:2])
     return img
