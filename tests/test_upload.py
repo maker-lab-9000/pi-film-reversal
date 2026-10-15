@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import signal
 import subprocess
 import threading
 import time
@@ -36,6 +37,7 @@ class FakeProcess:
         self.terminated = False
         self.killed = False
         self.waits: list[float | None] = []
+        self.pid = 4242
 
     def wait(self, timeout=None):
         self.waits.append(timeout)
@@ -71,7 +73,27 @@ class FakePopen:
         return self.process
 
 
-def make(process=None, *, error=None, environ=None, clock=None):
+class FakeKillpg:
+    """Records group signals and acts on the process like the real ones would."""
+
+    def __init__(self, process: FakeProcess | None = None, error: OSError | None = None):
+        self.process = process
+        self.error = error
+        self.calls: list[tuple[int, int]] = []
+
+    def __call__(self, pgid, sig):
+        self.calls.append((pgid, sig))
+        if self.error is not None:
+            raise self.error
+        if self.process is None:
+            return
+        if sig == signal.SIGKILL:
+            self.process.release.set()
+        elif not self.process.wait_timeouts:
+            self.process.release.set()
+
+
+def make(process=None, *, error=None, environ=None, clock=None, killpg=None):
     popen = FakePopen(process, error)
     logs: list[str] = []
     upload = Upload(
@@ -81,6 +103,7 @@ def make(process=None, *, error=None, environ=None, clock=None):
         clock=clock or FakeClock(),
         log=logs.append,
         environ=environ if environ is not None else {"HOME": "/home/pi"},
+        killpg=killpg if killpg is not None else FakeKillpg(process),
     )
     return upload, popen, logs
 
@@ -104,7 +127,9 @@ def test_start_runs_the_sync_module_with_apply_and_the_env_path():
     assert kwargs["stdout"] is subprocess.PIPE
     assert kwargs["stderr"] is subprocess.STDOUT
     assert kwargs["text"] is True
+    assert kwargs["errors"] == "replace"
     assert kwargs["bufsize"] == 1
+    assert kwargs["start_new_session"] is True
 
 
 def test_child_environment_lacks_the_remote_token_and_keeps_the_rest():
@@ -113,7 +138,7 @@ def test_child_environment_lacks_the_remote_token_and_keeps_the_rest():
     upload.start()
     finish(upload)
     env = popen.calls[0][1]["env"]
-    assert env == {"HOME": "/home/pi", "PATH": "/usr/bin"}
+    assert env == {"HOME": "/home/pi", "PATH": "/usr/bin", "PYTHONUNBUFFERED": "1"}
     assert environ["PIFILM_REMOTE_TOKEN"] == "secret"
 
 
@@ -213,23 +238,38 @@ def test_start_again_after_a_finish_runs_a_new_child():
     assert upload.status().startswith("DONE ")
 
 
-def test_close_terminates_a_running_child_and_joins():
+def test_close_terminates_the_childs_process_group_and_joins():
     process = FakeProcess([], code=-15, hold=True)
-    upload, _, _ = make(process)
+    killpg = FakeKillpg(process)
+    upload, _, _ = make(process, killpg=killpg)
     upload.start()
     upload.close(timeout=0.5)
-    assert process.terminated
+    assert killpg.calls == [(4242, signal.SIGTERM)]
+    assert not process.terminated
     assert not process.killed
     assert 0.5 in process.waits
     assert not upload.running
     assert upload.status() == "FAILED (EXIT -15)"
 
 
-def test_close_kills_a_child_that_outlasts_the_timeout():
+def test_close_kills_a_group_that_outlasts_the_timeout():
     process = FakeProcess([], code=-9, hold=True, wait_timeouts=1)
-    upload, _, _ = make(process)
+    killpg = FakeKillpg(process)
+    upload, _, _ = make(process, killpg=killpg)
     upload.start()
     upload.close(timeout=0.5)
+    assert killpg.calls == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+    assert not upload.running
+
+
+@pytest.mark.parametrize("error", [ProcessLookupError(3, "No such process"), OSError(1, "EPERM")])
+def test_close_falls_back_to_the_child_when_the_group_cannot_be_signalled(error):
+    process = FakeProcess([], code=-9, hold=True, wait_timeouts=1)
+    killpg = FakeKillpg(error=error)
+    upload, _, _ = make(process, killpg=killpg)
+    upload.start()
+    upload.close(timeout=0.5)
+    assert [sig for _, sig in killpg.calls] == [signal.SIGTERM, signal.SIGKILL]
     assert process.terminated
     assert process.killed
     assert not upload.running
@@ -247,6 +287,7 @@ def test_close_with_nothing_running_does_nothing_and_is_safe_twice():
     upload.close()
     assert not process.terminated
     assert not process.killed
+    assert upload._killpg.calls == []
 
 
 def test_popen_oserror_is_logged_and_failed_with_exit_127():
@@ -257,3 +298,31 @@ def test_popen_oserror_is_logged_and_failed_with_exit_127():
     assert len(logs) == 1
     assert logs[0].startswith("nextcloud: cannot start")
     upload.close()
+
+
+class _BrokenStdout:
+    """Yields one line, then fails like a decode error would without errors="replace"."""
+
+    def __init__(self, line: str) -> None:
+        self._lines = [line]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._lines:
+            return self._lines.pop(0)
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+
+def test_unreadable_output_is_logged_and_the_exit_still_recorded():
+    process = FakeProcess([], code=3)
+    process.stdout = _BrokenStdout("Transferred: 1 file\n")
+    upload, _, logs = make(process)
+    upload.start()
+    finish(upload)
+    assert logs[0] == "nextcloud: Transferred: 1 file"
+    assert logs[1].startswith("nextcloud: output unreadable (")
+    assert "invalid start byte" in logs[1]
+    assert upload.status() == "FAILED (EXIT 3)"
+    assert process.waits == [None]

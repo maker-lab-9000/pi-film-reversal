@@ -7,9 +7,19 @@ lives only in the child, the capture service never opens that file, and rclone's
 memory and file handles go when the child ends. A child also cannot block a
 capture: a network that hangs, an rclone that stalls, a sync that takes ten
 minutes all happen in another process, while this one only reads its output on a
-daemon thread, ``pifilm-upload``. When the service stops, ``close`` sends the
-child SIGTERM and then SIGKILL after the timeout; rclone uploads each file whole,
-so the next run carries on from what was copied.
+daemon thread, ``pifilm-upload``. The child starts in a session (and process
+group) of its own, and when the service stops ``close`` sends that whole group
+SIGTERM and then SIGKILL after the timeout, so rclone goes with it even when the
+service is stopped outside systemd, which would otherwise kill the whole cgroup.
+rclone uploads each file whole, so the next run carries on from what was copied.
+
+Why the output is read with ``errors="replace"``: rclone prints file names, and a
+name that is not UTF-8 would otherwise raise in the reader thread, which would
+stop draining the pipe; the child then blocks on a full pipe, the row stays on
+UPLOADING and the child keeps the sync's lock. If reading fails anyway, the line
+``nextcloud: output unreadable (...)`` is logged and the exit is still recorded.
+``PYTHONUNBUFFERED=1`` makes the child's lines arrive as they are printed, not
+when its buffer fills, outside systemd too.
 
 Why the token is removed from the child's environment: ``PIFILM_REMOTE_TOKEN``
 is the bearer token of the capture API, read from the systemd unit's environment
@@ -17,7 +27,7 @@ file. The sync has no use for it, and a child (and rclone, which it starts in
 turn) should not hold a secret it does not need, where a crash report or a
 process inspector could expose it. Every other variable is kept, so ``HOME``,
 ``PATH`` and ``XDG_STATE_HOME`` lead the child to the same lock file and rclone
-as the timer's run.
+as the timer's run (``PYTHONUNBUFFERED`` is the one variable added).
 
 Why the status is read from the last line: the sync's guards (no network, no
 Nextcloud, another sync running) all exit 0, like a successful copy, because a
@@ -37,6 +47,7 @@ the loop thread while the reader thread records lines and the exit.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -66,6 +77,7 @@ class Upload:
         clock: Any = time,
         log: Callable[[str], None] = print,
         environ: Mapping[str, str] = os.environ,
+        killpg: Callable[[int, int], None] = os.killpg,
     ) -> None:
         self._env_path = Path(env_path)
         self._python = python
@@ -73,6 +85,7 @@ class Upload:
         self._clock = clock
         self._log = log
         self._environ = environ
+        self._killpg = killpg
         self._lock = threading.Lock()
         self._process: Any = None
         self._thread: threading.Thread | None = None
@@ -87,6 +100,7 @@ class Upload:
         """Start a sync; False, starting nothing, while one is running."""
         argv = [self._python, "-m", "pifilm.nextcloud", "--apply", "--env", str(self._env_path)]
         env = {k: v for k, v in self._environ.items() if k != TOKEN_ENV}
+        env["PYTHONUNBUFFERED"] = "1"
         with self._lock:
             if self._running:
                 return False
@@ -100,8 +114,10 @@ class Upload:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    errors="replace",
                     bufsize=1,
                     env=env,
+                    start_new_session=True,
                 )
             except OSError as exc:
                 self._process = None
@@ -129,6 +145,8 @@ class Upload:
                 self._log(f"nextcloud: {line}")
                 with self._lock:
                     self._last_line = line
+        except Exception as exc:  # noqa: BLE001 - the exit must still be recorded
+            self._log(f"nextcloud: output unreadable ({exc})")
         finally:
             code = process.wait()
             with self._lock:
@@ -163,17 +181,27 @@ class Upload:
             return "SKIPPED: BUSY"
         return "SKIPPED"
 
+    def _signal(self, process: Any, sig: int) -> None:
+        """Send ``sig`` to the child's process group, or to the child alone if that fails."""
+        try:
+            self._killpg(process.pid, sig)
+        except OSError:  # ProcessLookupError included: the group is already gone
+            if sig == signal.SIGKILL:
+                process.kill()
+            else:
+                process.terminate()
+
     def close(self, timeout: float = 5.0) -> None:
-        """Stop a running child (SIGTERM, then SIGKILL after ``timeout``) and join."""
+        """Stop a running child's group (SIGTERM, then SIGKILL after ``timeout``) and join."""
         with self._lock:
             process = self._process if self._running else None
             thread = self._thread
         if process is not None:
-            process.terminate()
+            self._signal(process, signal.SIGTERM)
             try:
                 process.wait(timeout)
             except subprocess.TimeoutExpired:
-                process.kill()
+                self._signal(process, signal.SIGKILL)
                 process.wait()
         if thread is not None:
             thread.join(_JOIN_SECONDS)
