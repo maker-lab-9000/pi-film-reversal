@@ -37,7 +37,7 @@ python3.12 -m venv .venv
 
 # Tests. pyproject sets pytest `pythonpath = ["."]` because tests import `scripts/` and
 # `firmware/sticks3/scripts/` as namespace packages from the repo root.
-.venv/bin/pytest -q -m 'not slow'                     # ~40s, ~380 tests
+.venv/bin/pytest -q -m 'not slow'                     # ~85s, ~1430 tests
 .venv/bin/pytest -q tests/test_lut.py                 # one file
 .venv/bin/pytest -q tests/test_lut.py -k identity     # one test by name
 .venv/bin/pytest -q -m slow                           # builds a wheel, installs into a temp venv, runs pifilm-process
@@ -50,6 +50,8 @@ python3.12 -m venv .venv
 .venv/bin/pifilm-process IN_DIR OUT_DIR [--artifacts DIR]          # batch regrade
 .venv/bin/pifilm-capture --fake --no-preview                       # capture loop w/o hardware
 .venv/bin/pifilm-battery                                           # print the X728 battery level (Pi only)
+.venv/bin/pifilm-gpu-check --artifacts DIR [--image FILE] [--runs N]   # GPU grade against its reference (Pi only)
+.venv/bin/pifilm-tuning [--tuning-file NAME] [--stamp DIR]          # tuning fingerprint; stamp a look (Pi; --sha1 HEX on the Mac)
 .venv/bin/pifilm-train --source data/source --target data/references --out artifacts/pifilm-v1
 .venv/bin/pifilm-fetch --category 'Category:...'                   # Wikimedia Commons corpus fetch
 
@@ -73,6 +75,11 @@ sudo .venv/bin/python scripts/pi_hotspot.py --env .env --apply
 # Pi photo volume (run ON the Pi; dry run prints the steps)
 python3 scripts/pi_photo_volume.py
 sudo python3 scripts/pi_photo_volume.py --apply
+
+# Pi journal kept across reboots, and the capture service's restarts (run ON the Pi)
+python3 scripts/pi_journal.py              # dry run
+sudo python3 scripts/pi_journal.py --apply
+python3 scripts/pi_journal.py --report     # starts, stalls, error exits per boot
 ```
 
 `pifilm-train` exit code 3 means an artifact was written but a quality gate failed.
@@ -84,6 +91,11 @@ sudo python3 scripts/pi_photo_volume.py --apply
 `Pipeline.process()` in `pipeline.py` is the single grading path for captures, previews, and batch:
 **normalize → LUT → grain**, in that fixed order. Normalization runs first because the LUT was
 fitted on normalized input; grain runs last because it models developed film.
+`process(..., grader=, used=)` can hand the three steps to a GPU grader as one pass; the statistics
+stay on the CPU, so the audit fields are the same on both paths. The grader is asked first
+(`can_grade`), a `GpuError` falls back to the CPU for the same frame with the generator's state
+restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, and a GPU result is
+(H, W, 4) with an unused fourth byte. Without a grader nothing differs.
 
 - `normalize.py`: per-image white balance and exposure/levels normalization. The trainer applies the
   identical maths in float (`normalize_float`); the Pi uses 256-entry lookup tables (`normalize_u8`).
@@ -92,12 +104,41 @@ fitted on normalized input; grain runs last because it models developed film.
 - `grain.py`: `add_grain`, luminance-only. `model="gaussian"` is the original hand-set grain;
   `model="two_scale"` is Ilford HP5 Plus 400 measured from scans (fine + coarse clumps in mm of a
   36 mm frame, measured brightness envelope; `docs/experiments/2026-10-01-hp5-grain.md`).
+  `model="two_scale_tile"` is the same HP5 grain laid down from a noise tile built once
+  (`tile_px` square, seamless, fixed seed) and placed per shot by the seed (offset and one of
+  eight orientations); about a tenth of the time, different pixels, so its own model and version.
 - `lut.py`: `LUT3D` with `apply_numpy` (reference, used in tests/trainer) and `apply_pillow`
   (C fast path, used on the Pi). Both `.cube` and Pillow order the flat table red-fastest.
   `sha1_hex` is the LUT content identity.
 - `artifacts.py`: an artifact is `pifilm.cube` + `params.json`. Loading verifies `lut_sha1` matches the
   cube on disk so a half-written pair cannot load. `publish()` stages then swaps the directory with
   `os.replace`. `Artifacts.default()` resolves the packaged `pifilm/data/`; `--artifacts DIR` overrides.
+  An optional top-level `tuning_sha1` (forty lowercase hex, validated; `Artifacts.tuning_sha1`) is
+  the libcamera tuning the look was trained under; `stamp_tuning` writes it into `params.json`
+  (temp file + `os.replace`, other keys and the file mode kept, loaded before and after).
+  Older builds ignore it, so no params version change.
+- `tuning.py`: the tuning fingerprint (SHA-1 of the parsed JSON with sorted keys and no
+  whitespace), `resolve` (the dict the camera is opened with for `--tuning-file`, else
+  `<model>.json`; a failure there is a reason, not an error; `LIBCAMERA_RPI_TUNING_FILE` is
+  ignored because Picamera2 clears it when it opens without a tuning)
+  and `check` (the `tuning:` log line). No Picamera2 import; `pifilm-tuning` is
+  `capture/tuningcli.py`.
+- `gpu/`: the grade as one pass on the Pi 4's GPU. `shader.py` is the GLSL and `SHADER_VERSION`
+  (`BACKEND` is `"gpu-1"`; any change that can move pixels raises it). `reference.py` is the same
+  pass in NumPy, the definition the tests and the self-test hold the GPU to. `grader.py` is
+  `GpuGrader`: a self-test at set-up (a 96 x 64 frame against the reference, at most 1 level),
+  one thread only (another thread is told it cannot grade), every failure a `GpuError`, three in
+  a row switch it off. `egl.py` is the only file that loads `libEGL`/`libGLESv2`, through
+  `ctypes`, inside functions, so the package imports on a Mac. `check.py` is `pifilm-gpu-check`.
+  Only `two_scale_tile` grain (or none), EV 0 and frames up to 4096 wide go to the GPU. A GPU
+  grade is not byte-identical to the CPU's: a few levels on ordinary colours, 10 to 20 on strongly
+  saturated ones (the CPU rounds to bytes before the LUT). Design:
+  `docs/superpowers/specs/2026-10-13-gpu-grading-design.md`.
+- `raw.py`: reads a Picamera2 DNG and develops it with the camera's own libcamera tuning file
+  (black level, lens shading, digital gain and white balance, OpenCV demosaic, colour matrix,
+  tone curve). Offline only: a look trained on developed DNGs showed no visible gain
+  (`docs/experiments/2026-10-14-raw-look.md`), so capture does not use it and the example unit
+  passes `--no-dng`. Full-field sensor modes only.
 - `color.py`: sRGB ↔ linear ↔ Oklab/Oklch. All trainer statistics are computed in Oklab.
 - `imageio.py`: the only place pixels enter. Applies EXIF orientation and converts embedded ICC
   profiles to sRGB. Do not load images elsewhere with raw `Image.open`.
@@ -121,20 +162,64 @@ fitted on normalized input; grain runs last because it models developed film.
   exposure compensation: `ExposureValue` is sent as 0.0 so `ev_comp` stays in records. Every read waits a bounded time
   for its frame and raises `CameraStalled` (see `docs/known-issues.md`); three stalled preview
   reads end the viewfinder and the process exits 1 for a systemd restart.
+  The tuning is fingerprinted at open (`tuning` property; `tuning_sha1` after `tuning_file` in
+  records); one that cannot be is one `tuning: cannot fingerprint ...` line, and the camera opens.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
   captures-only display (`--show-captures`, shows TV colour bars while processing), and headless
   terminal. `--display waveshare35dsi` (or `waveshare28`) runs the LCD viewfinder instead of any
   OpenCV window. Output:
   `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,graded|double_graded}.jpg` plus an audit
   line in `captures.jsonl` (LUT hash, normalisation hash and grain seed allow regenerating the
-  graded file).
+  graded file). `--grade background` (the default) splits a shot into two sides: the
+  capture side saves the original, writes a pending entry, makes a quick grade (reduced by a whole
+  factor to about 1,000 px on the long side, no grain; what the review screen and the Stick show) and frees the camera;
+  the grade side (`_run_grade`, on the queue's worker) grades at full size, saves the graded
+  file, appends the record and removes the entry, in that order. Such a record gains
+  `shutter_to_ready_ms`, `grade: "background"`, stages `preview` and `queued`, and
+  `recovered: true` when it was finished at a later start from the saved JPEG.
+  `--grade inline` is the earlier behaviour, with no queue and none of those fields (its records
+  do carry `pipeline_backend`, always `"cpu"`); `--state-dir`
+  moves the pending entries (default `~/.local/state/pifilm/pending`). The grade
+  worker fsyncs the original (and DNG) as its first step, not the capture (that cost up to 1 s a
+  shot on the Pi's SD card), and the graded file and the log line before the entry is removed.
+  SIGTERM ends every loop the way Ctrl-C does (`main` raises `_Terminated` in the main thread;
+  the viewfinder's own handler sets its stop event instead), and every clean-up starts with
+  `_ignore_sigterm`, so a later SIGTERM cannot break into it. A stop finishes the photographs
+  taken in this run; recovered grades not yet started keep their entries for the next start,
+  as does anything a power cut or a kill interrupts. Just after a restart with many unfinished
+  grades the recovered ones go first, and a fourth new shot waits for them.
+  `--grade-backend auto` (the default; `cpu` is the other choice) lets the grade worker open a
+  `GpuGrader` on its own thread before its first job and close it after its last; a session
+  grading inline never opens one, and the quick grade and a shot a closing queue refused stay on
+  the CPU. A photograph the GPU fails on is graded on the CPU in the same call and logged as
+  `gpu grade failed (...)`. An open that hangs in the driver would hold the only grade worker
+  at every start, so the worker writes a marker, `gpu-opening`, beside the state directory
+  (`~/.local/state/pifilm/gpu-opening`) before the open and removes it when the open returns; a
+  start that finds the marker logs one `gpu grading off: ...` line naming it, grades on the CPU
+  and leaves it for a person to delete. Every record of a graded photograph has `pipeline_backend`
+  (`"gpu-1"` or `"cpu"`): after `stage_ms` in an inline record, last in a background one. Each record also carries `stage_ms`, the
+  milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, LUT,
+  grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`
+  is the plan those numbers feed. At start-up the session checks the camera's tuning
+  fingerprint against the look's `tuning_sha1` (warn only, never refuses to start): one
+  `tuning:` line, `tuning_matches` right after the camera fields in every record when both
+  have a fingerprint (a recovered grade keeps the capture run's value), and
+  `CaptureSession.tuning_mismatch` (True only when they differ) for the viewfinder's tag.
 - Double exposure: `CaptureSession` owns the mode and pending first frame; `pifilm/double.py`
   adds the two ungraded frames in linear light (one stop down each), and the composite is
   graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card in a temp dir
   (never under the synced output folder); toggled via `CaptureController.set_double_exposure`.
+- `gradequeue.py`: `GradeQueue`, one `pifilm-grade` worker with three waiting places (a full
+  queue makes the next capture wait), and the pending entries: atomically written JSON files
+  that let the next start finish a grade a power cut interrupted. A failed grade is logged by its entry's name; an entry that fails twice is
+  renamed `*.failed` (a second log line says so). `close()` finishes the running job and
+  those accepted by `submit`, and drops the recovery backlog not yet started. `on_start` and
+  `on_stop` run on the worker thread before the first job and after the last (the GPU grader is
+  opened and closed there); one that raises is logged. No camera, pipeline or display in it.
 - `controller.py`: `CaptureController` serializes captures on one worker thread, one active job at
   a time, idempotent by `request_id`. Shared by the local SPACE key, the LCD, the GPIO shutter
-  button and the remote API.
+  button and the remote API. `ControllerSnapshot.pending_grades` is read live from the session
+  (it includes a recovery backlog), and closing finishes this run's grades before the camera closes.
 - `button.py`: optional physical shutter button (`--shutter-gpio BCM`, documented on BCM 21 with
   ground on physical pin 39). gpiozero `Button` with the internal pull-up, lazy import; a press
   calls `CaptureController.submit` like an LCD tap, so a press during a capture is dropped as
@@ -148,7 +233,12 @@ fitted on normalized input; grain runs last because it models developed film.
 - `batch.py`: `pifilm-process`. Skips `*_graded.*`, defaults to only `_original`/`_ungraded` files in a
   capture folder, refuses an output dir equal to or inside the input. When the folder has a
   `captures.jsonl`, each frame is graded with its logged `ev_comp` and `grain_seed`, so the same
-  artifact reproduces the Pi's graded file pixel for pixel (`--ignore-log` grades at EV 0).
+  artifact reproduces the Pi's graded file (`--ignore-log` grades at EV 0): pixel for pixel
+  for a USB camera, whose original is the camera's own JPEG; closely for the Pi camera, whose
+  original is a quality-95 JPEG of the frame the Pi graded (1 to 2 levels on average).
+  It always grades on the CPU, so a record the Pi graded on its GPU (`pipeline_backend` starting
+  `gpu`) is reproduced closely, not byte for byte; the tool prints one note per run when it
+  regrades such records.
 
 ### Display (`pifilm/display/`)
 
@@ -163,7 +253,10 @@ readout (pure, from preview metadata + pixels). The manual controls are pure ste
 last two over the generic `stepscale.py` (an auto end, and a first step from auto that lands on
 what the camera is metering). `liveview.py` draws the live screen, an SLR-finder style black
 strip of three selectable cells (SHUTTER, ISO, WB) with one `+`/`-` pair, shutter button at the
-top right, meter dots, `2x`, battery and focus gauge, from cached anti-aliased tiles in the
+top right, meter dots, `2x`, battery, the developing count (an amber number right of the
+battery tag: `LiveState.developing`, from the snapshot's `pending_grades` at every frame,
+absent at zero), an amber `TUNING` tag last in that row (`LiveState.tuning_mismatch`, from the
+snapshot's `tuning_mismatch`) and focus gauge, from cached anti-aliased tiles in the
 bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
 holds only the review, processing and message screens. Both work in 320×240 base units at an
 integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW state machine
@@ -249,9 +342,9 @@ be launched from the Pi's desktop session, not over SSH. Full guide: `docs/stick
 - `.env` holds Pi/Wi-Fi/token secrets and is gitignored. `.env.example` documents keys. Scripts parse
   it as `KEY=VALUE` data only; never source it or echo values. Never put the token, Wi-Fi password,
   or SSH password into a command line, source file, service unit, or commit.
-- `params.json` `version` is 2, or 3 when the artifact uses a non-Gaussian grain model
-  (`GRAIN_MODEL_VERSION`; older builds then refuse it instead of misreading the grain). The
-  loader reads 1 to `PARAMS_VERSION` (3). `lut_sha1` is required.
+- `params.json` `version` follows the grain model (`GRAIN_MODEL_VERSIONS`): 2 for Gaussian,
+  3 for `two_scale`, 4 for `two_scale_tile`, so an older build refuses grain it would misread.
+  The loader reads 1 to `PARAMS_VERSION` (4). `lut_sha1` is required.
 - Module docstrings carry the design rationale (why an order is fixed, why a check exists). Read them
   before changing behaviour; many encode failures found on real hardware.
 - Reference photographs must be credited to Martin Parr from primary sources with permission;

@@ -58,7 +58,8 @@ The 3.5 inch touchscreen is the viewfinder. Left: everything on auto. Right: ful
 - **2x** — double exposure. Two shots become one photo.
 - **Battery** — charge level, top left.
 - **Light and clipping** — lux and how much of the picture is blown out.
-- **After a shot** — colour bars while the Pi works, then the graded photo. Tap to go back.
+- **After a shot** — colour bars while the Pi works, then a quick preview of the photo. Tap to go back.
+- **Developing** — a small number next to the battery. It counts photos still being graded. Wait for it to go before you switch off.
 - **Sleep** — the screen turns off after 5 minutes. A tap wakes it.
 
 More in [the viewfinder guide](docs/lcd-viewfinder.md).
@@ -92,18 +93,24 @@ The Pi takes one photo at a time. A press during a photo is ignored.
     ↓ colour bars on the screen
 Camera switches to full resolution → takes one frame → back to live view
     ↓
-Grade: normalize → 3D LUT → grain
+Save: original JPEG + raw DNG
     ↓
-Save: original JPEG + raw DNG + graded JPEG + one line in captures.jsonl
+The screen shows a quick preview. The camera is ready for the next photo.
+    ↓ in the background, up to three photos waiting
+Grade: normalize → 3D LUT → grain (on the Pi's graphics chip, about 0.7 s)
     ↓
-The screen shows the graded photo.
+Save: graded JPEG + one line in captures.jsonl
 ```
+
+If the power goes before a photo is graded, the Pi finishes it at the next start.
 
 The grading has three steps, always in this order:
 
 - **Normalize** — fixes exposure and levels, so every photo starts from the same place.
 - **3D LUT** — the look. A colour table that maps every colour to a new one.
 - **Grain** — film-like noise, added last. Either a simple grain, or one measured from Ilford HP5 scans.
+
+The Pi does the grading on its graphics chip. It checks the chip at every start. If the chip fails, or the look uses the older grain, the Pi grades on its processor instead. That is slower, but the photo is the same within a few levels.
 
 A double exposure adds the two frames first, then grades the result once.
 
@@ -139,7 +146,7 @@ Pi saves original + graded JPEG + captures.jsonl → job complete
 | --- | --- | --- |
 | Headless (field) | `pifilm-capture --no-preview --remote-listen 0.0.0.0:8765` | battery, no monitor; the Stick still gets the preview |
 | Camera with screen and button | `pifilm-capture --no-preview --remote-listen 0.0.0.0:8765 --display waveshare35dsi --shutter-gpio 21` | the touchscreen is the viewfinder; the Stick still works |
-| Two-screen | `pifilm-capture --show-captures` | run in a Pi desktop session; the Pi also shows colour bars + the graded photo |
+| Two-screen | `pifilm-capture --show-captures` | run in a Pi desktop session; the Pi also shows colour bars + a preview of the photo |
 
 Full config and rollback: the [deployment guide](docs/sticks3-remote.md).
 

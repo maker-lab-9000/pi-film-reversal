@@ -27,6 +27,17 @@ black and white. ``strength`` is again the sd at mid-grey. Artifacts using it
 are written as params version 3 (``pifilm.artifacts``), because an older
 build would read these fields as the Gaussian model at six times its strength.
 
+A third model, ``two_scale_tile``, is the same HP5 grain made cheaper to lay
+down. Building the noise field (random numbers, two blurs, normalising) was
+over half of the grain stage on the Pi 4 (2026-10-13), and none of it depends
+on the photograph. So the field is built once as a square tile that wraps
+without a seam (``tile_px`` on a side, from a fixed seed, for the frame's
+pixels per millimetre), and each shot only places it: the shot's generator
+draws an offset and one of eight orientations. Clump sizes, mix, envelope and
+``strength`` mean what they do in ``two_scale``; the pixels differ, so it is
+its own model name and params version (4). The tile is also what a GPU shader
+would sample as its noise texture, which is why it is periodic.
+
 Reproducibility: ``add_grain`` takes an explicit generator. The capture app
 draws a seed per shot and records it, so a graded file can be regenerated
 from its original (spec 7.2).
@@ -34,6 +45,7 @@ from its original (spec 7.2).
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import asdict, dataclass, fields
 
@@ -44,7 +56,11 @@ from ._cv2 import require_cv2
 cv2 = require_cv2()
 
 
-MODELS = ("gaussian", "two_scale")
+MODELS = ("gaussian", "two_scale", "two_scale_tile")
+# The tile's content is fixed by this seed (and the grain parameters), so a
+# shot is reproduced from its own seed alone. Changing it is a new model.
+TILE_SEED = 0x48503534
+_TILE_FIELDS = ("tile_px",)
 GAUSSIAN_FIELDS = ("strength", "blur_sigma", "enabled")
 # HP5 Plus 400, relative sd by display luminance (1.0 at mid-grey), measured
 # 2026-10-01; the ends are pinned to zero so black and white stay untouched.
@@ -64,6 +80,7 @@ class GrainParams:
     frame_width_mm: float = 36.0
     envelope_luma: tuple[float, ...] = HP5_ENVELOPE_LUMA
     envelope_rel: tuple[float, ...] = HP5_ENVELOPE_REL
+    tile_px: int = 2048
 
     def __post_init__(self) -> None:
         self.envelope_luma = tuple(float(v) for v in self.envelope_luma)
@@ -76,6 +93,8 @@ class GrainParams:
                 raise ValueError(f"{name} must be finite, got {value!r}")
             if value < 0:
                 raise ValueError(f"{name} must not be negative, got {value}")
+        if type(self.tile_px) is not int or not 64 <= self.tile_px <= 8192:
+            raise ValueError(f"tile_px must be an integer from 64 to 8192, got {self.tile_px!r}")
         if not 0.0 <= self.fine_share <= 1.0:
             raise ValueError(f"fine_share must be in [0, 1], got {self.fine_share}")
         if not self.frame_width_mm > 0:
@@ -98,6 +117,10 @@ class GrainParams:
         if self.model == "gaussian":
             # Exactly the pre-two_scale keys, so existing artifacts are unchanged.
             return {k: d[k] for k in GAUSSIAN_FIELDS}
+        if self.model != "two_scale_tile":
+            # Exactly the two_scale keys, so those artifacts are unchanged too.
+            for name in _TILE_FIELDS:
+                del d[name]
         d["envelope_luma"] = list(self.envelope_luma)
         d["envelope_rel"] = list(self.envelope_rel)
         return d
@@ -106,28 +129,46 @@ class GrainParams:
 def add_grain(
     rgb_u8: np.ndarray, params: GrainParams, rng: np.random.Generator | None = None
 ) -> np.ndarray:
+    """Add grain to the luminance of an 8-bit frame.
+
+    The luminance the envelope is read at is one of 256 byte values, so the
+    envelope (times ``strength``) is a 256-entry table indexed by the Y byte,
+    and only Y is ever made a float: Cr and Cb pass through as bytes. That is
+    the same arithmetic, value for value, as interpolating the envelope at
+    every pixel and rounding all three channels (which this did until
+    2026-10-13, at about twice the time on a 12 MP frame); the result is
+    identical byte for byte, so no grain model or params version changed.
+    """
     if not params.enabled or params.strength <= 0:
         return rgb_u8.copy()
     rng = rng if rng is not None else np.random.default_rng()
 
-    ycc = cv2.cvtColor(np.ascontiguousarray(rgb_u8), cv2.COLOR_RGB2YCrCb).astype(np.float32)
-    luma = ycc[..., 0] / 255.0
+    ycc = cv2.cvtColor(np.ascontiguousarray(rgb_u8), cv2.COLOR_RGB2YCrCb)
+    y = ycc[..., 0]
+    levels = np.arange(256, dtype=np.float32) / 255.0
 
+    if params.model == "two_scale_tile":
+        envelope = np.interp(levels, params.envelope_luma, params.envelope_rel).astype(np.float32)
+        ycc[..., 0] = _apply_tile(y, 255.0 * params.strength * envelope, params, rng)
+        return cv2.cvtColor(ycc, cv2.COLOR_YCrCb2RGB)
     if params.model == "two_scale":
-        noise = _two_scale_noise(luma.shape, params, rng)
-        envelope = np.interp(luma, params.envelope_luma, params.envelope_rel).astype(np.float32)
-        ycc[..., 0] = np.clip(luma + params.strength * envelope * noise, 0.0, 1.0) * 255.0
-        return cv2.cvtColor(np.clip(np.round(ycc), 0, 255).astype(np.uint8),
-                            cv2.COLOR_YCrCb2RGB)
+        noise = _two_scale_noise(y.shape, params, rng)
+        envelope = np.interp(levels, params.envelope_luma, params.envelope_rel).astype(np.float32)
+    else:
+        noise = rng.standard_normal(y.shape, dtype=np.float32)
+        if params.blur_sigma > 0:
+            noise = cv2.GaussianBlur(noise, (0, 0), params.blur_sigma)
+            noise /= max(float(noise.std()), 1e-6)
+        envelope = 4.0 * levels * (1.0 - levels)
 
-    noise = rng.standard_normal(luma.shape, dtype=np.float32)
-    if params.blur_sigma > 0:
-        noise = cv2.GaussianBlur(noise, (0, 0), params.blur_sigma)
-        noise /= max(float(noise.std()), 1e-6)
-
-    envelope = 4.0 * luma * (1.0 - luma)
-    ycc[..., 0] = np.clip(luma + params.strength * envelope * noise, 0.0, 1.0) * 255.0
-    return cv2.cvtColor(np.clip(np.round(ycc), 0, 255).astype(np.uint8), cv2.COLOR_YCrCb2RGB)
+    # luma + strength * envelope * noise, in place in the noise field.
+    noise *= (params.strength * envelope)[y]
+    noise += levels[y]
+    np.clip(noise, 0.0, 1.0, out=noise)
+    noise *= 255.0
+    np.rint(noise, out=noise)
+    ycc[..., 0] = noise   # already within 0..255
+    return cv2.cvtColor(ycc, cv2.COLOR_YCrCb2RGB)
 
 
 def _two_scale_noise(shape: tuple[int, int], params: GrainParams,
@@ -145,3 +186,89 @@ def _two_scale_noise(shape: tuple[int, int], params: GrainParams,
             field = cv2.GaussianBlur(field, (0, 0), sigma_px)
         total += math.sqrt(share) * field / max(float(field.std()), 1e-6)
     return total / max(float(total.std()), 1e-6)
+
+
+def warm(params: GrainParams, shape: tuple[int, int]) -> None:
+    """Build whatever ``add_grain`` would otherwise build on the first frame of
+    this ``(height, width)``: the tile model's tile (0.56 s on the Pi 4)."""
+    if params.enabled and params.strength > 0 and params.model == "two_scale_tile":
+        grain_tile(params, max(shape) / params.frame_width_mm)
+
+
+def _apply_tile(y: np.ndarray, gain: np.ndarray, params: GrainParams,
+                rng: np.random.Generator) -> np.ndarray:
+    """``round(y + gain[y] * noise)`` saturated to a byte, the noise being the
+    tile placed by ``rng``. OpenCV's arithmetic does the multiply and the
+    rounding, saturating add in two threaded passes."""
+    tile = grain_tile(params, max(y.shape) / params.frame_width_mm)
+    oy, ox, orientation = tile_placement(params, rng)
+    noise = place_tile(_oriented(tile, orientation), y.shape, oy, ox)
+    cv2.multiply(noise, cv2.LUT(y, gain.astype(np.float32)), dst=noise)
+    return cv2.add(noise, y, dtype=cv2.CV_8U)
+
+
+def tile_placement(params: GrainParams, rng: np.random.Generator) -> tuple[int, int, int]:
+    """``(oy, ox, orientation)`` for one shot: the same three draws, in the same
+    order, that ``add_grain`` makes for the ``two_scale_tile`` model.
+
+    It is its own function because the GPU pass (``pifilm.gpu``) places the tile
+    too, and a shot's seed must put the grain in the same place on both paths.
+    Any change to these calls, or to their order, moves the grain of every
+    recorded seed."""
+    oy, ox = (int(v) for v in rng.integers(0, params.tile_px, 2))
+    return oy, ox, int(rng.integers(0, 8))
+
+
+def _oriented(tile: np.ndarray, orientation: int) -> np.ndarray:
+    """One of the square tile's eight orientations, as a view."""
+    if orientation & 1:
+        tile = tile[::-1]
+    if orientation & 2:
+        tile = tile[:, ::-1]
+    if orientation & 4:
+        tile = tile.T
+    return tile
+
+
+def place_tile(tile: np.ndarray, shape: tuple[int, int], oy: int, ox: int) -> np.ndarray:
+    """A new ``shape`` field: the tile repeated, starting ``(oy, ox)`` into it."""
+    th, tw = tile.shape
+    out = np.empty(shape, np.float32)
+    row, ty = 0, oy % th
+    while row < shape[0]:
+        rows = min(th - ty, shape[0] - row)
+        col, tx = 0, ox % tw
+        while col < shape[1]:
+            cols = min(tw - tx, shape[1] - col)
+            out[row:row + rows, col:col + cols] = tile[ty:ty + rows, tx:tx + cols]
+            col, tx = col + cols, 0
+        row, ty = row + rows, 0
+    return out
+
+
+def grain_tile(params: GrainParams, px_per_mm: float) -> np.ndarray:
+    """The model's unit-variance noise tile for this frame scale (cached,
+    read-only). About a third of a second on a laptop the first time."""
+    return _tile(params.tile_px, float(px_per_mm), params.fine_sigma_mm,
+                 params.coarse_sigma_mm, params.fine_share)
+
+
+@functools.lru_cache(maxsize=2)
+def _tile(size: int, px_per_mm: float, fine_sigma_mm: float, coarse_sigma_mm: float,
+          fine_share: float) -> np.ndarray:
+    rng = np.random.default_rng(TILE_SEED)
+    total = np.zeros((size, size), np.float32)
+    for sigma_mm, share in ((fine_sigma_mm, fine_share), (coarse_sigma_mm, 1.0 - fine_share)):
+        if share <= 0:
+            continue
+        field = rng.standard_normal((size, size), dtype=np.float32)
+        sigma_px = sigma_mm * px_per_mm
+        if sigma_px > 0:
+            # Blurred over a wrapped border, so the tile repeats without a seam.
+            pad = int(4 * sigma_px) + 2
+            field = cv2.GaussianBlur(np.pad(field, pad, mode="wrap"), (0, 0), sigma_px)
+            field = field[pad:-pad, pad:-pad]
+        total += math.sqrt(share) * field / max(float(field.std()), 1e-6)
+    total /= max(float(total.std()), 1e-6)
+    total.flags.writeable = False
+    return total

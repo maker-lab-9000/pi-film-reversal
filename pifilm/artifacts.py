@@ -22,12 +22,24 @@ directory, this module loads and validates that directory, and only then is
 it moved into place with ``os.replace`` on the directory. A capture process
 reading concurrently sees either the whole old artifact or the whole new
 one.
+
+**The tuning it was trained under.** An optional top-level ``tuning_sha1`` is
+the fingerprint of the libcamera tuning the camera ran with when the training
+photographs were taken (``pifilm.tuning``). It is top-level and optional so an
+older build, which ignores unknown top-level keys, still loads a stamped look:
+no params version change, and ``lut_sha1``, ``normalize_sha1`` and the pixels
+are unaffected. When present it is validated (forty lowercase hex digits):
+anything else would never equal a camera's fingerprint, so a typo would report
+every shot as a mismatch instead of failing once at load. ``stamp_tuning`` adds
+it to an existing artifact through a temporary file and ``os.replace``, so a
+failure part way leaves the old ``params.json``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -38,12 +50,15 @@ from .grain import GrainParams
 from .lut import LUT3D, CubeError, read_cube, sha1_hex, write_cube
 from .normalize import NormalizeParams
 
-PARAMS_VERSION = 3
+PARAMS_VERSION = 4
 # Version 3 exists only to carry a non-Gaussian grain model: an older build ignores
 # the extra grain fields and would grain at the Gaussian model's settings, so such
 # an artifact must be one it refuses. Gaussian-grain artifacts stay at version 2.
 GRAIN_MODEL_VERSION = 3
+# Version 4 carries the tiled HP5 grain, whose pixels differ from version 3's.
+GRAIN_MODEL_VERSIONS = {"gaussian": 2, "two_scale": GRAIN_MODEL_VERSION, "two_scale_tile": 4}
 DEFAULT_LUT_FILE = "pifilm.cube"
+_TUNING_SHA1 = re.compile(r"[0-9a-f]{40}")
 
 
 class ArtifactsError(Exception):
@@ -56,6 +71,15 @@ def _require_object(value: object, name: str, path: Path) -> dict:
     return value
 
 
+def validate_tuning_sha1(value: object, path: Path | str) -> str:
+    """The one check of ``tuning_sha1``, for loading, writing and stamping."""
+    if not isinstance(value, str) or not _TUNING_SHA1.fullmatch(value):
+        raise ArtifactsError(
+            f"{path}: 'tuning_sha1' must be forty lowercase hex digits, got {value!r}"
+        )
+    return value
+
+
 @dataclass
 class Artifacts:
     lut: LUT3D
@@ -64,6 +88,7 @@ class Artifacts:
     training: dict
     path: Path
     lut_sha1: str
+    tuning_sha1: str | None = None
 
     @classmethod
     def load(cls, dir_path: str | Path) -> Artifacts:
@@ -105,10 +130,10 @@ class Artifacts:
             # {"wb_gain_min": "oops"} reaches math.isfinite and raises TypeError,
             # which would otherwise escape unwrapped past this loader.
             raise ArtifactsError(f"{params_path}: {exc}") from exc
-        if grain.model != "gaussian" and version < GRAIN_MODEL_VERSION:
+        if grain.model != "gaussian" and version < GRAIN_MODEL_VERSIONS[grain.model]:
             raise ArtifactsError(
                 f"{params_path}: grain model {grain.model!r} needs params version "
-                f"{GRAIN_MODEL_VERSION}, file says {version}"
+                f"{GRAIN_MODEL_VERSIONS[grain.model]}, file says {version}"
             )
 
         lut_file = raw.get("lut_file", DEFAULT_LUT_FILE)
@@ -150,6 +175,10 @@ class Artifacts:
                 f"({actual}). The artifact is mixed; re-run training or restore it."
             )
 
+        tuning_sha1 = None
+        if "tuning_sha1" in raw:
+            tuning_sha1 = validate_tuning_sha1(raw["tuning_sha1"], params_path)
+
         return cls(
             lut=lut,
             normalize=normalize,
@@ -157,6 +186,7 @@ class Artifacts:
             training=training,
             path=path,
             lut_sha1=actual,
+            tuning_sha1=tuning_sha1,
         )
 
     @classmethod
@@ -191,9 +221,15 @@ def write_artifact(
     grain: GrainParams,
     training: dict | None = None,
     lut_file: str = DEFAULT_LUT_FILE,
+    tuning_sha1: str | None = None,
 ) -> Path:
-    """Write a complete artifact into ``dir_path`` (creating it) and return the directory."""
+    """Write a complete artifact into ``dir_path`` (creating it) and return the directory.
+
+    ``tuning_sha1``, when given, is written top-level (see the module docstring).
+    """
     path = Path(dir_path)
+    if tuning_sha1 is not None:
+        validate_tuning_sha1(tuning_sha1, path / "params.json")
     path.mkdir(parents=True, exist_ok=True)
     write_cube(lut, path / lut_file, title="pifilm")
     # Hash what will actually be read back, not the in-memory table. The .cube
@@ -202,15 +238,64 @@ def write_artifact(
     # artifact fail its own integrity check on load — and an identity table would
     # not reveal it, because its values are exact at six decimals.
     payload = {
-        "version": GRAIN_MODEL_VERSION if grain.model != "gaussian" else 2,
+        "version": GRAIN_MODEL_VERSIONS[grain.model],
         "lut_file": lut_file,
         "lut_sha1": sha1_hex(read_cube(path / lut_file)),
         "normalize": normalize.to_dict(),
         "grain": grain.to_dict(),
         "training": training or {},
     }
+    if tuning_sha1 is not None:
+        payload["tuning_sha1"] = tuning_sha1
     (path / "params.json").write_text(json.dumps(payload, indent=2) + "\n")
     return path
+
+
+def stamp_tuning(dir_path: str | Path, sha1: str) -> Path:
+    """Set ``tuning_sha1`` in the artifact at ``dir_path``; return its ``params.json``.
+
+    Every other key is kept, in its order (an earlier stamp is replaced where it
+    stands). The new file is written beside the old one, fsynced and moved over
+    it with ``os.replace``, so a reader, or a failure part way, sees the whole
+    old file or the whole new one. The artifact is loaded before (an already
+    broken one is refused untouched) and after, to confirm. The file's mode is
+    kept. The ``.cube`` is not touched, so ``lut_sha1`` still holds.
+    """
+    path = Path(dir_path)
+    params_path = path / "params.json"
+    validate_tuning_sha1(sha1, params_path)
+    # Refuse an artifact that is already unloadable (a mixed lut_sha1, say) before
+    # anything is written, so a failed stamp leaves params.json as it was.
+    Artifacts.load(path)
+    try:
+        raw = json.loads(params_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArtifactsError(f"cannot read {params_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ArtifactsError(f"{params_path}: top level must be a JSON object")
+    raw["tuning_sha1"] = sha1
+
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=".params.", suffix=".json.tmp", dir=path)
+    except OSError as exc:
+        raise ArtifactsError(f"could not stamp {params_path}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(raw, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        # mkstemp makes the file 0600 and os.replace would carry that onto
+        # params.json; keep the mode the artifact had.
+        shutil.copymode(params_path, tmp_name)
+        os.replace(tmp_name, params_path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise ArtifactsError(f"could not stamp {params_path}: {exc}") from exc
+    Artifacts.load(path)
+    return params_path
 
 
 def publish(staging_dir: str | Path, dest_dir: str | Path) -> Path:

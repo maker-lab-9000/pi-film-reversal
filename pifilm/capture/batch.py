@@ -13,9 +13,22 @@ real capture folder, which holds ``<time>_original.jpg`` next to
   logged grain seed. A regrade that ignored ``captures.jsonl`` undid every
   deliberate EV and drew new grain, so when the folder has that log, each
   frame is graded with its logged ``ev_comp`` and ``grain_seed``: the same
-  artifact then reproduces the Pi's file, up to the re-encoded original.
+  artifact then reproduces the Pi's file, up to the re-encoded original. A USB
+  camera's original is the camera's own JPEG, which is what the Pi graded, so
+  that regrade is exact. The Pi camera's original is a quality-95 JPEG of the
+  frame, and the Pi graded the frame itself, so the regrade starts from a
+  slightly different picture: about 1 to 2 levels on average, more where the
+  look's LUT is steep (measured 2026-10-14 on sixteen IMX477 photographs, GPU
+  graded: mean 0.7 to 2.1, at most 18 to 27).
   Double-exposure frames are regraded singly, with their own EV and fresh
   grain, because their logged seed belongs to the composite.
+* **A file the Pi graded on its GPU.** The regrade here is always the CPU's.
+  A record whose ``pipeline_backend`` starts with ``gpu`` was graded by the
+  one-pass shader, which does not round between its stages as the CPU does,
+  so the regraded file is close to the Pi's and not the same bytes (see
+  ``pifilm.pipeline``). The tool says so once per run. Records graded on the
+  CPU, and records from before the field existed, reproduce as closely as the
+  original allows (exactly for a USB camera, above).
 * **Clobbering.** ``a.jpg`` and ``a.png`` would produce the same output
   name, and re-running would silently overwrite. Same-stem inputs get their
   extension folded into the output name, existing outputs are skipped unless
@@ -54,6 +67,7 @@ class BatchResult:
     from_log: int = 0
     ev_applied: int = 0
     doubles: int = 0
+    gpu_graded: int = 0  # regraded here on the CPU, graded by the Pi on its GPU
     bad_log_lines: int = 0
 
 
@@ -62,6 +76,7 @@ class LogEntry:
     ev: float
     seed: int | None
     double: bool = False
+    gpu: bool = False  # the Pi graded this record on its GPU
 
 
 def _log_entry(record: dict) -> LogEntry:
@@ -70,10 +85,14 @@ def _log_entry(record: dict) -> LogEntry:
         evs = double.get("ev_comp")
         ev = evs[1] if double.get("index") == 2 and isinstance(evs, list) else record.get(
             "ev_comp")
+        # Not marked as a GPU record: a double's frame is regraded singly, which
+        # is a different picture from the Pi's composite whatever graded that.
         return LogEntry(float(ev or 0.0), None, double=True)
     seed = record.get("grain_seed")
+    backend = record.get("pipeline_backend")
     return LogEntry(float(record.get("ev_comp") or 0.0),
-                    int(seed) if seed is not None else None)
+                    int(seed) if seed is not None else None,
+                    gpu=isinstance(backend, str) and backend.startswith("gpu"))
 
 
 def load_capture_log(in_dir: Path) -> tuple[dict[str, LogEntry], int]:
@@ -162,6 +181,7 @@ def process_dir(
             result.from_log += 1
             result.ev_applied += entry.ev != 0.0
             result.doubles += entry.double
+            result.gpu_graded += entry.gpu
             ev = entry.ev
             if entry.seed is not None:
                 rng = np.random.default_rng(entry.seed)
@@ -229,6 +249,12 @@ def main(argv: list[str] | None = None) -> int:
         f"Processed {len(result.written)} image(s) into {args.out_dir} "
         f"in {time.perf_counter() - t0:.1f}s{suffix}"
     )
+    if result.gpu_graded:
+        print(
+            f"Note: the Pi graded {result.gpu_graded} of these on its GPU, and this regrade "
+            "is the CPU's. Those files match the Pi's within a few levels on average (more "
+            "on strongly saturated colours), not byte for byte."
+        )
     return 0
 
 

@@ -173,8 +173,10 @@ message screens keep the default font.
 | Focus gauge (vertical bar, left edge) | Absolute sharpness of the central quarter of the frame, 0 (far out of focus, or nothing to focus on) to full; an amber tick marks the best level of the last few seconds | — |
 | `2x` toggle (outlined tag, top left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
 | Battery tag (outlined, top left, right of `2x`) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
-| Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — is being graded, roughly 3 s on the Pi 4; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
-| Review screen | Full-screen graded result, one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
+| Developing count (amber number on a dark patch, right of the battery tag) | How many photographs are still being graded behind the shutter; see [Developing count](#developing-count). Absent at zero and with `--grade inline` | — |
+| `TUNING` tag (amber word on a dark patch, last in the top-left row) | The camera's libcamera tuning differs from the one the look was trained under; see [Tuning warning](#tuning-warning). Absent otherwise | — |
+| Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
+| Review screen | Full-screen quick grade (the frame reduced by a whole factor to about 1,000 pixels on the long side, four times each way for the IMX477, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
 Press feedback: `+`, `-` and the shutter button light while a finger is on them, not
 only on release, and a tap shorter than one frame still lights its key for 0.15 s.
@@ -186,6 +188,49 @@ when they will do nothing (the top of a scale).
 While the processing screen is showing, taps on the cells, on `+`/`-` and on `2x`
 are ignored: the colour bars hide them, so nothing is selected or stepped. A tap on
 the shutter button's place still reaches the controller, which answers busy.
+
+### Developing count
+
+The full-resolution grade of a photograph runs behind the shutter, on a queue
+(`--grade background`, the default). While any grade is unfinished, an amber number
+beside the battery tag says how many photographs are still developing. It counts the
+grade that is running and the ones waiting. It disappears at zero.
+
+- At zero nothing is being graded and nothing is waiting, so it is safe to switch off.
+  Every graded file and its record are then on disk, unless a grade failed: a failed
+  grade is reported in the log and its entry is kept for the next start, or set aside
+  as `.failed` after two failures.
+- The queue holds three waiting grades. When it is full the next capture waits for
+  a place, with the processing screen showing. That is why the shutter may wait
+  although the last picture has already been reviewed.
+- Just after a restart the number can be higher than the queue allows: grades left
+  unfinished by a power cut are counted too, and are finished first. With many of
+  them, three new photographs can be taken at once and a fourth waits until the
+  recovered grades are done.
+- Numbers above 99 are drawn as `99`.
+
+The review screen and the Stick show the quick grade, not the final file: it is
+reduced and has no grain, and its tone can differ slightly from the graded file.
+
+### Tuning warning
+
+A trained look is fitted to the colours of one libcamera tuning file. At start-up
+the service compares the fingerprint of the tuning the camera opened with against
+the one stamped in the look. When they differ, an amber `TUNING` tag shows at the
+end of the top-left row, after the battery tag and the developing count. It stays
+for the whole run, because the tuning cannot change while the service runs.
+
+- The camera still works. Photographs are taken and graded as usual, but their
+  colours may be off, and their records say `tuning_matches: false`.
+- The journal has the line `tuning: DIFFERS from the look: ...`, naming the
+  tuning file in use.
+- The usual cause is an OS or libcamera update, or a `--tuning-file` that is not
+  the one the look was trained under. What to do is in
+  [known issues](known-issues.md#a-libcamera-update-could-silently-retune-a-deployed-trained-lut).
+
+There is no tag when they match, when the look has no fingerprint (the bundled
+starter, or a trained look not yet stamped with `pifilm-tuning --stamp`), or with
+a USB camera.
 
 ### Idle dimming
 
@@ -535,6 +580,52 @@ Not yet run on hardware. The branch is `feat/manual-controls-ui`.
 | 7 | The shutter button is not hit while working `+`/`-` | Not yet run |
 | 8 | `2x`, focus gauge, battery, review, idle screen-off, Stick and GPIO button work as before | Not yet run |
 | 9 | About 10 fps is kept (`viewfinder: N fps` in the journal) | Not yet run |
+
+#### Background grading
+
+Not yet run on hardware. The branch is `feat/background-grade`; the design is
+[2026-10-13-background-grading-design.md](superpowers/specs/2026-10-13-background-grading-design.md).
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | A single shot: the review appears and the camera is free in about 1.6 s; the graded file appears a few seconds later; the record has `shutter_to_ready_ms` | |
+| 2 | Five shots as fast as the camera allows: all five graded files and records are present, in order; the developing count rises and returns to zero | |
+| 3 | A double exposure: the card, then the composite's review; one graded file | |
+| 4 | Stick: the picture arrives after each shot, as before | |
+| 5 | Power cut with the count above zero (pull the supply with the UPS off, or `kill -9`): after the restart the missing graded files appear, and their records are marked `recovered` | |
+| 6 | `--grade inline`: behaves as before this change | |
+| 7 | Ten minutes of ordinary use: no preview stall, and the live view is acceptable | |
+
+#### GPU grading
+
+Not yet run on hardware. The branch is `feat/gpu-grade`; the design is
+[2026-10-13-gpu-grading-design.md](superpowers/specs/2026-10-13-gpu-grading-design.md).
+Use a look with the tile grain (`two_scale_tile`): the bundled starter has Gaussian
+grain and is always graded on the CPU. Run `pip install -e .` again in the Pi's venv
+first, so that `pifilm-gpu-check` exists.
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | The service starts with the display on. The journal has `gpu grading on (..., self-test passed)`. This is the first time the GPU context runs beside the display in one process. If the start hangs here, the next start logs `gpu grading off: the last start did not finish opening the GPU; delete <path> to try again` and grades on the CPU: note it, and delete the file only to try again | |
+| 2 | `pifilm-gpu-check --artifacts DIR --image FILE` on a real photograph: within 1 level of the reference, and timings near the spike's (upload 142 ms, shader 239 ms, read-back 180 ms) | |
+| 3 | Ten photographs: every record has `pipeline_backend: gpu-1`; `stage_ms` shows the grade near 0.7 s (`normalize` plus `gpu`); the graded files look right at 100 %, grain included | |
+| 4 | A double exposure and a Stick shot work as before | |
+| 5 | `--grade-backend cpu`: records have `pipeline_backend: cpu`, and the timings are as before | |
+| 6 | `pifilm-process` on today's folder: it runs, and prints the note about the records graded on the GPU | |
+| 7 | Ten minutes of ordinary use: no preview stall, and the live view is no worse than now | |
+
+#### Tuning check
+
+Passed on the Pi 4 with the IMX477 on 2026-10-14 (PR #63). The design is
+[2026-10-14-tuning-identity-design.md](superpowers/specs/2026-10-14-tuning-identity-design.md).
+Run `pip install -e .` again in the Pi's venv first, so that `pifilm-tuning` exists.
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | `pifilm-tuning --tuning-file imx477.json` prints a fingerprint and the file | Pass |
+| 2 | `pifilm-tuning --tuning-file imx477.json --stamp <the service's artifacts>`, run as `george` (not with `sudo`), then restart the service with `sudo systemctl restart pifilm-capture.service`: the journal says `tuning: matches the look`; records carry `tuning_sha1` and `tuning_matches: true`; no tag on the screen | Pass |
+| 3 | Stamp the look with a wrong fingerprint (`pifilm-tuning --sha1 0000000000000000000000000000000000000000 --stamp <dir>`) and restart: the journal says `DIFFERS`, the amber `TUNING` tag shows, records say `tuning_matches: false`, and photographs are still taken and graded. (An edited copy of `imx477.json` passed to `--tuning-file` by its absolute path tests the same thing from the camera's side.) | Pass |
+| 4 | Stamp the right fingerprint again and restart: the tag is gone | Pass |
 
 ## 8. Troubleshooting
 

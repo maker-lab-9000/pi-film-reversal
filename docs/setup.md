@@ -175,7 +175,7 @@ On Picamera2, each capture saves three files: `_original.jpg` (the ISP's own
 rendering), `<stem>.dng` (a raw sidecar from the same capture request, on by
 default; `--no-dng` disables it and saves storage — about 28 MB per shot
 otherwise, and only omits the `.dng`; the original still stays `_original.jpg`),
-and `_graded.jpg` (the graded output). `captures.jsonl` gains
+and `_graded.jpg` (the graded output). The example unit passes `--no-dng` (since 2026-10-14): a look trained on developed DNGs showed no visible gain ([write-up](experiments/2026-10-14-raw-look.md)), and leaving the DNG out frees the camera about 0.5 s sooner. `captures.jsonl` gains
 `camera_metadata` (a filtered subset of the request's metadata, such as
 `ExposureTime`, `AnalogueGain`, `Lux`, `LensPosition`) and `dng` (the sidecar's
 filename) when present. Autofocus defaults to continuous

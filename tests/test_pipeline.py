@@ -4,10 +4,14 @@ import numpy as np
 import pytest
 
 from pifilm.artifacts import Artifacts, write_artifact
+from pifilm.capture.camera import synthetic_frame
+from pifilm.gpu.grader import GpuError, GpuGrader
+from pifilm.gpu.shader import BACKEND
 from pifilm.grain import GrainParams
 from pifilm.lut import LUT3D, sha1_hex
-from pifilm.normalize import NormalizeParams
+from pifilm.normalize import NormalizeParams, stats_gains
 from pifilm.pipeline import Pipeline
+from tests.gpu_fakes import FakeDevice, tile_artifacts
 
 
 @pytest.fixture
@@ -153,3 +157,148 @@ def test_ev_zero_is_the_unchanged_grade(pipeline):
     a = pipeline.process(frame, grain=False)[0]
     b = pipeline.process(frame, grain=False, ev=0.0)[0]
     assert np.array_equal(a, b)
+
+
+def test_process_reports_how_long_each_stage_took(pipeline):
+    """Step 1 of the pipeline roadmap: decisions about speed rest on per-stage
+    numbers from the Pi, so the pipeline has to hand them over."""
+    rgb = np.full((24, 32, 3), 120, np.uint8)
+    timings = {}
+    _, info = pipeline.process(rgb, rng=np.random.default_rng(0), timings=timings)
+    assert set(timings) == {"normalize", "lut", "grain"}
+    assert all(isinstance(v, float) and v >= 0.0 for v in timings.values())
+    # The audit fields are what a regrade is reproduced from: timings stay out.
+    assert not any("ms" in key or key == "timings" for key in info)
+
+
+def test_a_skipped_grain_stage_is_not_timed(pipeline):
+    timings = {}
+    pipeline.process(np.full((24, 32, 3), 120, np.uint8), grain=False, timings=timings)
+    assert set(timings) == {"normalize", "lut"}
+
+
+def test_timings_do_not_change_the_pixels(pipeline):
+    rgb = np.random.default_rng(3).integers(0, 255, (24, 32, 3), dtype=np.uint8)
+    plain, _ = pipeline.process(rgb, rng=np.random.default_rng(1))
+    timed, _ = pipeline.process(rgb, rng=np.random.default_rng(1), timings={})
+    assert np.array_equal(plain, timed)
+
+
+# --- the GPU grader ----------------------------------------------------------
+
+
+class _Grader:
+    """A grader as ``Pipeline.process`` sees one: no GL, a fixed picture."""
+
+    def __init__(self, *, can=True, fail=False):
+        self.can, self.fail = can, fail
+        self.asked, self.graded = [], []
+
+    def can_grade(self, shape, *, ev, grain):
+        self.asked.append((tuple(shape), ev, grain))
+        return self.can
+
+    def grade(self, rgb_u8, gains, rng, *, grain=True, timings=None):
+        self.graded.append((gains, grain))
+        if grain and rng is not None:
+            rng.integers(0, 2048, 2)  # the placement draw, as the real grader makes it
+            rng.integers(0, 8)
+        if timings is not None:
+            timings.update(gpu_upload=1.0, gpu_shader=2.0, gpu_readback=3.0)
+        if self.fail:
+            raise GpuError("GL error after grading: 0x505")
+        return np.full((*rgb_u8.shape[:2], 4), 77, np.uint8)
+
+
+def test_a_grader_that_can_grade_supplies_the_picture(pipeline):
+    frame = _scene()
+    _, cpu_info = pipeline.process(frame, rng=np.random.default_rng(4))
+    grader, used, timings = _Grader(), {}, {}
+    out, info = pipeline.process(frame, rng=np.random.default_rng(4), timings=timings,
+                                 grader=grader, used=used)
+    assert out.shape == (48, 64, 4) and out.dtype == np.uint8 and (out == 77).all()
+    assert used == {"backend": BACKEND} and BACKEND == "gpu-1"
+    assert info == cpu_info
+    assert set(timings) == {"normalize", "gpu", "gpu_upload", "gpu_shader", "gpu_readback"}
+    assert grader.asked == [((48, 64, 3), 0.0, True)]
+    ((gains, grain),) = grader.graded
+    assert grain is True
+    want = stats_gains(frame, pipeline.artifacts.normalize)
+    assert np.array_equal(gains.wb, want.wb) and gains.exposure == want.exposure
+    assert gains.levels == want.levels and gains.clamped == want.clamped
+
+
+def test_the_grader_is_told_whether_grain_will_run(pipeline, tmp_path):
+    grader = _Grader()
+    pipeline.process(_scene(), grain=False, grader=grader)
+    assert grader.asked[-1][2] is False and grader.graded[-1][1] is False
+    write_artifact(tmp_path / "off", LUT3D.identity(9), NormalizeParams(),
+                   GrainParams(enabled=False))
+    Pipeline(Artifacts.load(tmp_path / "off")).process(_scene(), grader=grader)
+    assert grader.asked[-1][2] is False and grader.graded[-1][1] is False
+
+
+@pytest.mark.parametrize("ev", [0.0, -1.0])
+def test_a_grader_that_cannot_grade_changes_nothing(starter, ev):
+    frame = _scene()
+    plain, plain_info = starter.process(frame, rng=np.random.default_rng(9), ev=ev)
+    grader, used, timings = _Grader(can=False), {}, {}
+    out, info = starter.process(frame, rng=np.random.default_rng(9), ev=ev, timings=timings,
+                                grader=grader, used=used)
+    assert out.shape == frame.shape and out.tobytes() == plain.tobytes()
+    assert info == plain_info
+    assert used == {"backend": "cpu"}
+    assert grader.graded == []
+    assert set(timings) == {"normalize", "lut", "grain"}
+
+
+def test_a_failed_gpu_grade_is_the_cpu_grade_of_the_same_seed(starter):
+    """The grader draws the grain's placement before the device fails; the CPU
+    must then draw the same numbers, or the photograph's seed no longer
+    reproduces its grain."""
+    frame = _scene()
+    plain, plain_info = starter.process(frame, rng=np.random.default_rng(21))
+    grader, used, timings = _Grader(fail=True), {}, {}
+    out, info = starter.process(frame, rng=np.random.default_rng(21), timings=timings,
+                                grader=grader, used=used)
+    assert len(grader.graded) == 1
+    assert out.tobytes() == plain.tobytes() and info == plain_info
+    assert used["backend"] == "cpu"
+    assert "0x505" in used["gpu_error"]
+    # What the failed attempt timed is not this photograph's grade.
+    assert set(timings) == {"normalize", "lut", "grain"}
+
+
+def test_a_failed_gpu_grade_leaves_the_generator_where_the_cpu_does(starter):
+    frame = _scene()
+    cpu, gpu = np.random.default_rng(5), np.random.default_rng(5)
+    starter.process(frame, rng=cpu)
+    starter.process(frame, rng=gpu, grader=_Grader(fail=True))
+    assert cpu.bit_generator.state == gpu.bit_generator.state
+
+
+def test_a_real_grader_on_a_fake_device_grades_within_the_pass_tolerance():
+    """The whole chain without GL: the real grader, a device built on the
+    reference, and the same seed placing the grain on both paths."""
+    pipe = Pipeline(tile_artifacts())
+    frame = synthetic_frame(96, 160)
+    cpu, cpu_info = pipe.process(frame, rng=np.random.default_rng(3))
+    device = FakeDevice()
+    grader = GpuGrader(pipe.artifacts, device, log=lambda _: None)
+    used = {}
+    out, info = pipe.process(frame, rng=np.random.default_rng(3), grader=grader, used=used)
+    assert used == {"backend": "gpu-1"} and info == cpu_info
+    assert out.shape == (96, 160, 4)
+    diff = np.abs(out[..., :3].astype(int) - cpu.astype(int))
+    assert diff.mean() < 1.25 and diff.max() <= 24  # the reference's measured bounds on luma
+    # And when the device fails, the CPU's own bytes.
+    device.fail_next = 1
+    used = {}
+    out, _ = pipe.process(frame, rng=np.random.default_rng(3), grader=grader, used=used)
+    assert out.tobytes() == cpu.tobytes() and used["backend"] == "cpu"
+
+
+def test_used_is_filled_without_a_grader(pipeline):
+    used = {}
+    pipeline.process(_scene(), grain=False, used=used)
+    assert used == {"backend": "cpu"}

@@ -89,7 +89,7 @@ faster, which closes the camera-servicing gap that trips the watchdog. Raising
 
 **Status:** **cause unknown; contained 2026-10-10.** The freeze no longer hangs
 the process: it is logged with Picamera2's state and the service restarts
-itself. Seen once.
+itself. Seen twice.
 
 **First seen:** 2026-10-10, Raspberry Pi 4 + IMX477, `python3-picamera2`
 0.3.37-1, `python3-libcamera` 0.7.2+rpt20260817-1, the DSI viewfinder with the
@@ -149,6 +149,42 @@ the stall cannot be produced on demand.
 Only the LCD viewfinder has this exit. In the headless Stick-only mode a
 stalled still fails that one capture with the same message and the process
 keeps running.
+
+### Second occurrence
+
+2026-10-13, about 18:38, during the GPU grading test (PR #60): the same three
+`no preview frame within 5.0 s (started=True completed=0 ...)` lines, then the
+exit and a restart by systemd, which worked. It came about 7 s after the
+viewfinder restarted the live view for a white-balance change; no grade was
+running. The GPU's self-test had passed at that start and at the three before
+and after it. Whether GPU grading or the live-view restart makes the stall more
+likely is not known from two occurrences.
+
+### The journal is kept across reboots (2026-10-15)
+
+Raspberry Pi OS keeps the journal in memory (`Storage=volatile` in
+`/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`), so a reboot or a
+power cut lost every stall logged before it. That happened on 2026-10-15: several
+restarts during outdoor use, and nothing left to read once the Pi had been switched
+off and on. `scripts/pi_journal.py` keeps it on the card instead (a drop-in that
+sorts after the OS's, capped at 200 MB and always leaving 1 GB free). Once, on the
+Pi:
+
+```bash
+cd ~/repos/pi-film-reversal
+python3 scripts/pi_journal.py              # prints the plan, changes nothing
+sudo python3 scripts/pi_journal.py --apply
+```
+
+After restarts, every boot's starts, stalls and error exits, the lines before each
+exit, and any undervoltage or out-of-memory message from the kernel (no sudo
+needed; the user is in `adm`):
+
+```bash
+python3 scripts/pi_journal.py --report
+```
+
+`sudo python3 scripts/pi_journal.py --undo --apply` goes back to memory only.
 
 ### If it happens again
 
@@ -251,24 +287,58 @@ that took live changes after a photo.
 
 ## A libcamera update could silently retune a deployed trained LUT
 
-**Status:** understood, mitigated by a documented deployment step, not enforced
-in code.
+**Status:** checked at start-up, warn only (step 4 of the
+[pipeline roadmap](superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md)).
+The check works only for a look stamped with its tuning's fingerprint.
 
-**Description:** the Picamera2 backend defaults `--tuning-file` to `None`,
-meaning libcamera's own automatic tuning choice for the detected sensor
-(recorded as `tuning_file: auto:<model>` in `captures.jsonl`); the example
-systemd unit runs with this default. A trained LUT is fitted against whatever
-colour science its source corpus was captured under. If the automatic tuning
-file libcamera picks ever changes — an OS or libcamera package update, or a
-sensor firmware/variant change read differently — a deployment running the
-default would start feeding a **different** colour response through an
-unchanged LUT, with no error and no changed `lut_sha1` to flag it.
+**Description:** a trained LUT is fitted against the colour science its source
+corpus was captured under, which is one libcamera tuning file. If that file
+changes (an OS or libcamera package update, or a sensor read differently), the
+camera feeds a different colour response through an unchanged LUT. There is no
+error and no changed `lut_sha1`. The Picamera2 backend defaults `--tuning-file`
+to libcamera's automatic choice for the detected sensor (`tuning_file:
+auto:<model>` in `captures.jsonl`); the example systemd unit runs with this
+default.
 
-**Mitigation:** when deploying a trained (not the bundled starter) LUT, pin
-`--tuning-file` to the exact file the corpus was captured under (see
-[docs/training.md](training.md), Step 7). This is a documentation-only
-safeguard; nothing currently checks that a running service's tuning file
-matches what a deployed artifact was trained against.
+**The check.** The Pi fingerprints the tuning it opens the camera with: the
+SHA-1 of the file's parsed JSON, so a change of whitespace or key order does not
+count and any changed value does. A look can carry the fingerprint it was
+trained under, as `tuning_sha1` in its `params.json`. At start-up the service
+compares the two and writes one line to the journal:
+
+- `tuning: matches the look (<12 hex>)`: nothing to do.
+- `tuning: DIFFERS from the look: camera <12 hex> (<tuning file>), look <12 hex>; colours may be off`:
+  the amber `TUNING` tag shows on the viewfinder for the whole run (see
+  [docs/lcd-viewfinder.md](lcd-viewfinder.md#tuning-warning)).
+- `tuning: cannot check the look's tuning (<reason>)`: the camera's tuning
+  could not be read, so nothing was compared.
+
+Nothing is checked, and no line is written, for a look without a fingerprint
+(the bundled starter, or a trained look not yet stamped) or for a USB camera.
+The service never refuses to start over this: photographs are still taken and
+graded, and the originals are kept, so they can be regraded later. From this
+build on, every record from the Pi camera carries `tuning_sha1` when the tuning
+could be fingerprinted, and when the check ran also `tuning_matches` (`true` or
+`false`).
+
+**What to do.** When you deploy a trained look, pin `--tuning-file` to the file
+the corpus was captured under and stamp the look on the Pi (see
+[docs/training.md](training.md), Step 7):
+
+```sh
+pifilm-tuning --tuning-file imx477.json --stamp <the service's artifacts dir>
+sudo systemctl restart pifilm-capture.service
+```
+
+Run the stamp as the service user, not with `sudo`; only the restart needs it.
+Stamp the Mac's copy of the look as well (`pifilm-tuning --sha1 <hex> --stamp
+<dir>`), or a later `rsync` from the Mac puts back the unstamped `params.json`
+and the check goes quiet.
+
+If the tag shows after an update, the tuning file changed under the look.
+Either put the old tuning file back and name it with `--tuning-file`, or retrain
+the look on frames taken under the new tuning. Stamping the look again with the
+new fingerprint only hides the warning; it does not make the colours right.
 
 ## Capture records written before 2026-09-19 cannot be told apart by `lut_sha1`
 

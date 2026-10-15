@@ -1111,6 +1111,10 @@ class ViewfinderLoop:
                 cells=self._cells(reading, metered_k), selected=self.selected,
                 pressed=self._pressed(now),
                 double=(snap.double_exposure, snap.exposures_taken),
+                # Read at every frame: the count falls while no capture is running.
+                developing=getattr(snap, "pending_grades", 0),
+                # The tuning cannot change while the service runs; read like the count.
+                tuning_mismatch=getattr(snap, "tuning_mismatch", False) is True,
             ),
             scale=self._scale,
         ))

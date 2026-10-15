@@ -2,6 +2,7 @@ import argparse
 import builtins
 import io
 import json
+import os
 import sys
 import threading
 import time
@@ -17,17 +18,23 @@ from PIL import Image
 from pifilm.artifacts import Artifacts, write_artifact
 from pifilm.capture.app import (
     CaptureSession,
+    _announce,
     _colour_gains,
     main,
     run_headless_loop,
     run_preview_loop,
 )
 from pifilm.capture.camera import CameraError, FakeCamera, Frame, StreamInfo, synthetic_frame
+from pifilm.capture.controller import CaptureController
+from pifilm.capture.gradequeue import read_entries, write_entry
+from pifilm.gpu.grader import GpuGrader
 from pifilm.grain import GrainParams
-from pifilm.imageio import load_rgb
+from pifilm.imageio import load_rgb, save_jpeg
 from pifilm.lut import LUT3D
 from pifilm.normalize import NormalizeParams
 from pifilm.pipeline import Pipeline
+from pifilm.tuning import Resolved
+from tests.gpu_fakes import FakeDevice, tile_artifacts
 
 
 def _jpeg_bytes(rgb):
@@ -1916,3 +1923,1772 @@ def test_bad_white_balance_arguments_are_refused(camera_cli, tmp_path, argv):
     with pytest.raises(SystemExit) as caught:
         camera_cli.main([*argv, "--no-preview", "--out", str(tmp_path / "shots")])
     assert caught.value.code == 2
+
+
+def test_record_breaks_the_shot_down_by_stage(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    record = session.capture().record
+    stages = record["stage_ms"]
+    assert set(stages) == {
+        "capture", "normalize", "lut", "grain", "save_original", "save_graded",
+    }
+    assert all(isinstance(v, float) and v >= 0.0 for v in stages.values())
+    # The parts cannot exceed the whole (rounding to 0.1 ms aside), and the
+    # existing totals stay in the record.
+    assert sum(stages.values()) <= record["shutter_to_saved_ms"] + 1.0
+    assert record["pipeline_ms"] >= 0.0
+
+
+def test_camera_stage_timings_are_carried_into_the_record(tmp_path, pipeline):
+    camera = FakeCamera([synthetic_frame(90, 160)])
+    real_read = camera.read
+
+    def read(**kwargs):
+        frame = real_read(**kwargs)
+        frame.timings = {"request": 400.0, "array": 30.0, "dng": 900.0}
+        return frame
+
+    camera.read = read
+    stages = _session(tmp_path, pipeline, camera=camera).capture().record["stage_ms"]
+    assert stages["capture_request"] == 400.0
+    assert stages["capture_array"] == 30.0
+    assert stages["capture_dng"] == 900.0
+
+
+def test_a_saved_dng_is_timed(tmp_path, pipeline):
+    camera = FakeCamera([synthetic_frame(90, 160)])
+    real_read = camera.read
+
+    def read(**kwargs):
+        frame = real_read(**kwargs)
+        frame.dng = b"raw"
+        return frame
+
+    camera.read = read
+    record = _session(tmp_path, pipeline, camera=camera).capture().record
+    assert record["stage_ms"]["save_dng"] >= 0.0
+
+
+def test_double_exposure_records_are_broken_down_too(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline)
+    session.set_double_exposure(True)
+    first = session.capture().record["stage_ms"]
+    second = session.capture().record["stage_ms"]
+    assert set(first) == {"capture", "save_original", "card"}
+    assert set(second) == {
+        "capture", "save_original", "composite", "normalize", "lut", "grain",
+        "save_graded",
+    }
+
+
+def test_session_warms_the_pipeline_for_the_cameras_still_size(tmp_path):
+    """The tile grain's tile is built at start-up, not during the first photograph."""
+    import threading
+
+    warmed = threading.Event()
+    shapes = []
+
+    class _Pipeline:
+        def warm(self, shape):
+            shapes.append(shape)
+            warmed.set()
+
+    camera = FakeCamera()
+    camera.still_size = (4056, 3040)
+    CaptureSession(camera, _Pipeline(), tmp_path)
+    assert warmed.wait(5.0)
+    assert shapes == [(3040, 4056)]
+
+
+def test_session_without_a_still_size_does_not_warm(tmp_path):
+    class _Pipeline:
+        def warm(self, shape):
+            raise AssertionError("no size to warm for")
+
+    CaptureSession(FakeCamera(), _Pipeline(), tmp_path)
+
+
+# --- Grading behind the shutter -------------------------------------------------
+
+FIXED = datetime(2026, 9, 3, 21, 5, 7)
+NEW_KEYS = {"shutter_to_ready_ms", "grade"}
+
+
+def _earlier_keys(record):
+    """The record's keys without what grading behind the shutter added, and without
+    ``pipeline_backend``, which sits after ``stage_ms`` in an inline record and
+    after ``grade`` in a background one."""
+    return [k for k in record if k not in NEW_KEYS and k != "pipeline_backend"]
+
+
+class _HeldPipeline:
+    """A pipeline whose full grades each wait for one permit; quick grades pass.
+
+    The quick grade is the only caller that asks for no grain, so that flag tells
+    the two apart. Nothing waits longer than 5 s, so a broken test fails instead
+    of hanging.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.entered = threading.Semaphore(0)  # one release per full grade started
+        self._permits = threading.Semaphore(0)
+
+    def process(self, rgb, *, grain=True, **kwargs):
+        if grain:
+            self.entered.release()
+            assert self._permits.acquire(timeout=5), "the grade was never released"
+        return self._inner.process(rgb, grain=grain, **kwargs)
+
+    def release(self, grades=1):
+        for _ in range(grades):
+            self._permits.release()
+
+    def wait_entered(self):
+        assert self.entered.acquire(timeout=5), "no grade started"
+
+
+@pytest.fixture
+def background(tmp_path, pipeline):
+    """Build background sessions; every one is closed, and every hold released, at the end."""
+    made, held = [], []
+
+    def make(camera=None, *, hold=False, root=None, state=None, **kwargs):
+        pipe = pipeline
+        if hold:
+            pipe = _HeldPipeline(pipeline)
+            held.append(pipe)
+        log = kwargs.pop("log", [])
+        session = CaptureSession(
+            camera or FakeCamera([synthetic_frame(90, 160)]), pipe,
+            root or tmp_path / "shots",
+            now=kwargs.pop("now", None), seed_rng=np.random.default_rng(0),
+            background=True, state_dir=state or tmp_path / "state", log=log.append, **kwargs,
+        )
+        session.test_log = log
+        made.append(session)
+        return session
+
+    yield make
+    for pipe in held:
+        pipe.release(100)
+    for session in made:
+        assert session.close_grades(timeout=5), "a grade worker outlived its test"
+
+
+def _lines(root):
+    out = []
+    for f in sorted(Path(root).glob("*/captures.jsonl")):
+        out += [json.loads(line) for line in f.read_text().splitlines()]
+    return out
+
+
+def _settle(session):
+    """Wait, at most 5 s, for every accepted grade to finish (the session stays open)."""
+    deadline = time.monotonic() + 5
+    while session.pending_grades:
+        assert time.monotonic() < deadline, "grades did not finish"
+        threading.Event().wait(0.005)
+
+
+def test_inline_session_never_touches_a_state_directory(tmp_path, pipeline, monkeypatch):
+    home = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_STATE_HOME", str(home))
+    session = _session(tmp_path, pipeline)
+    result = session.capture()
+    assert session.pending_grades == 0
+    assert session.close_grades() is True
+    assert result.graded == result.pifilm
+    assert not home.exists()
+    assert not any(t.name == "pifilm-grade" for t in threading.enumerate())
+
+
+def test_background_graded_file_is_byte_identical_to_inline(tmp_path, pipeline, background):
+    inline = _session(tmp_path / "inline", pipeline, now=lambda: FIXED).capture()
+    session = background(now=lambda: FIXED)
+    result = session.capture()
+    assert session.close_grades(timeout=5)
+    assert result.graded.name == inline.pifilm.name == "210507_graded.jpg"
+    assert result.graded.read_bytes() == inline.pifilm.read_bytes()
+    assert result.original.read_bytes() == inline.original.read_bytes()
+    assert _lines(session.out_root)[0]["grain_seed"] == inline.record["grain_seed"]
+
+
+def test_capture_returns_before_the_grade_finishes(tmp_path, background):
+    session = background(hold=True)
+    result = session.capture()
+    session.pipeline.wait_entered()
+    quick = load_rgb(result.pifilm)[0]
+    assert quick.shape == (90, 160, 3)
+    assert session.out_root.resolve() not in result.pifilm.resolve().parents
+    assert result.pifilm.name.startswith("preview-")
+    assert result.graded.parent.parent == session.out_root
+    assert not result.graded.exists()
+    assert session.pending_grades == 1
+    assert _lines(session.out_root) == []
+    session.pipeline.release()
+    assert session.close_grades(timeout=5)
+    assert result.graded.exists()
+    assert session.pending_grades == 0
+    assert session.close_grades() is True  # a second close is harmless
+
+
+def test_background_record_is_the_inline_record_plus_the_new_fields(
+    tmp_path, pipeline, background,
+):
+    inline = _session(tmp_path / "inline", pipeline, now=lambda: FIXED).capture().record
+    assert not NEW_KEYS & set(inline)
+    assert not {"preview", "queued"} & set(inline["stage_ms"])
+
+    # Held until capture() has returned, so "ready" is always measured before "saved".
+    session = background(hold=True, now=lambda: FIXED)
+    result = session.capture()
+    session.pipeline.release()
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    # Today's fields in today's order, the new ones after them.
+    assert _earlier_keys(record) == _earlier_keys(inline)
+    assert list(record)[-3:] == ["shutter_to_ready_ms", "grade", "pipeline_backend"]
+    assert record["grade"] == "background"
+    assert "recovered" not in record
+    assert {"capture", "save_original", "preview", "queued", "normalize", "lut", "grain",
+            "save_graded"} <= set(record["stage_ms"])
+    assert record["shutter_to_saved_ms"] >= record["shutter_to_ready_ms"] > 0
+    for key in ("timestamp", "original", "pifilm", "wb_gains", "lut_sha1", "normalize_sha1",
+                "ev_comp", "grain_seed", "params_version", "package_version", "width"):
+        assert record[key] == inline[key], key
+    # What the capture job carries: nothing from the grade, and its own copy of the stages.
+    assert result.record["shutter_to_ready_ms"] == record["shutter_to_ready_ms"]
+    assert "wb_gains" not in result.record and "shutter_to_saved_ms" not in result.record
+    assert "preview" in result.record["stage_ms"]
+    assert "save_graded" not in result.record["stage_ms"]
+    assert result.record["pifilm"] == result.graded.name
+
+
+def test_background_record_keeps_camera_metadata_and_dng_last(tmp_path, pipeline, background):
+    class MetaCamera(FakeCamera):
+        def read(self, full=True):
+            frame = super().read()
+            return Frame(frame.rgb, None, "picamera2", dng=b"raw", metadata={"Lux": 1.0})
+
+    def make_camera():
+        return MetaCamera([synthetic_frame(90, 160)])
+
+    inline_session = CaptureSession(make_camera(), pipeline, tmp_path / "inline",
+                                    now=lambda: FIXED, seed_rng=np.random.default_rng(0))
+    inline = inline_session.capture().record
+    session = background(make_camera(), now=lambda: FIXED)
+    session.capture()
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    assert _earlier_keys(record) == _earlier_keys(inline)
+    assert record["dng"] == "210507.dng" and record["camera_metadata"] == {"Lux": 1.0}
+
+
+def test_records_are_appended_in_shot_order(background):
+    session = background(now=lambda: FIXED)
+    results = [session.capture() for _ in range(3)]
+    assert session.close_grades(timeout=5)
+    names = ["210507_graded.jpg", "210507-2_graded.jpg", "210507-3_graded.jpg"]
+    assert [r.graded.name for r in results] == names
+    assert [line["pifilm"] for line in _lines(session.out_root)] == names
+    assert all(r.graded.exists() for r in results)
+
+
+def test_pending_entry_lives_exactly_as_long_as_the_grade(tmp_path, background):
+    session = background(hold=True, now=lambda: FIXED)
+    result = session.capture()
+    session.pipeline.wait_entered()
+    ((path, entry),) = read_entries(tmp_path / "state")
+    assert path.name == "2026-09-03_210507.json"
+    assert entry["out_root"] == str(session.out_root.absolute())
+    assert entry["day"] == "2026-09-03" and entry["graded"] == "210507_graded.jpg"
+    assert entry["originals"] == ["2026-09-03/210507_ungraded.jpg"]
+    assert entry["seed"] == result.record["grain_seed"]
+    assert entry["ev"] == 0.0 and entry["double"] is None and entry["attempts"] == 0
+    assert entry["record"]["pifilm"] == "210507_graded.jpg"
+    session.pipeline.release()
+    assert session.close_grades(timeout=5)
+    assert read_entries(tmp_path / "state") == []
+    assert list((tmp_path / "state").iterdir()) == []
+
+
+def _interrupted_shot(tmp_path, background, *, double=False):
+    """Take a shot, keep a copy of its pending entry, and let the session finish.
+
+    Returns (result, entry path, entry text): putting the text back is the state a
+    power cut during the grade leaves behind.
+    """
+    frames = [synthetic_frame(90, 160), synthetic_frame(90, 160)[:, ::-1].copy()]
+    session = background(FakeCamera(frames), hold=True, now=lambda: FIXED)
+    if double:
+        session.set_double_exposure(True)
+        session.capture()
+    result = session.capture()
+    session.pipeline.wait_entered()
+    ((path, _),) = read_entries(tmp_path / "state")
+    text = path.read_text()
+    session.pipeline.release()
+    assert session.close_grades(timeout=5)
+    assert not path.exists()
+    return result, path, text
+
+
+def test_an_unfinished_grade_is_finished_at_the_next_start(tmp_path, background):
+    result, path, text = _interrupted_shot(tmp_path, background)
+    first = result.graded.read_bytes()
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+
+    again = background()
+    assert again.test_log == ["recovering 1 unfinished grade(s)"]
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    assert not path.exists()
+    (record,) = _lines(again.out_root)
+    assert record["pifilm"] == result.graded.name
+    assert record["recovered"] is True and record["grade"] == "background"
+    assert "shutter_to_saved_ms" not in record and "shutter_to_ready_ms" not in record
+    assert record["stage_ms"]["queued"] == 0.0 and "pipeline_ms" in record
+    assert record["grain_seed"] == result.record["grain_seed"]
+    # From the saved JPEG and the stored seed: the same picture within JPEG rounding.
+    diff = np.abs(load_rgb(result.graded)[0].astype(int)
+                  - np.asarray(Image.open(io.BytesIO(first)).convert("RGB")).astype(int))
+    assert diff.mean() < 3.0
+
+
+def test_recovery_does_not_record_a_finished_grade_twice(tmp_path, background):
+    """The record was written and the power went before the entry was removed."""
+    result, path, text = _interrupted_shot(tmp_path, background)
+    before = _lines(result.graded.parents[1])
+    result.graded.unlink()  # so a second grade would be visible as a new file
+    path.write_text(text)
+
+    again = background()
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    assert not path.exists()
+    assert _lines(again.out_root) == before and len(before) == 1
+    assert not result.graded.exists()
+
+
+def test_recovery_leaves_other_folders_alone_and_survives_a_missing_original(
+    tmp_path, background,
+):
+    result, path, text = _interrupted_shot(tmp_path, background)
+    result.original.unlink()
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+    foreign = write_entry(tmp_path / "state", "elsewhere", {
+        **json.loads(text), "out_root": str(tmp_path / "another-folder"),
+    })
+
+    again = background(now=lambda: FIXED)
+    assert again.test_log[0] == "recovering 1 unfinished grade(s)"
+    shot = again.capture()  # start-up was not stopped, and neither is the next shot
+    assert again.close_grades(timeout=5)
+    assert shot.graded.exists()
+    assert [line["pifilm"] for line in _lines(again.out_root)] == [shot.graded.name]
+    assert sum(line.startswith(f"grade failed ({path.name}): ") for line in again.test_log) == 1
+    assert json.loads(path.read_text())["attempts"] == 1
+    assert json.loads(foreign.read_text())["attempts"] == 0
+    assert {p.name for p in (tmp_path / "state").iterdir()} == {path.name, foreign.name}
+
+
+def test_a_damaged_entry_fails_on_the_worker_not_at_start_up(tmp_path, background):
+    root = tmp_path / "shots"
+    for name, payload in (
+        ("missing-keys", {}),
+        ("escaping", {"day": "..", "graded": "x.jpg", "originals": ["../../x.jpg"], "seed": 1,
+                      "ev": 0.0, "double": None, "record": {}}),
+    ):
+        write_entry(tmp_path / "state", name, {"out_root": str(root.absolute()), **payload})
+    session = background()
+    _settle(session)  # the two damaged entries are tried at start-up
+    shot = session.capture()
+    assert session.close_grades(timeout=5)
+    assert shot.graded.exists()
+    assert [line for line in session.test_log if line.startswith("grade failed")] == [
+        "grade failed (escaping.json): pending entry has a bad name: '..'",
+        "grade failed (missing-keys.json): 'day'",
+    ]
+    assert len(_lines(root)) == 1
+    assert not list(tmp_path.glob("x.jpg")) and not list(tmp_path.parent.glob("x.jpg"))
+
+
+def _double_frames():
+    return [np.full((90, 160, 3), 10, np.uint8), np.full((90, 160, 3), 230, np.uint8)]
+
+
+def test_background_double_exposure_matches_inline(tmp_path, pipeline, background):
+    inline_session = _session(tmp_path / "inline", pipeline, FakeCamera(_double_frames()),
+                              now=lambda: FIXED)
+    inline_session.set_double_exposure(True)
+    inline_session.capture()
+    inline = inline_session.capture()
+
+    session = background(FakeCamera(_double_frames()), now=lambda: FIXED)
+    session.set_double_exposure(True)
+    first = session.capture()
+    assert first.exposure == (1, 2) and first.graded is None
+    assert session.pending_grades == 0
+    assert read_entries(tmp_path / "state") == []
+    assert not list(session.out_root.glob("*/*_graded.jpg"))
+    assert session.double_state == (True, 1)
+
+    second = session.capture()
+    assert second.exposure == (2, 2)
+    assert session.double_state == (True, 0)
+    assert load_rgb(second.pifilm)[0].shape == (90, 160, 3)
+    assert session.out_root.resolve() not in second.pifilm.resolve().parents
+    assert session.close_grades(timeout=5)
+    assert second.graded.name == inline.pifilm.name == "210507-2_double_graded.jpg"
+    assert second.graded.read_bytes() == inline.pifilm.read_bytes()
+    one, two = _lines(session.out_root)
+    assert one["double"] == {"index": 1, "of": 2} and "grade" not in one
+    assert two["double"] == inline.record["double"] and two["double"]["index"] == 2
+    assert two["grade"] == "background" and two["ev_comp"] == 0.0
+    assert _earlier_keys(two) == _earlier_keys(inline.record)
+    assert {"preview", "queued", "composite", "save_graded"} <= set(two["stage_ms"])
+    assert read_entries(tmp_path / "state") == []
+
+
+def test_an_unfinished_double_is_finished_from_both_originals(tmp_path, background):
+    result, path, text = _interrupted_shot(tmp_path, background, double=True)
+    entry = json.loads(text)
+    assert entry["originals"] == ["2026-09-03/210507_ungraded.jpg",
+                                  "2026-09-03/210507-2_ungraded.jpg"]
+    assert entry["ev"] == 0.0 and entry["double"]["ev_comp"] == [0.0, 0.0]
+    first = result.graded.read_bytes()
+    result.graded.unlink()
+    log = result.graded.parent / "captures.jsonl"
+    log.write_text(log.read_text().splitlines()[0] + "\n")  # exposure 1's line only
+    path.write_text(text)
+
+    again = background()
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    record = _lines(again.out_root)[-1]
+    assert record["recovered"] is True and record["double"]["index"] == 2
+    assert "composite" in record["stage_ms"]
+    diff = np.abs(load_rgb(result.graded)[0].astype(int)
+                  - np.asarray(Image.open(io.BytesIO(first)).convert("RGB")).astype(int))
+    assert diff.mean() < 3.0
+    assert not path.exists()
+
+
+def test_a_full_queue_makes_the_next_capture_wait(background):
+    session = background(hold=True, queue_depth=1, now=lambda: FIXED)
+    session.capture()
+    session.pipeline.wait_entered()  # the worker has the first; nothing is waiting
+    session.capture()  # takes the one place
+    assert session.pending_grades == 2
+    done, results = threading.Event(), []
+
+    def third():
+        results.append(session.capture())
+        done.set()
+
+    thread = threading.Thread(target=third, daemon=True)
+    thread.start()
+    # A bounded look for something that must not happen; it cannot fail by being slow.
+    assert not done.wait(0.3), "the capture did not wait for a place in the queue"
+    assert session.pending_grades == 2
+    assert results == []
+    session.pipeline.release()  # the first grade ends, the second leaves the queue
+    assert done.wait(5), "the capture was not released by a free place"
+    thread.join(5)
+    assert results[0].original.exists()  # it waited; it did not fail or drop the shot
+    session.pipeline.release(2)
+    assert session.close_grades(timeout=5)
+    assert [line["pifilm"] for line in _lines(session.out_root)] == [
+        "210507_graded.jpg", "210507-2_graded.jpg", "210507-3_graded.jpg",
+    ]
+
+
+def test_closing_releases_a_capture_waiting_on_a_full_queue(background):
+    """Stopping must not deadlock, and the waiting photograph is still finished."""
+    session = background(hold=True, queue_depth=1, now=lambda: FIXED)
+    session.capture()
+    session.pipeline.wait_entered()
+    session.capture()
+    done, results = threading.Event(), []
+
+    def third():
+        results.append(session.capture())
+        done.set()
+
+    thread = threading.Thread(target=third, daemon=True)
+    thread.start()
+    assert not done.wait(0.3)
+    assert session.close_grades(timeout=0) is False  # the worker is still grading
+    session.pipeline.release(3)
+    assert done.wait(5), "close did not release the waiting capture"
+    thread.join(5)
+    assert session.close_grades(timeout=5)
+    assert results[0].graded.exists()
+    # The refused shot was graded after the two the queue had accepted.
+    assert [line["pifilm"] for line in _lines(session.out_root)] == [
+        "210507_graded.jpg", "210507-2_graded.jpg", "210507-3_graded.jpg",
+    ]
+    assert all(line["grade"] == "background" for line in _lines(session.out_root))
+
+
+def test_a_shot_refused_by_a_closing_queue_is_graded_inline(tmp_path, pipeline, background):
+    inline = _session(tmp_path / "inline", pipeline, now=lambda: FIXED).capture()
+    session = background(now=lambda: FIXED)
+    assert session.close_grades(timeout=5)
+    result = session.capture()
+    # No worker is left, so the file and its record are there when capture returns.
+    assert result.graded.read_bytes() == inline.pifilm.read_bytes()
+    (record,) = _lines(session.out_root)
+    assert record["pifilm"] == result.graded.name
+    assert record["shutter_to_saved_ms"] >= record["shutter_to_ready_ms"]
+    assert read_entries(tmp_path / "state") == []
+    assert result.pifilm.exists() and result.pifilm != result.graded
+
+
+class _CheapPipeline:
+    """Returns the frame as given: for tests about sizes and files, not about colour."""
+
+    def process(self, rgb, *, grain=True, rng=None, ev=0.0, timings=None):
+        return rgb, {"wb_gains": [1.0, 1.0, 1.0], "ev_comp": ev}
+
+
+@pytest.mark.parametrize(("frame", "quick"), [
+    ((3040, 4056), (760, 1014)),
+    ((480, 640), (480, 640)),
+    ((1080, 1920), (540, 960)),
+])
+def test_quick_grade_is_reduced_by_a_whole_factor(tmp_path, frame, quick):
+    camera = FakeCamera([np.zeros((*frame, 3), np.uint8)])
+    session = CaptureSession(camera, _CheapPipeline(), tmp_path / "shots",
+                             background=True, state_dir=tmp_path / "state", log=lambda _: None)
+    try:
+        result = session.capture()
+        assert load_rgb(result.pifilm)[0].shape == (*quick, 3)
+    finally:
+        assert session.close_grades(timeout=5)
+    assert load_rgb(result.graded)[0].shape == (*frame, 3)
+
+
+def test_only_the_newest_quick_grades_are_kept(tmp_path):
+    camera = FakeCamera([np.zeros((6, 8, 3), np.uint8)])
+    session = CaptureSession(camera, _CheapPipeline(), tmp_path / "shots", now=lambda: FIXED,
+                             background=True, state_dir=tmp_path / "state", log=lambda _: None)
+    try:
+        results = [session.capture() for _ in range(19)]
+    finally:
+        assert session.close_grades(timeout=5)
+    kept = sorted(results[0].pifilm.parent.glob("preview-*.jpg"))
+    assert len(kept) == 16
+    assert [r.pifilm.exists() for r in results] == [False] * 3 + [True] * 16
+    assert all(r.graded.exists() for r in results)  # photographs are never pruned
+
+
+def test_a_failed_grade_is_logged_counted_and_does_not_block_the_next(
+    tmp_path, monkeypatch, background,
+):
+    from pifilm.capture import app
+
+    real, failures = app.save_jpeg, []
+
+    def flaky(rgb, path, *args, **kwargs):
+        if Path(path).name.endswith("_graded.jpg") and not failures:
+            failures.append(path)
+            raise OSError("No space left on device")
+        return real(rgb, path, *args, **kwargs)
+
+    monkeypatch.setattr(app, "save_jpeg", flaky)
+    session = background(now=lambda: FIXED)
+    first = session.capture()
+    _settle(session)
+    second = session.capture()
+    assert session.close_grades(timeout=5)
+    assert session.test_log == [
+        "grade failed (2026-09-03_210507.json): No space left on device",
+    ]
+    assert not first.graded.exists() and second.graded.exists()
+    assert [line["pifilm"] for line in _lines(session.out_root)] == [second.graded.name]
+    ((path, entry),) = read_entries(tmp_path / "state")
+    assert entry["attempts"] == 1 and entry["graded"] == first.graded.name
+
+    # The next start tries once more, and this time the disk has room.
+    again = background()
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    assert first.graded.exists() and not path.exists()
+    assert _lines(again.out_root)[-1]["recovered"] is True
+
+
+def test_a_failed_quick_grade_still_grades_the_photograph(tmp_path, monkeypatch, background):
+    from pifilm.capture import app
+
+    real = app.save_jpeg
+
+    def no_previews(rgb, path, *args, **kwargs):
+        if Path(path).name.startswith("preview-"):
+            raise OSError("temporary directory is full")
+        return real(rgb, path, *args, **kwargs)
+
+    monkeypatch.setattr(app, "save_jpeg", no_previews)
+    session = background(now=lambda: FIXED)
+    with pytest.raises(OSError, match="temporary directory"):
+        session.capture()
+    assert session.close_grades(timeout=5)
+    assert (session.out_root / "2026-09-03" / "210507_graded.jpg").exists()
+    assert len(_lines(session.out_root)) == 1
+    assert read_entries(tmp_path / "state") == []
+
+
+def test_an_unwritable_state_directory_costs_the_entry_not_the_photograph(tmp_path, background):
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("in the way")
+    session = background(state=blocked)
+    result = session.capture()
+    assert session.close_grades(timeout=5)
+    assert result.graded.exists() and len(_lines(session.out_root)) == 1
+    assert len(session.test_log) == 1
+    assert session.test_log[0].startswith("warning: could not write the pending entry")
+    assert blocked.read_text() == "in the way"
+
+
+def test_a_new_shot_never_overwrites_another_folders_entry(tmp_path, background):
+    theirs = write_entry(tmp_path / "state", "2026-09-03_210507",
+                         {"out_root": str(tmp_path / "another-folder")})
+    session = background(hold=True, now=lambda: FIXED)
+    session.capture()
+    session.pipeline.wait_entered()
+    names = sorted(path.name for path, _ in read_entries(tmp_path / "state"))
+    assert names == ["2026-09-03_210507-2.json", "2026-09-03_210507.json"]
+    session.pipeline.release()
+    assert session.close_grades(timeout=5)
+    assert [path for path, _ in read_entries(tmp_path / "state")] == [theirs]
+
+
+def test_the_controller_reports_and_finishes_the_sessions_grades(background):
+    session = background(hold=True)
+    controller = CaptureController(session)
+    closed = False
+    try:
+        controller.submit("one")
+        session.pipeline.wait_entered()
+        deadline = time.monotonic() + 5
+        while controller.status("one").state != "complete":
+            assert time.monotonic() < deadline
+            threading.Event().wait(0.005)
+        # The capture job is over while its grade is still running.
+        assert controller.snapshot().pending_grades == 1
+        result = controller.status("one").result
+        assert result.pifilm.exists() and not result.graded.exists()
+        session.pipeline.release()
+        controller.close()
+        closed = True
+        assert result.graded.exists()
+        assert controller.snapshot().pending_grades == 0
+    finally:
+        session.pipeline.release(10)
+        if not closed:
+            controller.close()
+
+
+def test_pipeline_process_is_safe_from_two_threads_at_once(pipeline):
+    """The quick grade runs on the capture thread while the worker grades a full frame."""
+    full, small = synthetic_frame(480, 640), synthetic_frame(120, 160)
+    want_full, _ = pipeline.process(full, rng=np.random.default_rng(7))
+    want_small, _ = pipeline.process(small, grain=False)
+    start, wrong = threading.Barrier(2), []
+
+    def run(frame, want, **kwargs):
+        start.wait(timeout=5)
+        for _ in range(8):
+            got, _ = pipeline.process(frame, **dict(kwargs, rng=np.random.default_rng(7)))
+            if not np.array_equal(got, want):
+                wrong.append(kwargs)
+
+    threads = [
+        threading.Thread(target=run, args=(full, want_full)),
+        threading.Thread(target=run, args=(small, want_small), kwargs={"grain": False}),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+    assert wrong == []
+
+
+def test_announce_says_a_background_shot_is_still_grading(tmp_path, pipeline, background):
+    session = background(now=lambda: FIXED)
+    lines = []
+    _announce(session.capture(), lines.append)
+    assert session.close_grades(timeout=5)
+    assert len(lines) == 1
+    assert lines[0].startswith("Saved 210507_ungraded.jpg in ")
+    assert lines[0].endswith(" ms; grading 210507_graded.jpg in the background")
+
+    _announce(_session(tmp_path / "inline", pipeline, now=lambda: FIXED).capture(), lines.append)
+    assert lines[1].startswith("Saved 210507_graded.jpg + 210507_ungraded.jpg in ")
+    assert "wb=" in lines[1] and "background" not in lines[1]
+
+
+@pytest.mark.parametrize(("argv", "background_expected"), [
+    ([], True),
+    (["--grade", "background"], True),
+    (["--grade", "inline"], False),
+])
+def test_grade_flag_reaches_the_session(camera_cli, monkeypatch, tmp_path, argv,
+                                        background_expected):
+    session_kwargs = {}
+
+    class RecordingSession:
+        def __init__(self, camera, pipeline, out, **kwargs):
+            session_kwargs.update(kwargs)
+            self.camera = camera
+
+        def capture(self):
+            raise AssertionError("capture should not be called in this test")
+
+    monkeypatch.setattr(camera_cli, "CaptureSession", RecordingSession)
+    assert camera_cli.main(["--fake", "--no-preview", "--out", str(tmp_path), *argv]) == 0
+    assert session_kwargs["background"] is background_expected
+    assert session_kwargs["state_dir"] is None  # the session resolves the default
+
+
+def test_state_dir_flag_reaches_the_session(camera_cli, monkeypatch, tmp_path):
+    session_kwargs, closes = {}, []
+
+    class RecordingSession:
+        def __init__(self, camera, pipeline, out, **kwargs):
+            session_kwargs.update(kwargs)
+            self.camera = camera
+
+        def close_grades(self, timeout=None):
+            closes.append(timeout)
+            return True
+
+    monkeypatch.setattr(camera_cli, "CaptureSession", RecordingSession)
+    state = tmp_path / "pending"
+    assert camera_cli.main(
+        ["--fake", "--no-preview", "--out", str(tmp_path), "--state-dir", str(state)]
+    ) == 0
+    assert session_kwargs["state_dir"] == state
+    assert closes, "main must finish the grades on the way out"
+
+
+def test_an_unknown_grade_mode_is_refused(camera_cli, tmp_path):
+    with pytest.raises(SystemExit):
+        camera_cli.main(["--fake", "--no-preview", "--out", str(tmp_path), "--grade", "later"])
+
+
+def test_main_finishes_the_grades_before_it_returns(tmp_path, monkeypatch, capsys):
+    from pifilm.capture import app
+
+    keys = iter([" ", "q"])
+    terminal = Mock()
+    terminal.read = lambda *args, **kwargs: next(keys)
+    terminal.__enter__ = Mock(return_value=terminal)
+    terminal.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(app, "TerminalKeys", lambda: terminal)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    out, state = tmp_path / "shots", tmp_path / "state"
+    assert main(["--fake", "--no-preview", "--seed", "1", "--out", str(out),
+                 "--state-dir", str(state)]) == 0
+    assert len(list(out.glob("*/*_graded.jpg"))) == 1
+    (record,) = _lines(out)
+    assert record["grade"] == "background"
+    assert read_entries(state) == []
+    assert "in the background" in capsys.readouterr().out
+    assert not any(t.name == "pifilm-grade" for t in threading.enumerate())
+
+
+def test_main_inline_writes_no_state(tmp_path, monkeypatch):
+    from pifilm.capture import app
+
+    keys = iter([" ", "q"])
+    terminal = Mock()
+    terminal.read = lambda *args, **kwargs: next(keys)
+    terminal.__enter__ = Mock(return_value=terminal)
+    terminal.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(app, "TerminalKeys", lambda: terminal)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    out, state = tmp_path / "shots", tmp_path / "state"
+    assert main(["--fake", "--no-preview", "--grade", "inline", "--out", str(out),
+                 "--state-dir", str(state)]) == 0
+    (record,) = _lines(out)
+    assert not NEW_KEYS & set(record)
+    assert not state.exists()
+
+
+def _record_syncs(monkeypatch):
+    """Record every ``os.fsync`` (as the file's inode) and every entry removal, in order."""
+    from pifilm.capture import app
+
+    events = []
+    real_fsync, real_remove = os.fsync, app.remove_entry
+
+    def fsync(fd):
+        events.append(os.fstat(fd).st_ino)
+        return real_fsync(fd)
+
+    def remove(path):
+        events.append("remove")
+        return real_remove(path)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(app, "remove_entry", remove)
+    return events
+
+
+def test_a_background_grade_is_on_disk_before_its_entry_is_removed(monkeypatch, background):
+    """The entry's removal can reach the disk before data that was only written.
+
+    Without the two syncs a power cut just after a grade could leave no entry, no
+    record and an empty graded file, with nothing left to say a grade is owed.
+    """
+    events = _record_syncs(monkeypatch)
+    session = background(now=lambda: FIXED)
+    result = session.capture()
+    assert session.close_grades(timeout=5)
+    graded = result.graded.stat().st_ino
+    log = (result.graded.parent / "captures.jsonl").stat().st_ino
+    assert [e for e in events if e in (graded, log, "remove")] == [graded, log, "remove"]
+
+
+def test_a_recovered_grade_is_on_disk_before_its_entry_is_removed(
+    tmp_path, monkeypatch, background,
+):
+    result, path, text = _interrupted_shot(tmp_path, background)
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+    events = _record_syncs(monkeypatch)
+    again = background()
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    graded = result.graded.stat().st_ino
+    log = (result.graded.parent / "captures.jsonl").stat().st_ino
+    assert [e for e in events if e in (graded, log, "remove")] == [graded, log, "remove"]
+
+
+def test_an_inline_capture_syncs_nothing(tmp_path, pipeline, monkeypatch):
+    events = _record_syncs(monkeypatch)
+    session = _session(tmp_path, pipeline)
+    session.capture()
+    session.set_double_exposure(True)
+    session.capture()
+    session.capture()
+    assert events == []
+
+
+def test_a_recovered_record_never_joins_a_torn_line(tmp_path, background):
+    """A power cut can leave half a line at the end of the log, with no newline."""
+    result, path, text = _interrupted_shot(tmp_path, background)
+    log = result.graded.parent / "captures.jsonl"
+    whole = log.read_text()
+    assert whole.endswith("\n")
+    log.write_text(whole[: len(whole) // 2])  # the record was being written when it went
+    path.write_text(text)
+
+    again = background(now=lambda: FIXED)
+    shot = again.capture()
+    assert again.close_grades(timeout=5)
+    lines = log.read_text().splitlines()
+    assert len(lines) == 3 and lines[0] == whole[: len(whole) // 2]
+    recovered, new = json.loads(lines[1]), json.loads(lines[2])
+    assert recovered["recovered"] is True and recovered["pifilm"] == result.graded.name
+    assert new["pifilm"] == shot.graded.name
+    assert log.read_text().endswith("\n")
+    assert "\n\n" not in log.read_text()  # a whole log gets no blank line
+
+
+class _Signals:
+    """Stands in for ``signal.signal``: keeps the handlers instead of installing them."""
+
+    def __init__(self):
+        self.previous = object()
+        self.calls = []
+
+    def __call__(self, number, handler):
+        self.calls.append((number, handler))
+        return self.previous
+
+    def deliver(self):
+        """What the kernel does on SIGTERM: run the handler installed now."""
+        number, handler = self.calls[-1]
+        assert callable(handler), "SIGTERM arrived with no handler of ours installed"
+        handler(number, None)
+
+
+def test_sigterm_ends_the_headless_service_cleanly(monkeypatch, tmp_path):
+    """systemd stops the service with SIGTERM; the clean-up, which finishes the
+    queued grades, has to run as it does on Ctrl-C."""
+    import signal as signal_module
+
+    from pifilm.capture import app
+
+    signals, closed = _Signals(), []
+
+    class Listener:
+        def __init__(self, controller, token, listen, power=None):
+            pass
+
+        def start(self):
+            pass
+
+        def close(self):
+            signals.deliver()  # a second SIGTERM, in the middle of the clean-up
+            closed.append("remote")
+
+    real_close = app.CaptureSession.close_grades
+
+    def close_grades(self, timeout=None):
+        signals.deliver()
+        closed.append("grades")
+        return real_close(self, timeout)
+
+    def sleep(_):
+        signals.deliver()
+        raise AssertionError("SIGTERM did not end the loop")
+
+    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "secret")
+    monkeypatch.setattr(app, "RemoteCaptureServer", Listener)
+    monkeypatch.setattr(app.CaptureSession, "close_grades", close_grades)
+    monkeypatch.setattr(app, "has_display", lambda: False)
+    monkeypatch.setattr(app.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(app.signal, "signal", signals)
+    monkeypatch.setattr(app.time, "sleep", sleep)
+
+    assert app.main(["--fake", "--no-preview", "--out", str(tmp_path / "shots"),
+                     "--state-dir", str(tmp_path / "state"),
+                     "--remote-listen", "127.0.0.1:8765"]) == 0
+    assert closed == ["remote", "grades"]
+    assert not any(t.name == "pifilm-grade" for t in threading.enumerate())
+    # Installed for SIGTERM, silenced for the clean-up, and the handler that was
+    # there before put back on the way out.
+    assert [number for number, _ in signals.calls] == [signal_module.SIGTERM] * 3
+    assert signals.calls[-1][1] is signals.previous
+
+
+def test_sigterm_ends_the_terminal_loop_cleanly(monkeypatch, tmp_path):
+    from pifilm.capture import app
+
+    signals = _Signals()
+    terminal = Mock()
+    terminal.read = lambda *args, **kwargs: signals.deliver()
+    terminal.__enter__ = Mock(return_value=terminal)
+    terminal.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(app, "TerminalKeys", lambda: terminal)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(app.signal, "signal", signals)
+    assert main(["--fake", "--no-preview", "--out", str(tmp_path / "shots"),
+                 "--state-dir", str(tmp_path / "state")]) == 0
+    assert not any(t.name == "pifilm-grade" for t in threading.enumerate())
+    assert signals.calls[-1][1] is signals.previous
+
+
+def test_main_off_the_main_thread_installs_no_signal_handler(monkeypatch, tmp_path):
+    """``signal.signal`` raises outside the main thread; ``main`` must still run there."""
+    from pifilm.capture import app
+
+    signals = _Signals()
+    terminal = Mock()
+    terminal.read = lambda *args, **kwargs: "q"
+    terminal.__enter__ = Mock(return_value=terminal)
+    terminal.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(app, "TerminalKeys", lambda: terminal)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(app.signal, "signal", signals)
+    codes = []
+    thread = threading.Thread(target=lambda: codes.append(main(
+        ["--fake", "--no-preview", "--out", str(tmp_path / "shots"),
+         "--state-dir", str(tmp_path / "state")])))
+    thread.start()
+    thread.join(5)
+    assert codes == [0]
+    assert signals.calls == []
+
+
+def test_private_pictures_stay_out_of_the_real_temporary_directory(
+    background, tmp_path_factory,
+):
+    """The suite's own guard: a session's cards and quick grades land in pytest's tree."""
+    result = background().capture()
+    assert tmp_path_factory.getbasetemp().resolve() in result.pifilm.resolve().parents
+
+
+class _MetaCamera(FakeCamera):
+    """A Picamera2-style frame: no camera JPEG, a DNG and metadata."""
+
+    def read(self, full=True):
+        frame = super().read()
+        return Frame(frame.rgb, None, "picamera2", dng=b"raw", metadata={"Lux": 1.0})
+
+
+def test_a_background_original_is_synced_by_the_grade_worker_not_the_capture(
+    tmp_path, monkeypatch, background,
+):
+    """Syncing 20 MB of DNG cost the Pi up to a second per shot, so the camera does
+    not wait for it: the worker syncs the original and the DNG before it grades."""
+    from pifilm.capture import app
+
+    events = _record_syncs(monkeypatch)
+    real_sync = app._sync_file
+    threads = []
+
+    def sync(path):
+        threads.append(threading.current_thread().name)
+        return real_sync(path)
+
+    monkeypatch.setattr(app, "_sync_file", sync)
+    session = background(_MetaCamera([synthetic_frame(90, 160)]), hold=True, now=lambda: FIXED)
+    result = session.capture()
+    session.pipeline.wait_entered()  # the full grade has begun: the syncs are done
+    original = result.original.stat().st_ino
+    dng = (result.original.parent / "210507.dng").stat().st_ino
+    assert [e for e in events if e in (original, dng)] == [original, dng]
+    assert threads == ["pifilm-grade", "pifilm-grade"]
+    session.pipeline.release()
+    session.close_grades()
+    record = json.loads((result.original.parent / "captures.jsonl").read_text())
+    assert "sync_original" in record["stage_ms"]
+
+
+def test_both_originals_of_a_background_double_are_synced(monkeypatch, background):
+    events = _record_syncs(monkeypatch)
+    session = background(FakeCamera(_double_frames()), hold=True, now=lambda: FIXED)
+    session.set_double_exposure(True)
+    first = session.capture()
+    second = session.capture()
+    session.pipeline.wait_entered()
+    assert first.original.stat().st_ino in events
+    assert second.original.stat().st_ino in events
+    session.pipeline.release()
+
+
+def test_an_inline_capture_with_a_dng_syncs_nothing(tmp_path, pipeline, monkeypatch):
+    events = _record_syncs(monkeypatch)
+    session = CaptureSession(_MetaCamera([synthetic_frame(90, 160)]), pipeline, tmp_path / "shots")
+    session.capture()
+    assert events == []
+
+
+def test_a_stop_leaves_the_recovery_backlog_for_the_next_start(tmp_path, background):
+    """Stopping finishes this run's photographs, not everything an old run left."""
+    first = background(hold=True, now=lambda: FIXED)
+    results = [first.capture() for _ in range(3)]
+    first.pipeline.wait_entered()
+    texts = {path: path.read_text() for path, _ in read_entries(tmp_path / "state")}
+    assert len(texts) == 3
+    first.pipeline.release(3)
+    assert first.close_grades(timeout=5)
+    for result in results:
+        result.graded.unlink()
+    (results[0].graded.parent / "captures.jsonl").unlink()
+    for path, text in texts.items():
+        path.write_text(text)
+
+    again = background(hold=True, now=lambda: FIXED)
+    assert again.pending_grades == 3
+    again.pipeline.wait_entered()  # the first recovered grade is running
+    shot = again.capture()  # a photograph of this run, behind it
+    assert again.close_grades(timeout=0) is False
+    assert again.pending_grades == 2  # the running one and this run's; the rest are left
+    again.pipeline.release(2)
+    assert again.close_grades(timeout=5)
+    assert again.pending_grades == 0
+    # One recovered grade had started and was finished. (Which one: entries are
+    # taken in name order, and "-2" sorts before the unsuffixed name.)
+    assert sum(r.graded.exists() for r in results) == 1
+    assert shot.graded.exists()
+    assert len(read_entries(tmp_path / "state")) == 2
+    assert "leaving 2 unfinished grade(s) for the next start" in again.test_log
+
+    # And the next start does finish them.
+    third = background()
+    _settle(third)
+    assert third.close_grades(timeout=5)
+    assert all(r.graded.exists() for r in results)
+    assert read_entries(tmp_path / "state") == []
+
+
+def test_a_grade_does_not_wait_for_ever_for_the_capture_side(
+    tmp_path, pipeline, monkeypatch, background,
+):
+    """An interrupt can end a capture between handing the job over and saying how
+    long the shutter was held. The grade is then finished without that number."""
+    from pifilm.capture import app
+
+    monkeypatch.setattr(app, "READY_WAIT_S", 0.01, raising=False)
+    session = background(now=lambda: FIXED)
+    day = session.out_root / "2026-09-03"
+    day.mkdir(parents=True)
+    entry = write_entry(tmp_path / "state", "by-hand", {})
+    work = app._GradeWork(
+        "2026-09-03", "x_graded.jpg", ["2026-09-03/x_ungraded.jpg"], 1, 0.0,
+        {"timestamp": "t", "pifilm": "x_graded.jpg", "ev_comp": 0.0},
+        frames=(synthetic_frame(90, 160),), shutter=time.perf_counter(),
+    )
+    done = threading.Event()
+
+    def grade():
+        session._run_grade(app.GradeJob(payload=work, entry=entry))  # ``ready`` is never set
+        done.set()
+
+    threading.Thread(target=grade, daemon=True).start()
+    assert done.wait(5), "the grade waited for ever for the capture side"
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    assert "shutter_to_ready_ms" not in record and "shutter_to_saved_ms" in record
+    assert (day / "x_graded.jpg").exists()
+    assert not entry.exists()
+
+
+def test_a_twice_failed_grade_is_reported_as_given_up(tmp_path, background):
+    result, path, text = _interrupted_shot(tmp_path, background)
+    result.original.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+    for _ in range(2):
+        again = background()
+        _settle(again)
+        assert again.close_grades(timeout=5)
+    assert again.test_log[0] == "recovering 1 unfinished grade(s)"
+    assert again.test_log[1].startswith(f"grade failed ({path.name}): ")
+    assert again.test_log[2] == (
+        f"grade given up ({path.name}): failed 2 times, kept as {path.stem}.failed"
+    )
+    assert path.with_suffix(".failed").exists() and not path.exists()
+
+
+class _Part:
+    """A display, a touch reader or a server that is sent SIGTERM while it closes."""
+
+    def __init__(self, signals, closed, name):
+        self._signals, self._closed, self._name = signals, closed, name
+
+    def start(self):
+        return None
+
+    def close(self):
+        self._signals.deliver()
+        self._closed.append(self._name)
+
+
+def _viewfinder_main(camera_cli, monkeypatch, tmp_path, run):
+    """Run ``main`` with a viewfinder whose loop is ``run``; SIGTERM arrives at every close."""
+    signals, closed = _Signals(), []
+
+    class Loop:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, stop):
+            return run(signals, stop)
+
+    class Camera(FakeCamera):
+        def close(self):
+            signals.deliver()
+            closed.append("camera")
+
+    real_close = camera_cli.CaptureSession.close_grades
+
+    def close_grades(self, timeout=None):
+        signals.deliver()
+        closed.append("grades")
+        return real_close(self, timeout)
+
+    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
+    monkeypatch.setattr(camera_cli, "FakeCamera", Camera)
+    monkeypatch.setattr(camera_cli.CaptureSession, "close_grades", close_grades)
+    monkeypatch.setattr(camera_cli, "RemoteCaptureServer",
+                        lambda *args, **kwargs: _Part(signals, closed, "remote"))
+    monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: (
+        _Part(signals, closed, "display"), _Part(signals, closed, "touch"),
+    ))
+    monkeypatch.setattr(camera_cli, "ViewfinderLoop", Loop)
+    monkeypatch.setattr(camera_cli, "_arm_exit_deadline", lambda seconds, code: None)
+    monkeypatch.setattr(camera_cli.signal, "signal", signals)
+    code = camera_cli.main([
+        "--fake", "--display", "waveshare28", "--no-preview",
+        "--remote-listen", "127.0.0.1:8765", "--out", str(tmp_path / "shots"),
+        "--state-dir", str(tmp_path / "state"),
+    ])
+    assert signals.calls[-1][1] is signals.previous
+    return code, closed
+
+
+def test_a_second_sigterm_cannot_break_into_the_viewfinders_clean_up(
+    camera_cli, monkeypatch, tmp_path,
+):
+    """The viewfinder's own handler takes the first SIGTERM, so ``main``'s has not
+    fired; a second one during the clean-up used to raise inside it and leave the
+    camera open."""
+    def run(signals, stop):
+        signals.deliver()  # the first SIGTERM: the viewfinder's handler sets ``stop``
+        assert stop.is_set()
+
+    code, closed = _viewfinder_main(camera_cli, monkeypatch, tmp_path, run)
+    assert code == 0
+    assert closed == ["touch", "display", "remote", "grades", "camera"]
+
+
+def test_sigterm_cannot_break_into_the_stall_exits_clean_up(camera_cli, monkeypatch, tmp_path):
+    from pifilm.capture.errors import CameraStalled
+
+    def run(signals, stop):
+        raise CameraStalled("no preview frame within 5.0 s")
+
+    code, closed = _viewfinder_main(camera_cli, monkeypatch, tmp_path, run)
+    assert code == 1  # still the exit that makes systemd restart the service
+    assert closed == ["touch", "display", "remote", "grades", "camera"]
+
+
+# --- grading on the GPU ------------------------------------------------------
+
+
+@pytest.fixture
+def gpu(tmp_path, monkeypatch):
+    """Background sessions whose grader is a real ``GpuGrader`` on a fake device.
+
+    ``GpuGrader.open`` is replaced, so nothing here looks for a GPU. ``gpu.make``
+    builds a session (closed at the end, like ``background``'s); ``gpu.opened``
+    waits for the worker to have opened its grader and returns the device.
+    """
+    real_open = GpuGrader.open
+    box = SimpleNamespace(threads=[], devices=[], graders=[], available=True,
+                          pipeline=Pipeline(tile_artifacts()), max_texture=4096,
+                          hold=None, entered=threading.Event(),
+                          marker=tmp_path / "gpu-opening")
+    done = threading.Event()
+    made, held = [], []
+
+    def fake_open(artifacts, *, log=print):
+        box.threads.append(threading.current_thread().name)
+        try:
+            box.entered.set()
+            if box.hold is not None:
+                assert box.hold.wait(5), "the held open was never released"
+            if not box.available:
+                log("gpu grading off: no GPU in this test")
+                return None
+            device = FakeDevice(max_texture=box.max_texture)
+            grader = real_open(artifacts, log=log, device_factory=lambda: device)
+            box.devices.append(device)
+            box.graders.append(grader)
+            return grader
+        finally:
+            done.set()
+
+    monkeypatch.setattr(GpuGrader, "open", staticmethod(fake_open))
+
+    def make(camera=None, *, hold=False, grade_backend="auto", background=True, **kwargs):
+        pipe = box.pipeline
+        if hold:
+            pipe = _HeldPipeline(pipe)
+            held.append(pipe)
+        log = []
+        state = {}
+        if background:
+            state["state_dir"] = kwargs.pop("state_dir", tmp_path / "state")
+        session = CaptureSession(
+            camera or FakeCamera([synthetic_frame(90, 160)]), pipe, tmp_path / "shots",
+            now=kwargs.pop("now", lambda: FIXED), seed_rng=np.random.default_rng(0),
+            background=background, log=log.append, grade_backend=grade_backend,
+            **state, **kwargs,
+        )
+        session.test_log = log
+        made.append(session)
+        return session
+
+    def opened():
+        assert done.wait(5), "the worker never opened a grader"
+        return box.devices[-1] if box.devices else None
+
+    box.make, box.opened = make, opened
+    yield box
+    if box.hold is not None:
+        box.hold.set()
+    for pipe in held:
+        pipe.release(100)
+    for session in made:
+        assert session.close_grades(timeout=5), "a grade worker outlived its test"
+
+
+def _gpu_bytes(tmp_path, seed, frame=None):
+    """The file a GPU grade of the fixture's frame with ``seed`` must be."""
+    pipe = Pipeline(tile_artifacts())
+    grader = GpuGrader(pipe.artifacts, FakeDevice(), log=lambda _: None)
+    frame = synthetic_frame(90, 160) if frame is None else frame
+    graded, _ = pipe.process(frame, rng=np.random.default_rng(seed), grader=grader)
+    assert graded.shape[2] == 4
+    return save_jpeg(graded, tmp_path / "expected-gpu.jpg").read_bytes()
+
+
+def _cpu_bytes(tmp_path, seed, frame=None):
+    pipe = Pipeline(tile_artifacts())
+    frame = synthetic_frame(90, 160) if frame is None else frame
+    graded, _ = pipe.process(frame, rng=np.random.default_rng(seed))
+    return save_jpeg(graded, tmp_path / "expected-cpu.jpg").read_bytes()
+
+
+def test_the_grade_worker_opens_the_grader_and_grades_on_it(tmp_path, gpu):
+    session = gpu.make()
+    result = session.capture()
+    device = gpu.opened()
+    assert session.close_grades(timeout=5)
+    assert gpu.threads == ["pifilm-grade"]
+    (record,) = _lines(session.out_root)
+    assert record["pipeline_backend"] == "gpu-1"
+    assert list(record)[-1] == "pipeline_backend"
+    assert {"normalize", "gpu", "gpu_upload", "gpu_shader", "gpu_readback"} <= set(
+        record["stage_ms"])
+    assert not {"lut", "grain"} & set(record["stage_ms"])
+    seed = record["grain_seed"]
+    assert result.graded.read_bytes() == _gpu_bytes(tmp_path, seed)
+    assert result.graded.read_bytes() != _cpu_bytes(tmp_path, seed)
+    # The self-test and the one photograph, both on the worker's thread.
+    assert [run["shape"] for run in device.runs] == [(64, 96, 3), (90, 160, 3)]
+    assert len(device.threads) == 1 and threading.get_ident() not in device.threads
+    assert device.closed == 1 and gpu.graders[0].enabled is False
+    assert session.test_log == ["gpu grading on (Fake GPU, self-test passed)"]
+    # What the capture job carries says nothing of a grade that had not happened.
+    assert "pipeline_backend" not in result.record
+
+
+def test_without_a_gpu_the_worker_grades_on_the_cpu(tmp_path, gpu):
+    gpu.available = False
+    session = gpu.make()
+    results = [session.capture() for _ in range(2)]
+    assert session.close_grades(timeout=5)
+    records = _lines(session.out_root)
+    assert [r["pipeline_backend"] for r in records] == ["cpu", "cpu"]
+    for result, record in zip(results, records, strict=True):
+        assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert {"normalize", "lut", "grain"} <= set(records[0]["stage_ms"])
+    assert gpu.threads == ["pifilm-grade"]
+    assert session.test_log == ["gpu grading off: no GPU in this test"]
+
+
+def test_a_photograph_the_gpu_fails_on_is_graded_on_the_cpu(tmp_path, gpu):
+    session = gpu.make()
+    gpu.opened().fail_next = 1
+    first, second = session.capture(), session.capture()
+    assert session.close_grades(timeout=5)
+    one, two = _lines(session.out_root)
+    assert (one["pipeline_backend"], two["pipeline_backend"]) == ("cpu", "gpu-1")
+    assert first.graded.read_bytes() == _cpu_bytes(tmp_path, one["grain_seed"])
+    assert second.graded.read_bytes() == _gpu_bytes(tmp_path, two["grain_seed"])
+    assert {"lut", "grain"} <= set(one["stage_ms"]) and "gpu" not in one["stage_ms"]
+    assert session.test_log[1:] == [
+        "gpu grade failed (210507_graded.jpg): GL error after grading: 0x505; "
+        "graded on the CPU",
+    ]
+    assert read_entries(tmp_path / "state") == []
+
+
+def test_three_failures_in_a_row_leave_the_rest_to_the_cpu_quietly(tmp_path, gpu):
+    session = gpu.make()
+    gpu.opened().fail_next = 3
+    results = [session.capture() for _ in range(5)]
+    assert session.close_grades(timeout=5)
+    records = _lines(session.out_root)
+    assert [r["pipeline_backend"] for r in records] == ["cpu"] * 5
+    for result, record in zip(results, records, strict=True):
+        assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    log = session.test_log
+    assert sum(line.startswith("gpu grade failed") for line in log) == 3
+    assert "gpu grading off: 3 failures in a row" in log
+    assert len(log) == 5  # on, three failures, off: nothing for the last two
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"grade_backend": "cpu"},
+    {"grade_backend": "cpu", "background": False},
+    {"grade_backend": "auto", "background": False},
+])
+def test_the_cpu_backend_and_inline_sessions_never_open_a_grader(tmp_path, gpu, kwargs):
+    session = gpu.make(**kwargs)
+    result = session.capture()
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    assert record["pipeline_backend"] == "cpu"
+    assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert gpu.threads == [] and session.test_log == []
+
+
+def test_an_inline_record_names_its_backend_after_the_stages(tmp_path, pipeline):
+    class MetaCamera(FakeCamera):
+        def read(self, full=True):
+            frame = super().read()
+            return Frame(frame.rgb, None, "picamera2", dng=b"raw", metadata={"Lux": 1.0})
+
+    session = CaptureSession(MetaCamera([synthetic_frame(90, 160)]), pipeline,
+                             tmp_path / "shots", seed_rng=np.random.default_rng(0))
+    record = session.capture().record
+    assert list(record)[-4:] == ["stage_ms", "pipeline_backend", "camera_metadata", "dng"]
+    assert record["pipeline_backend"] == "cpu"
+    assert _lines(session.out_root) == [record]
+
+
+def test_an_unknown_grade_backend_is_refused(tmp_path, pipeline):
+    with pytest.raises(ValueError, match="grade_backend"):
+        CaptureSession(FakeCamera([synthetic_frame(90, 160)]), pipeline, tmp_path / "shots",
+                       grade_backend="gpu")
+
+
+def test_a_shot_refused_by_a_closing_queue_is_graded_on_the_cpu(tmp_path, gpu):
+    """It is graded on the capture's thread, which the graphics context is not."""
+    session = gpu.make()
+    gpu.opened()
+    assert session.close_grades(timeout=5)
+    result = session.capture()
+    (record,) = _lines(session.out_root)
+    assert record["pipeline_backend"] == "cpu"
+    assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert len(gpu.devices[0].runs) == 1  # the self-test only
+
+
+def test_a_grader_is_not_used_from_the_capture_thread(tmp_path, gpu, monkeypatch):
+    """The same refused shot while the worker's grader is still open: the
+    grader says no by thread, and nothing is logged about it."""
+    session = gpu.make()
+    device = gpu.opened()
+    grader = gpu.graders[0]
+    with monkeypatch.context() as patch:
+        patch.setattr(session._queue, "submit", lambda job: False)
+        # The worker, and so its grader, live on past this shot.
+        patch.setattr(session._queue, "close", lambda timeout=None: True)
+        result = session.capture()
+    assert grader.enabled is True
+    (record,) = _lines(session.out_root)
+    assert record["pipeline_backend"] == "cpu"
+    assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert len(device.runs) == 1
+    assert session.test_log == ["gpu grading on (Fake GPU, self-test passed)"]
+
+
+def test_a_recovered_grade_records_what_graded_it(tmp_path, gpu):
+    first = gpu.make(hold=True, grade_backend="cpu")
+    result = first.capture()
+    first.pipeline.wait_entered()
+    ((path, _),) = read_entries(tmp_path / "state")
+    text = path.read_text()
+    first.pipeline.release()
+    assert first.close_grades(timeout=5)
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+
+    again = gpu.make()
+    gpu.opened()
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    (record,) = _lines(again.out_root)
+    assert record["recovered"] is True and record["pipeline_backend"] == "gpu-1"
+    assert list(record)[-3:] == ["grade", "recovered", "pipeline_backend"]
+    assert again.test_log[0] == "recovering 1 unfinished grade(s)"
+    # Graded from the saved JPEG, on the GPU.
+    assert gpu.devices[0].runs[-1]["shape"] == (90, 160, 3)
+    expected = _gpu_bytes(tmp_path, record["grain_seed"], load_rgb(result.original)[0])
+    assert result.graded.read_bytes() == expected
+
+
+def test_a_double_exposure_is_graded_on_the_gpu_and_exposure_1_names_no_backend(tmp_path, gpu):
+    session = gpu.make(FakeCamera(_double_frames()))
+    session.set_double_exposure(True)
+    session.capture()
+    session.capture()
+    assert session.close_grades(timeout=5)
+    one, two = _lines(session.out_root)
+    assert "pipeline_backend" not in one and "params_version" not in one
+    assert two["pipeline_backend"] == "gpu-1" and two["double"]["index"] == 2
+    assert "composite" in two["stage_ms"] and "gpu" in two["stage_ms"]
+
+
+def test_an_inline_double_exposure_records_the_cpu(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline, FakeCamera(_double_frames()))
+    session.set_double_exposure(True)
+    one, two = session.capture().record, session.capture().record
+    assert "pipeline_backend" not in one
+    assert two["pipeline_backend"] == "cpu"
+    assert list(two)[-3:] == ["stage_ms", "pipeline_backend", "double"]
+
+
+@pytest.mark.parametrize(("argv", "expected"), [
+    ([], "auto"),
+    (["--grade-backend", "auto"], "auto"),
+    (["--grade-backend", "cpu"], "cpu"),
+])
+def test_grade_backend_flag_reaches_the_session(camera_cli, monkeypatch, tmp_path, argv,
+                                                expected):
+    session_kwargs = {}
+
+    class RecordingSession:
+        def __init__(self, camera, pipeline, out, **kwargs):
+            session_kwargs.update(kwargs)
+            self.camera = camera
+
+    monkeypatch.setattr(camera_cli, "CaptureSession", RecordingSession)
+    assert camera_cli.main(["--fake", "--no-preview", "--out", str(tmp_path), *argv]) == 0
+    assert session_kwargs["grade_backend"] == expected
+
+
+def test_grade_backend_flag_refuses_anything_else(camera_cli, tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        camera_cli.main(["--fake", "--no-preview", "--out", str(tmp_path),
+                         "--grade-backend", "gpu"])
+    assert "--grade-backend" in capsys.readouterr().err
+
+
+# --- the marker that keeps a hanging GPU from stopping every start ----------
+
+
+def test_a_marker_left_by_the_last_start_keeps_the_gpu_closed(tmp_path, gpu):
+    """An open that hangs holds the only grade worker for ever: no grade runs,
+    the fourth shot waits, and without the marker the next start does the same."""
+    gpu.marker.write_text("left by a start that never came back\n")
+    session = gpu.make()
+    results = [session.capture() for _ in range(2)]
+    assert session.close_grades(timeout=5)
+    assert gpu.threads == []
+    assert session.test_log == [
+        "gpu grading off: the last start did not finish opening the GPU; "
+        f"delete {gpu.marker} to try again",
+    ]
+    records = _lines(session.out_root)
+    assert [r["pipeline_backend"] for r in records] == ["cpu", "cpu"]
+    for result, record in zip(results, records, strict=True):
+        assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"])
+    assert gpu.marker.exists()  # only a person removes it
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_the_marker_is_gone_once_the_open_has_returned(gpu, available):
+    gpu.available = available
+    session = gpu.make()
+    gpu.opened()
+    assert session.close_grades(timeout=5)
+    assert gpu.threads == ["pifilm-grade"]
+    assert not gpu.marker.exists()
+    assert not any("did not finish" in line for line in session.test_log)
+
+
+def test_the_marker_is_there_for_as_long_as_the_open_takes(gpu):
+    gpu.hold = threading.Event()
+    session = gpu.make()
+    assert gpu.entered.wait(5)
+    assert gpu.marker.is_file()
+    assert not list(gpu.marker.parent.glob("state/*"))  # never among the entries
+    gpu.hold.set()
+    assert session.close_grades(timeout=5)
+    assert not gpu.marker.exists()
+
+
+def test_the_marker_is_written_where_no_state_directory_exists_yet(tmp_path, gpu):
+    gpu.hold = threading.Event()
+    gpu.marker = tmp_path / "deep" / "pifilm" / "gpu-opening"
+    session = gpu.make(state_dir=tmp_path / "deep" / "pifilm" / "pending")
+    assert gpu.entered.wait(5)
+    assert gpu.marker.is_file()
+    gpu.hold.set()
+    assert session.close_grades(timeout=5)
+    assert not gpu.marker.exists()
+
+
+def test_a_marker_that_cannot_be_written_does_not_stop_the_open(tmp_path, gpu):
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a directory")
+    session = gpu.make(state_dir=blocker / "pending")
+    gpu.opened()
+    session.capture()
+    assert session.close_grades(timeout=5)
+    assert gpu.threads == ["pifilm-grade"]
+    assert "gpu grading on (Fake GPU, self-test passed)" in session.test_log
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"grade_backend": "cpu"},
+    {"grade_backend": "cpu", "background": False},
+    {"grade_backend": "auto", "background": False},
+])
+def test_the_cpu_backend_and_inline_sessions_write_no_marker(gpu, monkeypatch, kwargs):
+    written = []
+    real_write = Path.write_text
+
+    def spy(self, *args, **kw):
+        written.append(self.name)
+        return real_write(self, *args, **kw)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    session = gpu.make(**kwargs)
+    session.capture()
+    assert session.close_grades(timeout=5)
+    assert "gpu-opening" not in written and not gpu.marker.exists()
+    # And a marker already there is nothing to them: no line about the GPU.
+    gpu.marker.write_text("stale\n")
+    other = gpu.make(**kwargs)
+    assert other.close_grades(timeout=5)
+    assert other.test_log == []
+
+
+def test_a_frame_wider_than_the_largest_texture_goes_to_the_cpu_quietly(tmp_path, gpu):
+    gpu.max_texture = 256  # the tile (256 px) and the self-test fit; the frame does not
+    frame = synthetic_frame(180, 320)
+    session = gpu.make(FakeCamera([frame]))
+    device = gpu.opened()
+    results = [session.capture() for _ in range(3)]
+    assert session.close_grades(timeout=5)
+    records = _lines(session.out_root)
+    assert [r["pipeline_backend"] for r in records] == ["cpu"] * 3
+    for result, record in zip(results, records, strict=True):
+        assert result.graded.read_bytes() == _cpu_bytes(tmp_path, record["grain_seed"], frame)
+    assert len(device.runs) == 1  # the self-test only
+    assert session.test_log == ["gpu grading on (Fake GPU, self-test passed)"]
+
+
+# The tuning check (pifilm.tuning): once at start-up, warn only.
+
+_LOOK_TUNING = "1" * 40
+_OTHER_TUNING = "2" * 40
+
+
+class _TunedCamera(FakeCamera):
+    """A FakeCamera that, like Picamera2Camera, reports the tuning it opened with."""
+
+    def __init__(self, sha1, frames=None, label="imx477.json"):
+        super().__init__(frames or [synthetic_frame(90, 160)])
+        self.tuning = Resolved(label=label, source=label, sha1=sha1,
+                               reason=None if sha1 else "cannot load imx477.json")
+
+
+def _tuned_pipeline(tmp_path, sha1=_LOOK_TUNING):
+    d = tmp_path / "tuned-art"
+    write_artifact(d, LUT3D.identity(9), NormalizeParams(), GrainParams(), tuning_sha1=sha1)
+    return Pipeline(Artifacts.load(d))
+
+
+def _tuned_session(tmp_path, camera, pipeline, **kwargs):
+    log = []
+    session = CaptureSession(camera, pipeline, tmp_path / "shots",
+                             seed_rng=np.random.default_rng(0), log=log.append, **kwargs)
+    session.test_log = log
+    return session
+
+
+def test_a_matching_tuning_is_one_line_and_marks_every_record(tmp_path):
+    session = _tuned_session(tmp_path, _TunedCamera(_LOOK_TUNING), _tuned_pipeline(tmp_path))
+    assert session.test_log == [f"tuning: matches the look ({_LOOK_TUNING[:12]})"]
+    assert session.tuning_mismatch is False
+    result = session.capture()
+    assert result.record["tuning_matches"] is True
+    (record,) = _lines(session.out_root)
+    assert record["tuning_matches"] is True
+
+
+def test_a_different_tuning_warns_and_the_photograph_is_still_graded(tmp_path):
+    session = _tuned_session(tmp_path, _TunedCamera(_OTHER_TUNING), _tuned_pipeline(tmp_path))
+    assert session.test_log == [
+        f"tuning: DIFFERS from the look: camera {_OTHER_TUNING[:12]} (imx477.json), "
+        f"look {_LOOK_TUNING[:12]}; colours may be off"
+    ]
+    assert session.tuning_mismatch is True
+    result = session.capture()
+    assert result.pifilm.exists() and result.original.exists()
+    (record,) = _lines(session.out_root)
+    assert record["tuning_matches"] is False
+
+
+def test_tuning_matches_sits_right_after_the_camera_fields(tmp_path):
+    camera = _TunedCamera(_LOOK_TUNING)
+    camera._info = StreamInfo(
+        width=160, height=90, fps=1.0, fourcc="RGB888", raw_mjpeg=False,
+        tuning_file="imx477.json", tuning_sha1=_LOOK_TUNING,
+    )
+    session = _tuned_session(tmp_path, camera, _tuned_pipeline(tmp_path))
+    keys = list(session.capture().record)
+    assert keys.index("tuning_matches") == keys.index("tuning_sha1") + 1
+
+
+def test_a_look_without_a_fingerprint_checks_nothing(tmp_path, pipeline):
+    session = _tuned_session(tmp_path, _TunedCamera(_LOOK_TUNING), pipeline)
+    assert session.test_log == []
+    assert session.tuning_mismatch is False
+    assert "tuning_matches" not in session.capture().record
+
+
+def test_a_camera_without_a_tuning_checks_nothing(tmp_path):
+    session = _tuned_session(tmp_path, FakeCamera([synthetic_frame(90, 160)]),
+                             _tuned_pipeline(tmp_path))
+    assert session.test_log == []
+    assert session.tuning_mismatch is False
+    assert "tuning_matches" not in session.capture().record
+
+
+def test_a_tuning_that_could_not_be_fingerprinted_says_it_cannot_check(tmp_path):
+    session = _tuned_session(tmp_path, _TunedCamera(None), _tuned_pipeline(tmp_path))
+    assert session.test_log == [
+        "tuning: cannot check the look's tuning (cannot load imx477.json)"
+    ]
+    assert session.tuning_mismatch is False
+    assert "tuning_matches" not in session.capture().record
+
+
+def test_every_session_has_a_tuning_mismatch_flag(tmp_path, pipeline):
+    assert _session(tmp_path, pipeline).tuning_mismatch is False
+
+
+def test_a_background_record_carries_tuning_matches(tmp_path):
+    session = _tuned_session(tmp_path, _TunedCamera(_OTHER_TUNING), _tuned_pipeline(tmp_path),
+                             background=True, state_dir=tmp_path / "state")
+    result = session.capture()
+    assert result.record["tuning_matches"] is False
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    assert record["tuning_matches"] is False
+    assert record["grade"] == "background"
+
+
+def test_a_recovered_grade_keeps_the_tuning_of_the_run_that_shot_it(tmp_path):
+    tuned = _tuned_pipeline(tmp_path)
+    held = _HeldPipeline(tuned)
+    held.artifacts = tuned.artifacts
+    first = _tuned_session(tmp_path, _TunedCamera(_LOOK_TUNING), held,
+                           background=True, state_dir=tmp_path / "state")
+    result = first.capture()
+    held.wait_entered()
+    ((path, payload),) = read_entries(tmp_path / "state")
+    assert payload["record"]["tuning_matches"] is True  # stored at capture time
+    text = path.read_text()
+    held.release()
+    assert first.close_grades(timeout=5)
+    # Put the shot back as a power cut would have left it.
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+
+    again = _tuned_session(tmp_path, _TunedCamera(_OTHER_TUNING), tuned,
+                           background=True, state_dir=tmp_path / "state")
+    assert again.tuning_mismatch is True
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    (recovered,) = _lines(again.out_root)
+    assert recovered["recovered"] is True
+    assert recovered["tuning_matches"] is True
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_a_double_exposure_carries_tuning_matches(tmp_path, background):
+    frames = [synthetic_frame(90, 160), synthetic_frame(90, 160)[:, ::-1].copy()]
+    kwargs = {"background": True, "state_dir": tmp_path / "state"} if background else {}
+    session = _tuned_session(tmp_path, _TunedCamera(_LOOK_TUNING, frames),
+                             _tuned_pipeline(tmp_path), **kwargs)
+    session.set_double_exposure(True)
+    session.capture()
+    session.capture()
+    assert session.close_grades(timeout=5)
+    records = _lines(session.out_root)
+    assert [r["double"]["index"] for r in records] == [1, 2]
+    assert [r["tuning_matches"] for r in records] == [True, True]

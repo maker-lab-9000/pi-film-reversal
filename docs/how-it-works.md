@@ -56,6 +56,166 @@ with shutter and ISO both fixed there is no auto-exposure and the meter is the g
 There is no exposure compensation (removed 2026-10-11). The grade does not change: a
 frame that ran out of gain (`MAX` in the `ISO` cell) is normalised like any dark frame.
 
+### The order of a shot
+
+The three steps above take about 2 s on a full-resolution frame on the Pi 4. By
+default (`--grade background`) the camera does not wait for them:
+
+1. The frame is read and the original JPEG is saved (and the DNG, when enabled),
+   The grade worker forces both onto the disk as its first step, usually within a
+   second; a power cut before that can lose the photograph. The camera does not wait
+   for it, because on the Pi's SD card that cost up to a second a shot.
+2. A pending entry is written: a small JSON file outside the photo folder
+   (`~/.local/state/pifilm/pending/`, or `--state-dir PATH`) with the original's
+   name, the grain seed, the EV and the camera fields of the record.
+3. A quick grade is made for the review screen and the Stick: the frame reduced
+   by a whole factor to about 1,000 pixels on the long side (four times each way,
+   1014 × 760, from the IMX477), through the same pipeline without grain. The camera is now free for the next photograph.
+4. Behind the shutter, one worker thread grades the full frame, saves
+   `*_graded.jpg`, appends the record to `captures.jsonl` and deletes the pending
+   entry, in that order. Photographs are graded in the order they were shot.
+
+The record is therefore written when the graded file is saved, not when the shutter
+is pressed. It gains `shutter_to_ready_ms` (shutter to the camera being free),
+`grade: "background"`, and the stages `preview` and `queued` in `stage_ms`;
+`shutter_to_saved_ms` now includes the time spent waiting in the queue. The graded
+file is byte for byte the one inline grading would write: same frame, seed and
+pipeline.
+
+The quick grade is not the final file. It has no grain and its normalisation is
+measured on the reduced frame, so its tone can differ slightly. It is kept in a
+private temporary directory, never in the photo folder.
+
+At most three grades wait at once, each holding its frame in memory. When the queue
+is full the next capture waits for a place. The viewfinder shows how many
+photographs are still developing.
+
+**Recovery.** At start-up the pending entries that belong to the same output folder
+are finished first, on the same worker. A recovered grade starts from the saved JPEG,
+not from the frame in memory, so it can differ from the uninterrupted grade by JPEG
+rounding; its record carries `recovered: true` and has no shutter timings. Just after
+a restart with many unfinished grades, the recovered ones go first: three new
+photographs can be taken at once and a fourth waits until they are done. A grade
+that fails is reported in the log by its entry's name; an entry that fails twice is
+renamed `*.failed` and a second line says so.
+
+**Stopping.** A stop finishes the photographs taken in this run (the grade that is
+running and those waiting) before the process exits, with or without the LCD
+viewfinder: SIGTERM (how systemd stops the service) ends the loops the way Ctrl-C
+does, and once the clean-up has begun a further SIGTERM is ignored. Recovered
+grades that have not started are not waited for: their entries stay and the next
+start finishes them, so a stop is never longer than this run's queue. What is not
+finished, because the power went or the process was killed, is also completed at
+the next start.
+
+**Order in the log.** Records are written when a grade is saved, so they are in
+shot order. One exception: exposure 1 of a double is logged at once, so its line
+can land ahead of the photographs still waiting to be graded (up to four: the one
+being graded and three waiting).
+
+`--grade inline` restores the earlier order: the full grade is saved before the
+camera is free, there is no queue and no pending entry, and records have none of the
+new fields above. They do have `pipeline_backend`, always `cpu` (see
+[Grading on the GPU](#grading-on-the-gpu)).
+
+### The tuning check
+
+A trained look is fitted to frames taken under one libcamera tuning file, and it
+grades as intended only under that tuning. Every record from the Pi camera names
+the tuning (`tuning_file`). From this build on it also carries its fingerprint
+(`tuning_sha1`, the SHA-1 of the file's parsed JSON) when the tuning could be
+fingerprinted. A look can be stamped with the fingerprint it was trained
+under (`tuning_sha1` in `params.json`, written by `pifilm-tuning --stamp` or
+`pifilm-train --tuning-sha1`). At start-up the service compares the two and writes
+one `tuning:` line to the journal. When the check ran, every record says whether
+they agreed (`tuning_matches`), and when they differ the viewfinder shows an amber
+`TUNING` tag. It only warns: photographs are still taken and graded. A grade
+recovered at a later start keeps the values of the run that took the photograph.
+See [known issues](known-issues.md#a-libcamera-update-could-silently-retune-a-deployed-trained-lut).
+
+### Grading on the GPU
+
+On the Pi 4 the grade worker can do the three steps as one pass on the GPU
+(`pifilm/gpu/`). Measured on 2026-10-13 with the IMX477 at 12 MP: about 0.67 s
+against 1.73 s on the CPU. The camera is already free by then, so the wait between
+photographs does not change. The graded file exists about a second sooner and a
+burst drains faster.
+
+**What runs where.** The GPU grades the worker's full-resolution grade when all of
+these hold: a GPU grader was set up at start, the look's grain is `two_scale_tile`
+(or grain is off), the frame is no wider than the GPU's largest texture (4096; the
+IMX477's 4056 fits, the IMX708's 4608 does not), and the EV is 0. Everything else
+is graded on the CPU as before: the quick grade for the screen, `--grade inline`,
+a shot taken while the service is stopping, `pifilm-process`, the trainer, and
+looks with the Gaussian or `two_scale` grain. A double exposure is composited on
+the CPU and the composite is then graded like any other frame.
+
+**The pass.** The statistics (white balance, levels) are measured on the CPU by the
+same code as before, so the audit fields of a record are the same whichever path
+graded. The shader then does, per pixel and in float: the per-channel
+normalisation tables, the luma tone curve, the 3D LUT with trilinear interpolation
+written out in the shader (never the GPU's own filtering), and the grain, from the
+same tile placed by the same seed as on the CPU. It rounds to bytes once, at the
+end. The CPU path rounds after normalising, after the tone curve, after the LUT
+and in the grain.
+
+**The self-test.** The GPU code cannot run in the test suite, so the service checks
+it at every start. The grader grades a 96 × 64 frame with a 64 px grain tile and
+compares it with a NumPy version of the same pass (`pifilm/gpu/reference.py`).
+More than 1 level of difference anywhere, or any graphics error, and GPU grading is
+off for this run. The log has one line either way: `gpu grading on (...)` or
+`gpu grading off: ...` with the reason. The service starts in both cases.
+
+**If opening the GPU hangs.** A driver that blocks while the GPU is opened would
+hold the only grade worker: no photograph would be graded, and the next start
+would hang the same way. So the worker writes a marker file, `gpu-opening`, beside
+the pending entries (`~/.local/state/pifilm/gpu-opening`) before it opens the GPU,
+and removes it when the open returns, whether or not it worked. A start that finds
+the marker does not open the GPU. It logs
+`gpu grading off: the last start did not finish opening the GPU; delete <path> to try again`
+and grades on the CPU until the file is deleted.
+
+**Fallback.** A photograph the GPU fails on is graded on the CPU at once, from the
+same seed, so it is never lost and never waits. The log names it
+(`gpu grade failed (...)`). Three failures in a row switch the GPU off for the run.
+Nothing shows on the screen.
+
+**The record.** Every record of a graded photograph has `pipeline_backend`: `gpu-1`
+or `cpu`. The number is the shader's version and rises with any change that can
+move pixels. A GPU grade adds the stages `gpu`, `gpu_upload`, `gpu_shader` and
+`gpu_readback` to `stage_ms` and has no `lut` or `grain` stage.
+
+**Reproducibility.** `pifilm-process` regrades on the CPU, from the saved original.
+For a USB camera that original is the camera's own JPEG, the very picture the Pi
+graded, and a record marked `cpu` reproduces pixel for pixel. For the Pi camera the
+original is a quality-95 JPEG of the frame the Pi graded, so even a `cpu` record
+regrades about 1 to 2 levels from the Pi's file on average, more where the LUT is
+steep. Measured on 2026-10-14 on sixteen IMX477 photographs graded on the GPU, all
+effects together: 0.7 to 2.1 levels on average, at most 18 to 27, no difference
+visible. A record marked `gpu-1` cannot be byte for byte in any case: the GPU's file is
+the more exact of the two, because the CPU rounds colours to bytes before the LUT.
+Against a CPU regrade it differs by about 0.2 to 0.6 levels on average and by a few
+levels at most on ordinary colours. On strongly saturated areas, where the look's
+LUT is steep, it differs by 10 to 20 levels. Measured on 2026-10-13: at most 5
+levels on a real photograph with the trained IMX477 look on the Pi, and up to 20 on
+synthetic saturated frames with the bundled starter look. `pifilm-process` says so
+once when the folder's log has such records. The grain lands in the same place on
+both paths.
+
+**The switch.** `--grade-backend auto` (the default) uses the GPU when it can.
+`--grade-backend cpu` never opens the GPU and is the earlier behaviour exactly.
+
+**Checking it.** `pifilm-gpu-check --artifacts DIR [--image FILE] [--runs N]` grades
+a full frame on the GPU, compares it with the reference and with the CPU, and
+prints the timings. It exits 0 when the GPU is within 1 level of the reference.
+The command appears only after `pip install -e .` has been run again in the Pi's
+venv; `python -m pifilm.gpu.check` with the same arguments works without that.
+The bundled starter look has Gaussian grain, so it is always graded on the CPU:
+pass a look with the tile grain.
+
+**Memory.** The textures for a 12 MP frame take about 110 MB of graphics memory,
+held while the service runs.
+
 ### Double exposure
 
 With the viewfinder's `2x` toggle on, two captures make one picture
@@ -129,11 +289,13 @@ The full procedure, from an empty `data/` folder to a verified deployment, is
 | SciPy | trainer only | Sparse matrices, the conjugate-gradient solver, isotonic regression |
 | requests, tqdm | `pifilm-fetch` only | Wikimedia Commons downloads with licence checks |
 | smbus2, gpiozero | Pi only, `--ups x728` | Reading the UPS fuel gauge over I2C and the power-loss pin |
+| `libEGL`, `libGLESv2` (through `ctypes`) | Pi only, `--grade-backend auto` | The GPU grade: a windowless context and one shader pass. System libraries, loaded when the grade worker starts, no Python package |
 | Paramiko | Mac only, deploy script | SSH to the Pi with a reject-unknown-hosts policy |
 | pytest, ruff, build | development | Tests, lint, wheel build |
 
-Not used: PyTorch, TensorFlow, scikit-learn, or any GPU. Nothing is downloaded
-at runtime and no data leaves the machine.
+Not used: PyTorch, TensorFlow or scikit-learn. The trainer uses no GPU; the Pi's
+GPU runs only the grade described above. Nothing is downloaded at runtime and no
+data leaves the machine.
 
 ## Dependencies by role
 

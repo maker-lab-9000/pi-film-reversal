@@ -149,3 +149,40 @@ def test_list_images_filters_and_sorts(tmp_path):
 def test_missing_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_rgb(tmp_path / "nope.jpg")
+
+
+@pytest.mark.parametrize("fourth", [0, 255, "noise"])
+def test_a_four_byte_image_saves_as_the_same_jpeg(tmp_path, fourth):
+    """The GPU hands its result back as four bytes a pixel; the fourth is not
+    part of the picture, whatever it holds."""
+    rng = np.random.default_rng(11)
+    rgb = rng.integers(0, 256, (37, 53, 3), dtype=np.uint8)
+    rgbx = np.empty((37, 53, 4), np.uint8)
+    rgbx[..., :3] = rgb
+    rgbx[..., 3] = rng.integers(0, 256, (37, 53)) if fourth == "noise" else fourth
+    three = save_jpeg(rgb, tmp_path / "three.jpg").read_bytes()
+    four = save_jpeg(rgbx, tmp_path / "four.jpg").read_bytes()
+    assert four == three
+    plain = save_jpeg(rgb, tmp_path / "a.jpg", quality=80, embed_srgb=False, subsampling=2)
+    packed = save_jpeg(rgbx, tmp_path / "b.jpg", quality=80, embed_srgb=False, subsampling=2)
+    assert packed.read_bytes() == plain.read_bytes()
+
+
+def test_a_four_byte_view_that_is_not_contiguous_still_saves_the_same(tmp_path):
+    rng = np.random.default_rng(12)
+    rgbx = rng.integers(0, 256, (40, 60, 4), dtype=np.uint8)
+    view = rgbx[::2, ::3]
+    want = save_jpeg(np.ascontiguousarray(view[..., :3]), tmp_path / "w.jpg").read_bytes()
+    assert save_jpeg(view, tmp_path / "g.jpg").read_bytes() == want
+
+
+@pytest.mark.parametrize("array", [
+    np.zeros((8, 8, 2), np.uint8),
+    np.zeros((8, 8, 5), np.uint8),
+    np.zeros((8, 8, 4), np.float32),
+    np.zeros((8, 8, 4), np.uint16),
+])
+def test_save_jpeg_refuses_what_is_not_a_picture(tmp_path, array):
+    with pytest.raises((ValueError, TypeError)):
+        save_jpeg(array, tmp_path / "bad.jpg")
+    assert not (tmp_path / "bad.jpg").exists()

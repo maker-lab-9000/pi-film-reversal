@@ -14,6 +14,16 @@ still names the colour science it was shot with. Passing ``tuning_file`` loads t
 file explicitly and records its name, which is how a non-default variant (for
 example ``imx708_wide.json`` on a wide Camera Module 3) is pinned.
 
+The tuning in use is also fingerprinted at open (``pifilm.tuning``), so a look
+trained under one tuning can be checked against the camera's and a libcamera
+update that replaced the file does not go unnoticed. A given name is hashed
+from the very dict the camera is opened with; the automatic case hashes the
+sensor's default ``<model>.json`` while the camera is still opened without a
+tuning, exactly as before. ``LIBCAMERA_RPI_TUNING_FILE`` plays no part:
+Picamera2 removes it from the environment when it opens without a tuning.
+The fingerprint never stops the camera: one that cannot be taken is one
+``tuning: cannot fingerprint ...`` line and a record without ``tuning_sha1``.
+
 Not every sensor has a focus motor: the IMX477 has a fixed C/CS mount and its
 libcamera control set has no ``AfMode``. Autofocus controls are therefore applied
 only when the camera advertises them, the recorded ``autofocus`` becomes ``"none"``,
@@ -81,15 +91,19 @@ and ``restart_preview``, which stops and reconfigures the camera, is a still.
 from __future__ import annotations
 
 import contextlib
+import copy
 import math
 import numbers
 import sys
 import tempfile
 import threading
+import time
 from typing import Any
 
 import numpy as np
 
+from ..tuning import Resolved
+from ..tuning import resolve as resolve_tuning
 from .camera import CameraError, Frame, StreamInfo
 from .errors import CameraStalled
 
@@ -155,6 +169,13 @@ def serialisable_metadata(raw: dict) -> dict:
             except (TypeError, ValueError):
                 pass
     return out
+
+
+def _lap(timings: dict[str, float], stage: str, started: float) -> float:
+    """Record the milliseconds since ``started`` under ``stage``; return now."""
+    now = time.perf_counter()
+    timings[stage] = round((now - started) * 1000.0, 1)
+    return now
 
 
 class Picamera2Camera:
@@ -224,6 +245,7 @@ class Picamera2Camera:
         self._frame_limits: dict[str, tuple[int, int] | None] = {"still": None, "preview": None}
         self._still_config: Any | None = None
         self._preview_config: Any | None = None
+        self._tuning: Resolved | None = None
 
         try:
             from picamera2 import Picamera2
@@ -240,6 +262,9 @@ class Picamera2Camera:
                 raise CameraError(
                     f"Failed to load Picamera2 tuning file {tuning_file!r}: {exc}"
                 ) from exc
+        # The fingerprint is of the dict as loaded, kept aside before it is passed
+        # on, so nothing the camera does with its own copy can change it.
+        tuning_as_loaded = copy.deepcopy(tuning)
         try:
             camera = Picamera2(tuning=tuning) if tuning is not None else Picamera2()
         except Exception as exc:
@@ -263,6 +288,9 @@ class Picamera2Camera:
             # generic wrapper below instead.
             model = str(camera.camera_properties.get("Model", "unknown"))
             tuning_label = tuning_file if tuning_file is not None else f"auto:{model}"
+            self._tuning = _fingerprint_tuning(
+                tuning_file, model, tuning_label, Picamera2.load_tuning_file, tuning_as_loaded,
+            )
             has_autofocus = "AfMode" in camera.camera_controls
             # Shutter priority: libcamera 0.5 (Trixie) ignores ExposureTime unless
             # ExposureTimeMode is Manual; older stacks take a non-zero ExposureTime with
@@ -322,7 +350,9 @@ class Picamera2Camera:
             )
             camera.configure(config)
             actual = camera.camera_configuration()
-            self._stream_info = _stream_info(actual, tuning_label, self._native_size)
+            self._stream_info = _stream_info(
+                actual, tuning_label, self._native_size, self._tuning.sha1,
+            )
             self._stream_info.autofocus = autofocus if has_autofocus else "none"
             self._still_config = config
             if self._preview is not None:
@@ -357,6 +387,12 @@ class Picamera2Camera:
     def stream_info(self) -> StreamInfo:
         return self._stream_info
 
+    @property
+    def tuning(self) -> Resolved | None:
+        """The tuning this camera opened with, fingerprinted (``sha1`` None when
+        it could not be); the capture session checks it against the look."""
+        return self._tuning
+
     def read(self, *, full: bool = True) -> Frame:
         """Acquire one frame. ``full=False`` (preview) skips the autofocus cycle
         and DNG extraction, which otherwise make each read too slow for a live
@@ -381,6 +417,10 @@ class Picamera2Camera:
 
             still = full or self._preview is None
             timeout = self._frame_timeout(still)
+            # Stage timings for the capture record (stills only): the mode switch
+            # and capture, the copy out of the camera's buffer, and the DNG.
+            started = time.perf_counter()
+            timings: dict[str, float] = {}
             try:
                 if full and self._preview is not None:
                     # Switches to the still configuration, captures, and restores
@@ -403,6 +443,7 @@ class Picamera2Camera:
             processing_failed = False
             try:
                 try:
+                    started = _lap(timings, "request", started)
                     bgr = request.make_array("main")
                     if not isinstance(bgr, np.ndarray):
                         raise CameraError("Picamera2 main array is not a NumPy array")
@@ -420,6 +461,7 @@ class Picamera2Camera:
                         # come from the binned viewfinder stream and would
                         # otherwise make a record claim the wrong frame rate.
                         self._update_fps({"FrameDuration": metadata.get("FrameDuration", 0)})
+                    started = _lap(timings, "array", started)
                     dng = None
                     if full and self._save_dng:
                         # The ".dng" suffix is load-bearing: PiDNG (used by save_dng)
@@ -430,8 +472,10 @@ class Picamera2Camera:
                             request.save_dng(tmp.name)
                             tmp.seek(0)
                             dng = tmp.read()
+                        _lap(timings, "dng", started)
                     return Frame(
-                        rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng
+                        rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng,
+                        timings=timings if full else None,
                     )
                 except CameraError:
                     processing_failed = True
@@ -489,6 +533,11 @@ class Picamera2Camera:
             return
         if duration > 0 and math.isfinite(duration):
             self._stream_info.fps = 1_000_000.0 / duration
+
+    @property
+    def still_size(self) -> tuple[int, int]:
+        """(width, height) of a full-resolution still."""
+        return self._native_size
 
     def set_shutter(self, us: int | None) -> None:
         """Fix the exposure time (shutter priority), or return to auto with ``None``.
@@ -842,7 +891,35 @@ def _drop_config_control(config: Any, name: str) -> None:
         pass
 
 
-def _stream_info(actual: Any, tuning_file: str, native_size: tuple[int, int]) -> StreamInfo:
+def _fingerprint_tuning(
+    tuning_file: str | None, model: str, label: str, load: Any, loaded: dict | None,
+) -> Resolved:
+    """Resolve and fingerprint the tuning in use, never raising.
+
+    ``loaded`` is the dict the camera was opened with, so a given name is not
+    read a second time. A tuning that cannot be fingerprinted is one line on
+    stderr and a ``Resolved`` without ``sha1``: the camera opens all the same.
+    """
+    try:
+        resolved = resolve_tuning(
+            tuning_file, model, load=load, loaded=loaded,
+        )
+    except Exception as exc:  # the fingerprint must never stop the camera
+        text = str(exc).strip()
+        reason = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+        resolved = Resolved(label=label, source=tuning_file, sha1=None, reason=reason)
+    if resolved.sha1 is None:
+        print(
+            f"tuning: cannot fingerprint the tuning in use ({resolved.reason})",
+            file=sys.stderr,
+        )
+    return resolved
+
+
+def _stream_info(
+    actual: Any, tuning_file: str, native_size: tuple[int, int],
+    tuning_sha1: str | None = None,
+) -> StreamInfo:
     try:
         main_size = tuple(actual["main"]["size"])
         main_format = actual["main"]["format"]
@@ -879,6 +956,7 @@ def _stream_info(actual: Any, tuning_file: str, native_size: tuple[int, int]) ->
         sensor_mode=f"{raw_size[0]}x{raw_size[1]} {raw_format}",
         bit_depth=bit_depth,
         tuning_file=tuning_file,
+        tuning_sha1=tuning_sha1,
     )
 
 

@@ -353,6 +353,152 @@ def test_a_long_double_exposure_label_does_not_run_into_the_battery_tag():
         assert (_crop(pixels, (34, 0, 35, 22), scale) >= 200).all()
 
 
+def _changed_box(before, after, scale):
+    """The bounding box, in base units, of the pixels that differ between two renders.
+
+    Differences of a few levels are left out: the Lanczos reduction of a tile rings
+    faintly for some pixels around every edge, far below what can be seen.
+    """
+    rows, cols = np.nonzero((np.abs(before - after) > 12).any(axis=2))
+    assert rows.size, "the two renders are identical"
+    return (cols.min() / scale, rows.min() / scale,
+            (cols.max() + 1) / scale, (rows.max() + 1) / scale)
+
+
+def _apart(a, b):
+    return a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1]
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_no_photographs_developing_draws_nothing(scale):
+    for double in (None, (False, 0), (True, 1)):
+        for battery in (None, 88):
+            as_before = LiveState(cells=_cells(), selected=1, pressed=None, double=double)
+            zero = LiveState(cells=_cells(), selected=1, pressed=None, double=double,
+                             developing=0)
+            assert np.array_equal(
+                _pixels(as_before, scale=scale, battery_percent=battery),
+                _pixels(zero, scale=scale, battery_percent=battery))
+
+
+def test_developing_and_the_tuning_flag_are_the_last_fields_with_off_defaults():
+    # New fields go on the end, so an older positional construction keeps its meaning.
+    assert LiveState(cells=_cells()).developing == 0
+    assert LiveState(cells=_cells()).tuning_mismatch is False
+    assert list(LiveState.__dataclass_fields__)[-2:] == ["developing", "tuning_mismatch"]
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("developing", [3, 12, 250])
+@pytest.mark.parametrize("battery, on_ac", [(5, False), (88, True), (100, True)])
+@pytest.mark.parametrize("double", [(False, 0), (True, 1)])
+def test_the_developing_count_sits_beside_the_battery_and_touches_nothing_else(
+        scale, developing, battery, on_ac, double):
+    reading = dict(battery_percent=battery, external_power=on_ac)
+    plain = _pixels(_state(double=double), scale=scale, **reading)
+    count = _changed_box(
+        plain, _pixels(_state(double=double, developing=developing), scale=scale, **reading),
+        scale)
+    # Where the battery and the 2x mark are, found by taking each away.
+    battery_box = _changed_box(
+        plain, _pixels(_state(double=double), scale=scale, battery_percent=None), scale)
+    double_box = _changed_box(
+        plain, _pixels(_state(double=None), scale=scale, **reading), scale)
+    assert _apart(count, battery_box) and _apart(count, double_box)
+    # Just past the battery's right end, on its line and no taller than it.
+    assert battery_box[2] <= count[0] <= battery_box[2] + 5
+    assert count[2] - count[0] <= 16
+    assert battery_box[1] <= count[1] and count[3] <= battery_box[3]
+    middle, battery_middle = (count[1] + count[3]) / 2, (battery_box[1] + battery_box[3]) / 2
+    assert abs(middle - battery_middle) <= 1.0
+    # Clear of the keys on the right and of the focus gauge below.
+    assert count[2] < 256 and count[3] <= 22
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_developing_count_is_amber_and_two_digits_are_wider_than_one(scale):
+    plain = _pixels(scale=scale)
+    one = _pixels(_state(developing=3), scale=scale)
+    two = _pixels(_state(developing=12), scale=scale)
+    box = _changed_box(plain, one, scale)
+    assert _near(_crop(one, box, scale), AMBER, 60).any()
+    wide = _changed_box(plain, two, scale)
+    assert wide[2] - wide[0] > box[2] - box[0]
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_a_count_above_99_is_drawn_as_99(scale):
+    assert np.array_equal(_pixels(_state(developing=250), scale=scale),
+                          _pixels(_state(developing=99), scale=scale))
+    assert not np.array_equal(_pixels(_state(developing=98), scale=scale),
+                              _pixels(_state(developing=99), scale=scale))
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_developing_count_is_drawn_without_a_battery_or_a_2x_mark(scale):
+    state = _state(double=None)
+    plain = _pixels(state, scale=scale, battery_percent=None)
+    assert (_crop(plain, (0, 0, 120, 22), scale) == np.array(FRAME_GREY)).all()
+    count = _changed_box(
+        plain, _pixels(_state(double=None, developing=2), scale=scale, battery_percent=None),
+        scale)
+    # Where the battery tag would start, clear of the place of the 2x mark.
+    assert DOUBLE_BOX[2] < count[0] and count[2] < 60
+    assert DOUBLE_BOX[1] <= count[1] and count[3] <= DOUBLE_BOX[3]
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_no_tuning_mismatch_draws_nothing(scale):
+    for double in (None, (True, 1)):
+        for battery in (None, 100):
+            for developing in (0, 9):
+                as_before = LiveState(cells=_cells(), selected=1, pressed=None, double=double,
+                                      developing=developing)
+                off = LiveState(cells=_cells(), selected=1, pressed=None, double=double,
+                                developing=developing, tuning_mismatch=False)
+                assert np.array_equal(
+                    _pixels(as_before, scale=scale, battery_percent=battery),
+                    _pixels(off, scale=scale, battery_percent=battery))
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("developing", [0, 9, 99])
+@pytest.mark.parametrize("battery, on_ac", [(None, None), (5, False), (100, True)])
+@pytest.mark.parametrize("double", [None, (True, 1)])
+def test_the_tuning_tag_is_last_in_the_tag_row_and_inside_its_box(
+        scale, developing, battery, on_ac, double):
+    reading = dict(battery_percent=battery, external_power=on_ac)
+    plain = _pixels(_state(double=double, developing=developing), scale=scale, **reading)
+    tagged = _pixels(_state(double=double, developing=developing, tuning_mismatch=True),
+                     scale=scale, **reading)
+    tag = _changed_box(plain, tagged, scale)
+    assert _near(_crop(tagged, tag, scale), AMBER, 60).any()
+    # Past everything else in the row, which it leaves as it was.
+    row = (_changed_box(_pixels(_state(double=None), scale=scale, battery_percent=None),
+                        plain, scale)
+           if double is not None or battery is not None or developing else None)
+    if row is not None:
+        assert row[2] <= tag[0] <= row[2] + 5
+    else:
+        assert DOUBLE_BOX[2] < tag[0]
+    # On the battery tag's line and no taller.
+    assert DOUBLE_BOX[1] <= tag[1] and tag[3] <= DOUBLE_BOX[3]
+    # Drawn whole: it ends short of the tile's right edge, which would clip it.
+    assert tag[2] < liveview._TAGS_BOX[2] - 1
+    # Clear of every control. Without a battery tag it starts where the developing count
+    # would, which the 2x toggle's grown hit region reaches by one unit, as it does the count.
+    for x in range(math.floor(tag[0] * scale), math.ceil(tag[2] * scale)):
+        for y in range(math.floor(tag[1] * scale), math.ceil(tag[3] * scale)):
+            assert hit(x, y, scale) in (Action.NONE, Action.DOUBLE_TOGGLE)
+
+
+def test_the_tag_box_clears_the_shutter_button_and_the_keys():
+    x1 = liveview._TAGS_BOX[2]
+    assert x1 < SHUTTER_CENTRE[0] - SHUTTER_HIT_RADIUS
+    assert x1 <= liveview._CONTROLS_BOX[0]
+    assert liveview._TAGS_BOX[3] <= liveview.FOCUS_TRACK[1]
+
+
 @pytest.mark.parametrize("scale", [1, 2])
 def test_the_focus_gauge_is_absent_without_a_focus_score(scale):
     box = (0, 20, 14, 200)
@@ -440,3 +586,24 @@ def test_the_bundled_fonts_are_packaged_and_load(name):
 def test_a_missing_font_file_falls_back_to_the_default_font():
     font = liveview._font("NoSuchFont.ttf", 14)
     assert font.getlength("400") > 0
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("focus", [1e-6, 1e-4, 0.001, 0.0019])
+def test_a_focus_score_too_small_for_one_pixel_draws_an_empty_gauge(focus, scale):
+    # Seen on the Pi 2026-10-15: a sharpness score just above zero made the fill
+    # less than half a pixel tall, both edges rounded to the same row, the
+    # inclusive far corner then sat above the near one and Pillow raised
+    # "y1 must be greater than or equal to y0", which ended the service.
+    tile = liveview._focus_tile(focus, focus, scale)
+    empty = liveview._focus_tile(0.0, None, scale)
+    assert tile.size == empty.size
+
+
+@pytest.mark.parametrize("box", [(10, 10, 10, 20), (10, 10, 20, 10), (10, 10.1, 20, 10.2),
+                                 (10.3, 10, 10.4, 20)])
+def test_canvas_shapes_that_round_to_no_pixels_draw_nothing(box):
+    canvas = liveview._Canvas((0, 0, 40, 40), 1)
+    canvas.rect(box, (255, 255, 255, 255))
+    canvas.pill(box, 2, (255, 255, 255, 255))
+    assert canvas.finish().getbbox() is None

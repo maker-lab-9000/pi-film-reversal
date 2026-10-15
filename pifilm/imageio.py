@@ -126,10 +126,30 @@ def save_jpeg(
     against 4.9 MB for a 1080p frame — which is the right trade for a project
     whose entire purpose is colour, and for files that double as the archival
     record. Pass ``subsampling=2`` for 4:2:0 if storage matters more.
+
+    The image is ``(H, W, 3)``, or ``(H, W, 4)`` with the picture in bytes 0 to 2
+    and a fourth byte that is ignored. That is what the GPU grade reads back
+    (it cannot read three bytes a pixel), and the encoder takes it as it is:
+    repacking 12 MP to three bytes cost more than it saved (2026-10-13). The
+    file is byte for byte the one the same pixels give as three bytes.
     """
+    rgb_u8 = np.asarray(rgb_u8)
+    if rgb_u8.ndim != 3 or rgb_u8.shape[2] not in (3, 4) or rgb_u8.dtype != np.uint8:
+        raise ValueError(
+            f"save_jpeg expects a uint8 array of shape (H, W, 3) or (H, W, 4); "
+            f"got dtype {rgb_u8.dtype} shape {rgb_u8.shape}"
+        )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    image = Image.fromarray(np.ascontiguousarray(rgb_u8), "RGB")
+    if rgb_u8.shape[2] == 4:
+        # Pillow reads the caller's buffer in place (no copy when it is
+        # contiguous, as a read-back is); "RGBX" is RGB with a padding byte.
+        height, width = rgb_u8.shape[:2]
+        image = Image.frombuffer(
+            "RGBX", (width, height), np.ascontiguousarray(rgb_u8), "raw", "RGBX", 0, 1
+        )
+    else:
+        image = Image.fromarray(np.ascontiguousarray(rgb_u8), "RGB")
     kwargs = {}
     if embed_srgb:
         kwargs["icc_profile"] = ImageCms.ImageCmsProfile(srgb_profile()).tobytes()
