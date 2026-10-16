@@ -1,5 +1,10 @@
 # Settings menu on the viewfinder: design
 
+Amended 2026-10-16 at the owner's request: the `MENU` key moved from between the
+shutter and `+` to under `-`, so the area above is for the shutter and the camera's
+controls only. Centre (287, 199), pill 40 x 12, hit box (264, 190, 311, 215) with
+x0, y0 included and x1, y1 excluded. Read the key's place below accordingly.
+
 Amended 2026-10-15, during implementation, at the owner's request: the `ROTATE` row
 is dropped ("leave the display flip option out, not important"). The menu remembers
 three settings, not four: `save_dng`, `ae_constraint` and `ae_metering`. There is no

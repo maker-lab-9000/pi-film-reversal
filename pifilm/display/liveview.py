@@ -14,8 +14,10 @@ Design intent:
   (31 units between the hit circles): a thumb that slips while stepping a value
   must not take a photograph. The hit regions are stated next to the drawn
   geometry, from the same constants, and never overlap.
-- A ``MENU`` key, a small pill in that gap, opens the settings menu. Its hit box
-  stays clear of both circles, so no tap that worked before changes meaning.
+- A ``MENU`` key, a small pill under ``-``, opens the settings menu, so the right
+  edge above it holds only the shutter and the camera's controls. Its hit box starts
+  under ``-``'s hit circle and reaches into the strip's meter part, which has no tap
+  action, so no tap that worked before changes meaning.
 
 Geometry is in 320x240 base units, as in ``ui.py``; every render takes the panel's
 integer ``scale`` (1 for the 2.8" SPI panel, 2 for the 640x480 DSI panel). Unlike
@@ -85,12 +87,14 @@ SHUTTER_DISC_RADIUS = 21.5
 SHUTTER_HIT_RADIUS = 34
 PLUS_CENTRE, MINUS_CENTRE, KEY_RADIUS = (287, 125), (287, 168), 17
 KEY_HIT_RADIUS = 21
-# The MENU key: a pill in the keys' style in the gap between the shutter and +.
-# The shutter's hit circle ends at y 73 and +'s starts at y 104; the pill (y 81 to
-# 95) grown by the margin on every side is the hit box, x 264 to 310 and y 78 to
-# 98 with both edges included, clear of both circles.
-MENU_CENTRE, MENU_SIZE = (287, 88), (40, 14)
-MENU_HIT_MARGIN = 3
+# The MENU key: a pill in the keys' style under -, drawn x 267 to 307 and y 193 to
+# 205, between -'s hit circle (it ends at y 189) and the strip (y 208). The hit box
+# is (x0, y0, x1, y1) with x0 and y0 included and x1 and y1 excluded: x 264 to 310
+# and y 190 to 214. It starts one unit under -'s hit circle and reaches into the
+# strip's right part, where only the meter is (the cells' hit columns end at x 190),
+# so the target is 25 units tall and takes no tap from anything else.
+MENU_CENTRE, MENU_SIZE = (287, 199), (40, 12)
+MENU_HIT_BOX = (264, 190, 311, 215)
 MENU_LABEL = "MENU"
 DOUBLE_BOX = (6, 5, 30, 16)
 DOUBLE_HIT_MARGIN = 6
@@ -149,7 +153,8 @@ SUPERSAMPLE = 2
 # Tile boxes in base units; whole numbers, so a tile lands on whole panel pixels.
 _STRIP_BOX = (0, BAR_TOP, WIDTH, HEIGHT)
 _CELL_BOX = (CELL_HIT_X0, BAR_TOP, CELL_HIT_X0 + CELL_PITCH, HEIGHT)  # cell 0
-_CONTROLS_BOX = (256, 8, 318, 188)
+# Down to y 207, so the MENU pill under - is in it, and short of the strip at 208.
+_CONTROLS_BOX = (256, 8, 318, 207)
 # Wide enough for "AC 100%", a two-digit count and TUNING (they end at 115.5 units
 # at scale 1, 114 at scale 2), and well short of the shutter's hit circle at 253.
 _TAGS_BOX = (0, 0, 124, 22)
@@ -621,9 +626,8 @@ def hit(x: int, y: int, scale: int = 1) -> Action:
         return Action.PLUS
     if math.hypot(x - MINUS_CENTRE[0], y - MINUS_CENTRE[1]) <= KEY_HIT_RADIUS:
         return Action.MINUS
-    (cx, cy), (w, h) = MENU_CENTRE, MENU_SIZE
-    reach_x, reach_y = w / 2 + MENU_HIT_MARGIN, h / 2 + MENU_HIT_MARGIN
-    if abs(x - cx) <= reach_x and abs(y - cy) <= reach_y:
+    x0, y0, x1, y1 = MENU_HIT_BOX
+    if x0 <= x < x1 and y0 <= y < y1:
         return Action.MENU
     x0, y0, x1, y1 = DOUBLE_BOX
     # Grown by the margin; the left and top sides end at the screen's edge.

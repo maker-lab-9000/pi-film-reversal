@@ -18,7 +18,6 @@ from pifilm.display.liveview import (
     HEIGHT,
     KEY_RADIUS,
     MENU_CENTRE,
-    MENU_HIT_MARGIN,
     MENU_LABEL,
     MENU_SIZE,
     METER_X0,
@@ -47,9 +46,9 @@ KEY_HIT_RADIUS = 21
 DOUBLE_HIT_MARGIN = 6
 CELL_HIT_TOP = 204
 CELL_HIT_X0 = 8
-# The MENU pill (287, 88), 40 x 14, grown by 3 on every side: x 264 to 310, y 78 to 98,
-# both edges included.
-MENU_HIT_BOX = (264, 78, 310, 98)
+# The MENU pill (287, 199), 40 x 12, under -: hit over x 264 to 310 and y 190 to 214
+# (x0, y0 included, x1, y1 excluded), from one unit under -'s hit circle into the strip.
+MENU_HIT_BOX = (264, 190, 311, 215)
 FRAME_GREY = (128, 128, 128)
 
 
@@ -136,7 +135,7 @@ def _regions():
                                & (ys >= y0 - DOUBLE_HIT_MARGIN) & (ys < y1 + DOUBLE_HIT_MARGIN)),
     }
     mx0, my0, mx1, my1 = MENU_HIT_BOX
-    regions[Action.MENU] = (xs >= mx0) & (xs <= mx1) & (ys >= my0) & (ys <= my1)
+    regions[Action.MENU] = (xs >= mx0) & (xs < mx1) & (ys >= my0) & (ys < my1)
     for index, action in enumerate(SELECT_ACTIONS):
         left = CELL_HIT_X0 + CELL_PITCH * index
         regions[action] = (ys >= CELL_HIT_TOP) & (xs >= left) & (xs < left + CELL_PITCH)
@@ -157,8 +156,8 @@ def test_the_geometry_constants_are_the_ones_the_viewfinder_loop_is_planned_agai
     assert (SHUTTER_CENTRE, SHUTTER_RADIUS) == ((287, 39), 28)
     assert (PLUS_CENTRE, MINUS_CENTRE, KEY_RADIUS) == ((287, 125), (287, 168), 17)
     assert DOUBLE_BOX == (6, 5, 30, 16)
-    assert (MENU_CENTRE, MENU_SIZE, MENU_HIT_MARGIN, MENU_LABEL) == ((287, 88), (40, 14), 3,
-                                                                      "MENU")
+    assert (MENU_CENTRE, MENU_SIZE, MENU_LABEL) == ((287, 199), (40, 12), "MENU")
+    assert liveview.MENU_HIT_BOX == MENU_HIT_BOX
     assert SELECT_ACTIONS == (Action.SELECT_SHUTTER, Action.SELECT_ISO, Action.SELECT_WB)
 
 
@@ -284,7 +283,7 @@ def test_a_pressed_key_is_filled_amber_and_the_others_are_unchanged(pressed, sca
         cx, cy = centre
         box = (cx - 8, cy - 8, cx + 8, cy + 8)
         if action is Action.MENU:
-            # The pill is 14 units tall and its label black when lit: look at its
+            # The pill is 12 units tall and its label black when lit: look at its
             # left end, inside the outline and clear of the label.
             box = (cx - 17, cy - 4, cx - 10, cy + 4)
         before = _crop(idle, box, scale)
@@ -706,7 +705,7 @@ def test_the_disk_box_clears_the_tag_row_the_shutter_and_the_keys():
     assert y1 <= liveview._TAGS_BOX[3]
 
 
-# The MENU key: a pill between the shutter and +, hit over the pill grown by 3 units.
+# The MENU key: a pill under -, hit over MENU_HIT_BOX (x0, y0 included, x1, y1 excluded).
 
 def test_live_state_has_no_network_field():
     # The addresses moved to the menu; ``ControllerSnapshot.network`` stays.
@@ -715,42 +714,62 @@ def test_live_state_has_no_network_field():
 
 
 @pytest.mark.parametrize("scale", [1, 2])
-def test_menu_is_hit_at_its_centre_and_at_the_corners_of_its_grown_box(scale):
+def test_menu_is_hit_at_its_centre_and_at_the_corners_of_its_box(scale):
     x0, y0, x1, y1 = MENU_HIT_BOX
-    for x, y in (MENU_CENTRE, (x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+    for x, y in (MENU_CENTRE, (x0, y0), (x1 - 1, y0), (x0, y1 - 1), (x1 - 1, y1 - 1)):
         assert hit(x * scale, y * scale, scale) is Action.MENU, (x, y)
         assert hit(x * scale + scale - 1, y * scale + scale - 1, scale) is Action.MENU, (x, y)
-    # One unit outside each side is not MENU.
-    for x, y in ((x0 - 1, MENU_CENTRE[1]), (x1 + 1, MENU_CENTRE[1]),
-                 (MENU_CENTRE[0], y0 - 1), (MENU_CENTRE[0], y1 + 1)):
+    # Just outside each side is not MENU.
+    for x, y in ((x0 - 1, MENU_CENTRE[1]), (x1, MENU_CENTRE[1]),
+                 (MENU_CENTRE[0], y0 - 1), (MENU_CENTRE[0], y1)):
         assert hit(x * scale, y * scale, scale) is not Action.MENU, (x, y)
 
 
-def test_the_grown_box_is_the_pill_grown_by_the_margin_and_clear_of_the_other_keys():
-    (cx, cy), (w, h), m = MENU_CENTRE, MENU_SIZE, MENU_HIT_MARGIN
-    assert MENU_HIT_BOX == (cx - w / 2 - m, cy - h / 2 - m, cx + w / 2 + m, cy + h / 2 + m)
-    # The shutter's hit circle ends at y 73, +'s starts at y 104.
-    assert SHUTTER_CENTRE[1] + SHUTTER_HIT_RADIUS < MENU_HIT_BOX[1]
-    assert MENU_HIT_BOX[3] < PLUS_CENTRE[1] - KEY_HIT_RADIUS
-    x0, y0, x1, y1 = liveview._CONTROLS_BOX
+def test_the_menu_box_is_under_minus_and_holds_the_pill_in_the_controls_tile():
+    (cx, cy), (w, h) = MENU_CENTRE, MENU_SIZE
+    x0, y0, x1, y1 = MENU_HIT_BOX
+    # One unit under -'s hit circle (its bottom is y 189), into the strip's meter part.
+    assert y0 == MINUS_CENTRE[1] + KEY_HIT_RADIUS + 1
+    assert y1 > BAR_TOP and x0 >= CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)
+    # The pill (y 193 to 205) lies inside the box, under y 208 and in the controls tile.
     assert x0 <= cx - w / 2 and cx + w / 2 <= x1 and y0 <= cy - h / 2 and cy + h / 2 <= y1
+    assert cy + h / 2 < BAR_TOP
+    tx0, ty0, tx1, ty1 = liveview._CONTROLS_BOX
+    assert liveview._CONTROLS_BOX == (256, 8, 318, 207)
+    assert tx0 <= cx - w / 2 and cx + w / 2 <= tx1 and ty0 <= cy - h / 2 and cy + h / 2 <= ty1
+    assert ty1 <= BAR_TOP
 
 
-def test_the_shutter_and_plus_still_answer_everywhere_in_their_hit_circles():
+def test_the_shutter_plus_and_minus_still_answer_everywhere_in_their_hit_circles():
     for centre, radius, action in ((SHUTTER_CENTRE, SHUTTER_HIT_RADIUS, Action.SHUTTER),
-                                   (PLUS_CENTRE, KEY_HIT_RADIUS, Action.PLUS)):
+                                   (PLUS_CENTRE, KEY_HIT_RADIUS, Action.PLUS),
+                                   (MINUS_CENTRE, KEY_HIT_RADIUS, Action.MINUS)):
         for y in range(centre[1] - radius, centre[1] + radius + 1):
             for x in range(centre[0] - radius, centre[0] + radius + 1):
                 if math.hypot(x - centre[0], y - centre[1]) <= radius:
                     assert hit(x, y) is action, (x, y)
 
 
-def test_no_point_outside_the_grown_box_is_menu():
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_old_menu_place_is_nothing_again(scale):
+    assert hit(287 * scale, 88 * scale, scale) is Action.NONE
+    for y in range(78, 99):
+        for x in range(264, 311):
+            assert hit(x * scale, y * scale, scale) is Action.NONE, (x, y)
+
+
+def test_no_point_outside_the_box_is_menu():
     x0, y0, x1, y1 = MENU_HIT_BOX
     for y in range(HEIGHT):
         for x in range(WIDTH):
-            inside = x0 <= x <= x1 and y0 <= y <= y1
+            inside = x0 <= x < x1 and y0 <= y < y1
             assert (hit(x, y) is Action.MENU) is inside, (x, y)
+
+
+def test_the_cells_hit_columns_in_the_strip_are_unchanged():
+    for y in range(CELL_HIT_TOP, HEIGHT):
+        for x in range(CELL_HIT_X0, CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)):
+            assert hit(x, y) is SELECT_ACTIONS[(x - CELL_HIT_X0) // CELL_PITCH], (x, y)
 
 
 def _without_the_menu_key(monkeypatch):
@@ -779,10 +798,13 @@ def test_the_menu_key_changes_nothing_outside_its_hit_box(scale, pressed, monkey
         liveview._controls_tile.cache_clear()
     x0, y0, x1, y1 = MENU_HIT_BOX
     outside = np.ones((HEIGHT * scale, WIDTH * scale), dtype=bool)
-    outside[y0 * scale:(y1 + 1) * scale, x0 * scale:(x1 + 1) * scale] = False
+    outside[y0 * scale:y1 * scale, x0 * scale:x1 * scale] = False
     for a, b in zip(with_key, without, strict=True):
         assert not np.array_equal(a, b)  # the key is drawn at all
         assert np.array_equal(a[outside], b[outside])
+        # Nothing in the strip, and nothing above y 190.
+        assert np.array_equal(a[BAR_TOP * scale:], b[BAR_TOP * scale:])
+        assert np.array_equal(a[:y0 * scale], b[:y0 * scale])
 
 
 @pytest.mark.parametrize("scale", [1, 2])

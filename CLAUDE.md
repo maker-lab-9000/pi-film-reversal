@@ -279,7 +279,7 @@ battery tag: `LiveState.developing`, from the snapshot's `pending_grades` at eve
 absent at zero), an amber `TUNING` tag last in that row (`LiveState.tuning_mismatch`, from the
 snapshot's `tuning_mismatch`), amber `PHOTOS NN%`/`SD NN%` tags in their own tile between that
 row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning`), a `MENU`
-key between the shutter and `+` that opens the settings menu, and focus gauge, from cached anti-aliased tiles in the
+key under `-` that opens the settings menu, and focus gauge, from cached anti-aliased tiles in the
 bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
 holds only the review, processing and message screens; `menu.py` draws the settings menu page
 (rows, `DONE` where the shutter is) and hit-tests it. Both work in 320×240 base units at an
