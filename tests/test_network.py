@@ -1,15 +1,20 @@
 """The network addresses behind the viewfinder's ETH / WLAN tag."""
 
+import ctypes
 import socket
+import sys
 import threading
 
+from pifilm.capture import network
 from pifilm.capture.network import (
     DEFAULT_INTERVAL_S,
     INTERFACES,
     NetworkMonitor,
     addresses,
     ipv4_address,
+    ipv4_addresses,
     is_up,
+    pick,
 )
 
 
@@ -75,29 +80,143 @@ def test_an_address_lookup_for_an_interface_that_does_not_exist_is_none():
     assert ipv4_address("pifilm-no-such0") is None
 
 
-def test_an_address_lookup_never_raises_for_an_ioctl_failure(monkeypatch):
-    import fcntl
+def test_pick_prefers_the_routable_address_over_the_link_local_one():
+    assert pick(["169.254.67.20", "192.168.178.59"]) == "192.168.178.59"
 
-    def failing(*args):
-        raise OSError(99, "Cannot assign requested address")
 
-    monkeypatch.setattr(fcntl, "ioctl", failing)
+def test_pick_falls_back_to_the_link_local_address_when_there_is_no_other():
+    assert pick(["169.254.67.20"]) == "169.254.67.20"
+
+
+def test_pick_of_nothing_is_none():
+    assert pick([]) is None
+
+
+def test_pick_skips_loopback_and_unspecified():
+    assert pick(["127.0.0.1", "10.42.0.1"]) == "10.42.0.1"
+    assert pick(["0.0.0.0", "10.42.0.1"]) == "10.42.0.1"
+    assert pick(["127.0.0.1"]) is None
+
+
+def test_pick_skips_an_invalid_string():
+    assert pick(["not an address", "192.168.1.5"]) == "192.168.1.5"
+    assert pick(["999.1.1.1"]) is None
+
+
+def test_pick_keeps_the_order_among_routable_addresses():
+    assert pick(["10.0.0.2", "192.168.1.5"]) == "10.0.0.2"
+
+
+def test_an_address_lookup_picks_from_the_interface_s_addresses():
+    asked = []
+
+    def list_addresses(name):
+        asked.append(name)
+        return ["169.254.67.20", "192.168.178.59"]
+
+    assert ipv4_address("eth0", list_addresses=list_addresses) == "192.168.178.59"
+    assert asked == ["eth0"]
+    assert ipv4_address("eth0", list_addresses=lambda name: []) is None
+
+
+def test_the_addresses_are_none_on_a_machine_that_is_not_linux(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert ipv4_addresses("eth0") == []
     assert ipv4_address("eth0") is None
 
 
-def test_an_address_lookup_reads_the_address_from_the_ioctl_reply(monkeypatch):
-    import fcntl
+def test_the_addresses_read_on_this_machine_without_raising():
+    found = ipv4_addresses("lo")
+    assert isinstance(found, list)
+    assert all(isinstance(address, str) for address in found)
+    if sys.platform.startswith("linux"):
+        assert "127.0.0.1" in found
 
-    calls = []
 
-    def ioctl(fd, request, arg):
-        calls.append((request, arg[:16]))
-        # struct ifreq: 16 bytes of name, then a sockaddr_in (family, port, address).
-        return arg[:16] + b"\x02\x00\x00\x00" + socket.inet_aton("10.42.0.1") + bytes(236)
+def test_the_addresses_are_empty_when_getifaddrs_fails(monkeypatch):
+    class FailingLibc:
+        def getifaddrs(self, head):
+            return -1
 
-    monkeypatch.setattr(fcntl, "ioctl", ioctl)
-    assert ipv4_address("wlan0") == "10.42.0.1"
-    assert calls == [(0x8915, b"wlan0" + bytes(11))]
+        def freeifaddrs(self, head):
+            raise AssertionError("nothing to free")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(network, "_libc", lambda: FailingLibc())
+    assert ipv4_addresses("eth0") == []
+
+
+def test_the_addresses_are_empty_without_a_libc(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(network, "_libc", lambda: None)
+    assert ipv4_addresses("eth0") == []
+
+
+def _sockaddr_in(address):
+    sin = network._SockaddrIn()
+    sin.sin_family = network.AF_INET
+    sin.sin_addr = (ctypes.c_ubyte * 4)(*socket.inet_aton(address))
+    return sin
+
+
+def _sockaddr_in6():
+    raw = (ctypes.c_ubyte * 28)()
+    family = network._Sockaddr.from_buffer(raw)
+    family.sa_family = socket.AF_INET6
+    return raw
+
+
+def test_the_addresses_walk_the_getifaddrs_list_for_that_interface(monkeypatch):
+    """A fake libc hands back a list laid out as glibc's struct ifaddrs."""
+    keep = []
+    entries = [
+        (b"lo", _sockaddr_in("127.0.0.1")),
+        (b"eth0", _sockaddr_in("169.254.67.20")),
+        (b"eth0", _sockaddr_in6()),
+        (b"eth0", None),  # an entry with no address (an AF_PACKET-less link)
+        (b"wlan0", _sockaddr_in("10.42.0.1")),
+        (b"eth0", _sockaddr_in("192.168.178.59")),
+    ]
+    nodes = [network._Ifaddrs() for _ in entries]
+    for node, following, (name, addr) in zip(nodes, nodes[1:] + [None], entries,
+                                              strict=True):
+        buffer = ctypes.create_string_buffer(name)
+        keep.append(buffer)
+        node.ifa_name = ctypes.cast(buffer, ctypes.c_char_p)
+        if addr is not None:
+            node.ifa_addr = ctypes.cast(ctypes.pointer(addr), ctypes.POINTER(network._Sockaddr))
+        if following is not None:
+            node.ifa_next = ctypes.pointer(following)
+    freed = []
+
+    class FakeLibc:
+        def getifaddrs(self, head):
+            head[0] = ctypes.pointer(nodes[0])
+            return 0
+
+        def freeifaddrs(self, head):
+            freed.append(ctypes.addressof(head.contents))
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(network, "_libc", lambda: FakeLibc())
+    assert ipv4_addresses("eth0") == ["169.254.67.20", "192.168.178.59"]
+    assert ipv4_addresses("wlan0") == ["10.42.0.1"]
+    assert ipv4_addresses("usb0") == []
+    assert freed == [ctypes.addressof(nodes[0])] * 3
+
+
+def test_the_glibc_layout_of_struct_ifaddrs():
+    """Pointers, then an unsigned int padded to a pointer boundary (LP64 aarch64)."""
+    pointer = ctypes.sizeof(ctypes.c_void_p)
+    fields = network._Ifaddrs
+    assert fields.ifa_next.offset == 0
+    assert fields.ifa_name.offset == pointer
+    assert fields.ifa_flags.offset == 2 * pointer
+    assert fields.ifa_addr.offset == 3 * pointer
+    assert fields.ifa_data.offset == 6 * pointer
+    assert ctypes.sizeof(fields) == 7 * pointer
+    assert ctypes.sizeof(network._SockaddrIn) == 16
+    assert network._SockaddrIn.sin_addr.offset == 4
 
 
 class FakeNet:

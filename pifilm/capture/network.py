@@ -12,13 +12,20 @@ white, not amber.
 How it is read. An interface counts while ``/sys/class/net/<if>/operstate`` reads
 ``up`` (a missing interface or file is not up): the kernel's own word for a cable
 plugged in, or a Wi-Fi link associated, with no tool to run and nothing to parse.
-Its address then comes from the ``SIOCGIFADDR`` ioctl on an ``AF_INET`` socket,
-the call ``ifconfig`` makes: the standard library has it (``fcntl``), so there is
-no ``ip`` subprocess every few seconds and no ``netifaces`` dependency. The ioctl
-returns the interface's primary IPv4 address, the one a person would type; an
-interface with none raises OSError, and so does any machine that is not Linux,
-which is how a run on a Mac reads as nothing connected. IPv4 only, and only these
-two interfaces: those are what the Pi has and what a person types.
+Its addresses then come from libc's
+``getifaddrs``, through ``ctypes``: the standard library has it, so there is no
+``ip`` subprocess every few seconds and no ``netifaces`` dependency. Not the
+``SIOCGIFADDR`` ioctl ``ifconfig`` makes, which returns only the interface's first
+IPv4 address: with NetworkManager's ``ipv4.link-local`` fallback kept on for a
+direct cable to the Mac, ``eth0`` carries ``169.254.x.x`` first and the router's
+``192.168.x.x`` second, and the ioctl showed the one nobody on the network can
+reach. Of all the addresses the first that is not link-local, loopback or
+unspecified is shown (the Nextcloud sync's rule, ``home_lan_ipv4`` in
+``pifilm/nextcloud.py``); with none, the first link-local one, still the address
+to SSH to over a direct cable. A machine that is not Linux, a libc that cannot be
+loaded, or a ``getifaddrs`` that fails gives no addresses, which is how a run on a
+Mac reads as nothing connected. IPv4 only, and only these two interfaces: those
+are what the Pi has and what a person types.
 
 The Pi's own hotspot (``scripts/pi_hotspot.py``) is shown like any other Wi-Fi
 link, ``WLAN 10.42.0.1``: that is the address the Stick and a phone joined to the
@@ -29,7 +36,7 @@ The poller is a daemon thread, ``pifilm-network``, shaped like the disk monitor
 (``disk.py``): it checks at once when started, then every 10 s on an event that
 ``close`` sets, so stopping it never waits out the interval. 10 s because a
 person who has just plugged in a cable looks at the screen for the address
-straight away, and a check is two small file reads and an ioctl. It logs one line
+straight away, and a check is two small file reads and a getifaddrs. It logs one line
 when an address appears or changes (``network: wlan0 192.168.178.56``) and one
 when it goes (``network: eth0 gone``), through the session's log, so the journal
 says which address the Pi had when. Nothing a read raises leaves the poller: a
@@ -40,15 +47,19 @@ and never touch the network.
 
 from __future__ import annotations
 
+import ctypes
+import ipaddress
+import socket
+import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 DEFAULT_INTERVAL_S = 10.0
 SYSFS_NET = Path("/sys/class/net")
 # (label on the screen, interface), in the order they are shown.
 INTERFACES = (("ETH", "eth0"), ("WLAN", "wlan0"))
-SIOCGIFADDR = 0x8915
+AF_INET = 2  # Linux's value, read from sa_family in the getifaddrs list
 
 Addresses = tuple[tuple[str, str], ...]
 
@@ -61,24 +72,109 @@ def is_up(name: str, *, sysfs: Path = SYSFS_NET) -> bool:
         return False
 
 
-def ipv4_address(name: str) -> str | None:
-    """The interface's primary IPv4 address, or None when it has none.
+class _Sockaddr(ctypes.Structure):
+    """Linux ``struct sockaddr``: a 16-bit family, then 14 bytes of address."""
 
-    None too for an interface that does not exist and on a machine that is not
-    Linux (the ioctl fails there); never raises for either.
-    """
+    _fields_ = [("sa_family", ctypes.c_ushort), ("sa_data", ctypes.c_ubyte * 14)]
+
+
+class _SockaddrIn(ctypes.Structure):
+    """Linux ``struct sockaddr_in``: family, port (network order), the address."""
+
+    _fields_ = [
+        ("sin_family", ctypes.c_ushort),
+        ("sin_port", ctypes.c_ushort),
+        ("sin_addr", ctypes.c_ubyte * 4),
+        ("sin_zero", ctypes.c_ubyte * 8),
+    ]
+
+
+class _Ifaddrs(ctypes.Structure):
+    """glibc's ``struct ifaddrs`` (``<ifaddrs.h>``); ctypes pads as the C compiler does."""
+
+
+_Ifaddrs._fields_ = [
+    ("ifa_next", ctypes.POINTER(_Ifaddrs)),
+    ("ifa_name", ctypes.c_char_p),
+    ("ifa_flags", ctypes.c_uint),
+    ("ifa_addr", ctypes.POINTER(_Sockaddr)),
+    ("ifa_netmask", ctypes.POINTER(_Sockaddr)),
+    ("ifa_ifu", ctypes.POINTER(_Sockaddr)),  # union of broadaddr / dstaddr
+    ("ifa_data", ctypes.c_void_p),
+]
+
+
+def _libc():
+    """The process's C library with ``getifaddrs`` typed, or None when it cannot be had."""
     try:
-        import fcntl
-        import socket
-        import struct
-
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            request = struct.pack("256s", name.encode()[:15])
-            reply = fcntl.ioctl(sock.fileno(), SIOCGIFADDR, request)
-        # struct ifreq: 16 bytes of name, then a sockaddr_in whose address is at 4.
-        return socket.inet_ntoa(reply[20:24])
-    except (OSError, ImportError):
+        libc = ctypes.CDLL(None)
+        libc.getifaddrs.argtypes = [ctypes.POINTER(ctypes.POINTER(_Ifaddrs))]
+        libc.getifaddrs.restype = ctypes.c_int
+        libc.freeifaddrs.argtypes = [ctypes.POINTER(_Ifaddrs)]
+        libc.freeifaddrs.restype = None
+        return libc
+    except (OSError, AttributeError):
         return None
+
+
+def ipv4_addresses(name: str) -> list[str]:
+    """Every IPv4 address of the interface, in the order ``getifaddrs`` lists them.
+
+    Empty for an interface without one or that does not exist, on a machine that
+    is not Linux, without a libc, or when ``getifaddrs`` fails; never raises.
+    """
+    if not sys.platform.startswith("linux"):
+        return []
+    try:
+        libc = _libc()
+        if libc is None:
+            return []
+        head = ctypes.POINTER(_Ifaddrs)()
+        if libc.getifaddrs(ctypes.pointer(head)) != 0:
+            return []
+        try:
+            wanted = name.encode()
+            found = []
+            node = head
+            while node:
+                entry = node.contents
+                addr = entry.ifa_addr
+                if entry.ifa_name == wanted and addr and addr.contents.sa_family == AF_INET:
+                    sin = ctypes.cast(addr, ctypes.POINTER(_SockaddrIn)).contents
+                    found.append(socket.inet_ntoa(bytes(sin.sin_addr)))
+                node = entry.ifa_next
+            return found
+        finally:
+            libc.freeifaddrs(head)
+    except Exception:
+        return []
+
+
+def pick(addresses: Sequence[str]) -> str | None:
+    """The first routable address, else the first link-local one, else None.
+
+    Routable here is not link-local (169.254.0.0/16), loopback or unspecified;
+    strings that are not IPv4 addresses are skipped.
+    """
+    link_local = None
+    for candidate in addresses:
+        try:
+            address = ipaddress.IPv4Address(candidate)
+        except ValueError:
+            continue
+        if address.is_link_local:
+            if link_local is None:
+                link_local = str(address)
+        elif not (address.is_loopback or address.is_unspecified):
+            return str(address)
+    return link_local
+
+
+def ipv4_address(
+    name: str, *, list_addresses: Callable[[str], Sequence[str]] = ipv4_addresses
+) -> str | None:
+    """The interface's address to show (``pick`` of its addresses), or None."""
+    return pick(list_addresses(name))
 
 
 def addresses(*, sysfs: Path = SYSFS_NET,
