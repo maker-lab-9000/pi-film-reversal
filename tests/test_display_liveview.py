@@ -17,6 +17,9 @@ from pifilm.display.liveview import (
     DOUBLE_BOX,
     HEIGHT,
     KEY_RADIUS,
+    MENU_CENTRE,
+    MENU_LABEL,
+    MENU_SIZE,
     METER_X0,
     METER_X1,
     METER_Y,
@@ -43,6 +46,9 @@ KEY_HIT_RADIUS = 21
 DOUBLE_HIT_MARGIN = 6
 CELL_HIT_TOP = 204
 CELL_HIT_X0 = 8
+# The MENU pill (287, 199), 40 x 12, under -: hit over x 264 to 310 and y 190 to 214
+# (x0, y0 included, x1, y1 excluded), from one unit under -'s hit circle into the strip.
+MENU_HIT_BOX = (264, 190, 311, 215)
 FRAME_GREY = (128, 128, 128)
 
 
@@ -128,6 +134,8 @@ def _regions():
         Action.DOUBLE_TOGGLE: ((xs >= x0 - DOUBLE_HIT_MARGIN) & (xs < x1 + DOUBLE_HIT_MARGIN)
                                & (ys >= y0 - DOUBLE_HIT_MARGIN) & (ys < y1 + DOUBLE_HIT_MARGIN)),
     }
+    mx0, my0, mx1, my1 = MENU_HIT_BOX
+    regions[Action.MENU] = (xs >= mx0) & (xs < mx1) & (ys >= my0) & (ys < my1)
     for index, action in enumerate(SELECT_ACTIONS):
         left = CELL_HIT_X0 + CELL_PITCH * index
         regions[action] = (ys >= CELL_HIT_TOP) & (xs >= left) & (xs < left + CELL_PITCH)
@@ -148,6 +156,8 @@ def test_the_geometry_constants_are_the_ones_the_viewfinder_loop_is_planned_agai
     assert (SHUTTER_CENTRE, SHUTTER_RADIUS) == ((287, 39), 28)
     assert (PLUS_CENTRE, MINUS_CENTRE, KEY_RADIUS) == ((287, 125), (287, 168), 17)
     assert DOUBLE_BOX == (6, 5, 30, 16)
+    assert (MENU_CENTRE, MENU_SIZE, MENU_LABEL) == ((287, 199), (40, 12), "MENU")
+    assert liveview.MENU_HIT_BOX == MENU_HIT_BOX
     assert SELECT_ACTIONS == (Action.SELECT_SHUTTER, Action.SELECT_ISO, Action.SELECT_WB)
 
 
@@ -159,6 +169,7 @@ def test_every_control_is_hit_at_its_centre(scale):
         Action.PLUS: PLUS_CENTRE,
         Action.MINUS: MINUS_CENTRE,
         Action.DOUBLE_TOGGLE: ((x0 + x1) // 2, (y0 + y1) // 2),
+        Action.MENU: MENU_CENTRE,
     }
     for index, action in enumerate(SELECT_ACTIONS):
         centres[action] = (CELL_HIT_X0 + CELL_PITCH * index + CELL_PITCH // 2, 222)
@@ -261,21 +272,22 @@ def test_a_fixed_control_has_no_auto_tag():
     assert _near(fixed, AMBER).any()
 
 
-def _key_centre(pixels, centre, scale, half=8):
-    cx, cy = centre
-    return _crop(pixels, (cx - half, cy - half, cx + half, cy + half), scale)
-
-
 @pytest.mark.parametrize("scale", [1, 2])
-@pytest.mark.parametrize("pressed", [Action.PLUS, Action.MINUS, Action.SHUTTER])
+@pytest.mark.parametrize("pressed", [Action.PLUS, Action.MINUS, Action.SHUTTER, Action.MENU])
 def test_a_pressed_key_is_filled_amber_and_the_others_are_unchanged(pressed, scale):
     centres = {Action.PLUS: PLUS_CENTRE, Action.MINUS: MINUS_CENTRE,
-               Action.SHUTTER: SHUTTER_CENTRE}
+               Action.SHUTTER: SHUTTER_CENTRE, Action.MENU: MENU_CENTRE}
     idle = _pixels(_state(pressed=None), scale=scale)
     lit = _pixels(_state(pressed=pressed), scale=scale)
     for action, centre in centres.items():
-        before = _key_centre(idle, centre, scale)
-        after = _key_centre(lit, centre, scale)
+        cx, cy = centre
+        box = (cx - 8, cy - 8, cx + 8, cy + 8)
+        if action is Action.MENU:
+            # The pill is 12 units tall and its label black when lit: look at its
+            # left end, inside the outline and clear of the label.
+            box = (cx - 17, cy - 4, cx - 10, cy + 4)
+        before = _crop(idle, box, scale)
+        after = _crop(lit, box, scale)
         assert _near(before, AMBER).mean() < 0.05
         if action is pressed:
             assert _near(after, AMBER).mean() > 0.75
@@ -385,7 +397,7 @@ def test_developing_and_the_tuning_flag_are_the_last_fields_with_off_defaults():
     # New fields go on the end, so an older positional construction keeps its meaning.
     assert LiveState(cells=_cells()).developing == 0
     assert LiveState(cells=_cells()).tuning_mismatch is False
-    assert list(LiveState.__dataclass_fields__)[-4:-2] == ["developing", "tuning_mismatch"]
+    assert list(LiveState.__dataclass_fields__)[-3:-1] == ["developing", "tuning_mismatch"]
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -611,9 +623,9 @@ def test_canvas_shapes_that_round_to_no_pixels_draw_nothing(box):
 
 # The disk-space warning: amber PHOTOS / SD tags between the tag row and the shutter.
 
-def test_the_disk_warning_comes_before_network_and_is_empty_by_default():
+def test_the_disk_warning_is_the_last_field_and_empty_by_default():
     assert LiveState(cells=_cells()).disk_warning == ()
-    assert list(LiveState.__dataclass_fields__)[-2] == "disk_warning"
+    assert list(LiveState.__dataclass_fields__)[-1] == "disk_warning"
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -693,109 +705,120 @@ def test_the_disk_box_clears_the_tag_row_the_shutter_and_the_keys():
     assert y1 <= liveview._TAGS_BOX[3]
 
 
-# The network addresses: ETH / WLAN at the bottom left of the picture, white.
+# The MENU key: a pill under -, hit over MENU_HIT_BOX (x0, y0 included, x1, y1 excluded).
 
-WIDEST_NETWORK = (("ETH", "255.255.255.255"), ("WLAN", "255.255.255.255"))
-
-
-def test_network_is_the_last_field_and_empty_by_default():
-    assert LiveState(cells=_cells()).network == ()
-    assert list(LiveState.__dataclass_fields__)[-1] == "network"
+def test_live_state_has_no_network_field():
+    # The addresses moved to the menu; ``ControllerSnapshot.network`` stays.
+    assert "network" not in LiveState.__dataclass_fields__
+    assert not hasattr(liveview, "_network_tile") and not hasattr(liveview, "_NETWORK_BOX")
 
 
 @pytest.mark.parametrize("scale", [1, 2])
-def test_no_network_never_builds_the_tile(scale, monkeypatch):
-    # The byte-identical guarantee: without an address the tile is not drawn at all.
-    def refuse(*args):
-        raise AssertionError("network tile drawn without an address")
-    monkeypatch.setattr(liveview, "_network_tile", refuse)
-    for disk in ((), WIDEST_DISK):
-        state = LiveState(cells=_cells(), selected=1, double=(True, 1), developing=9,
-                          tuning_mismatch=True, disk_warning=disk)
-        _pixels(state, scale=scale, battery_percent=100, focus=0.5, focus_peak=0.5)
+def test_menu_is_hit_at_its_centre_and_at_the_corners_of_its_box(scale):
+    x0, y0, x1, y1 = MENU_HIT_BOX
+    for x, y in (MENU_CENTRE, (x0, y0), (x1 - 1, y0), (x0, y1 - 1), (x1 - 1, y1 - 1)):
+        assert hit(x * scale, y * scale, scale) is Action.MENU, (x, y)
+        assert hit(x * scale + scale - 1, y * scale + scale - 1, scale) is Action.MENU, (x, y)
+    # Just outside each side is not MENU.
+    for x, y in ((x0 - 1, MENU_CENTRE[1]), (x1, MENU_CENTRE[1]),
+                 (MENU_CENTRE[0], y0 - 1), (MENU_CENTRE[0], y1)):
+        assert hit(x * scale, y * scale, scale) is not Action.MENU, (x, y)
+
+
+def test_the_menu_box_is_under_minus_and_holds_the_pill_in_the_controls_tile():
+    (cx, cy), (w, h) = MENU_CENTRE, MENU_SIZE
+    x0, y0, x1, y1 = MENU_HIT_BOX
+    # One unit under -'s hit circle (its bottom is y 189), into the strip's meter part.
+    assert y0 == MINUS_CENTRE[1] + KEY_HIT_RADIUS + 1
+    assert y1 > BAR_TOP and x0 >= CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)
+    # The pill (y 193 to 205) lies inside the box, under y 208 and in the controls tile.
+    assert x0 <= cx - w / 2 and cx + w / 2 <= x1 and y0 <= cy - h / 2 and cy + h / 2 <= y1
+    assert cy + h / 2 < BAR_TOP
+    tx0, ty0, tx1, ty1 = liveview._CONTROLS_BOX
+    assert liveview._CONTROLS_BOX == (256, 8, 318, 207)
+    assert tx0 <= cx - w / 2 and cx + w / 2 <= tx1 and ty0 <= cy - h / 2 and cy + h / 2 <= ty1
+    assert ty1 <= BAR_TOP
+
+
+def test_the_shutter_plus_and_minus_still_answer_everywhere_in_their_hit_circles():
+    for centre, radius, action in ((SHUTTER_CENTRE, SHUTTER_HIT_RADIUS, Action.SHUTTER),
+                                   (PLUS_CENTRE, KEY_HIT_RADIUS, Action.PLUS),
+                                   (MINUS_CENTRE, KEY_HIT_RADIUS, Action.MINUS)):
+        for y in range(centre[1] - radius, centre[1] + radius + 1):
+            for x in range(centre[0] - radius, centre[0] + radius + 1):
+                if math.hypot(x - centre[0], y - centre[1]) <= radius:
+                    assert hit(x, y) is action, (x, y)
 
 
 @pytest.mark.parametrize("scale", [1, 2])
-def test_no_network_draws_nothing(scale):
-    for double in (None, (True, 1)):
-        for battery in (None, 100):
-            for disk in ((), WIDEST_DISK):
-                as_before = LiveState(cells=_cells(), selected=1, double=double,
-                                      developing=9, tuning_mismatch=True, disk_warning=disk)
-                empty = LiveState(cells=_cells(), selected=1, double=double,
-                                  developing=9, tuning_mismatch=True, disk_warning=disk,
-                                  network=())
-                for focus in (None, 0.5):
-                    reading = dict(battery_percent=battery, focus=focus, focus_peak=focus)
-                    assert np.array_equal(_pixels(as_before, scale=scale, **reading),
-                                          _pixels(empty, scale=scale, **reading))
+def test_the_old_menu_place_is_nothing_again(scale):
+    assert hit(287 * scale, 88 * scale, scale) is Action.NONE
+    for y in range(78, 99):
+        for x in range(264, 311):
+            assert hit(x * scale, y * scale, scale) is Action.NONE, (x, y)
+
+
+def test_no_point_outside_the_box_is_menu():
+    x0, y0, x1, y1 = MENU_HIT_BOX
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            inside = x0 <= x < x1 and y0 <= y < y1
+            assert (hit(x, y) is Action.MENU) is inside, (x, y)
+
+
+def test_the_cells_hit_columns_in_the_strip_are_unchanged():
+    for y in range(CELL_HIT_TOP, HEIGHT):
+        for x in range(CELL_HIT_X0, CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)):
+            assert hit(x, y) is SELECT_ACTIONS[(x - CELL_HIT_X0) // CELL_PITCH], (x, y)
+
+
+def _without_the_menu_key(monkeypatch):
+    """Render with the pill's drawing switched off; the tile cache is emptied both ways."""
+    liveview._controls_tile.cache_clear()
+    monkeypatch.setattr(liveview, "_menu_key", lambda canvas, lit: None)
 
 
 @pytest.mark.parametrize("scale", [1, 2])
-@pytest.mark.parametrize("network", [
-    (("ETH", "192.168.1.20"),), (("WLAN", "10.42.0.1"),),
-    (("ETH", "192.168.1.20"), ("WLAN", "192.168.178.56")), WIDEST_NETWORK,
-])
-def test_the_network_tag_sits_above_the_strip_right_of_the_focus_gauge(scale, network):
-    reading = dict(focus=0.6, focus_peak=0.9)
-    plain = _pixels(scale=scale, **reading)
-    tagged = _pixels(_state(network=network), scale=scale, **reading)
-    tag = _changed_box(plain, tagged, scale)
-    # White text, not amber: information, not a warning.
-    ink = _crop(tagged, tag, scale)
-    assert _near(ink, WHITE, 40).any()
-    assert not _near(ink, AMBER, 60).any()
-    # Inside its own box: right of the focus gauge, above the strip, short of the box's
-    # right edge (drawn whole), and touching no control.
-    box = liveview._NETWORK_BOX
-    assert box[0] <= tag[0] and liveview.FOCUS_TICK_X[1] < tag[0]
-    assert box[1] <= tag[1] and tag[3] <= box[3] <= BAR_TOP
-    assert tag[2] < box[2] - 1
-    for x in range(math.floor(tag[0] * scale), math.ceil(tag[2] * scale)):
-        for y in range(math.floor(tag[1] * scale), math.ceil(tag[3] * scale)):
-            if y // scale < CELL_HIT_TOP:  # the cells' taps may land on it; it is drawn only
-                assert hit(x, y, scale) is Action.NONE
+@pytest.mark.parametrize("pressed", [None, Action.PLUS, Action.MINUS, Action.SHUTTER,
+                                     Action.MENU])
+def test_the_menu_key_changes_nothing_outside_its_hit_box(scale, pressed, monkeypatch):
+    states = [_state(pressed=pressed),
+              LiveState(cells=_cells(), selected=None, pressed=pressed, double=(True, 1),
+                        developing=9, tuning_mismatch=True, disk_warning=WIDEST_DISK)]
+    readings = [dict(), dict(battery_percent=None, focus=0.5, focus_peak=0.7)]
+    liveview._controls_tile.cache_clear()
+    try:
+        with_key = [_pixels(s, scale=scale, frame=f, **r)
+                    for s in states for r in readings for f in (0, 255)]
+        with monkeypatch.context() as m:
+            _without_the_menu_key(m)
+            without = [_pixels(s, scale=scale, frame=f, **r)
+                       for s in states for r in readings for f in (0, 255)]
+    finally:
+        liveview._controls_tile.cache_clear()
+    x0, y0, x1, y1 = MENU_HIT_BOX
+    outside = np.ones((HEIGHT * scale, WIDTH * scale), dtype=bool)
+    outside[y0 * scale:y1 * scale, x0 * scale:x1 * scale] = False
+    for a, b in zip(with_key, without, strict=True):
+        assert not np.array_equal(a, b)  # the key is drawn at all
+        assert np.array_equal(a[outside], b[outside])
+        # Nothing in the strip, and nothing above y 190.
+        assert np.array_equal(a[BAR_TOP * scale:], b[BAR_TOP * scale:])
+        assert np.array_equal(a[:y0 * scale], b[:y0 * scale])
 
 
 @pytest.mark.parametrize("scale", [1, 2])
-def test_the_widest_addresses_fit_the_box(scale):
-    canvas = liveview._Canvas(liveview._NETWORK_BOX, scale)
-    font = canvas.font(liveview.SEMIBOLD, liveview.TAG_SIZE)
-    end = float(liveview._NETWORK_BOX[0])
-    for label, address in WIDEST_NETWORK:
-        end = math.ceil(end + canvas.text_width(f"{label} {address}", font)
-                        + 2 * liveview.TAG_PADDING) + liveview.DEVELOPING_GAP
-    assert end - liveview.DEVELOPING_GAP < liveview._NETWORK_BOX[2] - 1
-
-
-@pytest.mark.parametrize("scale", [1, 2])
-def test_two_network_tags_are_eth_then_wlan(scale):
-    plain = _pixels(scale=scale)
-    eth_only = _pixels(_state(network=(("ETH", "192.168.1.20"),)), scale=scale)
-    eth = _changed_box(plain, eth_only, scale)
-    wlan = _changed_box(plain, _pixels(_state(network=(("WLAN", "10.42.0.1"),)),
-                                       scale=scale), scale)
-    both_pixels = _pixels(_state(network=(("ETH", "192.168.1.20"), ("WLAN", "10.42.0.1"))),
-                          scale=scale)
-    both = _changed_box(plain, both_pixels, scale)
-    # WLAN alone starts where ETH does; with both, ETH first and WLAN after it.
-    assert wlan[0] == eth[0]
-    assert both[0] == eth[0] and both[2] > eth[2] + (wlan[2] - wlan[0])
-    left = (0, 190, math.ceil(eth[2]), BAR_TOP)
-    assert np.array_equal(_crop(both_pixels, left, scale), _crop(eth_only, left, scale))
-
-
-@pytest.mark.parametrize("scale", [1, 2])
-def test_the_network_tag_shows_the_address(scale):
-    a = _pixels(_state(network=(("WLAN", "10.42.0.1"),)), scale=scale)
-    b = _pixels(_state(network=(("WLAN", "10.42.0.7"),)), scale=scale)
-    assert not np.array_equal(a, b)
-
-
-def test_the_network_box_clears_the_focus_gauge_the_strip_and_the_meter_text():
-    x0, y0, x1, y1 = liveview._NETWORK_BOX
-    assert all(isinstance(v, int) for v in liveview._NETWORK_BOX)
-    assert liveview._FOCUS_BOX[2] < x0
-    assert y1 <= BAR_TOP
-    assert x1 <= liveview._METER_TEXT_BOX[0]
-    assert x1 <= liveview._CONTROLS_BOX[0]
+def test_the_menu_key_is_an_outlined_pill_with_a_white_label(scale):
+    pixels = _pixels(frame=255, scale=scale)
+    (cx, cy), (w, h) = MENU_CENTRE, MENU_SIZE
+    pill = _crop(pixels, (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2), scale)
+    assert _near(pill, AMBER, 90).any()  # the outline
+    inner = _crop(pixels, (cx - w / 2 + 3, cy - h / 2 + 2, cx + w / 2 - 3, cy + h / 2 - 2),
+                  scale)
+    assert inner.max(axis=-1).min() < 200  # the translucent fill
+    # The label: white ink on the fill, over a black frame.
+    dark = _crop(_pixels(frame=0, scale=scale),
+                 (cx - w / 2 + 3, cy - h / 2 + 2, cx + w / 2 - 3, cy + h / 2 - 2), scale)
+    assert _neutral_peak(dark) > WHITE_INK
+    # Outside the pill, the untouched frame.
+    assert tuple(pixels[cy * scale, (cx - w // 2 - 2) * scale]) == (255, 255, 255)

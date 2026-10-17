@@ -7,7 +7,10 @@ off-device archive; it changes nothing about capture or grading.
 ## What it does, and what it does not
 
 `scripts/nextcloud_sync.py` runs `rclone copy` from the Pi's photo folder to one
-Nextcloud folder. Design choices, each deliberate:
+Nextcloud folder. The sync itself lives in the package, in `pifilm/nextcloud.py`
+(run it as `python -m pifilm.nextcloud`); the script is a thin wrapper kept so the
+installed timer unit works unchanged, and the `.env` parser it uses is
+`pifilm/envfile.py`. Design choices, each deliberate:
 
 - **Copy, never mirror.** It uses `rclone copy`, which only adds or updates
   files on Nextcloud. Deleting a photo on the Pi (an SD-card cleanup) never
@@ -38,6 +41,12 @@ Nextcloud folder. Design choices, each deliberate:
   raws, and `captures.jsonl`. rclone skips files already uploaded, so repeated
   runs only transfer what is new. `--min-age 30s` avoids grabbing a file that a
   capture is still writing.
+- **One sync at a time.** Each run takes an exclusive lock on
+  `~/.local/state/pifilm/nextcloud-sync.lock` (`$XDG_STATE_HOME` if set; `--lock
+  PATH` overrides it) before the network checks. A run that finds it held, for
+  example the timer's while an upload from the viewfinder's menu is going, logs
+  `another Nextcloud sync is running; skipping` and exits 0. The kernel drops the
+  lock when a run ends, so a killed run cannot leave it stuck.
 
 Why not plain `rsync`? A Nextcloud server speaks HTTP/WebDAV, not the rsync
 protocol, unless you have shell access to its data directory (and writing there
@@ -119,6 +128,27 @@ The service runs as `george` with the repo as its working directory, so it
 reads the same `.env`. It fires a few minutes after boot and every 15 minutes
 after that; each run is a no-op unless the Pi is on the home network, so the
 frequent schedule is cheap.
+
+## From the viewfinder's menu
+
+The LCD viewfinder's [settings menu](lcd-viewfinder.md#settings-menu) has an
+`UPLOAD` row that runs this sync once, now, without waiting for the timer. It is
+there when `pifilm-capture` is given `--nextcloud-env PATH`, the same `.env` the
+timer's service reads:
+
+```
+--nextcloud-env /home/george/repos/pi-film-reversal/.env
+```
+
+The capture service never opens that file. It only hands the path to a child,
+`python -m pifilm.nextcloud --apply --env PATH`, run without
+`PIFILM_REMOTE_TOKEN` in its environment, so the Nextcloud password lives only in
+the child and no hang or stall in the network can hold up a capture. Each line the
+child prints is in the capture service's journal as `nextcloud: <line>`, and the
+row reads `UPLOADING 0:42` while it runs, then `DONE 14:05`, `SKIPPED: NO NETWORK`,
+`SKIPPED: NO NEXTCLOUD` (the hotspot), `SKIPPED: BUSY` (the lock above: the
+timer's run was going) or `FAILED (EXIT n)`. The timer keeps running as before;
+the two never copy at the same time.
 
 ## Troubleshooting
 

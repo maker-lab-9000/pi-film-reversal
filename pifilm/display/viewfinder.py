@@ -1,4 +1,4 @@
-"""The viewfinder state machine: LIVE ⇄ REVIEW.
+"""The viewfinder state machine: LIVE ⇄ REVIEW, and LIVE ⇄ MENU.
 
 Every shot goes through the shared ``CaptureController`` exactly like a Stick
 request, so the LCD is one more trigger and one more screen, never a second
@@ -8,6 +8,17 @@ controller knowing about displays.
 Double exposure adds a third state, NOTICE: after exposure 1 of a pair there is
 nothing developed to review, so a short "Exposure 1/2" message replaces the
 review and the loop returns to LIVE for the second exposure.
+The ``MENU`` key opens a fourth state, MENU: the settings page (``menu.py``),
+left by its ``DONE`` key. The camera is not the menu's, so the GPIO button and the
+Stick still take photographs while it is open; a shot that finishes then is
+counted as seen but opens neither REVIEW nor NOTICE, and no colour bars cover the
+page while a job runs, because the photographer opened the menu to change
+something and a review would throw them out of it. The frame thread is not asked
+for frames in MENU (nothing of the picture is behind the page), the page is
+pushed only when its rows or ``DONE``'s press change (an upload's elapsed time
+changes once a second, and an identical page would only occupy the SPI bus), and
+the idle dim and screen-off apply as in LIVE. ``RESET`` takes two taps within
+``RESET_ARM_SECONDS``, so one stray touch cannot undo every setting.
 The live screen (``liveview.py``) is select-and-adjust: a tap on one of the strip's
 three cells (SHUTTER, ISO, WB) selects it, and one ``+``/``-`` pair steps whichever
 is selected. While a job is processing the colour bars hide the cells and the
@@ -90,6 +101,7 @@ from typing import Any
 from PIL import Image
 
 from ..capture.errors import CameraError, CameraStalled
+from ..capture.settings import AE_CONSTRAINTS, AE_METERINGS, SettingsControl
 from ..imageio import load_rgb
 from . import DisplayError, iso, shutter, stepscale, whitebalance
 from .idle import IdleDimmer, Screen
@@ -103,6 +115,7 @@ from .liveview import (
     hit,
     render_live,
 )
+from .menu import DONE, MenuRow, menu_hit, render_menu
 from .meter import FocusTracker, MeterReading, compute_reading, focus_score, format_shutter
 from .touch import Tap, TapDetector
 from .ui import iso_label, render_message, render_processing, render_review, text_or_dash
@@ -207,6 +220,10 @@ FULL_BACKLIGHT = 80
 NOTICE_SECONDS = 1.2
 PROCESSING_FIRST = "Exposure 1 of 2..."
 PROCESSING_DOUBLE = "Developing double exposure..."
+# The settings menu: how long the first tap on RESET waits for the second, and
+# the look's name when ``--artifacts`` is the bundled starter.
+RESET_ARM_SECONDS = 3.0
+STARTER_LOOK = "starter (bundled)"
 
 
 @dataclass
@@ -248,7 +265,9 @@ class ViewfinderLoop:
         max_display_failures: int = 5, log: Callable[..., None] = print,
         touch_debug: bool = False, dim_after: float = DIM_AFTER,
         off_after: float = OFF_AFTER, full_backlight: int = FULL_BACKLIGHT,
-        touch_period: float = 0.02,
+        touch_period: float = 0.02, settings: SettingsControl | None = None,
+        upload: Any | None = None, look: str = "",
+        menu_rows: tuple[str, ...] | None = None,
     ) -> None:
         self._camera, self._controller = camera, controller
         self._display, self._touch = display, touch
@@ -354,6 +373,18 @@ class ViewfinderLoop:
             now=clock.monotonic(),
         )
         self._backlight: int | None = None
+        # The settings menu. ``menu_rows`` names the optional setting rows this
+        # camera supports (``save_dng``, ``ae_constraint``, ``ae_metering``); the
+        # caller decides, because only it knows the backend. The page last pushed,
+        # as (rows, DONE pressed), or None to force the next push; and the time
+        # until which RESET is armed for its second tap. RESET needs setting rows
+        # too: without them (``--fake``) it would only delete the real camera's
+        # saved settings.
+        self._settings, self._upload, self._look = settings, upload, look
+        self._menu_optional = tuple(menu_rows or ())
+        self._menu_resettable = settings is not None and menu_rows is not None
+        self._menu_shown: tuple[tuple[MenuRow, ...], bool] | None = None
+        self._reset_until: float | None = None
 
     # -- plumbing -------------------------------------------------------------
 
@@ -794,7 +825,8 @@ class ViewfinderLoop:
         """
         self._frames, self._rate_since = 0, self._clock.monotonic()
 
-    def _show(self, image: Image.Image) -> None:
+    def _show(self, image: Image.Image) -> bool:
+        """Push ``image``; False when the display refused it (logged)."""
         try:
             self._display.show(image)
         except DisplayError as exc:
@@ -802,8 +834,9 @@ class ViewfinderLoop:
             self._log(f"display: {exc} ({self._display_failures}/{self._max_failures})")
             if self._display_failures >= self._max_failures:
                 raise
-            return
+            return False
         self._display_failures = 0
+        return True
 
     def _apply_backlight(self, now: float) -> None:
         """Drive the panel's backlight to the idle level, if it has one.
@@ -960,6 +993,92 @@ class ViewfinderLoop:
             return "Processing photo..."
         return PROCESSING_DOUBLE if snap.exposures_taken == 1 else PROCESSING_FIRST
 
+    # -- the settings menu ------------------------------------------------------
+
+    def _reset_armed(self, now: float) -> bool:
+        return self._reset_until is not None and now < self._reset_until
+
+    def _menu_rows(self, snap: Any, now: float) -> tuple[MenuRow, ...]:
+        """The menu's rows as they are now, in the spec's order."""
+        rows: list[MenuRow] = []
+        settings = self._settings
+        if settings is not None:
+            current = settings.current
+            if "save_dng" in self._menu_optional:
+                rows.append(MenuRow("save_dng", "SAVE DNG",
+                                    "ON" if current.save_dng else "OFF", True))
+            if "ae_constraint" in self._menu_optional:
+                rows.append(MenuRow("ae_constraint", "AE CONSTRAINT",
+                                    current.ae_constraint.upper(), True))
+            if "ae_metering" in self._menu_optional:
+                rows.append(MenuRow("ae_metering", "AE METERING",
+                                    current.ae_metering.upper(), True))
+        if self._upload is not None:
+            rows.append(MenuRow("upload", "UPLOAD", self._upload.status(), True))
+        network = dict(getattr(snap, "network", ()) or ())
+        rows.append(MenuRow("eth", "ETH", network.get("ETH") or "-", False))
+        rows.append(MenuRow("wlan", "WLAN", network.get("WLAN") or "-", False))
+        rows.append(MenuRow("look", "LOOK", self._look or STARTER_LOOK, False))
+        if self._menu_resettable:
+            rows.append(MenuRow("reset", "RESET",
+                                "TAP AGAIN" if self._reset_armed(now) else "TAP TWICE", True))
+        return tuple(rows)
+
+    @staticmethod
+    def _next(values: tuple, current: object) -> object:
+        """The value after ``current`` in ``values``, wrapping round."""
+        index = values.index(current) if current in values else -1
+        return values[(index + 1) % len(values)]
+
+    def _menu_tap(self, key: str, now: float) -> None:
+        """Act on a tap on the active row ``key``."""
+        settings = self._settings
+        if key == "upload":
+            self._upload.start()
+        elif key == "reset":
+            if self._reset_armed(now):
+                self._reset_until = None
+                settings.reset()
+            else:
+                self._reset_until = now + RESET_ARM_SECONDS
+        elif key == "save_dng":
+            settings.set(key, not settings.current.save_dng)
+        elif key == "ae_constraint":
+            settings.set(key, self._next(AE_CONSTRAINTS, settings.current.ae_constraint))
+        elif key == "ae_metering":
+            settings.set(key, self._next(AE_METERINGS, settings.current.ae_metering))
+
+    def _menu_step(self, snap: Any, tap: Tap | None, now: float) -> None:
+        """One step in MENU: the tap, then the page if it changed.
+
+        Asks for no frames (``step()`` cleared the request and this is not a
+        live step). A dark screen draws nothing and forgets the page pushed,
+        so the page is pushed again when it wakes.
+        """
+        if self._idle.screen(now) is Screen.OFF:
+            self._menu_shown = None
+            return
+        rows = self._menu_rows(snap, now)
+        if tap is not None:
+            target = menu_hit(tap.x, tap.y, len(rows), self._scale)
+            if target == DONE:
+                self.state = "LIVE"
+                self._reset_until = None
+                self._menu_shown = None
+                self._restart_rate_window()
+                return
+            if isinstance(target, int) and rows[target].active:
+                self._menu_tap(rows[target].key, now)
+                rows = self._menu_rows(snap, now)
+        finger = self._finger
+        pressed = finger is not None and menu_hit(
+            finger[0], finger[1], len(rows), self._scale) == DONE
+        page = (rows, pressed)
+        if page != self._menu_shown and self._show(
+                render_menu(rows, scale=self._scale, done_pressed=pressed)):
+            # Remembered only once pushed, so a refused page is tried again.
+            self._menu_shown = page
+
     # -- states -----------------------------------------------------------------
 
     def step(self) -> None:
@@ -988,6 +1107,10 @@ class ViewfinderLoop:
             self._seen_finished = snap.finished_count
             self._processing_shown = False
             self._flash = None
+            if self.state == "MENU":
+                # A GPIO or Stick shot: taken, but the menu stays open.
+                self._menu_step(snap, tap, now)
+                return
             job = snap.last_finished_job
             if job.state == "complete" and getattr(job.result, "exposure", None) == (1, 2):
                 self.state = "NOTICE"
@@ -999,6 +1122,9 @@ class ViewfinderLoop:
             self.state = "REVIEW"
             self._review_since = self._clock.monotonic()
             self._show(self._review_image(job))
+            return
+        if self.state == "MENU":
+            self._menu_step(snap, tap, now)
             return
         if self.state == "NOTICE":
             held = self._clock.monotonic() - self._notice_since
@@ -1023,6 +1149,13 @@ class ViewfinderLoop:
                 action = Action.NONE
             if action in PRESS_KEYS:
                 self._flash = (action, now + PRESS_FLASH_SECONDS)
+            if action is Action.MENU:
+                self.state = "MENU"
+                self._flash = None
+                self._reset_until = None
+                self._menu_shown = None
+                self._menu_step(snap, None, now)
+                return
             if action is Action.SHUTTER:
                 self._controller.submit(str(uuid.uuid4()))
                 # The still waits for the camera behind any preview read, so
@@ -1117,8 +1250,6 @@ class ViewfinderLoop:
                 tuning_mismatch=getattr(snap, "tuning_mismatch", False) is True,
                 # Changes at most once a minute; read like the count all the same.
                 disk_warning=getattr(snap, "disk_warning", ()),
-                # Changes only with a cable or a network; read like the count all the same.
-                network=getattr(snap, "network", ()),
             ),
             scale=self._scale,
         ))

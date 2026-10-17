@@ -448,3 +448,39 @@ def test_stream_info_to_dict_puts_tuning_sha1_right_after_tuning_file():
 def test_stream_info_to_dict_omits_tuning_sha1_when_unknown():
     info = StreamInfo(width=1, height=1, fps=1.0, fourcc="MJPG", raw_mjpeg=True)
     assert "tuning_sha1" not in info.to_dict()
+
+
+def test_stream_info_to_dict_puts_the_ae_modes_after_tuning_sha1():
+    info = StreamInfo(
+        width=4056, height=3040, fps=10.0, fourcc="RGB888", raw_mjpeg=False,
+        tuning_file="imx477.json", tuning_sha1="a" * 40, autofocus="none",
+        ae_constraint="shadows", ae_metering="matrix",
+    )
+    values = info.to_dict()
+    assert list(values) == [
+        "width", "height", "fps", "fourcc", "raw_mjpeg", "tuning_file", "tuning_sha1",
+        "ae_constraint", "ae_metering", "autofocus",
+    ]
+    assert values["ae_constraint"] == "shadows"
+    assert values["ae_metering"] == "matrix"
+
+
+def test_stream_info_to_dict_omits_unknown_ae_modes():
+    info = StreamInfo(width=1, height=1, fps=1.0, fourcc="MJPG", raw_mjpeg=True)
+    assert not {"ae_constraint", "ae_metering"} & set(info.to_dict())
+    info = StreamInfo(width=1, height=1, fps=1.0, fourcc="MJPG", raw_mjpeg=True,
+                      ae_metering="spot")
+    assert info.to_dict()["ae_metering"] == "spot"
+    assert "ae_constraint" not in info.to_dict()
+
+
+def test_fake_camera_stream_info_has_no_ae_modes():
+    assert not {"ae_constraint", "ae_metering"} & set(FakeCamera().stream_info.to_dict())
+
+
+def test_v4l2_stream_info_has_no_ae_modes(fake_capture):
+    data = _jpeg_bytes(synthetic_frame(48, 64))
+    fake_capture(buffers=[data] * 4)
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    assert not {"ae_constraint", "ae_metering"} & set(cam.stream_info.to_dict())
+    cam.close()

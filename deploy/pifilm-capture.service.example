@@ -37,7 +37,13 @@ EnvironmentFile=/etc/pifilm-capture.env
 # pin 40) and ground (pin 39) is pressed. With no button wired the pin just idles
 # high, so the flag is harmless; if the pin cannot be claimed the service logs one
 # warning line and carries on.
-ExecStart=/home/george/repos/pi-film-reversal/.venv/bin/pifilm-capture --no-preview --remote-listen 0.0.0.0:8765 --artifacts /home/george/repos/pi-film-reversal/pifilm/data --ups x728 --ae-constraint highlight --display waveshare35dsi --shutter-gpio 21 --no-dng
+# --nextcloud-env adds the viewfinder menu's UPLOAD row (docs/nextcloud-sync.md).
+# The service never reads that file: it only hands the path to the Nextcloud sync
+# it starts as a child for an upload. Drop the flag if Nextcloud is not set up.
+# --no-dng, --ae-constraint and --ae-metering are the starting values; a value
+# changed in the viewfinder's settings menu is kept in
+# ~/.local/state/pifilm/settings.json and wins over them (the journal says so).
+ExecStart=/home/george/repos/pi-film-reversal/.venv/bin/pifilm-capture --no-preview --remote-listen 0.0.0.0:8765 --artifacts /home/george/repos/pi-film-reversal/pifilm/data --ups x728 --ae-constraint highlight --display waveshare35dsi --shutter-gpio 21 --no-dng --nextcloud-env /home/george/repos/pi-film-reversal/.env
 Restart=on-failure
 RestartSec=3
 StandardInput=null
