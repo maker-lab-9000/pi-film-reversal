@@ -1,5 +1,6 @@
 import argparse
 import builtins
+import dataclasses
 import io
 import json
 import os
@@ -30,6 +31,7 @@ from pifilm.capture.gradequeue import read_entries, write_entry
 from pifilm.gpu.grader import GpuGrader
 from pifilm.gpu.shader import BACKEND
 from pifilm.grain import GrainParams
+from pifilm.halation import HalationParams
 from pifilm.imageio import load_rgb, save_jpeg
 from pifilm.lut import LUT3D
 from pifilm.normalize import NormalizeParams
@@ -253,6 +255,22 @@ def test_preview_frame_is_small_rgb(tmp_path, pipeline):
     session = _session(tmp_path, pipeline)
     assert session.preview_frame(graded=True).shape == (360, 640, 3)
     assert session.preview_frame(graded=False).shape == (360, 640, 3)
+
+
+def test_preview_frame_leaves_halation_and_grain_out(tmp_path, pipeline):
+    """The live view is a viewfinder: the quick grade and the photograph have the
+    halation, the live view does without it, as it does without the grain."""
+    calls = []
+
+    class Recording:
+        def process(self, rgb, **kwargs):
+            calls.append(kwargs)
+            return pipeline.process(rgb, **kwargs)
+
+    session = _session(tmp_path, pipeline)
+    session.pipeline = Recording()
+    session.preview_frame(graded=True)
+    assert calls and calls[-1]["halation"] is False and calls[-1]["grain"] is False
 
 
 def test_headless_loop_captures_on_space_and_quits_on_q(tmp_path, pipeline):
@@ -3996,3 +4014,42 @@ def test_nextcloud_env_without_a_display_makes_no_upload(tmp_path, monkeypatch):
     app.main(["--fake", "--no-preview", "--out", str(tmp_path),
               "--nextcloud-env", str(tmp_path / "nc.env")])
     assert made == []
+
+
+# --- halation in the records ---------------------------------------------------
+
+
+def _halation_pipeline(enabled=True):
+    look = dataclasses.replace(Artifacts.default(), halation=HalationParams(enabled=enabled))
+    return Pipeline(look)
+
+
+@pytest.mark.parametrize("grade", ["inline", "background"])
+def test_a_halation_look_names_its_halation_in_the_record(tmp_path, grade):
+    pipe = _halation_pipeline()
+    session = CaptureSession(FakeCamera([synthetic_frame(90, 160)]), pipe, tmp_path / "shots",
+                             now=lambda: FIXED, seed_rng=np.random.default_rng(0),
+                             background=grade == "background", state_dir=tmp_path / "state",
+                             log=lambda _: None)
+    session.capture()
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    keys = list(record)
+    assert record["halation_sha1"] == pipe.artifacts.halation.sha1
+    assert keys.index("halation_sha1") == keys.index("normalize_sha1") + 1
+    assert "halation" in record["stage_ms"]
+    stages = list(record["stage_ms"])
+    assert stages.index("normalize") < stages.index("halation") < stages.index("lut")
+
+
+@pytest.mark.parametrize("grade", ["inline", "background"])
+def test_a_look_without_halation_records_none(tmp_path, grade):
+    session = CaptureSession(FakeCamera([synthetic_frame(90, 160)]),
+                             _halation_pipeline(enabled=False), tmp_path / "shots",
+                             now=lambda: FIXED, seed_rng=np.random.default_rng(0),
+                             background=grade == "background", state_dir=tmp_path / "state",
+                             log=lambda _: None)
+    session.capture()
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    assert "halation_sha1" not in record and "halation" not in record["stage_ms"]

@@ -1,3 +1,4 @@
+import dataclasses
 import re
 
 import numpy as np
@@ -8,8 +9,9 @@ from pifilm.capture.camera import synthetic_frame
 from pifilm.gpu.grader import GpuError, GpuGrader
 from pifilm.gpu.shader import BACKEND
 from pifilm.grain import GrainParams
+from pifilm.halation import HalationParams, apply_cpu, prepare
 from pifilm.lut import LUT3D, sha1_hex
-from pifilm.normalize import NormalizeParams, stats_gains
+from pifilm.normalize import NormalizeParams, normalize_u8, stats_gains
 from pifilm.pipeline import Pipeline
 from tests.gpu_fakes import FakeDevice, tile_artifacts
 
@@ -198,8 +200,9 @@ class _Grader:
         self.asked.append((tuple(shape), ev, grain))
         return self.can
 
-    def grade(self, rgb_u8, gains, rng, *, grain=True, timings=None):
+    def grade(self, rgb_u8, gains, rng, *, grain=True, halation=True, timings=None):
         self.graded.append((gains, grain))
+        self.halation = halation
         if grain and rng is not None:
             rng.integers(0, 2048, 2)  # the placement draw, as the real grader makes it
             rng.integers(0, 8)
@@ -302,3 +305,100 @@ def test_used_is_filled_without_a_grader(pipeline):
     used = {}
     pipeline.process(_scene(), grain=False, used=used)
     assert used == {"backend": "cpu"}
+
+
+# --- halation ------------------------------------------------------------------
+
+
+def _halation_look():
+    return dataclasses.replace(Artifacts.default(), halation=HalationParams(enabled=True))
+
+
+def _a_frame_with_a_lamp(height=96, width=160):
+    """A dark frame with a 10 x 10 white square: something for a glow to grow round."""
+    frame = np.full((height, width, 3), 40, np.uint8)
+    frame[: height // 2] = 70   # uneven, so normalisation has a range to work on
+    top, left = height // 2 - 5, width // 2 - 5
+    frame[top:top + 10, left:left + 10] = 255
+    return frame
+
+
+def test_halation_runs_between_normalise_and_lut():
+    art = _halation_look()
+    frame = _a_frame_with_a_lamp()
+    pipe = Pipeline(art)
+    timings: dict = {}
+    got, info = pipe.process(frame, grain=False, timings=timings)
+    normalised, _ = normalize_u8(frame, art.normalize)
+    want = art.lut.apply_pillow(apply_cpu(normalised, prepare(normalised, art.halation)),
+                                art.lut.to_pillow())
+    assert np.array_equal(got[..., :3], want[..., :3])
+    # And it shows: not the grade without it.
+    plain = art.lut.apply_pillow(normalised, art.lut.to_pillow())
+    assert not np.array_equal(got, plain)
+    assert info["halation_sha1"] == art.halation.sha1
+    assert list(info).index("halation_sha1") == list(info).index("normalize_sha1") + 1
+    assert list(timings) == ["normalize", "halation", "lut"]
+
+
+def test_halation_false_and_a_look_without_it_are_todays_grade():
+    frame = _a_frame_with_a_lamp()
+    plain = Pipeline(Artifacts.default())
+    timings: dict = {}
+    a, info = plain.process(frame, grain=False, timings=timings)
+    assert "halation_sha1" not in info and "halation" not in timings
+    b, b_info = Pipeline(_halation_look()).process(frame, grain=False, halation=False,
+                                                   timings=timings)
+    assert np.array_equal(a, b)
+    assert "halation" not in timings
+    # The audit names the look's halation even when this call left it out.
+    assert b_info["halation_sha1"] == _halation_look().halation.sha1
+
+
+def test_halation_with_ev_compensation_uses_the_frame_the_lut_gets():
+    """The glow is made from the frame after the compensation is put back."""
+    from pifilm.pipeline import _ev_table
+    art = _halation_look()
+    frame = _a_frame_with_a_lamp()
+    timings: dict = {}
+    got, _ = Pipeline(art).process(frame, grain=False, ev=-1.0, timings=timings)
+    assert got.shape[:2] == frame.shape[:2] and "halation" in timings
+    normalised, _ = normalize_u8(_ev_table(1.0)[frame], art.normalize)
+    normalised = _ev_table(-1.0)[normalised]
+    want = art.lut.apply_pillow(apply_cpu(normalised, prepare(normalised, art.halation)),
+                                art.lut.to_pillow())
+    assert np.array_equal(got, want)
+
+
+def test_the_gpu_path_is_given_halation():
+    art = tile_artifacts(halation=HalationParams(enabled=True))
+    pipe = Pipeline(art)
+    frame = _a_frame_with_a_lamp()
+    device = FakeDevice()
+    grader = GpuGrader(art, device, log=lambda _: None)
+    used, timings = {}, {}
+    out, info = pipe.process(frame, rng=np.random.default_rng(3), timings=timings,
+                             grader=grader, used=used)
+    assert used == {"backend": BACKEND} and BACKEND == "gpu-2"
+    assert device.runs[-1]["halation"] is not None
+    assert "halation" in timings
+    assert info["halation_sha1"] == art.halation.sha1
+    cpu, cpu_info = pipe.process(frame, rng=np.random.default_rng(3))
+    assert info == cpu_info
+    diff = np.abs(out[..., :3].astype(int) - cpu.astype(int))
+    assert diff.mean() < 1.25
+    # halation=False reaches the grader too.
+    timings = {}
+    pipe.process(frame, rng=np.random.default_rng(3), timings=timings, halation=False,
+                 grader=grader)
+    assert device.runs[-1]["halation"] is None and "halation" not in timings
+
+
+def test_the_grader_is_told_whether_halation_will_run():
+    grader = _Grader()
+    Pipeline(_halation_look()).process(_scene(), grader=grader)
+    assert grader.halation is True
+    Pipeline(_halation_look()).process(_scene(), grader=grader, halation=False)
+    assert grader.halation is False
+    Pipeline(Artifacts.default()).process(_scene(), grader=grader)
+    assert grader.halation is False

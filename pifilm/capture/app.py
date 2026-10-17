@@ -102,8 +102,9 @@ grade is the first thing after it that can fail.
 The graded file is the same in both modes, byte for byte: same frame, same seed
 drawn at the same place in the seed stream, same pipeline call, same encoder. The
 quick grade is not that file. It has no grain and is normalised on the reduced
-frame, and it lives in the session's private temporary directory, never under
-``OUT``, so the Nextcloud sync never uploads it.
+frame (the look's halation too, which is sized in mm of the frame, so its glow is
+the same share of the picture), and it lives in the session's private temporary
+directory, never under ``OUT``, so the Nextcloud sync never uploads it.
 
 The record is written by the grade side, so it lands when the graded file does,
 in shot order (one worker). It gains ``shutter_to_ready_ms`` (shutter to the
@@ -144,10 +145,11 @@ GPU fails on is graded on the CPU in the same call, from the same seed, and one
 line in the log names it; it is never lost and never waits for another start.
 
 Every record of a graded photograph says what graded it: ``pipeline_backend`` is
-``"gpu-1"`` (the number is the shader's version) or ``"cpu"``. It is the newest
-field, so it comes last of the new ones: after ``stage_ms`` in an inline record,
-at the end of a background one. A GPU grade is not the CPU grade byte for byte
-(see ``pifilm.pipeline``), and this field is how ``pifilm-process`` knows.
+``"gpu-2"`` (``pifilm.gpu.shader.BACKEND``; the number is the shader's version)
+or ``"cpu"``. It is the newest field, so it comes last of the new ones: after
+``stage_ms`` in an inline record, at the end of a background one. A GPU grade is
+not the CPU grade byte for byte (see ``pifilm.pipeline``), and this field is how
+``pifilm-process`` knows.
 
 The tuning check
 ----------------
@@ -1106,8 +1108,10 @@ class CaptureSession:
         # cycle or DNG extraction cost; capture() below keeps the full=True default.
         small = _resize_to_fit(self.camera.read(full=False).rgb, size)
         if graded:
+            # The live view is a viewfinder: no grain and no halation. The quick
+            # grade and the photograph have the halation.
             small, _ = self.pipeline.process(
-                small, grain=False, ev=float(getattr(self.camera, "ev", 0.0)),
+                small, grain=False, halation=False, ev=float(getattr(self.camera, "ev", 0.0)),
             )
         return small
 
