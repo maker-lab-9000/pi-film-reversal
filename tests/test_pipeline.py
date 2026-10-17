@@ -402,3 +402,24 @@ def test_the_grader_is_told_whether_halation_will_run():
     assert grader.halation is False
     Pipeline(Artifacts.default()).process(_scene(), grader=grader)
     assert grader.halation is False
+
+
+def test_a_failed_gpu_grade_with_halation_is_the_cpu_grade_with_its_glow():
+    """The grader fails after its placement draw; the CPU grade that follows
+    has the glow and the grain of the same seed, as if no grader had been given."""
+    art = _halation_look()
+    assert art.grain.enabled and art.grain.strength > 0
+    pipe = Pipeline(art)
+    frame = _a_frame_with_a_lamp()
+    cpu = np.random.default_rng(13)
+    plain, plain_info = pipe.process(frame, rng=cpu)
+    no_glow, _ = pipe.process(frame, rng=np.random.default_rng(13), halation=False)
+    assert np.abs(plain.astype(int) - no_glow.astype(int)).max() > 5   # the glow is there
+    grader, used, timings = _Grader(fail=True), {}, {}
+    gpu = np.random.default_rng(13)
+    out, info = pipe.process(frame, rng=gpu, timings=timings, grader=grader, used=used)
+    assert len(grader.graded) == 1 and grader.halation is True
+    assert out.tobytes() == plain.tobytes() and info == plain_info
+    assert used["backend"] == "cpu" and "0x505" in used["gpu_error"]
+    assert cpu.bit_generator.state == gpu.bit_generator.state
+    assert list(timings) == ["normalize", "halation", "lut", "grain"]
