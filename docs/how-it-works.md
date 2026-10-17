@@ -211,7 +211,9 @@ move pixels: it was `gpu-1` until halation was added, for every photograph the G
 graded. A photograph graded with halation also has `halation_sha1` (a SHA-1 of the
 look's `halation` section, after `normalize_sha1`) on either path, and a
 `halation` stage in `stage_ms`; without halation the record is as before. A GPU grade adds the stages `gpu`, `gpu_upload`, `gpu_shader` and
-`gpu_readback` to `stage_ms` and has no `lut` or `grain` stage.
+`gpu_readback` to `stage_ms` and has no `lut` or `grain` stage. `gpu` is the whole
+GPU grade, so it includes `halation` (the glow, made on the CPU) as it includes the
+three `gpu_` stages: summing a GPU record's `stage_ms` counts them twice.
 
 **Reproducibility.** `pifilm-process` regrades on the CPU, from the saved original.
 For a USB camera that original is the camera's own JPEG, the very picture the Pi

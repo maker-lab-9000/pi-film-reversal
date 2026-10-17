@@ -226,6 +226,11 @@ class GpuGrader:
                         timings["halation"] = round(
                             (time.perf_counter() - started) * 1000.0, 1)
             except Exception as exc:  # noqa: BLE001 - one type leaves grade, see _run
+                # The glow is CPU work, but a failure here (a MemoryError, say) is
+                # counted below like the device's own, on purpose: the caller's CPU
+                # grade makes the same glow with the same ``prepare``, so a frame
+                # whose glow cannot be made fails there too, and three such frames in
+                # a row switching the GPU off costs speed, never a photograph.
                 raise GpuError(f"{type(exc).__name__}: {exc}") from exc
             out = self._run(rgb_u8, gains, params, placement, timings, hp)
         except GpuError:
