@@ -15,6 +15,7 @@ from pifilm.artifacts import (
     write_artifact,
 )
 from pifilm.grain import GrainParams
+from pifilm.halation import HalationParams
 from pifilm.lut import LUT3D, sha1_hex, write_cube
 from pifilm.normalize import NormalizeParams
 
@@ -421,3 +422,49 @@ def test_stamp_tuning_reports_a_temp_file_it_cannot_create(staged, monkeypatch):
     with pytest.raises(ArtifactsError, match="read-only"):
         stamp_tuning(staged, TUNING_SHA1)
     assert (staged / "params.json").read_bytes() == before
+
+
+def test_a_look_without_halation_loads_with_it_off(staged):
+    assert not Artifacts.load(staged).halation.active
+
+
+def test_halation_on_needs_version_5(staged):
+    raw = json.loads((staged / "params.json").read_text())
+    raw["halation"] = HalationParams(enabled=True).to_dict()
+    raw["version"] = 4
+    (staged / "params.json").write_text(json.dumps(raw))
+    with pytest.raises(ArtifactsError, match="halation.*version 5"):
+        Artifacts.load(staged)
+    raw["version"] = 5
+    (staged / "params.json").write_text(json.dumps(raw))
+    assert Artifacts.load(staged).halation == HalationParams(enabled=True)
+
+
+def test_halation_off_loads_at_an_older_version(staged):
+    raw = json.loads((staged / "params.json").read_text())
+    raw["halation"] = HalationParams(enabled=False).to_dict()
+    (staged / "params.json").write_text(json.dumps(raw))
+    assert not Artifacts.load(staged).halation.active
+
+
+def test_a_bad_halation_section_names_the_file(staged):
+    raw = json.loads((staged / "params.json").read_text())
+    raw["version"] = 5
+    raw["halation"] = {**HalationParams(enabled=True).to_dict(), "headroom": 2}
+    (staged / "params.json").write_text(json.dumps(raw))
+    with pytest.raises(ArtifactsError, match="params.json.*headroom"):
+        Artifacts.load(staged)
+    raw["halation"] = "on"
+    (staged / "params.json").write_text(json.dumps(raw))
+    with pytest.raises(ArtifactsError, match="halation"):
+        Artifacts.load(staged)
+
+
+def test_write_artifact_with_halation_writes_version_5(tmp_path):
+    base = Artifacts.default()
+    write_artifact(tmp_path / "a", base.lut, base.normalize, base.grain,
+                   halation=HalationParams(enabled=True))
+    raw = json.loads((tmp_path / "a" / "params.json").read_text())
+    assert raw["version"] == 5 and raw["halation"]["enabled"] is True
+    write_artifact(tmp_path / "b", base.lut, base.normalize, base.grain)
+    assert "halation" not in json.loads((tmp_path / "b" / "params.json").read_text())
