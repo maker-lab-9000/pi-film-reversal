@@ -37,7 +37,7 @@ python3.12 -m venv .venv
 
 # Tests. pyproject sets pytest `pythonpath = ["."]` because tests import `scripts/` and
 # `firmware/sticks3/scripts/` as namespace packages from the repo root.
-.venv/bin/pytest -q -m 'not slow'                     # ~85s, ~1430 tests
+.venv/bin/pytest -q -m 'not slow'                     # ~165s, ~2300 tests
 .venv/bin/pytest -q tests/test_lut.py                 # one file
 .venv/bin/pytest -q tests/test_lut.py -k identity     # one test by name
 .venv/bin/pytest -q -m slow                           # builds a wheel, installs into a temp venv, runs pifilm-process
@@ -117,9 +117,13 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
 - `halation.py`: `HalationParams` (the look's `halation` section; off by default, `model` "mix",
   strength 0.15, `sigma_mm` 0.25, `headroom` 0.5, weights 1.0/0.35/0.0) and the step: `prepare`
   makes the glow on the CPU (expand `x / (1 - c x)` through a 256-entry table, reduce by a whole
-  factor keeping four reduced pixels of sigma, three Gaussians at sigma, 2 and 4 sigma weighted
-  0.5/0.3/0.2), `apply_cpu` mixes it in (`x + strength * weights * (B - x)`, bilinear read-back)
-  and compresses with `x / (1 + c x)`. Global and linear, no threshold: a flat area is unchanged.
+  factor keeping two reduced pixels of sigma, `k = max(1, floor(sigma_px / 2))`, 3 on the quick
+  grade and 14 at 12 MP; three Gaussians at sigma, 2 and 4 sigma weighted 0.5/0.3/0.2, the two
+  wider ones on that copy reduced by a further 2 and 4 and read back bilinearly), `apply_cpu`
+  mixes it in (`x + strength * weights * (B - x)`) and compresses with `x / (1 + c x)`, in bands
+  of rows (`BAND_PIXELS`), each band's glow read by `glow_at` (the shader's bilinear read, which
+  `gpu/reference.py` calls too), sRGB encoded through a 65,536-entry table (within 0.03 of a level).
+  Global and linear, no threshold: a flat area is unchanged.
   Changing the fall-off, reduction or interpolation is a new model name. Chosen by eye:
   `docs/experiments/2026-10-17-halation.md`.
 - `lut.py`: `LUT3D` with `apply_numpy` (reference, used in tests/trainer) and `apply_pillow`

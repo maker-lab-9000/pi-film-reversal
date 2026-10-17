@@ -48,8 +48,15 @@ All in linear light, per channel, with `lin` the sRGB-decoded normalised frame:
    - `sigma` in pixels is `sigma_mm * max(H, W) / frame_width_mm`, the grain's scale,
      so the glow is the same share of the frame at any size (quick grade, batch,
      full photograph).
-   - `k = max(1, floor(sigma_px / 4))`: at least four reduced pixels of sigma. At
-     12 MP and 0.25 mm that is `k = 7`.
+   - `k = max(1, floor(sigma_px / 2))`: at least two reduced pixels of sigma. At
+     12 MP and 0.25 mm that is `k = 14`; on the quick grade (1014 px) `k = 3`.
+     **Amended (2026-10-17, final review):** it was `floor(sigma_px / 4)`, four
+     reduced pixels, `k = 7` at 12 MP. That left the quick grade (the review screen
+     and the Stick) unreduced, its blurs on the whole quick frame: 588 ms on the Pi 4
+     against 137 ms without halation, inside `shutter_to_ready_ms`. Against the
+     fall-off blurred on the full frame the glow at two pixels is within 6 % of its
+     peak, at most a level after the mix at the chosen strength. The model name stays
+     `"mix"`: nothing outside this branch used it.
 3. **Mix:** `x' = x + strength * weights * (B - x)`, the weights per channel. A flat
    area equals its own blur, so it is unchanged.
 4. **Compress:** `lin' = x' / (1 + c * x')`, the exact inverse of step 1, then back
@@ -110,8 +117,12 @@ code to expanded linear, `cv2.resize` with `INTER_AREA`, `cv2.GaussianBlur`).
 
 **CPU (`Pipeline.process`).** After `normalize_u8`: the glow, then steps 1, 3 and 4
 on the full frame (channels whose weight is 0 are skipped), worked in bands of rows
-so a 12 MP frame does not need a full-size float copy, rounded to bytes, then the LUT
-and grain as today. Stage `halation` in `stage_ms`.
+(`BAND_PIXELS`, as the GPU reference) so a 12 MP frame does not need a full-size float
+copy, rounded to bytes, then the LUT and grain as today. Each band reads its rows of
+the glow with `halation.glow_at`, the shader's bilinear read (which the reference
+calls too), so the bands give the whole frame's bytes; the sRGB encode is a
+65,536-entry table, within 0.03 of a level of the curve. Stage `halation` in
+`stage_ms`.
 
 **GPU.** When halation is on, the grader is given the glow with the tables: the CPU
 runs `normalize_u8` on the frame (it has only the statistics today), makes the glow,
@@ -149,7 +160,12 @@ real photograph:
   195, the float table about 120, the area reduction about 55, the blurs about 50); the
   whole grade about 1,040 ms, against about 650 ms without halation. The shader is
   264 ms against 245. Within 1 level of the reference (mean 0.007). The aim was 400 ms
-  for the glow; 450 is accepted: it is the background grade, the shutter is not slower.
+  for the glow; 450 was accepted as the background grade's. The shutter is not free of
+  it, though: the quick grade (the review screen and the Stick) runs on the capture
+  side and has halation, so its glow is inside `shutter_to_ready_ms`. That was 588 ms
+  against 137 without halation (`prepare` 331 ms on the unreduced quick frame,
+  `apply_cpu` 121 ms), which the two-pixel reduction rule and the banded, table-encoded
+  CPU mix address (measured after this change: see below).
 - **GPU path, a look without halation** (`gpu-2`): about 600 ms, as before; within 1
   level of the reference.
 - **CPU path** (the fallback, EV other than 0, `pifilm-process`): halation about 3.5 s,
@@ -158,7 +174,8 @@ real photograph:
 **Amended (2026-10-17, after the first measurement):** the glow first took 671 ms, 213
 of them the 4 sigma blur. The 2 sigma and 4 sigma terms are now blurred on the reduced
 copy further reduced by 2 and 4 (area mean), at the same width, and read back with
-bilinear interpolation: within 0.3 % of the glow's peak of the direct blur. The model
+bilinear interpolation: within 0.3 % of the glow's peak of the direct blur (up to 2 %
+once the reduction keeps two reduced pixels of sigma, the final-review amendment above). The model
 name stays `"mix"`: no look or record with halation existed before the change.
 
 ## The look
