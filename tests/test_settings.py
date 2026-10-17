@@ -219,7 +219,32 @@ def test_set_calls_the_applier_then_saves(tmp_path):
     assert calls == [(False, False)]
     assert control.current.save_dng is False
     assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1, "save_dng": False}
-    assert lines == []
+    assert lines == ["settings: dng off"]
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "line"),
+    [
+        ("ae_metering", "matrix", "settings: ae-metering matrix"),
+        ("ae_constraint", "shadows", "settings: ae-constraint shadows"),
+        ("save_dng", False, "settings: dng off"),
+        ("save_dng", True, "settings: dng on"),
+    ],
+)
+def test_set_logs_one_line_for_the_change(tmp_path, key, value, line):
+    control, _, lines = _control(tmp_path)
+    control.register(key, lambda value: None)
+    assert control.set(key, value) is True
+    assert lines == [line]
+
+
+def test_set_logs_the_change_after_the_applier_ran(tmp_path):
+    control, _, lines = _control(tmp_path)
+    seen = []
+    control.register("ae_metering", lambda value: seen.append(list(lines)))
+    control.set("ae_metering", "spot")
+    assert seen == [[]]
+    assert lines == ["settings: ae-metering spot"]
 
 
 def test_set_without_an_applier_still_saves(tmp_path):
@@ -253,7 +278,7 @@ def test_set_with_a_save_failure_keeps_the_change(tmp_path, monkeypatch):
     monkeypatch.setattr(settings_mod, "save", broken_save)
     assert control.set("ae_constraint", "normal") is True
     assert control.current.ae_constraint == "normal"
-    assert lines == ["settings: cannot save (disk full)"]
+    assert lines == ["settings: ae-constraint normal", "settings: cannot save (disk full)"]
     assert not path.exists()
 
 

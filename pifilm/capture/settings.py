@@ -189,13 +189,17 @@ class SettingsControl:
         return True
 
     def set(self, key: str, value: object) -> bool:
-        """Apply ``value`` and remember it. True when applied."""
+        """Apply ``value``, log it and remember it. True when applied."""
         if key not in KEYS:
             raise ValueError(f"unknown setting {key!r}")
         if not _valid(key, value):
             raise ValueError(f"invalid value {value!r} for {key}")
         if not self._apply(key, value):
             return False
+        # One line per change, so the journal shows the menu took effect (the
+        # Pi's frame metadata does not report the AE modes); before the save,
+        # whose failure keeps its own line.
+        self._log(f"settings: {_describe(key, value)}")
         self._current = replace(self._current, **{key: value})
         if value == getattr(self._defaults, key):
             self._overrides.pop(key, None)
