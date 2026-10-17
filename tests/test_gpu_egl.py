@@ -183,8 +183,13 @@ def _ready(libs) -> egl.EglDevice:
     device = egl.open_device()
     device.load_lut(_lut())
     device.load_tile(np.zeros((8, 8), np.float32))
+    device.load_glow(None)
     device.load_tables(_tables())
     return device
+
+
+def _glow(height: int = 3, width: int = 5) -> np.ndarray:
+    return np.random.default_rng(3).random((height, width, 3)).astype(np.float32)
 
 
 def _frame(height: int = 4, width: int = 6) -> np.ndarray:
@@ -194,7 +199,8 @@ def _frame(height: int = 4, width: int = 6) -> np.ndarray:
 def _uniform(libs, name: bytes):
     location = libs.uniforms[name]
     values = [args[1:] for call, args in libs.calls
-              if call in ("glUniform1i", "glUniform2i") and args[0] == location]
+              if call in ("glUniform1i", "glUniform2i", "glUniform1f", "glUniform3f")
+              and args[0] == location]
     return values[-1]
 
 
@@ -283,6 +289,9 @@ def test_pointer_arguments_are_declared(libs):
     assert libs.eglDestroyContext.argtypes == [ctypes.c_void_p] * 2
     for name in ("glTexSubImage2D", "glTexSubImage3D", "glReadPixels"):
         assert getattr(libs, name).argtypes[-1] is ctypes.c_void_p
+    # A Python float is refused by an undeclared function; these take floats.
+    assert libs.glUniform1f.argtypes == [ctypes.c_int, ctypes.c_float]
+    assert libs.glUniform3f.argtypes == [ctypes.c_int] + [ctypes.c_float] * 3
 
 
 def test_a_missing_library_is_a_gpu_error(monkeypatch):
@@ -379,6 +388,11 @@ def test_the_tables_are_made_once_and_then_only_refilled(libs):
                                        gain=np.zeros(256, np.float32))),
     lambda d: d.load_tile(np.zeros((8, 9), np.float32)),
     lambda d: d.load_lut(np.zeros((5, 5, 4, 3), np.float32)),
+    lambda d: d.load_glow(np.zeros((3, 5), np.float32)),
+    lambda d: d.load_glow(np.zeros((3, 5, 4), np.float32)),
+    lambda d: d.load_glow(np.zeros((3, 5, 3), np.float64)),
+    lambda d: d.load_glow(np.zeros((3, 5000, 3), np.float32)),
+    lambda d: d.load_glow(np.zeros((0, 5, 3), np.float32)),
 ])
 def test_a_table_of_the_wrong_shape_is_refused_before_any_upload(libs, bad):
     device = egl.open_device()
@@ -429,8 +443,9 @@ def test_a_pass_uploads_three_bytes_draws_and_reads_back_four(libs):
     assert _uniform(libs, b"S") == (8,)
     # Each sampler has its own unit.
     samplers = [_uniform(libs, name)[0]
-                for name in (b"img", b"chan", b"tone", b"lut", b"gain", b"tile")]
-    assert samplers == [0, 1, 2, 3, 4, 5]
+                for name in (b"img", b"chan", b"tone", b"lut", b"gain", b"tile", b"glow")]
+    assert samplers == [0, 1, 2, 3, 4, 5, 6]
+    assert _uniform(libs, b"use_halation") == (0,)
 
 
 def test_a_pass_without_grain_or_tone_says_so_to_the_shader(libs):
@@ -439,6 +454,56 @@ def test_a_pass_without_grain_or_tone_says_so_to_the_shader(libs):
     assert _uniform(libs, b"use_grain") == (0,)
     assert _uniform(libs, b"use_tone") == (0,)
     assert _uniform(libs, b"offset") == (0, 0)
+    assert _uniform(libs, b"use_halation") == (0,)
+
+
+def test_a_pass_with_halation_sets_its_uniforms(libs):
+    device = _ready(libs)
+    device.load_glow(_glow())
+    device.run(_frame(), use_tone=False, placement=None,
+               halation=(0.5, np.array([0.15, 0.0525, 0.0], np.float32)))
+    assert _uniform(libs, b"use_halation") == (1,)
+    assert _uniform(libs, b"hr") == (0.5,)
+    hw = _uniform(libs, b"hw")
+    assert len(hw) == 3 and np.allclose(hw, (0.15, 0.0525, 0.0))
+    assert all(type(v) is float for v in (*_uniform(libs, b"hr"), *hw))
+    # And the next pass without it says so.
+    device.run(_frame(), use_tone=False, placement=None)
+    assert _uniform(libs, b"use_halation") == (0,)
+
+
+def test_the_glow_is_a_float_rgb_texture_of_its_size_and_none_is_one_zero(libs):
+    device = egl.open_device()
+    device.load_glow(None)
+    glow = _glow()
+    device.load_glow(glow)
+    assert libs.args_of("glTexStorage2D") == [
+        (GL_TEXTURE_2D, 1, GL_RGB32F, 1, 1), (GL_TEXTURE_2D, 1, GL_RGB32F, 5, 3)]
+    assert libs.uploads[f"1x1:{GL_RGB:x}"] == b"\0" * 12
+    assert libs.uploads[f"5x3:{GL_RGB:x}"] == glow.tobytes()
+    assert len(libs.args_of("glDeleteTextures")) == 1      # the placeholder, replaced
+
+
+def test_a_glow_of_the_same_size_is_refilled_and_another_size_remade(libs):
+    device = egl.open_device()
+    device.load_glow(_glow())
+    device.load_glow(_glow() * 2)
+    assert len(libs.args_of("glTexStorage2D")) == 1
+    assert len(libs.args_of("glTexSubImage2D")) == 2
+    assert libs.args_of("glDeleteTextures") == []
+    assert libs.uploads[f"5x3:{GL_RGB:x}"] == (_glow() * 2).tobytes()
+    device.load_glow(_glow(4, 6))
+    assert libs.args_of("glTexStorage2D")[-1] == (GL_TEXTURE_2D, 1, GL_RGB32F, 6, 4)
+    assert len(libs.args_of("glDeleteTextures")) == 1
+
+
+def test_a_pass_without_the_glow_is_refused(libs):
+    device = egl.open_device()
+    device.load_lut(_lut())
+    device.load_tile(None)
+    device.load_tables(_tables())
+    with pytest.raises(GpuError, match="not loaded: glow"):
+        device.run(_frame(), use_tone=False, placement=None)
 
 
 def test_the_frames_textures_are_kept_for_the_same_size_and_remade_for_another(libs):
@@ -554,6 +619,7 @@ def test_an_incomplete_framebuffer_reports_the_gl_error_behind_it_and_leaves_no_
     (lambda d: d.load_tables(_tables()), ("chan", "tone", "gain"), "glTexStorage2D"),
     (lambda d: d.load_tile(np.zeros((8, 8), np.float32)), ("tile",), "glTexStorage2D"),
     (lambda d: d.load_lut(_lut()), ("lut",), "glTexStorage3D"),
+    (lambda d: d.load_glow(_glow()), ("glow",), "glTexStorage2D"),
 ])
 def test_a_load_that_fails_leaves_no_texture_and_the_next_load_starts_clean(
         libs, load, names, storage):

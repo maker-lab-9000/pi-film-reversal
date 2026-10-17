@@ -3,7 +3,7 @@
 The real device (``pifilm.gpu.egl``) cannot run on a Mac. This one computes
 what the shader would, with switches for the ways a real one goes wrong: a
 graphics error on chosen runs, pixels off by some levels, a pass that leaves
-out the grain or the tone curve.
+out the grain, the tone curve or the halation.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from pifilm.artifacts import Artifacts
 from pifilm.gpu.grader import GpuError
 from pifilm.gpu.reference import reference_pass
 from pifilm.grain import GrainParams
+from pifilm.halation import HalationPass
 
 TILE_GRAIN = GrainParams(model="two_scale_tile", strength=0.025, tile_px=256)
 
@@ -30,17 +31,21 @@ class FakeDevice:
     renderer = "Fake GPU"
 
     def __init__(self, *, max_texture: int = 4096, off_by: int = 0,
-                 skip_grain: bool = False, skip_tone: bool = False) -> None:
+                 skip_grain: bool = False, skip_tone: bool = False,
+                 skip_halation: bool = False) -> None:
         self.max_texture = max_texture
         self.off_by = off_by
         self.skip_grain = skip_grain
         self.skip_tone = skip_tone
+        self.skip_halation = skip_halation
         self.fail_next = 0            # this many coming runs raise GpuError
         self.error: Exception | None = None   # raised instead of GpuError when set
         self.lut = None
         self.tile = None
         self.tables = None
         self.tile_loads: list[tuple[int, int] | None] = []
+        self.glow = None              # None: the placeholder, one zero texel
+        self.glow_loads: list[tuple[int, ...] | None] = []
         self.table_loads = 0
         self.runs: list[dict] = []
         self.threads: set[int] = set()
@@ -63,19 +68,28 @@ class FakeDevice:
         self.tile = tile
         self.tile_loads.append(None if tile is None else tile.shape)
 
-    def run(self, rgb_u8, *, use_tone, placement, timings=None) -> np.ndarray:
+    def load_glow(self, glow: np.ndarray | None) -> None:
+        self._seen()
+        self.glow = glow
+        self.glow_loads.append(None if glow is None else glow.shape)
+
+    def run(self, rgb_u8, *, use_tone, placement, timings=None, halation=None) -> np.ndarray:
         self._seen()
         if self.closed:
             raise GpuError("the device is closed")
         self.runs.append({"shape": rgb_u8.shape, "use_tone": use_tone, "placement": placement,
-                          "gain": self.tables.gain.copy()})
+                          "gain": self.tables.gain.copy(), "halation": halation})
         if self.fail_next > 0:
             self.fail_next -= 1
             raise self.error or GpuError("GL error after grading: 0x505")
         tables = dataclasses.replace(self.tables, use_tone=use_tone and not self.skip_tone)
         grain = placement is not None and not self.skip_grain
+        hp = None
+        if halation is not None and not self.skip_halation:
+            glow = self.glow if self.glow is not None else np.zeros((1, 1, 3), np.float32)
+            hp = HalationPass(glow=glow, headroom=halation[0], mix=halation[1])
         rgb = reference_pass(rgb_u8, tables, self.lut, self.tile if grain else None,
-                             placement if grain else None)
+                             placement if grain else None, halation=hp)
         if self.off_by:
             # Towards the middle, so the shift is never lost to clipping.
             wide = rgb.astype(np.int16)

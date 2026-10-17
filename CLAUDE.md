@@ -37,7 +37,7 @@ python3.12 -m venv .venv
 
 # Tests. pyproject sets pytest `pythonpath = ["."]` because tests import `scripts/` and
 # `firmware/sticks3/scripts/` as namespace packages from the repo root.
-.venv/bin/pytest -q -m 'not slow'                     # ~85s, ~1430 tests
+.venv/bin/pytest -q -m 'not slow'                     # ~165s, ~2300 tests
 .venv/bin/pytest -q tests/test_lut.py                 # one file
 .venv/bin/pytest -q tests/test_lut.py -k identity     # one test by name
 .venv/bin/pytest -q -m slow                           # builds a wheel, installs into a temp venv, runs pifilm-process
@@ -54,6 +54,7 @@ python3.12 -m venv .venv
 .venv/bin/pifilm-tuning [--tuning-file NAME] [--stamp DIR]          # tuning fingerprint; stamp a look (Pi; --sha1 HEX on the Mac)
 .venv/bin/pifilm-train --source data/source --target data/references --out artifacts/pifilm-v1
 .venv/bin/pifilm-fetch --category 'Category:...'                   # Wikimedia Commons corpus fetch
+.venv/bin/python scripts/stamp_halation.py --artifacts DIR [--strength S] [--sigma-mm M] [--headroom C] [--off]
 
 # Experiments have no console scripts; run as modules from the repo root
 .venv/bin/python -m pifilm.experiments.{regression,candidates,train,evaluate} ...
@@ -92,12 +93,15 @@ python3 scripts/pi_journal.py --report     # starts, stalls, error exits per boo
 ### Processing core (`pifilm/`, runs on the Pi; NumPy + Pillow + OpenCV only)
 
 `Pipeline.process()` in `pipeline.py` is the single grading path for captures, previews, and batch:
-**normalize → LUT → grain**, in that fixed order. Normalization runs first because the LUT was
-fitted on normalized input; grain runs last because it models developed film.
-`process(..., grader=, used=)` can hand the three steps to a GPU grader as one pass; the statistics
+**normalize → halation → LUT → grain**, in that fixed order. Normalization runs first because the
+LUT was fitted on normalized input; halation (only when the look turns it on) comes before the LUT
+because the glow forms at exposure; grain runs last because it models developed film.
+`process(..., halation=False)` leaves halation out, as `grain=False` leaves grain (the live view
+does both; the quick grade and the photograph have halation).
+`process(..., grader=, used=)` can hand the steps to a GPU grader as one pass; the statistics
 stay on the CPU, so the audit fields are the same on both paths. The grader is asked first
 (`can_grade`), a `GpuError` falls back to the CPU for the same frame with the generator's state
-restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, and a GPU result is
+restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, and a GPU result is
 (H, W, 4) with an unused fourth byte. Without a grader nothing differs.
 
 - `normalize.py`: per-image white balance and exposure/levels normalization. The trainer applies the
@@ -110,6 +114,18 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   `model="two_scale_tile"` is the same HP5 grain laid down from a noise tile built once
   (`tile_px` square, seamless, fixed seed) and placed per shot by the seed (offset and one of
   eight orientations); about a tenth of the time, different pixels, so its own model and version.
+- `halation.py`: `HalationParams` (the look's `halation` section; off by default, `model` "mix",
+  strength 0.15, `sigma_mm` 0.25, `headroom` 0.5, weights 1.0/0.35/0.0) and the step: `prepare`
+  makes the glow on the CPU (expand `x / (1 - c x)` through a 256-entry table, reduce by a whole
+  factor keeping two reduced pixels of sigma, `k = max(1, floor(sigma_px / 2))`, 3 on the quick
+  grade and 14 at 12 MP; three Gaussians at sigma, 2 and 4 sigma weighted 0.5/0.3/0.2, the two
+  wider ones on that copy reduced by a further 2 and 4 and read back bilinearly), `apply_cpu`
+  mixes it in (`x + strength * weights * (B - x)`) and compresses with `x / (1 + c x)`, in bands
+  of rows (`BAND_PIXELS`), each band's glow read by `glow_at` (the shader's bilinear read, which
+  `gpu/reference.py` calls too), sRGB encoded through a 65,536-entry table (within 0.03 of a level).
+  Global and linear, no threshold: a flat area is unchanged.
+  Changing the fall-off, reduction or interpolation is a new model name. Chosen by eye:
+  `docs/experiments/2026-10-17-halation.md`.
 - `lut.py`: `LUT3D` with `apply_numpy` (reference, used in tests/trainer) and `apply_pillow`
   (C fast path, used on the Pi). Both `.cube` and Pillow order the flat table red-fastest.
   `sha1_hex` is the LUT content identity.
@@ -120,6 +136,9 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   the libcamera tuning the look was trained under; `stamp_tuning` writes it into `params.json`
   (temp file + `os.replace`, other keys and the file mode kept, loaded before and after).
   Older builds ignore it, so no params version change.
+  An optional `halation` section (`Artifacts.halation`); switched on it needs params version 5.
+  `stamp_halation` (`scripts/stamp_halation.py`) writes it the same way as `stamp_tuning` and
+  raises the version to 5 when it is on (never lowers it).
 - `tuning.py`: the tuning fingerprint (SHA-1 of the parsed JSON with sorted keys and no
   whitespace), `resolve` (the dict the camera is opened with for `--tuning-file`, else
   `<model>.json`; a failure there is a reason, not an error; `LIBCAMERA_RPI_TUNING_FILE` is
@@ -127,7 +146,10 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   and `check` (the `tuning:` log line). No Picamera2 import; `pifilm-tuning` is
   `capture/tuningcli.py`.
 - `gpu/`: the grade as one pass on the Pi 4's GPU. `shader.py` is the GLSL and `SHADER_VERSION`
-  (`BACKEND` is `"gpu-1"`; any change that can move pixels raises it). `reference.py` is the same
+  (`BACKEND` is `"gpu-2"` since halation; any change that can move pixels raises it). With a
+  look's halation on, the grader normalises on the CPU, makes the glow with `halation.prepare` and
+  uploads it as a small float texture the shader reads bilinearly by hand (a one-texel
+  placeholder otherwise); the self-test runs the step too. `reference.py` is the same
   pass in NumPy, the definition the tests and the self-test hold the GPU to. `grader.py` is
   `GpuGrader`: a self-test at set-up (a 96 x 64 frame against the reference, at most 1 level),
   one thread only (another thread is told it cannot grade), every failure a `GpuError`, three in
@@ -179,8 +201,9 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   terminal. `--display waveshare35dsi` (or `waveshare28`) runs the LCD viewfinder instead of any
   OpenCV window. Output:
   `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,graded|double_graded}.jpg` plus an audit
-  line in `captures.jsonl` (LUT hash, normalisation hash and grain seed allow regenerating the
-  graded file). `--grade background` (the default) splits a shot into two sides: the
+  line in `captures.jsonl` (LUT hash, normalisation hash, halation hash and grain seed allow
+  regenerating the graded file; `halation_sha1` follows `normalize_sha1` only for a look with
+  halation on; `params_version` is the build's `PARAMS_VERSION`, 5, whatever the look's). `--grade background` (the default) splits a shot into two sides: the
   capture side saves the original, writes a pending entry, makes a quick grade (reduced by a whole
   factor to about 1,000 px on the long side, no grain; what the review screen and the Stick show) and frees the camera;
   the grade side (`_run_grade`, on the queue's worker) grades at full size, saves the graded
@@ -207,9 +230,9 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   (`~/.local/state/pifilm/gpu-opening`) before the open and removes it when the open returns; a
   start that finds the marker logs one `gpu grading off: ...` line naming it, grades on the CPU
   and leaves it for a person to delete. Every record of a graded photograph has `pipeline_backend`
-  (`"gpu-1"` or `"cpu"`): after `stage_ms` in an inline record, last in a background one. Each record also carries `stage_ms`, the
-  milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, LUT,
-  grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`
+  (`"gpu-2"`, `"gpu-1"` before halation, or `"cpu"`): after `stage_ms` in an inline record, last in a background one. Each record also carries `stage_ms`, the
+  milliseconds each stage of the shot took (camera request, array copy, DNG, normalise, halation,
+  LUT, grain, each file write); `docs/superpowers/plans/2026-10-13-pipeline-improvements-roadmap.md`
   is the plan those numbers feed. At start-up the session checks the camera's tuning
   fingerprint against the look's `tuning_sha1` (warn only, never refuses to start): one
   `tuning:` line, `tuning_matches` right after the camera fields in every record when both
@@ -370,8 +393,10 @@ be launched from the Pi's desktop session, not over SSH. Full guide: `docs/stick
   it as `KEY=VALUE` data only; never source it or echo values. Never put the token, Wi-Fi password,
   or SSH password into a command line, source file, service unit, or commit.
 - `params.json` `version` follows the grain model (`GRAIN_MODEL_VERSIONS`): 2 for Gaussian,
-  3 for `two_scale`, 4 for `two_scale_tile`, so an older build refuses grain it would misread.
-  The loader reads 1 to `PARAMS_VERSION` (4). `lut_sha1` is required.
+  3 for `two_scale`, 4 for `two_scale_tile`, so an older build refuses grain it would misread;
+  5 when halation is on (`HALATION_VERSION`), so an older build refuses a look it would grade
+  without the glow. A look without halation keeps its version and its pixels.
+  The loader reads 1 to `PARAMS_VERSION` (5). `lut_sha1` is required.
 - Module docstrings carry the design rationale (why an order is fixed, why a check exists). Read them
   before changing behaviour; many encode failures found on real hardware.
 - Reference photographs must be credited to Martin Parr from primary sources with permission;

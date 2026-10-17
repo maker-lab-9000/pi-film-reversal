@@ -421,11 +421,11 @@ def stats_gains(
     return compute_gains(rgb_u8[::step, ::step].astype(np.float32) / 255.0, params)
 
 
-def normalize_u8(
-    rgb_u8: np.ndarray, params: NormalizeParams, max_stats_pixels: int = 300_000
-) -> tuple[np.ndarray, Gains]:
-    """Fast path for the Pi: statistics from a strided subsample, applied with ``cv2.LUT``."""
-    gains = stats_gains(rgb_u8, params, max_stats_pixels)
+def apply_gains_u8(rgb_u8: np.ndarray, gains: Gains) -> np.ndarray:
+    """``normalize_u8``'s second half: the tables of ``gains`` applied with ``cv2.LUT``.
+
+    On its own because halation on the GPU path needs the normalised frame, and the
+    statistics there are already computed (``stats_gains``)."""
     table = np.ascontiguousarray(gains_to_luts(gains).T).reshape(256, 1, 3)
     out = cv2.LUT(np.ascontiguousarray(rgb_u8), table)
     ylut = tone_lut(gains)
@@ -433,4 +433,12 @@ def normalize_u8(
         ycc = cv2.cvtColor(out, cv2.COLOR_RGB2YCrCb)
         ycc[..., 0] = cv2.LUT(ycc[..., 0], ylut)
         out = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2RGB)
-    return out, gains
+    return out
+
+
+def normalize_u8(
+    rgb_u8: np.ndarray, params: NormalizeParams, max_stats_pixels: int = 300_000
+) -> tuple[np.ndarray, Gains]:
+    """Fast path for the Pi: statistics from a strided subsample, applied with ``cv2.LUT``."""
+    gains = stats_gains(rgb_u8, params, max_stats_pixels)
+    return apply_gains_u8(rgb_u8, gains), gains

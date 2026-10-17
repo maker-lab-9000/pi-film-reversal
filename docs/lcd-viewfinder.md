@@ -707,7 +707,7 @@ first, so that `pifilm-gpu-check` exists.
 | --- | --- | --- |
 | 1 | The service starts with the display on. The journal has `gpu grading on (..., self-test passed)`. This is the first time the GPU context runs beside the display in one process. If the start hangs here, the next start logs `gpu grading off: the last start did not finish opening the GPU; delete <path> to try again` and grades on the CPU: note it, and delete the file only to try again | |
 | 2 | `pifilm-gpu-check --artifacts DIR --image FILE` on a real photograph: within 1 level of the reference, and timings near the spike's (upload 142 ms, shader 239 ms, read-back 180 ms) | |
-| 3 | Ten photographs: every record has `pipeline_backend: gpu-1`; `stage_ms` shows the grade near 0.7 s (`normalize` plus `gpu`); the graded files look right at 100 %, grain included | |
+| 3 | Ten photographs: every record has `pipeline_backend: gpu-2`; `stage_ms` shows the grade near 0.6 s without halation, about 1.0 s with (`normalize` plus `gpu`); the graded files look right at 100 %, grain included | |
 | 4 | A double exposure and a Stick shot work as before | |
 | 5 | `--grade-backend cpu`: records have `pipeline_backend: cpu`, and the timings are as before | |
 | 6 | `pifilm-process` on today's folder: it runs, and prints the note about the records graded on the GPU | |

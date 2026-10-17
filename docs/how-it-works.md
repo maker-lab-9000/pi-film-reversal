@@ -10,8 +10,9 @@ machine-learning runtime installed.
 
 ## At capture time, on the Pi
 
-Every graded frame goes through three steps, in a fixed order, in
-`pifilm/pipeline.py`:
+Every graded frame goes through four steps, in a fixed order, in
+`pifilm/pipeline.py`: normalise, halation, LUT, grain. Halation is part of a look
+and off unless the look turns it on; a look without it has the other three only.
 
 1. **Normalisation** (`pifilm/normalize.py`). Per-frame white balance (when the
    artifact enables it) and an exposure or levels correction, computed in
@@ -40,10 +41,32 @@ Every graded frame goes through three steps, in a fixed order, in
    `normalize` and delete (or set to `null`) `"levels_lift_highlight_ref"` —
    and pass `--artifacts DIR`. Editing `params.json` is safe here because
    `lut_sha1` covers only the `.cube`, not the normalisation block.
-2. **The 3D LUT** (`pifilm/lut.py`). Trilinear interpolation over the 35,937
+2. **Halation** (`pifilm/halation.py`), when the look has it. On colour film,
+   light reflects off the film base back through the red-sensitive layer, so
+   bright highlights grow a soft red-orange glow. The step mixes a blurred copy
+   of the whole frame into red and a little green, in linear light, with no
+   threshold: a flat area equals its own blur and is unchanged. The camera's
+   JPEG has clipped its highlights, so before the mix each value is expanded
+   (`x / (1 - c x)`, white counting as 2x at the chosen `headroom` of 0.5) and
+   after it compressed back exactly (`y / (1 + c y)`); without that a lamp is
+   no brighter than white paper and has no halo. The blur is three Gaussians
+   (`sigma`, `2 sigma`, `4 sigma`, weighted 0.5, 0.3, 0.2, about an exponential
+   fall-off), with `sigma` in mm of a 36 mm frame (0.25 mm), so the glow is the
+   same share of the picture at any size. It runs on a copy reduced by a whole
+   factor and is read back with bilinear interpolation, so the blur is cheap. On
+   the Pi 4 the quick grade (1014 x 760, on the capture side) takes 279 ms with
+   halation against 133 ms without, so a shot is ready about 146 ms later; at
+   12 MP the glow takes 437 ms on the GPU path and the step about 1.9 s on the CPU.
+   It comes after normalisation and before the LUT because the glow forms as the
+   film is exposed, and the LUT's roll-off then treats it as any other light.
+   It is set in the look's `halation` section of `params.json` (params version
+   5; `scripts/stamp_halation.py` writes it), and chosen by eye: see
+   [the write-up](experiments/2026-10-17-halation.md). The live view leaves it
+   out, as it leaves out grain; the quick grade and the photograph have it.
+3. **The 3D LUT** (`pifilm/lut.py`). Trilinear interpolation over the 35,937
    nodes, executed by Pillow's `ImageFilter.Color3DLUT` in C with 16-bit fixed
    point. A NumPy reference implementation exists for tests and the trainer.
-3. **Grain** (`pifilm/grain.py`). Gaussian noise on luminance only, blurred by
+4. **Grain** (`pifilm/grain.py`). Gaussian noise on luminance only, blurred by
    `blur_sigma` so it clumps like film rather than looking like sensor noise,
    scaled by `4Y(1 − Y)` so it vanishes in deep shadow and blown highlights.
    The seed is recorded per capture, so any graded file can be regenerated
@@ -58,7 +81,8 @@ frame that ran out of gain (`MAX` in the `ISO` cell) is normalised like any dark
 
 ### The order of a shot
 
-The three steps above take about 2 s on a full-resolution frame on the Pi 4. By
+The steps above take about 1.85 s on a full-resolution frame on the Pi 4's CPU
+(about 3.0 s when the look has halation). By
 default (`--grade background`) the camera does not wait for them:
 
 1. The frame is read and the original JPEG is saved (and the DNG, when enabled),
@@ -135,9 +159,11 @@ See [known issues](known-issues.md#a-libcamera-update-could-silently-retune-a-de
 
 ### Grading on the GPU
 
-On the Pi 4 the grade worker can do the three steps as one pass on the GPU
-(`pifilm/gpu/`). Measured on 2026-10-13 with the IMX477 at 12 MP: about 0.67 s
-against 1.73 s on the CPU. The camera is already free by then, so the wait between
+On the Pi 4 the grade worker can do the steps as one pass on the GPU
+(`pifilm/gpu/`). Measured with the IMX477 at 12 MP: about 0.6 s for a look without
+halation (0.67 s against 1.73 s on the CPU on 2026-10-13), and about 1.03 s with
+halation against about 3.0 s on the CPU (2026-10-18), the glow made on the CPU 437 ms
+of it. The camera is already free by then, so the wait between
 photographs does not change. The graded file exists about a second sooner and a
 burst drains faster.
 
@@ -152,8 +178,11 @@ the CPU and the composite is then graded like any other frame.
 
 **The pass.** The statistics (white balance, levels) are measured on the CPU by the
 same code as before, so the audit fields of a record are the same whichever path
-graded. The shader then does, per pixel and in float: the per-channel
-normalisation tables, the luma tone curve, the 3D LUT with trilinear interpolation
+graded. When the look has halation, the CPU also normalises the frame and makes
+the glow from it, the reduced and blurred copy, by the same code as the CPU path,
+and hands it to the GPU as a small float texture (stage `halation`). The shader
+then does, per pixel and in float: the per-channel normalisation tables, the luma
+tone curve, the halation mix (the glow read bilinearly by hand), the 3D LUT with trilinear interpolation
 written out in the shader (never the GPU's own filtering), and the grain, from the
 same tile placed by the same seed as on the CPU. It rounds to bytes once, at the
 end. The CPU path rounds after normalising, after the tone curve, after the LUT
@@ -161,7 +190,8 @@ and in the grain.
 
 **The self-test.** The GPU code cannot run in the test suite, so the service checks
 it at every start. The grader grades a 96 × 64 frame with a 64 px grain tile and
-compares it with a NumPy version of the same pass (`pifilm/gpu/reference.py`).
+compares it with a NumPy version of the same pass (`pifilm/gpu/reference.py`),
+halation included when the look has it.
 More than 1 level of difference anywhere, or any graphics error, and GPU grading is
 off for this run. The log has one line either way: `gpu grading on (...)` or
 `gpu grading off: ...` with the reason. The service starts in both cases.
@@ -180,10 +210,15 @@ same seed, so it is never lost and never waits. The log names it
 (`gpu grade failed (...)`). Three failures in a row switch the GPU off for the run.
 Nothing shows on the screen.
 
-**The record.** Every record of a graded photograph has `pipeline_backend`: `gpu-1`
+**The record.** Every record of a graded photograph has `pipeline_backend`: `gpu-2`
 or `cpu`. The number is the shader's version and rises with any change that can
-move pixels. A GPU grade adds the stages `gpu`, `gpu_upload`, `gpu_shader` and
-`gpu_readback` to `stage_ms` and has no `lut` or `grain` stage.
+move pixels: it was `gpu-1` until halation was added, for every photograph the GPU
+graded. A photograph graded with halation also has `halation_sha1` (a SHA-1 of the
+look's `halation` section, after `normalize_sha1`) on either path, and a
+`halation` stage in `stage_ms`; without halation the record is as before. A GPU grade adds the stages `gpu`, `gpu_upload`, `gpu_shader` and
+`gpu_readback` to `stage_ms` and has no `lut` or `grain` stage. `gpu` is the whole
+GPU grade, so it includes `halation` (the glow, made on the CPU) as it includes the
+three `gpu_` stages: summing a GPU record's `stage_ms` counts them twice.
 
 **Reproducibility.** `pifilm-process` regrades on the CPU, from the saved original.
 For a USB camera that original is the camera's own JPEG, the very picture the Pi
@@ -192,14 +227,16 @@ original is a quality-95 JPEG of the frame the Pi graded, so even a `cpu` record
 regrades about 1 to 2 levels from the Pi's file on average, more where the LUT is
 steep. Measured on 2026-10-14 on sixteen IMX477 photographs graded on the GPU, all
 effects together: 0.7 to 2.1 levels on average, at most 18 to 27, no difference
-visible. A record marked `gpu-1` cannot be byte for byte in any case: the GPU's file is
+visible. A record marked `gpu-1` or `gpu-2` cannot be byte for byte in any case: the GPU's file is
 the more exact of the two, because the CPU rounds colours to bytes before the LUT.
 Against a CPU regrade it differs by about 0.2 to 0.6 levels on average and by a few
 levels at most on ordinary colours. On strongly saturated areas, where the look's
 LUT is steep, it differs by 10 to 20 levels. Measured on 2026-10-13: at most 5
 levels on a real photograph with the trained IMX477 look on the Pi, and up to 20 on
 synthetic saturated frames with the bundled starter look. `pifilm-process` says so
-once when the folder's log has such records. The grain lands in the same place on
+once when the folder's log has such records. `pifilm-process` grades with the
+artifact's halation, so a record graded with halation is reproduced by the same
+artifact. The grain lands in the same place on
 both paths.
 
 **The switch.** `--grade-backend auto` (the default) uses the GPU when it can.
@@ -220,7 +257,7 @@ held while the service runs.
 
 With the viewfinder's `2x` toggle on, two captures make one picture
 (`pifilm/double.py`). Film adds exposures, H = H₁ + H₂, and is developed once, so the
-two *ungraded* frames are added in linear light and the sum goes through the three
+two *ungraded* frames are added in linear light and the sum goes through the
 steps above once. Grading each frame and blending the results would apply the LUT's
 tone curve twice, add values after the curve instead of light before it, lay grain
 down twice, and normalise twice, which normalisation does not support. Each frame is
@@ -285,7 +322,7 @@ The full procedure, from an empty `data/` folder to a verified deployment, is
 |---|---|---|
 | NumPy | everywhere | All array maths: colour conversions, sampling, transport, evaluation |
 | Pillow | runtime and trainer | Image I/O, EXIF orientation, ICC conversion (`ImageCms`), the `Color3DLUT` filter, `.cube` round-trips, contact sheets |
-| OpenCV (`cv2`) | runtime and trainer | Colour-space conversions, the 256-entry `LUT` tables, Gaussian blur for grain, resizing, and V4L2 camera capture on the Pi |
+| OpenCV (`cv2`) | runtime and trainer | Colour-space conversions, the 256-entry `LUT` tables, Gaussian blur for grain and halation, resizing, and V4L2 camera capture on the Pi |
 | SciPy | trainer only | Sparse matrices, the conjugate-gradient solver, isotonic regression |
 | requests, tqdm | `pifilm-fetch` only | Wikimedia Commons downloads with licence checks |
 | smbus2, gpiozero | Pi only, `--ups x728` | Reading the UPS fuel gauge over I2C and the power-loss pin |
