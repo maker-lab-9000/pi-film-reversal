@@ -171,6 +171,9 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-1"` or `"cpu"`, 
   reads end the viewfinder and the process exits 1 for a systemd restart.
   The tuning is fingerprinted at open (`tuning` property; `tuning_sha1` after `tuning_file` in
   records); one that cannot be is one `tuning: cannot fingerprint ...` line, and the camera opens.
+  `ae_constraint` / `ae_metering` follow `tuning_sha1` in records: the modes pifilm sent (set at
+  open, updated by `set_ae_constraint`/`set_ae_metering` in `stream_info`, which each record
+  copies when its photo is taken), left out for a mode the camera does not support.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
   captures-only display (`--show-captures`, shows TV colour bars while processing), and headless
   terminal. `--display waveshare35dsi` (or `waveshare28`) runs the LCD viewfinder instead of any

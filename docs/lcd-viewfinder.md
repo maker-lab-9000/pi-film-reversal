@@ -275,6 +275,11 @@ returns to the live view. Nothing in it needs sudo.
 | `LOOK` | the `--artifacts` folder's name (for example `imx477-2026-09-v4-dark-hp5-tile`), cut with `...` if too wide; `starter (bundled)` for the bundled look | always | read-only |
 | `RESET` | `TAP TWICE` | a camera with setting rows (not `--fake`) | see below |
 
+The Pi's libcamera does not report the two AE modes in its frame metadata, so a
+record's `ae_constraint` / `ae_metering` are what pifilm sent, and each change in the
+menu logs one line such as `settings: ae-metering matrix`. A dark scene at the
+exposure limits (the longest shutter and the top gain) looks the same in every mode.
+
 A row the camera cannot use is left out and the rows below move up. A USB camera
 (V4L2) runs without the display, so it has no menu at all; under `--fake` only
 `UPLOAD`, the addresses and `LOOK` are there.
@@ -749,7 +754,7 @@ With the service running with `--nextcloud-env` and the panel in live view:
 | --- | --- | --- |
 | 1 | `MENU` opens the menu; `DONE` returns to the live view; the shutter, `+`, `-` and the cells work as before | Not yet run |
 | 2 | `SAVE DNG` off: the next photograph has no `.dng`; on: it has one. Restart the service: the setting is kept and the journal has the `settings:` line | Not yet run |
-| 3 | `AE CONSTRAINT` and `AE METERING`: the record's camera metadata shows the new mode after a change | Not yet run |
+| 3 | `AE CONSTRAINT` and `AE METERING`: after a change in the menu the journal has `settings: ae-metering <mode>` (or `ae-constraint`), the next photograph's record has `ae_metering` / `ae_constraint` with the new mode, and after a restart the journal has the `settings: ... (saved in the menu; the unit says ...)` line | Not yet run |
 | 4 | `UPLOAD` on home Wi-Fi: `UPLOADING`, then `DONE`; the files are on Nextcloud; `journalctl -u pifilm-capture \| grep nextcloud:` shows rclone's lines. In hotspot mode: `SKIPPED: NO NEXTCLOUD`. Started while the timer's run is going: `SKIPPED: BUSY` | Not yet run |
 | 5 | `ETH`/`WLAN` show the addresses (unplug the cable: `ETH` turns to `-` within about 10 s), and the live view no longer shows them. `LOOK` shows the deployed look's folder name, or `starter (bundled)` | Not yet run |
 | 6 | `RESET`, tapped twice: the unit's flags are back and `settings.json` is gone | Not yet run |
