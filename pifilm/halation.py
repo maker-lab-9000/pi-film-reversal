@@ -67,7 +67,7 @@ MODEL = "mix"
 FALLOFF = ((1.0, 0.5), (2.0, 0.3), (4.0, 0.2))   # (sigma multiple, weight)
 MIN_REDUCED_SIGMA = 2.0                          # reduced pixels of sigma kept
 # ``apply_cpu`` works in bands of rows of about this many pixels, as the GPU reference
-# does: a float copy of a 12 MP frame is 146 MB, on a Pi that is holding the photograph.
+# does: a float copy of a 12 MP frame is 148 MB, on a Pi that is holding the photograph.
 BAND_PIXELS = 1 << 19
 
 
@@ -246,7 +246,7 @@ def glow_at(glow: np.ndarray, top: int, rows: int, cols: int,
 # The sRGB encode of ``apply_cpu``: the curve at 65,536 evenly spaced linear values,
 # read at the nearest. Its steepest slope, 3,295 levels per unit just above 0, makes a
 # step 0.05 of a level, so the read is within 0.03 of a level of the curve everywhere
-# (``tests/test_halation.py``), where a ``pow`` per value was a third of the step's time.
+# (``tests/test_halation.py``), three times as fast as a ``pow`` per value (Mac, 2026-10-17).
 _ENCODE_LEVELS = 1 << 16
 _ENCODE = linear_to_srgb(
     np.arange(_ENCODE_LEVELS, dtype=np.float32) / np.float32(_ENCODE_LEVELS - 1)
