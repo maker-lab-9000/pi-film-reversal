@@ -140,17 +140,26 @@ record is unchanged. `pifilm-process` regrades with the artifact's halation, so 
 record graded with halation is reproduced by the same artifact; it says nothing when
 `halation_sha1` differs from the artifact's (the same as `normalize_sha1` today).
 
-## Costs to check on the hardware
+## Costs on the hardware
 
-Estimated, to be measured on the Pi 4 at 12 MP:
+Measured on the Pi 4, 12 MP (4056 x 3040), 2026-10-17, `pifilm-gpu-check --runs 3` on a
+real photograph:
 
-- GPU path: the extra `normalize_u8` (about 120 ms), the float table and area
-  reduction (about 100 ms), the blur on the small copy (tens of ms), the upload of a
-  579 x 434 float texture, and the extra shader work. Aim: under 400 ms added to a
-  shot's grade (today 650 ms). It is the background grade, so the shutter is not
-  slower.
-- CPU path (the fallback, EV other than 0, `pifilm-process`): seconds, not measured
-  yet. Recorded, not a gate.
+- **GPU path, with halation:** the glow on the CPU takes 450 ms (`normalize_u8` about
+  195, the float table about 120, the area reduction about 55, the blurs about 50); the
+  whole grade about 1,040 ms, against about 650 ms without halation. The shader is
+  264 ms against 245. Within 1 level of the reference (mean 0.007). The aim was 400 ms
+  for the glow; 450 is accepted: it is the background grade, the shutter is not slower.
+- **GPU path, a look without halation** (`gpu-2`): about 600 ms, as before; within 1
+  level of the reference.
+- **CPU path** (the fallback, EV other than 0, `pifilm-process`): halation about 3.5 s,
+  the whole grade about 4.7 s.
+
+**Amended (2026-10-17, after the first measurement):** the glow first took 671 ms, 213
+of them the 4 sigma blur. The 2 sigma and 4 sigma terms are now blurred on the reduced
+copy further reduced by 2 and 4 (area mean), at the same width, and read back with
+bilinear interpolation: within 0.3 % of the glow's peak of the direct blur. The model
+name stays `"mix"`: no look or record with halation existed before the change.
 
 ## The look
 
