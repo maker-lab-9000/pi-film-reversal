@@ -374,6 +374,8 @@ def test_constructor_uses_explicit_native_still_configuration(install_picamera):
         "bit_depth": 10,
         "tuning_file": "delivered-lens.json",
         "tuning_sha1": fingerprint({"loaded-from": "delivered-lens.json"}),
+        "ae_constraint": "normal",
+        "ae_metering": "centre",
         "autofocus": "continuous",
     }
     camera.close()
@@ -2458,6 +2460,110 @@ def test_ae_support_flags_are_false_without_the_libcamera_enums(install_picamera
     with pytest.raises(CameraError):
         camera.set_ae_constraint("highlight")
     camera.close()
+
+
+def test_stream_info_records_the_ae_modes_opened_with(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera(ae_constraint="shadows", ae_metering="matrix")
+    assert camera.stream_info.ae_constraint == "shadows"
+    assert camera.stream_info.ae_metering == "matrix"
+    assert camera.stream_info.to_dict()["ae_metering"] == "matrix"
+    camera.close()
+
+
+def test_stream_info_leaves_an_unsupported_ae_mode_out(install_picamera):
+    install_picamera(ae_controls=("AeMeteringMode",))
+    camera = Picamera2Camera(ae_constraint="shadows", ae_metering="spot")
+    assert camera.stream_info.ae_constraint is None
+    assert camera.stream_info.ae_metering == "spot"
+    assert "ae_constraint" not in camera.stream_info.to_dict()
+    camera.close()
+
+    install_picamera(with_ae_enums=False)
+    camera = Picamera2Camera()
+    assert not {"ae_constraint", "ae_metering"} & set(camera.stream_info.to_dict())
+    camera.close()
+
+
+def test_stream_info_records_the_ae_modes_under_ae_lock(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera(ae_lock=True, ae_metering="spot")
+    assert camera.stream_info.ae_constraint == "normal"
+    assert camera.stream_info.ae_metering == "spot"
+    camera.close()
+
+
+@pytest.mark.parametrize(("setter", "field", "value"), [
+    ("set_ae_constraint", "ae_constraint", "highlight"),
+    ("set_ae_metering", "ae_metering", "matrix"),
+])
+def test_an_ae_mode_setter_updates_the_stream_info(install_picamera, setter, field, value):
+    install_picamera()
+    camera = Picamera2Camera()
+    getattr(camera, setter)(value)
+    assert getattr(camera.stream_info, field) == value
+    camera.close()
+
+
+@pytest.mark.parametrize(("setter", "field", "value", "before"), [
+    ("set_ae_constraint", "ae_constraint", "highlight", "normal"),
+    ("set_ae_metering", "ae_metering", "matrix", "centre"),
+])
+def test_a_rejected_ae_mode_leaves_the_stream_info(
+    install_picamera, setter, field, value, before,
+):
+    state = install_picamera()
+    camera = Picamera2Camera()
+
+    def boom(controls):
+        raise RuntimeError("control rejected")
+
+    state.instance.set_controls = boom
+    with pytest.raises(CameraError):
+        getattr(camera, setter)(value)
+    assert getattr(camera.stream_info, field) == before
+    camera.close()
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_a_record_after_an_ae_change_carries_the_new_modes(
+    install_picamera, tmp_path, background,
+):
+    array = np.broadcast_to(
+        np.array([[[10, 40, 230]]], dtype=np.uint8), (NATIVE_SIZE[1], NATIVE_SIZE[0], 3),
+    )
+    install_picamera(request=FakeRequest(array))
+    camera = Picamera2Camera(save_dng=False)
+    artifact_dir = tmp_path / "artifact"
+    write_artifact(
+        artifact_dir, LUT3D.identity(2), NormalizeParams(white_balance=False),
+        GrainParams(enabled=False),
+    )
+    session = CaptureSession(
+        camera, Pipeline(Artifacts.load(artifact_dir)), tmp_path / "captures",
+        seed_rng=np.random.default_rng(0), save_dng=False,
+        background=background, state_dir=tmp_path / "state", log=lambda _: None,
+    )
+    try:
+        first = session.capture()
+        camera.set_ae_metering("matrix")
+        camera.set_ae_constraint("shadows")
+        second = session.capture()
+        # A later change does not reach a photo already taken, even one still
+        # being graded behind the shutter.
+        camera.set_ae_metering("spot")
+        assert session.close_grades(timeout=30)
+    finally:
+        camera.close()
+    assert (first.record["ae_constraint"], first.record["ae_metering"]) == ("normal", "centre")
+    assert (second.record["ae_constraint"], second.record["ae_metering"]) == (
+        "shadows", "matrix",
+    )
+    record_path, = (tmp_path / "captures").rglob("captures.jsonl")
+    records = [json.loads(line) for line in record_path.read_text().splitlines()]
+    assert [(r["ae_constraint"], r["ae_metering"]) for r in records] == [
+        ("normal", "centre"), ("shadows", "matrix"),
+    ]
 
 
 def test_set_save_dng_false_means_the_next_still_has_no_dng(install_picamera):

@@ -367,6 +367,11 @@ class Picamera2Camera:
                 actual, tuning_label, self._native_size, self._tuning.sha1,
             )
             self._stream_info.autofocus = autofocus if has_autofocus else "none"
+            # What was sent, also under --ae-lock; an unsupported mode stays None.
+            if self.ae_constraint_supported:
+                self._stream_info.ae_constraint = ae_constraint
+            if self.ae_metering_supported:
+                self._stream_info.ae_metering = ae_metering
             self._still_config = config
             if self._preview is not None:
                 preview_config = camera.create_preview_configuration(
@@ -651,7 +656,9 @@ class Picamera2Camera:
 
         Like ``set_iso``: the control goes to the running camera and into both
         configurations, and nothing changes if it is refused, cannot be built, or
-        this camera or libcamera has no ``AeConstraintMode``.
+        this camera or libcamera has no ``AeConstraintMode``. On success the mode
+        also goes into ``stream_info``, which every later record copies when its
+        photograph is taken (the Pi 4's frame metadata does not report it).
         """
         if name not in _AE_CONSTRAINTS:
             raise CameraError(
@@ -660,6 +667,7 @@ class Picamera2Camera:
         self._set_ae_mode("AeConstraintMode", _ae_constraint_value, name,
                           self.ae_constraint_supported, "the AE constraint mode")
         self.ae_constraint = name
+        self._stream_info.ae_constraint = name
 
     def set_ae_metering(self, name: str) -> None:
         """Change the auto-exposure metering mode while the camera runs.
@@ -673,6 +681,7 @@ class Picamera2Camera:
         self._set_ae_mode("AeMeteringMode", _ae_metering_value, name,
                           self.ae_metering_supported, "the AE metering mode")
         self.ae_metering = name
+        self._stream_info.ae_metering = name
 
     def _set_ae_mode(
         self, control: str, lookup: Any, name: str, supported: bool, what: str,

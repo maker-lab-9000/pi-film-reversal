@@ -68,6 +68,10 @@ class StreamInfo:
     tuning_file: str | None = None
     tuning_sha1: str | None = None  # fingerprint of the tuning in use (pifilm.tuning)
     autofocus: str | None = None
+    # The auto-exposure modes pifilm sent (Picamera2 only; None where the camera
+    # has no such control, since libcamera's own default is then in force).
+    ae_constraint: str | None = None
+    ae_metering: str | None = None
 
     def to_dict(self) -> dict:
         values = {
@@ -85,6 +89,10 @@ class StreamInfo:
             values["tuning_file"] = self.tuning_file
         if self.tuning_sha1 is not None:
             values["tuning_sha1"] = self.tuning_sha1
+        if self.ae_constraint is not None:
+            values["ae_constraint"] = self.ae_constraint
+        if self.ae_metering is not None:
+            values["ae_metering"] = self.ae_metering
         if self.autofocus is not None:
             values["autofocus"] = self.autofocus
         return values
