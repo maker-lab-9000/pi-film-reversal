@@ -53,8 +53,10 @@ and off unless the look turns it on; a look without it has the other three only.
    (`sigma`, `2 sigma`, `4 sigma`, weighted 0.5, 0.3, 0.2, about an exponential
    fall-off), with `sigma` in mm of a 36 mm frame (0.25 mm), so the glow is the
    same share of the picture at any size. It runs on a copy reduced by a whole
-   factor and is read back with bilinear interpolation, so the blur is cheap
-   (the step's cost on the Pi is still to be measured).
+   factor and is read back with bilinear interpolation, so the blur is cheap. On
+   the Pi 4 the quick grade (1014 x 760, on the capture side) takes 279 ms with
+   halation against 133 ms without, so a shot is ready about 146 ms later; at
+   12 MP the glow takes 437 ms on the GPU path and the step about 1.9 s on the CPU.
    It comes after normalisation and before the LUT because the glow forms as the
    film is exposed, and the LUT's roll-off then treats it as any other light.
    It is set in the look's `halation` section of `params.json` (params version
@@ -79,7 +81,8 @@ frame that ran out of gain (`MAX` in the `ISO` cell) is normalised like any dark
 
 ### The order of a shot
 
-The steps above take about 2 s on a full-resolution frame on the Pi 4. By
+The steps above take about 1.85 s on a full-resolution frame on the Pi 4's CPU
+(about 3.0 s when the look has halation). By
 default (`--grade background`) the camera does not wait for them:
 
 1. The frame is read and the original JPEG is saved (and the DNG, when enabled),
@@ -157,8 +160,10 @@ See [known issues](known-issues.md#a-libcamera-update-could-silently-retune-a-de
 ### Grading on the GPU
 
 On the Pi 4 the grade worker can do the steps as one pass on the GPU
-(`pifilm/gpu/`). Measured on 2026-10-13 with the IMX477 at 12 MP: about 0.67 s
-against 1.73 s on the CPU. The camera is already free by then, so the wait between
+(`pifilm/gpu/`). Measured with the IMX477 at 12 MP: about 0.6 s for a look without
+halation (0.67 s against 1.73 s on the CPU on 2026-10-13), and about 1.03 s with
+halation against about 3.0 s on the CPU (2026-10-18), the glow made on the CPU 437 ms
+of it. The camera is already free by then, so the wait between
 photographs does not change. The graded file exists about a second sooner and a
 burst drains faster.
 

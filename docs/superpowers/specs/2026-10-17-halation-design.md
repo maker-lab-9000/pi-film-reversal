@@ -153,30 +153,41 @@ record graded with halation is reproduced by the same artifact; it says nothing 
 
 ## Costs on the hardware
 
-Measured on the Pi 4, 12 MP (4056 x 3040), 2026-10-17, `pifilm-gpu-check --runs 3` on a
-real photograph:
+Measured on the Pi 4 at the final review's fixes (`5c94941`, 2026-10-17/18), a real
+12 MP photograph (4056 x 3040) and the quick frame (1014 x 760):
 
-- **GPU path, with halation:** the glow on the CPU takes 450 ms (`normalize_u8` about
-  195, the float table about 120, the area reduction about 55, the blurs about 50); the
-  whole grade about 1,040 ms, against about 650 ms without halation. The shader is
-  264 ms against 245. Within 1 level of the reference (mean 0.007). The aim was 400 ms
-  for the glow; 450 was accepted as the background grade's. The shutter is not free of
-  it, though: the quick grade (the review screen and the Stick) runs on the capture
-  side and has halation, so its glow is inside `shutter_to_ready_ms`. That was 588 ms
-  against 137 without halation (`prepare` 331 ms on the unreduced quick frame,
-  `apply_cpu` 121 ms), which the two-pixel reduction rule and the banded, table-encoded
-  CPU mix address (measured after this change: see below).
-- **GPU path, a look without halation** (`gpu-2`): about 600 ms, as before; within 1
-  level of the reference.
-- **CPU path** (the fallback, EV other than 0, `pifilm-process`): halation about 3.5 s,
-  the whole grade about 4.7 s.
+- **The quick grade** (the review screen and the Stick, on the capture side, so inside
+  `shutter_to_ready_ms`): 279 ms with halation (`normalize` 91, `halation` 145, `lut`
+  42) against 133 ms without. The shutter is therefore slower by about 146 ms a shot
+  with halation on; before the final review's fixes it was 588 ms.
+- **GPU path, with halation:** the glow on the CPU 437 ms; the whole GPU grade about
+  1,030 ms (upload about 145 to 170, shader 263, read-back about 176, statistics 121).
+  Within 1 level of the reference (mean 0.007); against the CPU pipeline at most 4
+  levels, mean 0.27. It is the background grade: the camera does not wait for it.
+- **GPU path, a look without halation** (`gpu-2`): about 600 ms, within 1 level of the
+  reference (measured before the final review's fixes; nothing in that path changed).
+- **CPU path** (the fallback, EV other than 0, `pifilm-process`): about 3.0 s with
+  halation (`normalize` about 280, `halation` about 1,880, `lut` about 825), against
+  about 1.85 s without (`normalize` about 300, `lut` about 830, grain about 710, on the
+  `-hp5-tile` look). A process doing one 12 MP CPU grade with halation peaks at 389 MB
+  resident, 705 MB before the CPU step was banded.
 
 **Amended (2026-10-17, after the first measurement):** the glow first took 671 ms, 213
 of them the 4 sigma blur. The 2 sigma and 4 sigma terms are now blurred on the reduced
 copy further reduced by 2 and 4 (area mean), at the same width, and read back with
 bilinear interpolation: within 0.3 % of the glow's peak of the direct blur (up to 2 %
-once the reduction keeps two reduced pixels of sigma, the final-review amendment above). The model
+once the reduction keeps two reduced pixels of sigma, the final-review amendment
+above). That brought the glow to 450 ms (`normalize_u8` about 195, the float table
+about 120, the area reduction about 55, the blurs about 50) and the whole GPU grade to
+about 1,040 ms; the aim had been 400 ms, and 450 was accepted as the background
+grade's. The CPU path was then about 4.7 s, halation about 3.5 s of it. The model
 name stays `"mix"`: no look or record with halation existed before the change.
+
+**Amended (2026-10-17, final review):** "the shutter is not slower" was wrong: the
+quick grade runs on the capture side and has halation, and took 588 ms against 137
+without (`prepare` 331 ms on the unreduced quick frame, `apply_cpu` 121 ms). The
+two-pixel reduction rule, the banded CPU mix and the table encode brought it to the
+279 ms above.
 
 ## The look
 
