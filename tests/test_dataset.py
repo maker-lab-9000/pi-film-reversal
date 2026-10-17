@@ -141,3 +141,58 @@ def test_invalid_sample_config_names_the_field():
         SampleConfig(max_side=0)
     with pytest.raises(ValueError, match="crop_frac"):
         SampleConfig(crop_frac=0.5)
+
+
+# --- per-image weights (weights.json beside the images) ---------------------
+
+def test_a_weighted_image_gives_that_many_times_the_pixels(tmp_path):
+    import json
+
+    from pifilm.train.dataset import load_weights
+
+    paths = _write_images(tmp_path / "refs", 2)
+    (tmp_path / "refs" / "weights.json").write_text(json.dumps({paths[0].name: 3}))
+    weights = load_weights(tmp_path / "refs")
+    cfg = SampleConfig(crop_frac=0.0, pixels_per_image=200, l_min=0.0, l_max=1.0)
+    plain = build_pool(paths[1:], NormalizeParams(), cfg)
+    heavy = build_pool(paths[:1], NormalizeParams(), cfg, weights=weights)
+    assert len(plain.srgb) == 200
+    assert len(heavy.srgb) == 600
+
+
+def test_no_weights_file_means_every_image_counts_once(tmp_path):
+    from pifilm.train.dataset import load_weights
+
+    _write_images(tmp_path / "refs", 2)
+    assert load_weights(tmp_path / "refs") == {}
+
+
+@pytest.mark.parametrize(
+    "content, message",
+    [
+        ('{"missing.jpg": 2}', "not in"),
+        ('{"000.jpg": 0}', "positive"),
+        ('{"000.jpg": -1}', "positive"),
+        ('{"000.jpg": "2"}', "number"),
+        ('{"000.jpg": 11}', "at most"),
+        ('["000.jpg"]', "object"),
+    ],
+)
+def test_a_bad_weights_file_is_refused(tmp_path, content, message):
+    from pifilm.train.dataset import load_weights
+
+    _write_images(tmp_path / "refs", 2)
+    (tmp_path / "refs" / "weights.json").write_text(content)
+    with pytest.raises(ValueError, match=message):
+        load_weights(tmp_path / "refs")
+
+
+def test_weights_change_the_corpus_identity_and_are_carried(tmp_path):
+    cfg = SampleConfig(crop_frac=0.0, pixels_per_image=50, l_min=0.0, l_max=1.0)
+    _write_images(tmp_path / "refs", 6)
+    before = build_corpus(tmp_path / "refs", NormalizeParams(), cfg, 1, "target")
+    (tmp_path / "refs" / "weights.json").write_text('{"000.jpg": 2.5}')
+    after = build_corpus(tmp_path / "refs", NormalizeParams(), cfg, 1, "target")
+    assert before.weights == {}
+    assert after.weights == {"000.jpg": 2.5}
+    assert before.corpus_sha1 != after.corpus_sha1

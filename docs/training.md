@@ -177,6 +177,15 @@ shows up there.
 photograph must not land on both sides of the split. Balance series so none
 exceeds about a third of the corpus.
 
+**Weighting a few images.** When a handful of references are the look itself (your
+own scans of the film) and the rest are a broader family, put a `weights.json`
+beside them: `{"CNV00001.jpg": 3, "beach.jpg": 3}`. Each named file gives that many
+times the usual pixels; the rest count once. Weights are numbers above 0 and at most
+10, and every name must be an image in the folder. Do not copy files instead: copies
+land on both sides of the split and leak into the held-out evaluation. The weights
+are part of `corpus_sha1` and are recorded under `training.target.weights` in
+`params.json`.
+
 **Rights and provenance.** Follow [the reference guide](reference-sources.md):
 photographs credited to the photographer from primary sources, files you have
 permission to use, fan-submission groups excluded. Keep the source URL, author,

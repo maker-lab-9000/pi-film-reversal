@@ -160,6 +160,19 @@ def test_train_records_source_white_balance_and_lift_ref_in_the_artifact(tmp_pat
     assert normalize.levels is True
 
 
+def test_train_records_reference_weights_only_when_there_are_any(tmp_path):
+    _image_dir(tmp_path / "src", 8, 0)
+    _image_dir(tmp_path / "tgt", 8, 1, transform=lambda im: im**1.3)
+    (tmp_path / "tgt" / "weights.json").write_text('{"00.jpg": 3}')
+    out = tmp_path / "out"
+    cfg = FitConfig(lut_size=9, iterations=5)
+    sample = SampleConfig(crop_frac=0.0, max_side=64, pixels_per_image=500, val_fraction=0.25)
+    train(tmp_path / "src", tmp_path / "tgt", out, cfg, sample, None, allow_small=True)
+    training = Artifacts.load(out).training
+    assert training["target"]["weights"] == {"00.jpg": 3.0}
+    assert "weights" not in training["source"]
+
+
 def test_cli_exposes_source_white_balance_and_lift_ref_flags():
     args = build_parser().parse_args(["--source", "s", "--no-source-white-balance",
                                       "--source-lift-highlight-ref", "0.05"])
