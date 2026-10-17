@@ -6,6 +6,7 @@ from pifilm.normalize import (
     Gains,
     NormalizeParams,
     apply_gains_float,
+    apply_gains_u8,
     compute_gains,
     gains_to_luts,
     normalize_float,
@@ -499,3 +500,11 @@ def test_stats_gains_honours_max_stats_pixels():
     _, inside = normalize_u8(img_u8, p, max_stats_pixels=1000)
     assert stats_gains(img_u8, p, max_stats_pixels=1000).levels == inside.levels
     assert stats_gains(img_u8, p).levels != inside.levels
+
+
+def test_apply_gains_u8_is_normalize_u8s_second_half():
+    rng = np.random.default_rng(3)
+    rgb = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+    params = NormalizeParams()
+    out, gains = normalize_u8(rgb, params)
+    assert np.array_equal(apply_gains_u8(rgb, gains), out)
