@@ -410,17 +410,17 @@ def test_reference_without_halation_is_unchanged():
 def test_the_glow_read_is_the_cpus_bilinear_upsampling():
     """The shader reads the glow by hand at half-pixel centres with clamped
     edges; that is what ``cv2.resize(..., INTER_LINEAR)`` does on the CPU."""
-    from pifilm.gpu.reference import _glow_at
-    from pifilm.halation import upsample
+    from pifilm._cv2 import require_cv2
+    from pifilm.halation import glow_at
 
     glow = np.random.default_rng(9).random((7, 11, 3)).astype(np.float32)
-    want = upsample(glow, 45, 70)
-    got = np.concatenate([_glow_at(glow, top, rows, 70, 45, 70)
-                          for top, rows in ((0, 20), (20, 25))])
+    want = require_cv2().resize(glow, (70, 45), interpolation=require_cv2().INTER_LINEAR)
+    got = np.concatenate([glow_at(glow, top, rows, 70, 45, 70)
+                          for top, rows in ((0, 20), (20, 25))], axis=1).transpose(1, 2, 0)
     assert got.dtype == np.float32 and got.shape == want.shape
     assert np.abs(got - want).max() < 1e-3
     # A glow at full size reads back as itself.
-    assert np.allclose(_glow_at(glow, 0, 7, 11, 7, 11), glow, atol=1e-6)
+    assert np.allclose(glow_at(glow, 0, 7, 11, 7, 11), glow.transpose(2, 0, 1), atol=1e-6)
 
 
 def test_halation_off_in_the_mix_leaves_a_channel_as_the_pass_without_it():

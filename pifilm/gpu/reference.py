@@ -65,10 +65,11 @@ towards the glow by ``hw`` (strength times weights), compressed back
 copy of the frame, is not the shader's work: ``pifilm.halation.prepare`` makes
 it on the CPU from the normalised bytes for both paths, so the two mix the same
 numbers, and the shader only reads it back at full size with a hand-written
-bilinear read at half-pixel centres, edges clamped (``_glow_at`` here), which is
-what ``cv2.resize``'s ``INTER_LINEAR`` does on the CPU. The CPU path rounds to
-bytes once more, after the mix, where the pass does not. On a mid-tone random
-frame with a bright square (``tests/test_gpu_reference.py``, 2026-10-17) the
+bilinear read at half-pixel centres, edges clamped (``pifilm.halation.glow_at``,
+written as the shader's lines and shared with ``apply_cpu``, which reads its bands
+of the glow with it), which is what ``cv2.resize``'s ``INTER_LINEAR`` does. The
+CPU path rounds to bytes once more, after the mix, where the pass does not. On a
+mid-tone random frame with a bright square (``tests/test_gpu_reference.py``, 2026-10-17) the
 two are 0.77 levels apart on average and 7 at most at strength 0.4, against
 0.86 and 8 with no halation: the extra rounding does not show beside the
 others.
@@ -82,7 +83,7 @@ import numpy as np
 
 from ..color import linear_to_srgb, srgb_to_linear
 from ..grain import GrainParams
-from ..halation import HalationPass
+from ..halation import HalationPass, glow_at
 from ..normalize import Gains, _apply_levels_linear, _tone_curve
 
 # The shader's LUMA constant: the weights of the Y in YCrCb (BT.601), which is
@@ -190,35 +191,6 @@ def reference_pass(rgb_u8: np.ndarray, tables: PassTables, lut: np.ndarray,
     return out
 
 
-def _glow_at(glow: np.ndarray, top: int, rows: int, cols: int,
-             height: int, width: int) -> np.ndarray:
-    """The shader's read of the glow for rows ``top .. top + rows`` and columns
-    ``0 .. cols`` of a ``height`` x ``width`` frame: ``(rows, cols, 3)`` float32.
-    Bilinear by hand, at half-pixel centres, edges clamped, x first, then y."""
-    small_h, small_w = glow.shape[:2]
-
-    def axis(first: int, count: int, small: int, full: int):
-        # vec2 u = (vec2(px) + 0.5) * vec2(gs) / vec2(textureSize(img, 0)) - 0.5;
-        index = np.arange(first, first + count).astype(np.float32)
-        u = (index + np.float32(0.5)) * np.float32(small) / np.float32(full) - np.float32(0.5)
-        # u = clamp(u, vec2(0.0), vec2(gs - 1));
-        u = np.clip(u, np.float32(0.0), np.float32(small - 1))
-        # ivec2 i0 = ivec2(floor(u));  ivec2 i1 = min(i0 + 1, gs - 1);  vec2 t = u - vec2(i0);
-        lo = np.floor(u)
-        i0 = lo.astype(np.intp)
-        i1 = np.minimum(i0 + 1, small - 1)
-        return i0, i1, u - lo
-
-    y0, y1, ty = axis(top, rows, small_h, height)
-    x0, x1, tx = axis(0, cols, small_w, width)
-    tx, ty = tx[None, :, None], ty[:, None, None]
-    # vec3 B = mix(mix(G(i0), G(ivec2(i1.x, i0.y)), t.x),
-    #              mix(G(ivec2(i0.x, i1.y)), G(i1), t.x), t.y);
-    upper = _mix(glow[np.ix_(y0, x0)], glow[np.ix_(y0, x1)], tx)
-    lower = _mix(glow[np.ix_(y1, x0)], glow[np.ix_(y1, x1)], tx)
-    return _mix(upper, lower, ty).astype(np.float32, copy=False)
-
-
 def _band(b: np.ndarray, top: int, size: tuple[int, int], tables: PassTables, lut: np.ndarray,
           tile: np.ndarray | None, placement: tuple[int, int, int] | None,
           halation: HalationPass | None) -> np.ndarray:
@@ -241,7 +213,7 @@ def _band(b: np.ndarray, top: int, size: tuple[int, int], tables: PassTables, lu
                        ((c + np.float32(0.055)) / np.float32(1.055)) ** np.float32(2.4))
         # vec3 x = l / (1.0 - hr * l);
         x = lin / (np.float32(1.0) - hr * lin)
-        big = _glow_at(halation.glow, top, b.shape[0], b.shape[1], *size)
+        big = np.moveaxis(glow_at(halation.glow, top, b.shape[0], b.shape[1], *size), 0, -1)
         # x = x + hw * (B - x);  l = x / (1.0 + hr * x);
         x = x + np.asarray(halation.mix, np.float32) * (big - x)
         lin = x / (np.float32(1.0) + hr * x)

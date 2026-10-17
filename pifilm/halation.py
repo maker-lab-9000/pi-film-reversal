@@ -24,19 +24,31 @@ The model (``"mix"``), chosen by eye from two galleries on 2026-10-17
   of a 36 mm frame, the grain's scale, so the glow is the same share of the picture at
   any size.
 * **The blur runs on a reduced copy** (an area mean in expanded linear light, so a small
-  lamp keeps its energy), by the whole factor that keeps four reduced pixels of sigma,
+  lamp keeps its energy), by the whole factor that keeps two reduced pixels of sigma
+  (``k = max(1, floor(sigma_px / 2))``: 3 on the quick grade's 1014 px, 14 at 4056 px),
   and is read back with bilinear interpolation. The glow is soft, so this loses nothing
-  visible, and it is what lets the Pi make it in tens of milliseconds.
+  visible. The rule was four reduced pixels until 2026-10-17, when the Pi 4 timed the
+  quick grade (the review screen and the Stick, on the capture side, so inside
+  ``shutter_to_ready_ms``) at 588 ms with halation against 137 without: four pixels
+  left it unreduced, its blurs on the whole quick frame. Against the fall-off blurred
+  directly on the full frame the glow is within 6 % of its peak at the spot's edge,
+  at most a level after the mix at the chosen strength (``tests/test_halation.py``).
+  The model kept its name through that change: no look outside this branch had it.
 * **The wider terms on smaller copies still.** On the Pi 4 (12 MP, a 579 x 434 reduced
   copy) the three blurs cost 28, 56 and 213 ms, most of the glow's time. The term with
   multiple m is therefore blurred on the reduced copy reduced by a further m (2 and 4),
   at the same width in the reduced copy's pixels, and read back bilinearly: about 20 ms
   for both. Such a term is smooth at that scale, so it is the same soft glow (within
-  0.3 % of its peak of the direct blur on a lamp-like spot).
+  2 % of its peak of the direct blur on a lamp-like spot at two reduced pixels of
+  sigma; 0.3 % at four).
 
 ``prepare`` makes the glow for both paths, so the CPU and the GPU mix the same numbers:
-the CPU here (``apply_cpu``), the GPU in the shader (``pifilm.gpu``). Changing the
-fall-off, the reduction or the interpolation moves pixels: that is a new model name.
+the CPU here (``apply_cpu``), the GPU in the shader (``pifilm.gpu``). The CPU works in
+bands of rows, as the GPU reference does, reading each band's glow with ``glow_at``
+(the shader's own bilinear read, shared with ``pifilm.gpu.reference``), so a 12 MP
+frame needs no full-size float copy, and encodes to sRGB through a table rather than a
+``pow`` per value (within 0.03 of a level of the curve). Changing the fall-off, the
+reduction or the interpolation moves pixels: that is a new model name.
 """
 
 from __future__ import annotations
@@ -53,7 +65,10 @@ from .color import linear_to_srgb, srgb_to_linear
 
 MODEL = "mix"
 FALLOFF = ((1.0, 0.5), (2.0, 0.3), (4.0, 0.2))   # (sigma multiple, weight)
-MIN_REDUCED_SIGMA = 4.0                          # reduced pixels of sigma kept
+MIN_REDUCED_SIGMA = 2.0                          # reduced pixels of sigma kept
+# ``apply_cpu`` works in bands of rows of about this many pixels, as the GPU reference
+# does: a float copy of a 12 MP frame is 146 MB, on a Pi that is holding the photograph.
+BAND_PIXELS = 1 << 19
 
 
 def _number(name: str, value: object) -> float:
@@ -137,7 +152,7 @@ def sigma_px(shape: tuple[int, ...], params: HalationParams) -> float:
 
 
 def reduction(shape: tuple[int, ...], params: HalationParams) -> int:
-    """The whole factor the glow is made at: four reduced pixels of sigma at least."""
+    """The whole factor the glow is made at: two reduced pixels of sigma at least."""
     return max(1, int(sigma_px(shape, params) // MIN_REDUCED_SIGMA))
 
 
@@ -186,29 +201,97 @@ def prepare(normalised_u8: np.ndarray, params: HalationParams) -> HalationPass:
     return HalationPass(glow=glow, headroom=params.headroom, mix=mix)
 
 
-def upsample(glow: np.ndarray, height: int, width: int) -> np.ndarray:
-    """The glow at full size: bilinear, half-pixel centres, edges clamped."""
-    cv2 = require_cv2()
-    if glow.shape[:2] == (height, width):
-        return glow
-    up = cv2.resize(glow, (width, height), interpolation=cv2.INTER_LINEAR)
-    return up.reshape(height, width, glow.shape[2])
+def glow_at(glow: np.ndarray, top: int, rows: int, cols: int,
+            height: int, width: int) -> np.ndarray:
+    """The glow at full size for rows ``top .. top + rows`` and columns ``0 .. cols`` of
+    a ``height`` x ``width`` frame, from ``glow`` (h, w, C): ``(C, rows, cols)`` float32,
+    one plane per channel. Bilinear by hand, at half-pixel centres, edges clamped, x
+    first, then y: what ``cv2.resize``'s ``INTER_LINEAR`` does, written as the shader
+    reads the glow (the comments quote it), so the CPU's bands and
+    ``pifilm.gpu.reference`` read the same numbers. The x step is made once on each
+    reduced row the band reads and then picked per row, the same arithmetic as making
+    it per pixel, done fewer times; planes, because NumPy broadcasts a weight per row or
+    column several times faster over them than over interleaved channels."""
+    small_h, small_w = glow.shape[:2]
+
+    def axis(first: int, count: int, small: int, full: int):
+        # vec2 u = (vec2(px) + 0.5) * vec2(gs) / vec2(textureSize(img, 0)) - 0.5;
+        index = np.arange(first, first + count).astype(np.float32)
+        u = (index + np.float32(0.5)) * np.float32(small) / np.float32(full) - np.float32(0.5)
+        # u = clamp(u, vec2(0.0), vec2(gs - 1));
+        u = np.clip(u, np.float32(0.0), np.float32(small - 1))
+        # ivec2 i0 = ivec2(floor(u));  ivec2 i1 = min(i0 + 1, gs - 1);  vec2 t = u - vec2(i0);
+        lo = np.floor(u)
+        i0 = lo.astype(np.intp)
+        i1 = np.minimum(i0 + 1, small - 1)
+        return i0, i1, u - lo
+
+    def mix(a: np.ndarray, b: np.ndarray, t: np.ndarray) -> np.ndarray:
+        a *= 1.0 - t                                  # GLSL mix: a * (1 - t) + b * t,
+        b *= t                                        # in place on the two fresh reads
+        a += b
+        return a
+
+    y0, y1, ty = axis(top, rows, small_h, height)
+    x0, x1, tx = axis(0, cols, small_w, width)
+    # vec3 B = mix(mix(G(i0), G(ivec2(i1.x, i0.y)), t.x),
+    #              mix(G(ivec2(i0.x, i1.y)), G(i1), t.x), t.y);
+    first = int(y0[0])
+    planes = np.ascontiguousarray(np.moveaxis(glow[first:int(y1[-1]) + 1], -1, 0))
+    across = mix(planes[:, :, x0], planes[:, :, x1], tx)
+    return mix(np.take(across, y0 - first, axis=1), np.take(across, y1 - first, axis=1),
+               ty[:, None])
 
 
-def apply_cpu(normalised_u8: np.ndarray, hp: HalationPass) -> np.ndarray:
+# The sRGB encode of ``apply_cpu``: the curve at 65,536 evenly spaced linear values,
+# read at the nearest. Its steepest slope, 3,295 levels per unit just above 0, makes a
+# step 0.05 of a level, so the read is within 0.03 of a level of the curve everywhere
+# (``tests/test_halation.py``), where a ``pow`` per value was a third of the step's time.
+_ENCODE_LEVELS = 1 << 16
+_ENCODE = linear_to_srgb(
+    np.arange(_ENCODE_LEVELS, dtype=np.float32) / np.float32(_ENCODE_LEVELS - 1)
+) * np.float32(255.0)
+_ENCODE_U8 = np.rint(_ENCODE).astype(np.uint8)
+
+
+def _encode_index(lin: np.ndarray) -> np.ndarray:
+    """The nearest table entry of each linear value; works in ``lin`` (float32)."""
+    lin *= np.float32(_ENCODE_LEVELS - 1)
+    lin += np.float32(0.5)
+    np.clip(lin, 0.0, np.float32(_ENCODE_LEVELS - 1), out=lin)
+    return lin.astype(np.uint16)                  # floor of x + 0.5: the nearest
+
+
+def encode_u8(lin: np.ndarray) -> np.ndarray:
+    """Linear light to sRGB bytes through the table; overwrites ``lin``."""
+    return _ENCODE_U8[_encode_index(lin)]
+
+
+def apply_cpu(normalised_u8: np.ndarray, hp: HalationPass,
+              band_pixels: int = BAND_PIXELS) -> np.ndarray:
     """Expand, mix with the glow, compress, back to bytes. A channel whose weight is
-    0 is returned as it was."""
+    0 is returned as it was. Worked in bands of about ``band_pixels``, the glow read
+    per band (``glow_at``), so a 12 MP frame needs no full-size float copy; every
+    pixel's arithmetic is its own, so the bands change nothing."""
     height, width = normalised_u8.shape[:2]
     out = np.array(normalised_u8[..., :3], copy=True)
+    channels = [channel for channel in range(3) if hp.mix[channel] != 0.0]
+    if not channels:
+        return out
+    glow = np.ascontiguousarray(hp.glow[..., channels])
     table = expand_table(hp.headroom)
-    up = upsample(hp.glow, height, width)
     c = np.float32(hp.headroom)
-    for channel in range(3):
-        weight = np.float32(hp.mix[channel])
-        if weight == 0.0:
-            continue
-        x = table[normalised_u8[..., channel]]
-        x += weight * (up[..., channel] - x)
-        lin = x / (np.float32(1.0) + c * x)
-        out[..., channel] = np.rint(linear_to_srgb(lin) * np.float32(255.0)).astype(np.uint8)
+    rows = max(1, band_pixels // max(width, 1))
+    for top in range(0, height, rows):
+        band = normalised_u8[top:top + rows]
+        big = glow_at(glow, top, band.shape[0], width, height, width)
+        for plane, channel in zip(big, channels, strict=True):
+            x = table[band[..., channel]]
+            plane -= x                            # x += weight * (big - x)
+            plane *= np.float32(hp.mix[channel])
+            x += plane
+            denominator = c * x                   # lin = x / (1 + c x)
+            denominator += np.float32(1.0)
+            x /= denominator
+            out[top:top + band.shape[0], :, channel] = encode_u8(x)
     return out
