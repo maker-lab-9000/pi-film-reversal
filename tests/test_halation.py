@@ -121,3 +121,31 @@ def test_clipped_pixels_at_the_largest_headroom():
     assert out.dtype == np.uint8
     assert (out[..., 2] == frame[..., 2]).all()
     assert out[:, :28, 0].max() > 0                        # glow spills into the dark half
+
+
+def _direct_glow(frame, params):
+    """The fall-off as three direct Gaussians on the reduced copy: the reference."""
+    from pifilm._cv2 import require_cv2
+    from pifilm.halation import sigma_px
+    cv2 = require_cv2()
+    height, width = frame.shape[:2]
+    x = expand_table(params.headroom)[frame]
+    k = reduction(frame.shape, params)
+    small = cv2.resize(x, (width // k, height // k), interpolation=cv2.INTER_AREA)
+    sigma = sigma_px(frame.shape, params) / k
+    return sum(np.float32(w) * cv2.GaussianBlur(small, (0, 0), sigma * m,
+                                                borderType=cv2.BORDER_REFLECT)
+               for m, w in FALLOFF)
+
+
+def test_the_wide_blurs_on_smaller_copies_are_the_same_falloff():
+    frame = np.full((600, 800, 3), 20, np.uint8)
+    frame[295:305, 395:405] = 255
+    p = HalationParams(enabled=True, sigma_mm=1.0)     # k 5, reduced 160 x 120, 4 sigma 18 px
+    glow = prepare(frame, p).glow
+    want = _direct_glow(frame, p)
+    assert glow.shape == want.shape
+    # Measured: 0.3 % of the glow's peak above the background at most. A few percent
+    # would still be invisible after the mix; 1 % pins that it is the same fall-off.
+    excess = want - want.min()
+    assert np.abs(glow - want).max() <= 0.01 * excess.max()

@@ -27,6 +27,12 @@ The model (``"mix"``), chosen by eye from two galleries on 2026-10-17
   lamp keeps its energy), by the whole factor that keeps four reduced pixels of sigma,
   and is read back with bilinear interpolation. The glow is soft, so this loses nothing
   visible, and it is what lets the Pi make it in tens of milliseconds.
+* **The wider terms on smaller copies still.** On the Pi 4 (12 MP, a 579 x 434 reduced
+  copy) the three blurs cost 28, 56 and 213 ms, most of the glow's time. The term with
+  multiple m is therefore blurred on the reduced copy reduced by a further m (2 and 4),
+  at the same width in the reduced copy's pixels, and read back bilinearly: about 20 ms
+  for both. Such a term is smooth at that scale, so it is the same soft glow (within
+  0.3 % of its peak of the direct blur on a lamp-like spot).
 
 ``prepare`` makes the glow for both paths, so the CPU and the GPU mix the same numbers:
 the CPU here (``apply_cpu``), the GPU in the shader (``pifilm.gpu``). Changing the
@@ -141,6 +147,26 @@ def expand_table(headroom: float) -> np.ndarray:
     return (lin / (1.0 - headroom * lin)).astype(np.float32)
 
 
+def _blur(cv2, small: np.ndarray, sigma: float, multiple: float) -> np.ndarray:
+    """One term of the fall-off: ``small`` blurred by ``sigma * multiple`` reduced pixels.
+
+    The term with multiple m is blurred on a copy reduced by a further m (an area mean)
+    and read back bilinearly, the blur width given in that copy's own pixels (its actual
+    scale, so a size m does not divide stays right). A frame too small for that is
+    blurred directly."""
+    height, width = small.shape[:2]
+    m = int(multiple)
+    if m <= 1 or width // m < 1 or height // m < 1:
+        out = cv2.GaussianBlur(small, (0, 0), sigma * multiple, borderType=cv2.BORDER_REFLECT)
+        return out.reshape(small.shape)
+    size = (width // m, height // m)
+    r = cv2.resize(small, size, interpolation=cv2.INTER_AREA).reshape(size[1], size[0], 3)
+    blurred = cv2.GaussianBlur(r, (0, 0), sigma * multiple * size[0] / width,
+                               borderType=cv2.BORDER_REFLECT).reshape(r.shape)
+    out = cv2.resize(blurred, (width, height), interpolation=cv2.INTER_LINEAR)
+    return out.reshape(small.shape)
+
+
 def prepare(normalised_u8: np.ndarray, params: HalationParams) -> HalationPass:
     """The glow of the frame the LUT is about to be given."""
     cv2 = require_cv2()
@@ -155,9 +181,7 @@ def prepare(normalised_u8: np.ndarray, params: HalationParams) -> HalationPass:
     sigma = sigma_px(normalised_u8.shape, params) / k
     glow = np.zeros_like(small)
     for multiple, weight in FALLOFF:
-        blurred = cv2.GaussianBlur(small, (0, 0), sigma * multiple,
-                                   borderType=cv2.BORDER_REFLECT)
-        glow += np.float32(weight) * blurred.reshape(small.shape)
+        glow += np.float32(weight) * _blur(cv2, small, sigma, multiple)
     mix = (np.float32(params.strength) * np.asarray(params.weights, np.float32))
     return HalationPass(glow=glow, headroom=params.headroom, mix=mix)
 
