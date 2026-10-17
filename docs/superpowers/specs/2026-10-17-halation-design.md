@@ -154,14 +154,17 @@ Estimated, to be measured on the Pi 4 at 12 MP:
 
 ## The look
 
-`imx477-2026-09-v4-dark` is the colour look with the same LUT as the deployed
-`-hp5-tile` (`98e3671`), version 2, a faint Gaussian grain (0.004) and no
-`tuning_sha1`. Two consequences, decided at spec review:
+`imx477-2026-09-v4-dark` has the deployed `-hp5-tile` look's LUT (`98e3671`) and
+normalisation; only its grain, training notes and tuning stamp differed. Decided at
+spec review (2026-10-17) and done the same day, on the Mac and the Pi, before any code:
 
-- **Its Gaussian grain keeps it off the GPU** (the pass makes only the tile grain or
-  none). As it stands, every photograph with this look is graded on the CPU.
-- **No `tuning_sha1`**, so no tuning check for it; `pifilm-tuning --stamp` on the
-  Pi adds it.
+- **Grain off** (it was the Gaussian model at 0.004, barely visible, and the GPU pass
+  makes only the tile grain or none), so the GPU grades it. With grain off it is the
+  latest look without grain, and the owner may run it before halation exists.
+- **Stamped** with the Pi's tuning, `5404134af8256b674e5a8f93fe1bb616a1e0407e`
+  (`pifilm-tuning --stamp`), so the tuning check covers it.
+- **Changed in place** by `stamp_halation`, which raises it to version 5: builds from
+  before this branch refuse it. Nothing used it on 2026-10-17.
 
 ## Code
 
@@ -195,7 +198,7 @@ Estimated, to be measured on the Pi 4 at 12 MP:
 ## Acceptance (hardware)
 
 1. The shader compiles and `pifilm-gpu-check --artifacts .../imx477-2026-09-v4-dark`
-   passes (if the look's grain is changed to allow the GPU), with the halation stage
+   passes, with the halation stage
    timed.
 2. A photograph of a lamp in a dark room and one of a sunlit wall look like the
    gallery's 2x column on the review screen and in the graded file.
