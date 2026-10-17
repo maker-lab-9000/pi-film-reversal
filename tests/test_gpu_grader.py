@@ -18,7 +18,8 @@ from pifilm.gpu import grader as grader_module
 from pifilm.gpu.grader import GpuError, GpuGrader, self_test_frame
 from pifilm.gpu.reference import pass_tables, reference_pass
 from pifilm.grain import GrainParams, grain_tile, tile_placement
-from pifilm.normalize import stats_gains
+from pifilm.halation import HalationParams, prepare
+from pifilm.normalize import apply_gains_u8, stats_gains
 from tests.gpu_fakes import TILE_GRAIN, FakeDevice, tile_artifacts
 
 
@@ -506,3 +507,95 @@ def test_the_self_test_leaves_the_grain_tile_cache_alone():
     small = dataclasses.replace(artifacts.grain, tile_px=grader_module.SELF_TEST_TILE_PX)
     assert device.tile_loads[1] == (64, 64)
     assert np.array_equal(device.tile, grain_tile(small, 96 / small.frame_width_mm))
+
+
+# --- halation ------------------------------------------------------------------
+
+HALATION = HalationParams(enabled=True, strength=0.4)
+
+
+def test_a_halation_look_grades_as_the_reference_with_the_cpus_glow():
+    artifacts = tile_artifacts(halation=HALATION)
+    grader, device, _, _ = _open(artifacts)
+    frame = _frame()
+    gains = stats_gains(frame, artifacts.normalize)
+    out = grader.grade(frame, gains, np.random.default_rng(1234))
+    hp = prepare(apply_gains_u8(frame, gains), HALATION)
+    grain = artifacts.grain
+    tile = grain_tile(grain, max(frame.shape[:2]) / grain.frame_width_mm)
+    want = reference_pass(frame, pass_tables(gains, grain), artifacts.lut.table, tile,
+                          tile_placement(grain, np.random.default_rng(1234)), halation=hp)
+    assert np.array_equal(out[..., :3], want)
+    assert np.array_equal(device.glow, hp.glow)
+    headroom, mix = device.runs[-1]["halation"]
+    assert headroom == hp.headroom and np.array_equal(mix, hp.mix)
+    # And the glow shows: not the grade without halation.
+    assert not np.array_equal(out[..., :3], _expected(artifacts, frame, 1234))
+
+
+def test_grade_without_halation_on_a_halation_look_runs_without_it():
+    artifacts = tile_artifacts(halation=HALATION)
+    grader, device, _, _ = _open(artifacts)
+    frame = _frame()
+    _grade(grader, artifacts, frame, seed=3)
+    assert device.glow is not None
+    out = _grade(grader, artifacts, frame, seed=3, halation=False)
+    assert device.runs[-1]["halation"] is None
+    assert device.glow is None                       # the placeholder again
+    assert np.array_equal(out[..., :3], _expected(artifacts, frame, 3))
+
+
+def test_the_self_test_notices_a_pass_that_leaves_the_halation_out():
+    artifacts = tile_artifacts(halation=HALATION)
+    lines: list[str] = []
+    made: list[FakeDevice] = []
+
+    def factory():
+        made.append(FakeDevice(skip_halation=True))
+        return made[-1]
+
+    assert GpuGrader.open(artifacts, log=lines.append, device_factory=factory) is None
+    assert len(lines) == 1 and lines[0].startswith("gpu grading off: self-test: ")
+    assert made[0].runs[0]["halation"] is not None and made[0].closed == 1
+
+
+def test_a_look_without_halation_loads_the_placeholder_once_and_makes_no_glow(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("no glow is made for a look without halation")
+
+    monkeypatch.setattr(grader_module, "prepare", refuse)
+    grader, device, _, artifacts = _open()
+    for seed in (1, 2):
+        _grade(grader, artifacts, _frame(seed=seed), seed=seed)
+    assert device.glow_loads == [None]
+    assert all(run["halation"] is None for run in device.runs)
+
+
+def test_timings_have_halation_only_with_halation():
+    artifacts = tile_artifacts(halation=HALATION)
+    grader, _, _, _ = _open(artifacts)
+    timings: dict = {}
+    _grade(grader, artifacts, _frame(), timings=timings)
+    assert isinstance(timings["halation"], float) and timings["halation"] >= 0
+    timings = {}
+    _grade(grader, artifacts, _frame(), timings=timings, halation=False)
+    assert "halation" not in timings
+    grader, _, _, artifacts = _open()
+    timings = {}
+    _grade(grader, artifacts, _frame(), timings=timings)
+    assert "halation" not in timings
+
+
+def test_a_failure_making_the_glow_is_a_counted_gpu_error(monkeypatch):
+    artifacts = tile_artifacts(halation=HALATION)
+    grader, device, _, _ = _open(artifacts)
+
+    def broken(*args, **kwargs):
+        raise MemoryError("no room for the glow")
+
+    monkeypatch.setattr(grader_module, "prepare", broken)
+    runs = len(device.runs)
+    for _ in range(3):
+        with pytest.raises(GpuError, match="MemoryError: no room for the glow"):
+            _grade(grader, artifacts, _frame())
+    assert len(device.runs) == runs and not grader.enabled

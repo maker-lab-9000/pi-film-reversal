@@ -28,6 +28,7 @@ from pifilm.capture.camera import CameraError, FakeCamera, Frame, StreamInfo, sy
 from pifilm.capture.controller import CaptureController
 from pifilm.capture.gradequeue import read_entries, write_entry
 from pifilm.gpu.grader import GpuGrader
+from pifilm.gpu.shader import BACKEND
 from pifilm.grain import GrainParams
 from pifilm.imageio import load_rgb, save_jpeg
 from pifilm.lut import LUT3D
@@ -3241,7 +3242,7 @@ def test_the_grade_worker_opens_the_grader_and_grades_on_it(tmp_path, gpu):
     assert session.close_grades(timeout=5)
     assert gpu.threads == ["pifilm-grade"]
     (record,) = _lines(session.out_root)
-    assert record["pipeline_backend"] == "gpu-1"
+    assert record["pipeline_backend"] == BACKEND
     assert list(record)[-1] == "pipeline_backend"
     assert {"normalize", "gpu", "gpu_upload", "gpu_shader", "gpu_readback"} <= set(
         record["stage_ms"])
@@ -3278,7 +3279,7 @@ def test_a_photograph_the_gpu_fails_on_is_graded_on_the_cpu(tmp_path, gpu):
     first, second = session.capture(), session.capture()
     assert session.close_grades(timeout=5)
     one, two = _lines(session.out_root)
-    assert (one["pipeline_backend"], two["pipeline_backend"]) == ("cpu", "gpu-1")
+    assert (one["pipeline_backend"], two["pipeline_backend"]) == ("cpu", BACKEND)
     assert first.graded.read_bytes() == _cpu_bytes(tmp_path, one["grain_seed"])
     assert second.graded.read_bytes() == _gpu_bytes(tmp_path, two["grain_seed"])
     assert {"lut", "grain"} <= set(one["stage_ms"]) and "gpu" not in one["stage_ms"]
@@ -3387,7 +3388,7 @@ def test_a_recovered_grade_records_what_graded_it(tmp_path, gpu):
     _settle(again)
     assert again.close_grades(timeout=5)
     (record,) = _lines(again.out_root)
-    assert record["recovered"] is True and record["pipeline_backend"] == "gpu-1"
+    assert record["recovered"] is True and record["pipeline_backend"] == BACKEND
     assert list(record)[-3:] == ["grade", "recovered", "pipeline_backend"]
     assert again.test_log[0] == "recovering 1 unfinished grade(s)"
     # Graded from the saved JPEG, on the GPU.
@@ -3404,7 +3405,7 @@ def test_a_double_exposure_is_graded_on_the_gpu_and_exposure_1_names_no_backend(
     assert session.close_grades(timeout=5)
     one, two = _lines(session.out_root)
     assert "pipeline_backend" not in one and "params_version" not in one
-    assert two["pipeline_backend"] == "gpu-1" and two["double"]["index"] == 2
+    assert two["pipeline_backend"] == BACKEND and two["double"]["index"] == 2
     assert "composite" in two["stage_ms"] and "gpu" in two["stage_ms"]
 
 

@@ -15,8 +15,9 @@ from pifilm.capture.camera import synthetic_frame
 from pifilm.gpu import shader
 from pifilm.gpu.reference import PassTables, pass_tables, reference_pass, supports
 from pifilm.grain import GrainParams, _oriented, grain_tile, place_tile, tile_placement
+from pifilm.halation import HalationParams, apply_cpu, prepare
 from pifilm.lut import LUT3D
-from pifilm.normalize import Gains, stats_gains
+from pifilm.normalize import Gains, apply_gains_u8, stats_gains
 from pifilm.pipeline import Pipeline
 
 TILE_GRAIN = GrainParams(model="two_scale_tile", strength=0.025, tile_px=256)
@@ -353,10 +354,91 @@ def test_supports_the_tile_grain_and_no_grain_only():
 def test_the_shader_source_and_its_version():
     for source in (shader.VERTEX, shader.FRAGMENT):
         assert isinstance(source, bytes) and source.startswith(b"#version 300 es\n")
-    assert shader.SHADER_VERSION == 1
-    assert shader.BACKEND == "gpu-1"
+    assert shader.SHADER_VERSION == 2
+    assert shader.BACKEND == "gpu-2"
     # The uniforms the device binds, by the names the reference uses.
     for name in (b"img", b"chan", b"tone", b"lut", b"gain", b"tile", b"offset", b"orient",
-                 b"use_tone", b"use_grain"):
+                 b"use_tone", b"use_grain", b"glow", b"use_halation", b"hr", b"hw"):
         assert b" " + name + b";" in shader.FRAGMENT
 
+
+
+# --- halation ------------------------------------------------------------------
+
+
+def _halation_case(params: HalationParams):
+    """A random frame with a bright square, the bundled look without grain, and
+    what each path is given: the pass's tables and the glow ``prepare`` made.
+
+    Mid-tones (64 to 191), not the full range: on a full-range random frame the
+    starter LUT's steep gamut edge puts the CPU up to 22 levels from the pass on
+    a saturated pixel without any halation (19 with it), the documented
+    difference of the CPU's rounding, which would hide what this checks."""
+    rng = np.random.default_rng(5)
+    frame = rng.integers(64, 192, (90, 130, 3), dtype=np.uint8)
+    frame[40:50, 60:70] = 255
+    art = Artifacts.default()
+    gains = stats_gains(frame, art.normalize)
+    normalised = apply_gains_u8(frame, gains)
+    hp = prepare(normalised, params)
+    tables = pass_tables(gains, dataclasses.replace(art.grain, enabled=False))
+    return frame, art, normalised, hp, tables
+
+
+def test_reference_with_halation_matches_the_cpu_step():
+    frame, art, normalised, hp, tables = _halation_case(
+        HalationParams(enabled=True, strength=0.4))
+    want = art.lut.apply_pillow(apply_cpu(normalised, hp), art.lut.to_pillow())[..., :3]
+    got = reference_pass(frame, tables, art.lut.table, None, None, halation=hp)
+    diff = np.abs(got.astype(int) - want.astype(int))
+    assert diff.mean() < 1.0 and diff.max() <= 12   # the CPU's byte rounding, as without halation
+    # And the halation shows: the pass with it is not the pass without it.
+    plain = reference_pass(frame, tables, art.lut.table, None, None)
+    assert np.abs(got.astype(int) - plain.astype(int)).max() > 5
+
+
+def test_reference_without_halation_is_unchanged():
+    frame, art, _, _, tables = _halation_case(HalationParams(enabled=True, strength=0.4))
+    tile = grain_tile(TILE_GRAIN, max(frame.shape[:2]) / TILE_GRAIN.frame_width_mm)
+    placement = tile_placement(TILE_GRAIN, np.random.default_rng(3))
+    for args in ((None, None), (tile, placement)):
+        assert np.array_equal(
+            reference_pass(frame, tables, art.lut.table, *args, halation=None),
+            reference_pass(frame, tables, art.lut.table, *args))
+
+
+def test_the_glow_read_is_the_cpus_bilinear_upsampling():
+    """The shader reads the glow by hand at half-pixel centres with clamped
+    edges; that is what ``cv2.resize(..., INTER_LINEAR)`` does on the CPU."""
+    from pifilm.gpu.reference import _glow_at
+    from pifilm.halation import upsample
+
+    glow = np.random.default_rng(9).random((7, 11, 3)).astype(np.float32)
+    want = upsample(glow, 45, 70)
+    got = np.concatenate([_glow_at(glow, top, rows, 70, 45, 70)
+                          for top, rows in ((0, 20), (20, 25))])
+    assert got.dtype == np.float32 and got.shape == want.shape
+    assert np.abs(got - want).max() < 1e-3
+    # A glow at full size reads back as itself.
+    assert np.allclose(_glow_at(glow, 0, 7, 11, 7, 11), glow, atol=1e-6)
+
+
+def test_halation_off_in_the_mix_leaves_a_channel_as_the_pass_without_it():
+    """With a zero weight a channel goes through expand and compress only, which
+    is the identity to well below a level."""
+    frame, art, normalised, _, tables = _halation_case(HalationParams())
+    hp = prepare(normalised, HalationParams(enabled=True, weights=(0.0, 0.0, 0.0)))
+    identity = LUT3D.identity(33).table
+    got = reference_pass(frame, tables, identity, None, None, halation=hp)
+    want = reference_pass(frame, tables, identity, None, None)
+    assert np.abs(got.astype(int) - want.astype(int)).max() <= 1
+
+
+def test_bands_do_not_show_with_halation(monkeypatch):
+    from pifilm.gpu import reference
+
+    frame, art, _, hp, tables = _halation_case(HalationParams(enabled=True, strength=0.4))
+    whole = reference_pass(frame, tables, art.lut.table, None, None, halation=hp)
+    monkeypatch.setattr(reference, "BAND_PIXELS", 7 * frame.shape[1])
+    assert np.array_equal(
+        reference_pass(frame, tables, art.lut.table, None, None, halation=hp), whole)

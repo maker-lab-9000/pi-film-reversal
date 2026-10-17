@@ -217,7 +217,7 @@ def test_a_grader_that_can_grade_supplies_the_picture(pipeline):
     out, info = pipeline.process(frame, rng=np.random.default_rng(4), timings=timings,
                                  grader=grader, used=used)
     assert out.shape == (48, 64, 4) and out.dtype == np.uint8 and (out == 77).all()
-    assert used == {"backend": BACKEND} and BACKEND == "gpu-1"
+    assert used == {"backend": BACKEND} and BACKEND == "gpu-2"
     assert info == cpu_info
     assert set(timings) == {"normalize", "gpu", "gpu_upload", "gpu_shader", "gpu_readback"}
     assert grader.asked == [((48, 64, 3), 0.0, True)]
@@ -287,7 +287,7 @@ def test_a_real_grader_on_a_fake_device_grades_within_the_pass_tolerance():
     grader = GpuGrader(pipe.artifacts, device, log=lambda _: None)
     used = {}
     out, info = pipe.process(frame, rng=np.random.default_rng(3), grader=grader, used=used)
-    assert used == {"backend": "gpu-1"} and info == cpu_info
+    assert used == {"backend": BACKEND} and info == cpu_info
     assert out.shape == (96, 160, 4)
     diff = np.abs(out[..., :3].astype(int) - cpu.astype(int))
     assert diff.mean() < 1.25 and diff.max() <= 24  # the reference's measured bounds on luma

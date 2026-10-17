@@ -10,6 +10,7 @@ import pytest
 
 from pifilm.artifacts import write_artifact
 from pifilm.gpu import check
+from pifilm.halation import HalationParams
 from pifilm.imageio import save_jpeg
 from tests.gpu_fakes import TILE_GRAIN, FakeDevice, tile_artifacts
 
@@ -138,6 +139,34 @@ def test_an_artifact_without_grain_is_checked_without_it(tmp_path, image):
     code, text, devices = _run(["--artifacts", directory, "--image", image])
     assert code == 0
     assert all(run["placement"] is None for run in devices[0].runs)
+
+
+def test_a_halation_look_is_checked_with_its_glow(tmp_path, image):
+    base = tile_artifacts()
+    halation = HalationParams(enabled=True, strength=0.4)
+    directory = write_artifact(tmp_path / "glow", base.lut, base.normalize, TILE_GRAIN,
+                               halation=halation)
+    code, text, devices = _run(["--artifacts", directory, "--image", image])
+    assert code == 0
+    assert re.search(r"halation on the CPU: [\d.]+ ms", text)
+    assert re.search(r"against the reference: max 0 levels", text)
+    assert all(run["halation"] is not None for run in devices[0].runs)
+
+    # A device that leaves the halation out after its self-test is caught.
+    class LateSkip(FakeDevice):
+        def run(self, rgb_u8, **kwargs):
+            self.skip_halation = rgb_u8.shape[:2] != (64, 96)
+            return super().run(rgb_u8, **kwargs)
+
+    lines: list[str] = []
+    code = check.main(["--artifacts", str(directory), "--image", str(image)],
+                      out=lines.append, device_factory=LateSkip)
+    assert code == 1 and lines[-1].startswith("FAILED: the GPU is ")
+
+
+def test_a_look_without_halation_prints_no_halation_line(artifacts_dir, image):
+    code, text, _ = _run(["--artifacts", artifacts_dir, "--image", image])
+    assert code == 0 and "halation" not in text
 
 
 def test_the_synthetic_frame_is_the_imx477s_size():

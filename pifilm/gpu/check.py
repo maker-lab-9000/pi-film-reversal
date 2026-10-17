@@ -7,7 +7,9 @@ each pass took beside the CPU pipeline on the same frame, and exits 0 only
 when no pixel is more than one level from the reference. The difference from
 the CPU pipeline is printed for information: the CPU rounds to bytes four
 times where the pass rounds once (``pifilm.gpu.reference`` says where that
-shows), so it is not what passes or fails.
+shows), so it is not what passes or fails. A look with halation is checked
+with it: its glow is made on the CPU, as the grader makes it, timed and printed
+beside the statistics, and handed to the reference.
 
 Run it on the Pi with the capture service stopped, so the timings are the
 pass's own:
@@ -31,8 +33,9 @@ import numpy as np
 from ..artifacts import Artifacts, ArtifactsError
 from ..capture.camera import synthetic_frame
 from ..grain import grain_tile, tile_placement
+from ..halation import prepare
 from ..imageio import load_rgb
-from ..normalize import stats_gains
+from ..normalize import apply_gains_u8, stats_gains
 from ..pipeline import Pipeline
 from .grader import SELF_TEST_TOLERANCE, Device, GpuError, GpuGrader
 from .reference import pass_tables, reference_pass
@@ -83,6 +86,12 @@ def _check(grader: GpuGrader, artifacts: Artifacts, frame: np.ndarray, runs: int
     gains = stats_gains(frame, artifacts.normalize)
     out(f"statistics on the CPU: {(time.perf_counter() - started) * 1000.0:.1f} ms "
         "(paid per photograph on either path)")
+    hp = None
+    if artifacts.halation.active:
+        started = time.perf_counter()
+        hp = prepare(apply_gains_u8(frame, gains), artifacts.halation)
+        out(f"halation on the CPU: {(time.perf_counter() - started) * 1000.0:.1f} ms "
+            "(the glow, paid per photograph on the GPU path)")
 
     out("GPU pass (the first run also makes the textures and loads the tile):")
     gpu = None
@@ -115,7 +124,8 @@ def _check(grader: GpuGrader, artifacts: Artifacts, frame: np.ndarray, runs: int
     if grain_on:
         tile = grain_tile(grain, max(height, width) / grain.frame_width_mm)
         placement = tile_placement(grain, np.random.default_rng(SEED))
-    want = reference_pass(frame, pass_tables(gains, grain), artifacts.lut.table, tile, placement)
+    want = reference_pass(frame, pass_tables(gains, grain), artifacts.lut.table, tile, placement,
+                          halation=hp)
     worst = _difference(out, "against the reference", gpu[..., :3], want)
     _difference(out, "against the CPU pipeline", gpu[..., :3], cpu)
     if worst > SELF_TEST_TOLERANCE:
