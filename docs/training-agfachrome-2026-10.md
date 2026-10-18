@@ -9,9 +9,11 @@ is `docs/training.md`; the IMX477 settings are those of
 
 | | |
 |---|---|
-| Artifact | `artifacts/agfachrome-2026-10-b-dark-tile` (gitignored) |
+| Artifact | `artifacts/agfachrome-2026-10-b-dark` (gitignored; the gallery showed `-b-dark-tile`, the same LUT with HP5 grain) |
 | `lut_sha1` | `ee2a3b78…` (trained as `artifacts/agfachrome-2026-10-b`) |
-| Normalisation and grain | copied from the deployed `imx477-2026-09-v4-dark-hp5-tile`: levels gamma 1.0–1.25, stretch cap 1.5, no white balance, lift highlight ref 0.02, HP5 tile grain 0.025 (params version 4) |
+| Normalisation | from the deployed v4-dark look: levels gamma 1.0–1.25, stretch cap 1.5, no white balance, lift highlight ref 0.02 |
+| Grain | off, as in `imx477-2026-09-v4-dark` (the user's choice, 2026-10-18), so the GPU grades it |
+| Halation | on, `scripts/stamp_halation.py` defaults (strength 0.15, sigma 0.25 mm, headroom 0.5); params version 5 |
 | `tuning_sha1` | `5404134a…` (libcamera `imx477.json`, the same as the 2026-10-15 captures) |
 | LUT trained by | `pifilm-train --source data/source-imx477-agfa-2026-10 --target data/references-agfachrome-commons --out artifacts/agfachrome-2026-10-b --no-source-white-balance --source-lift-highlight-ref 0.02 --source-gamma-min 0.65 --source-gamma-max 1.25 --allow-small` |
 
@@ -67,4 +69,4 @@ previous look, slightly cooler.
 ## Rollback
 
 Point `--artifacts` in the unit's `ExecStart` back at
-`/home/george/repos/pi-film-reversal/artifacts/imx477-2026-09-v4-dark-hp5-tile` and restart.
+the previous look and restart.
