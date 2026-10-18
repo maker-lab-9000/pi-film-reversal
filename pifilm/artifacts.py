@@ -33,6 +33,15 @@ anything else would never equal a camera's fingerprint, so a typo would report
 every shot as a mismatch instead of failing once at load. ``stamp_tuning`` adds
 it to an existing artifact through a temporary file and ``os.replace``, so a
 failure part way leaves the old ``params.json``.
+
+**Halation and version 5.** An optional ``halation`` section holds the
+``HalationParams`` (``pifilm.halation``). A build from before halation ignores
+unknown sections and would grade the look without its glow, so a look with
+halation switched on must be at params version 5, which such a build refuses. A
+look without the section, or with it switched off, keeps its version and its
+exact pixels. ``stamp_halation`` writes the section into an existing artifact
+the way ``stamp_tuning`` writes its key, and raises the version (never lowers
+it) when the halation is on.
 """
 
 from __future__ import annotations
@@ -42,21 +51,25 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
 from .grain import GrainParams
+from .halation import HalationParams
 from .lut import LUT3D, CubeError, read_cube, sha1_hex, write_cube
 from .normalize import NormalizeParams
 
-PARAMS_VERSION = 4
+PARAMS_VERSION = 5
 # Version 3 exists only to carry a non-Gaussian grain model: an older build ignores
 # the extra grain fields and would grain at the Gaussian model's settings, so such
 # an artifact must be one it refuses. Gaussian-grain artifacts stay at version 2.
 GRAIN_MODEL_VERSION = 3
 # Version 4 carries the tiled HP5 grain, whose pixels differ from version 3's.
 GRAIN_MODEL_VERSIONS = {"gaussian": 2, "two_scale": GRAIN_MODEL_VERSION, "two_scale_tile": 4}
+# Version 5 carries halation, which an older build would ignore and grade without.
+HALATION_VERSION = 5
 DEFAULT_LUT_FILE = "pifilm.cube"
 _TUNING_SHA1 = re.compile(r"[0-9a-f]{40}")
 
@@ -89,6 +102,7 @@ class Artifacts:
     path: Path
     lut_sha1: str
     tuning_sha1: str | None = None
+    halation: HalationParams = field(default_factory=HalationParams)
 
     @classmethod
     def load(cls, dir_path: str | Path) -> Artifacts:
@@ -125,6 +139,11 @@ class Artifacts:
             grain = GrainParams.from_dict(
                 _require_object(raw.get("grain", {}), "grain", params_path)
             )
+            halation = HalationParams()
+            if "halation" in raw:
+                halation = HalationParams.from_dict(
+                    _require_object(raw["halation"], "halation", params_path)
+                )
         except (ValueError, TypeError) as exc:
             # TypeError too: a field-level type error such as
             # {"wb_gain_min": "oops"} reaches math.isfinite and raises TypeError,
@@ -134,6 +153,11 @@ class Artifacts:
             raise ArtifactsError(
                 f"{params_path}: grain model {grain.model!r} needs params version "
                 f"{GRAIN_MODEL_VERSIONS[grain.model]}, file says {version}"
+            )
+        if halation.active and version < HALATION_VERSION:
+            raise ArtifactsError(
+                f"{params_path}: halation needs params version {HALATION_VERSION}, "
+                f"file says {version}"
             )
 
         lut_file = raw.get("lut_file", DEFAULT_LUT_FILE)
@@ -187,6 +211,7 @@ class Artifacts:
             path=path,
             lut_sha1=actual,
             tuning_sha1=tuning_sha1,
+            halation=halation,
         )
 
     @classmethod
@@ -222,10 +247,13 @@ def write_artifact(
     training: dict | None = None,
     lut_file: str = DEFAULT_LUT_FILE,
     tuning_sha1: str | None = None,
+    halation: HalationParams | None = None,
 ) -> Path:
     """Write a complete artifact into ``dir_path`` (creating it) and return the directory.
 
     ``tuning_sha1``, when given, is written top-level (see the module docstring).
+    ``halation``, when given, is written after ``grain``; switched on, it makes the
+    file version 5 at least.
     """
     path = Path(dir_path)
     if tuning_sha1 is not None:
@@ -238,32 +266,35 @@ def write_artifact(
     # artifact fail its own integrity check on load — and an identity table would
     # not reveal it, because its values are exact at six decimals.
     payload = {
-        "version": GRAIN_MODEL_VERSIONS[grain.model],
+        "version": max(
+            GRAIN_MODEL_VERSIONS[grain.model],
+            HALATION_VERSION if halation is not None and halation.active else 0,
+        ),
         "lut_file": lut_file,
         "lut_sha1": sha1_hex(read_cube(path / lut_file)),
         "normalize": normalize.to_dict(),
         "grain": grain.to_dict(),
-        "training": training or {},
     }
+    if halation is not None:
+        payload["halation"] = halation.to_dict()
+    payload["training"] = training or {}
     if tuning_sha1 is not None:
         payload["tuning_sha1"] = tuning_sha1
     (path / "params.json").write_text(json.dumps(payload, indent=2) + "\n")
     return path
 
 
-def stamp_tuning(dir_path: str | Path, sha1: str) -> Path:
-    """Set ``tuning_sha1`` in the artifact at ``dir_path``; return its ``params.json``.
+def _rewrite_params(path: Path, change: Callable[[dict], None], verb: str) -> Path:
+    """Apply ``change`` to the artifact's ``params.json`` in place; return its path.
 
-    Every other key is kept, in its order (an earlier stamp is replaced where it
-    stands). The new file is written beside the old one, fsynced and moved over
-    it with ``os.replace``, so a reader, or a failure part way, sees the whole
-    old file or the whole new one. The artifact is loaded before (an already
-    broken one is refused untouched) and after, to confirm. The file's mode is
-    kept. The ``.cube`` is not touched, so ``lut_sha1`` still holds.
+    Every key ``change`` leaves alone is kept, in its order. The new file is
+    written beside the old one, fsynced and moved over it with ``os.replace``, so
+    a reader, or a failure part way, sees the whole old file or the whole new
+    one. The artifact is loaded before (an already broken one is refused
+    untouched) and after, to confirm. The file's mode is kept. The ``.cube`` is
+    not touched, so ``lut_sha1`` still holds.
     """
-    path = Path(dir_path)
     params_path = path / "params.json"
-    validate_tuning_sha1(sha1, params_path)
     # Refuse an artifact that is already unloadable (a mixed lut_sha1, say) before
     # anything is written, so a failed stamp leaves params.json as it was.
     Artifacts.load(path)
@@ -273,12 +304,12 @@ def stamp_tuning(dir_path: str | Path, sha1: str) -> Path:
         raise ArtifactsError(f"cannot read {params_path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ArtifactsError(f"{params_path}: top level must be a JSON object")
-    raw["tuning_sha1"] = sha1
+    change(raw)
 
     try:
         fd, tmp_name = tempfile.mkstemp(prefix=".params.", suffix=".json.tmp", dir=path)
     except OSError as exc:
-        raise ArtifactsError(f"could not stamp {params_path}: {exc}") from exc
+        raise ArtifactsError(f"could not {verb} {params_path}: {exc}") from exc
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(json.dumps(raw, indent=2) + "\n")
@@ -293,9 +324,42 @@ def stamp_tuning(dir_path: str | Path, sha1: str) -> Path:
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
-        raise ArtifactsError(f"could not stamp {params_path}: {exc}") from exc
+        raise ArtifactsError(f"could not {verb} {params_path}: {exc}") from exc
     Artifacts.load(path)
     return params_path
+
+
+def stamp_tuning(dir_path: str | Path, sha1: str) -> Path:
+    """Set ``tuning_sha1`` in the artifact at ``dir_path``; return its ``params.json``.
+
+    An earlier stamp is replaced where it stands; everything else is as
+    ``_rewrite_params`` keeps it.
+    """
+    path = Path(dir_path)
+    validate_tuning_sha1(sha1, path / "params.json")
+
+    def change(raw: dict) -> None:
+        raw["tuning_sha1"] = sha1
+
+    return _rewrite_params(path, change, "stamp")
+
+
+def stamp_halation(dir_path: str | Path, params: HalationParams) -> Path:
+    """Set the ``halation`` section of the artifact at ``dir_path``; return its ``params.json``.
+
+    Switched on, the version is raised to 5 if it is lower; switched off, the
+    version is left as it is (never lowered: the grain may need it). An earlier
+    section is replaced where it stands; everything else is as
+    ``_rewrite_params`` keeps it.
+    """
+
+    def change(raw: dict) -> None:
+        raw["halation"] = params.to_dict()
+        if params.active:
+            # The load before has checked the version is a whole number in range.
+            raw["version"] = max(raw.get("version", 0), HALATION_VERSION)
+
+    return _rewrite_params(Path(dir_path), change, "stamp halation in")
 
 
 def publish(staging_dir: str | Path, dest_dir: str | Path) -> Path:

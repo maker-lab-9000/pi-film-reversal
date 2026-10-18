@@ -1,10 +1,15 @@
-"""The Parr pipeline: normalise, apply the LUT, add grain.
+"""The Parr pipeline: normalise, halation, apply the LUT, add grain.
 
 The order is fixed and matters. The LUT was fitted on normalised input, so
 normalisation comes first; grain is a property of the developed film, so it
-goes on last. The same ``Pipeline`` serves full-resolution captures, the
-low-resolution live preview (``grain=False``) and batch reprocessing, which
-is what guarantees the preview shows the grade the capture will get.
+goes on last. Halation (``pifilm.halation``), when the look has it, sits
+between normalisation and the LUT: the glow forms as the film is exposed, so it
+is made from the exposure the LUT is handed, and the LUT's roll-off then treats
+the glow as it treats any other light. A look without halation grades exactly
+as before there was the step. The same ``Pipeline`` serves full-resolution
+captures, the low-resolution live preview (``grain=False``, ``halation=False``)
+and batch reprocessing, which is what guarantees the preview shows the grade
+the capture will get, less the two film effects a viewfinder does without.
 
 ``info`` returns the gains that were applied, whether either gain hit its
 clamp, the LUT's content hash and a hash of the normalisation parameters. The
@@ -26,10 +31,12 @@ uncompensated grade even where normalisation's clamps cannot fully restore a
 very dark frame - re-applying alone darkened such a frame twice. Before the
 LUT is where film takes exposure: the negative is exposed differently and
 developed the same. The value is recorded as ``ev_comp`` so a regrade can
-reproduce it.
+reproduce it. Halation follows the compensation: it is made from the frame as
+exposed, the one the LUT is given.
 
 The GPU. ``process`` can be handed a grader (``pifilm.gpu.grader``), which does
-normalise, LUT and grain as one pass on the Pi's GPU. The statistics stay here,
+normalise, halation, LUT and grain as one pass on the Pi's GPU (it makes the
+glow itself, on the CPU, and is told whether to). The statistics stay here,
 on the CPU, from the same subsample (``stats_gains``), so the audit fields are
 the same whichever path graded; only the pixels differ, by the CPU's rounding
 between its stages. The grader is asked first whether it can take the frame
@@ -55,6 +62,7 @@ from .color import linear_to_srgb, srgb_to_linear
 from .gpu.grader import GpuError
 from .gpu.shader import BACKEND
 from .grain import add_grain, warm
+from .halation import apply_cpu, prepare
 from .normalize import Gains, normalize_u8, stats_gains
 
 
@@ -89,17 +97,24 @@ class Pipeline:
         timings: dict | None = None,
         grader=None,
         used: dict | None = None,
+        halation: bool = True,
     ) -> tuple[np.ndarray, dict]:
         """Grade one frame. ``timings``, when given, is filled with the milliseconds
-        each stage took (``normalize``, ``lut``, and ``grain`` when it ran). It is
-        an out-parameter and not part of the returned audit dict, because that dict
-        is what a regrade is reproduced from and a duration is not reproducible.
+        each stage took (``normalize``, ``halation`` when it ran, ``lut``, and
+        ``grain`` when it ran). It is an out-parameter and not part of the
+        returned audit dict, because that dict is what a regrade is reproduced
+        from and a duration is not reproducible.
+
+        ``halation=False`` leaves the look's halation out, as ``grain=False`` its
+        grain (the live view does both); the audit still names the look's
+        halation (``halation_sha1``, when it has one), as it names its LUT.
 
         ``grader``, when given and able to take this frame, grades it on the GPU
         (see the module docstring); the stages are then ``normalize`` (the
         statistics), ``gpu`` (the whole pass) and the grader's ``gpu_upload``,
-        ``gpu_shader`` and ``gpu_readback``. ``used``, when given, is another
-        out-parameter: ``used["backend"]`` says what graded the frame (``"gpu-1"``
+        ``gpu_shader`` and ``gpu_readback``, and its ``halation`` (the glow)
+        when that ran. ``used``, when given, is another out-parameter:
+        ``used["backend"]`` says what graded the frame (``BACKEND``, ``"gpu-2"``,
         or ``"cpu"``), and ``used["gpu_error"]`` is there when the GPU was tried
         and failed, for the caller to log.
 
@@ -113,6 +128,7 @@ class Pipeline:
             )
         ev = float(ev)
         with_grain = bool(grain and self.artifacts.grain.enabled)
+        with_halation = bool(halation and self.artifacts.halation.active)
         if used is not None:
             used["backend"] = "cpu"
         if grader is not None and grader.can_grade(rgb_u8.shape, ev=ev, grain=with_grain):
@@ -123,7 +139,8 @@ class Pipeline:
                 started = time.perf_counter()
                 gains = stats_gains(rgb_u8, self.artifacts.normalize)
                 started = _lap(gpu_timings, "normalize", started)
-                graded = grader.grade(rgb_u8, gains, rng, grain=with_grain, timings=gpu_timings)
+                graded = grader.grade(rgb_u8, gains, rng, grain=with_grain,
+                                      halation=with_halation, timings=gpu_timings)
                 _lap(gpu_timings, "gpu", started)
             except GpuError as exc:
                 if rng is not None:
@@ -143,6 +160,10 @@ class Pipeline:
         if ev != 0.0:
             normalised = _ev_table(ev)[normalised]
         started = _lap(timings, "normalize", started)
+        if with_halation:
+            # From the frame the LUT is given: normalised, compensation put back.
+            normalised = apply_cpu(normalised, prepare(normalised, self.artifacts.halation))
+            started = _lap(timings, "halation", started)
         graded = self.artifacts.lut.apply_pillow(normalised, self._filter)
         started = _lap(timings, "lut", started)
         if with_grain:
@@ -152,8 +173,9 @@ class Pipeline:
 
     def _audit(self, gains: Gains, ev: float) -> dict:
         """The record's audit fields. The same for the same gains, whichever
-        path graded."""
-        return {
+        path graded. ``halation_sha1`` follows ``normalize_sha1`` only for a
+        look with halation, so a look without it records what it always did."""
+        audit = {
             "wb_gains": [round(float(g), 4) for g in gains.wb],
             "exposure_gain": round(float(gains.exposure), 4),
             "levels": (
@@ -164,8 +186,11 @@ class Pipeline:
             "clamped": dict(gains.clamped),
             "lut_sha1": self.artifacts.lut_sha1,
             "normalize_sha1": self.normalize_sha1,
-            "ev_comp": ev,
         }
+        if self.artifacts.halation.active:
+            audit["halation_sha1"] = self.artifacts.halation.sha1
+        audit["ev_comp"] = ev
+        return audit
 
 
 def _ev_table(ev: float) -> np.ndarray:

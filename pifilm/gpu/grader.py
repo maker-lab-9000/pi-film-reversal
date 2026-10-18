@@ -28,6 +28,16 @@ same photograph on the CPU. Three in a row switch the grader off for the run
 and release the device. ``open`` never raises: no GPU is an ordinary state
 (a Mac, a Pi without the driver), reported in one log line.
 
+**Halation.** With the look's halation on, the pass mixes each pixel towards
+a glow, and the glow is made here, on the CPU, by ``pifilm.halation.prepare``
+from the normalised bytes (``apply_gains_u8``): the CPU path makes it the same
+way from the same bytes, so both mix the same numbers, and a blur of a reduced
+copy is tens of milliseconds on the Pi's CPU where the shader would need passes
+of its own. Its time is ``timings["halation"]``. Without halation the device
+holds a one-texel placeholder, loaded at set-up and again only after a
+photograph that had a glow. The self-test runs the step whenever the look has
+it, so a driver that gets it wrong costs the run its grader.
+
 **The seed.** The grain's placement is drawn by ``pifilm.grain.tile_placement``
 exactly when the CPU's ``add_grain`` would draw it, so a shot's seed puts the
 grain in the same place on both paths, and a grade without grain draws nothing.
@@ -37,6 +47,7 @@ from __future__ import annotations
 
 import dataclasses
 import threading
+import time
 from collections.abc import Callable
 from typing import Protocol
 
@@ -45,7 +56,8 @@ import numpy as np
 from .. import grain as grain_module
 from ..artifacts import Artifacts
 from ..grain import GrainParams, grain_tile, tile_placement
-from ..normalize import Gains, stats_gains
+from ..halation import HalationPass, prepare
+from ..normalize import Gains, apply_gains_u8, stats_gains
 from .reference import PassTables, pass_tables, reference_pass, supports
 
 # The self-test: a frame of this (height, width), a tile of this size, placed
@@ -73,9 +85,13 @@ class Device(Protocol):
 
     def load_tile(self, tile: np.ndarray | None) -> None: ...  # once per tile; None: no grain
 
+    def load_glow(self, glow: np.ndarray | None) -> None: ...  # per photograph; None: no halation
+
     def run(self, rgb_u8: np.ndarray, *, use_tone: bool,
             placement: tuple[int, int, int] | None,
-            timings: dict | None = None) -> np.ndarray: ...    # (H, W, 4) uint8; raises GpuError
+            timings: dict | None = None,
+            halation: tuple[float, np.ndarray] | None = None,
+            ) -> np.ndarray: ...                               # (H, W, 4) uint8; raises GpuError
 
     def close(self) -> None: ...
 
@@ -115,6 +131,7 @@ class GpuGrader:
         self._closed = False
         self._failures = 0
         self._tile_key: tuple[int, float] | None = None
+        self._placeholder = False        # whether the device holds the no-glow texel
         try:
             self._set_up()
         except BaseException:
@@ -176,10 +193,13 @@ class GpuGrader:
             return False
 
     def grade(self, rgb_u8: np.ndarray, gains: Gains, rng: np.random.Generator | None,
-              *, grain: bool = True, timings: dict | None = None) -> np.ndarray:
+              *, grain: bool = True, halation: bool = True,
+              timings: dict | None = None) -> np.ndarray:
         """Grade one frame with ``gains`` (from ``stats_gains``). Returns
-        ``(H, W, 4)`` uint8, the fourth byte unused. ``timings``, when given,
-        gets ``gpu_upload``, ``gpu_shader`` and ``gpu_readback`` in milliseconds.
+        ``(H, W, 4)`` uint8, the fourth byte unused. ``halation=False`` leaves
+        the look's halation out (as ``grain=False`` its grain). ``timings``,
+        when given, gets ``gpu_upload``, ``gpu_shader`` and ``gpu_readback`` in
+        milliseconds, and ``halation`` (the glow, made on the CPU) when it ran.
 
         Raises ``GpuError`` on any failure; the caller then grades this frame
         on the CPU. The generator is advanced only by the placement draw, the
@@ -198,9 +218,21 @@ class GpuGrader:
                     placement = tile_placement(params, rng)
                 else:
                     params = dataclasses.replace(params, enabled=False)
+                hp = None
+                if halation and self._artifacts.halation.active:
+                    started = time.perf_counter()
+                    hp = prepare(apply_gains_u8(rgb_u8, gains), self._artifacts.halation)
+                    if timings is not None:
+                        timings["halation"] = round(
+                            (time.perf_counter() - started) * 1000.0, 1)
             except Exception as exc:  # noqa: BLE001 - one type leaves grade, see _run
+                # The glow is CPU work, but a failure here (a MemoryError, say) is
+                # counted below like the device's own, on purpose: the caller's CPU
+                # grade makes the same glow with the same ``prepare``, so a frame
+                # whose glow cannot be made fails there too, and three such frames in
+                # a row switching the GPU off costs speed, never a photograph.
                 raise GpuError(f"{type(exc).__name__}: {exc}") from exc
-            out = self._run(rgb_u8, gains, params, placement, timings)
+            out = self._run(rgb_u8, gains, params, placement, timings, hp)
         except GpuError:
             self._failures += 1
             if self._failures >= self.MAX_FAILURES:
@@ -248,6 +280,8 @@ class GpuGrader:
             # Every sampler of the shader has a texture from the start; a real
             # tile replaces this one when the first photograph with grain comes.
             self._device.load_tile(None)
+            self._device.load_glow(None)
+            self._placeholder = True
         except GpuError:
             raise
         except Exception as exc:  # noqa: BLE001 - see _run
@@ -276,9 +310,12 @@ class GpuGrader:
         else:
             grain = dataclasses.replace(grain, enabled=False)
             placement = tile = None
-        got = self._run(frame, gains, grain, placement, None, tile=tile)
+        hp = None
+        if self._artifacts.halation.active:
+            hp = prepare(apply_gains_u8(frame, gains), self._artifacts.halation)
+        got = self._run(frame, gains, grain, placement, None, hp, tile=tile)
         want = reference_pass(frame, pass_tables(gains, grain), self._artifacts.lut.table,
-                              tile, placement)
+                              tile, placement, halation=hp)
         worst = int(np.abs(got[..., :3].astype(np.int16) - want.astype(np.int16)).max())
         if worst > SELF_TEST_TOLERANCE:
             raise GpuError(f"the device is {worst} levels from the reference "
@@ -291,11 +328,12 @@ class GpuGrader:
 
     def _run(self, rgb_u8: np.ndarray, gains: Gains, grain: GrainParams,
              placement: tuple[int, int, int] | None, timings: dict | None,
-             tile: np.ndarray | None = None) -> np.ndarray:
+             halation: HalationPass | None, tile: np.ndarray | None = None) -> np.ndarray:
         """One pass on the device. Anything the device raises leaves as
         ``GpuError``: ctypes and NumPy have their own exceptions (a bad
         argument, no memory), and the caller's fallback catches one type.
-        ``tile`` is the self-test's own; a photograph's comes from the cache."""
+        ``tile`` is the self-test's own; a photograph's comes from the cache.
+        ``halation`` is this frame's glow, or None for none."""
         try:
             tables = pass_tables(gains, grain)
             if placement is not None:
@@ -307,9 +345,16 @@ class GpuGrader:
                     self._device.load_tile(
                         tile if tile is not None else self._tile(grain, rgb_u8.shape))
                     self._tile_key = key
+            if halation is not None:
+                self._placeholder = False      # until the load is done, neither is known
+                self._device.load_glow(halation.glow)
+            elif not self._placeholder:
+                self._device.load_glow(None)
+                self._placeholder = True
             self._device.load_tables(tables)
-            out = self._device.run(rgb_u8, use_tone=tables.use_tone, placement=placement,
-                                   timings=timings)
+            out = self._device.run(
+                rgb_u8, use_tone=tables.use_tone, placement=placement, timings=timings,
+                halation=None if halation is None else (halation.headroom, halation.mix))
         except GpuError:
             raise
         except Exception as exc:  # noqa: BLE001 - see the docstring

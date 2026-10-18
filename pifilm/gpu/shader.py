@@ -1,10 +1,13 @@
-"""The grade as one fragment shader: normalise, 3D LUT, tile grain.
+"""The grade as one fragment shader: normalise, halation, 3D LUT, tile grain.
 
 This is the source the Pi's GPU compiles (OpenGL ES 3.0, V3D on the Pi 4). It
 is the shader of ``scripts/experiments/gpu_pass_spike.py`` (branch
-``spike/gpu-pass``), character for character: that text compiled and ran
-correctly on the target on 2026-10-13, and it cannot be compiled on a Mac or
-in the test suite, so any edit here is unproven until it has run on the Pi.
+``spike/gpu-pass``), character for character, but for the halation step (the
+``glow``, ``use_halation``, ``hr`` and ``hw`` uniforms, the ``G`` helper and
+the ``use_halation`` block, added with version 2): the spike's text compiled
+and ran correctly on the target on 2026-10-13, and it cannot be compiled on a
+Mac or in the test suite, so any edit here, the halation step included, is
+unproven until it has run on the Pi.
 ``pifilm.gpu.reference`` is the same maths in NumPy, step for step and name
 for name; read the two side by side, and change them together.
 
@@ -18,6 +21,12 @@ What the shader relies on, which the device code must provide:
   ``px.y`` is the array's row and the tile lands where the CPU puts it.
 * ``offset`` is ``(ox, oy)``; ``orient`` is the orientation of
   ``pifilm.grain.tile_placement``.
+* ``glow`` is the halation glow of ``pifilm.halation.prepare``, an RGB float
+  texture of its reduced ``(w, h)`` (one zero texel without halation, so the
+  sampler always has a texture); ``hr`` is the headroom and ``hw`` the
+  strength times the weights. The shader reads it bilinearly by hand at the
+  pixel's centre, ``vec2(px) + 0.5``, the half-pixel mapping of the CPU's
+  ``cv2.resize``.
 * The vertex shader draws one triangle over the whole target from
   ``gl_VertexID`` alone: three vertices, no buffers.
 
@@ -28,7 +37,7 @@ tables and textures it is given.
 
 from __future__ import annotations
 
-SHADER_VERSION = 1
+SHADER_VERSION = 2
 # The value of a record's ``pipeline_backend`` for a photograph this pass graded.
 BACKEND = f"gpu-{SHADER_VERSION}"
 
@@ -55,6 +64,10 @@ uniform ivec2 offset;      // (ox, oy)
 uniform int orient;
 uniform int use_tone;
 uniform int use_grain;
+uniform sampler2D glow;    // (w, h) RGB float: the reduced, blurred, expanded glow
+uniform int use_halation;
+uniform float hr;          // headroom c
+uniform vec3 hw;           // strength * weights
 out vec4 o;
 const vec3 LUMA = vec3(0.299, 0.587, 0.114);
 float table(sampler2D t, float v) {
@@ -64,6 +77,7 @@ float table(sampler2D t, float v) {
   return mix(texelFetch(t, ivec2(i, 0), 0).r, texelFetch(t, ivec2(i + 1, 0), 0).r, x - lo);
 }
 vec3 at(ivec3 i) { return texelFetch(lut, i, 0).rgb; }
+vec3 G(ivec2 i) { return texelFetch(glow, i, 0).rgb; }
 void main() {
   ivec2 px = ivec2(gl_FragCoord.xy);
   ivec3 b = ivec3(texelFetch(img, px, 0).rgb * 255.0 + 0.5);
@@ -73,6 +87,22 @@ void main() {
   if (use_tone == 1) {
     float y = dot(c, LUMA);
     c = clamp(c + (table(tone, y) - y), 0.0, 1.0);
+  }
+  if (use_halation == 1) {
+    vec3 l = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c));
+    vec3 x = l / (1.0 - hr * l);
+    ivec2 gs = textureSize(glow, 0);
+    vec2 u = (vec2(px) + 0.5) * vec2(gs) / vec2(textureSize(img, 0)) - 0.5;
+    u = clamp(u, vec2(0.0), vec2(gs - 1));
+    ivec2 i0 = ivec2(floor(u));
+    ivec2 i1 = min(i0 + 1, gs - 1);
+    vec2 t = u - vec2(i0);
+    vec3 B = mix(mix(G(i0), G(ivec2(i1.x, i0.y)), t.x),
+                 mix(G(ivec2(i0.x, i1.y)), G(i1), t.x), t.y);
+    x = x + hw * (B - x);
+    l = x / (1.0 + hr * x);
+    c = clamp(mix(l * 12.92, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055,
+                  step(0.0031308, l)), 0.0, 1.0);
   }
   vec3 s = c * float(n - 1);
   vec3 lo = min(floor(s), float(n - 2));

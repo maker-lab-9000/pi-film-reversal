@@ -33,7 +33,14 @@ difference from it is listed here to be checked on the hardware:
 * The set-up, the tables, the LUT and the tile are each checked for a GL
   error (the spike checked after allocation and after a pass), and a frame or
   a table of the wrong shape is refused before it reaches a GL call.
-* With no grain the tile is one zero texel, so every sampler has a texture.
+* With no grain the tile is one zero texel, so every sampler has a texture;
+  with no halation the glow is one zero RGB texel, for the same reason.
+* The halation glow (shader version 2, not in the spike) is a ``GL_RGB32F``
+  texture of the glow's reduced size, made again only when that size changes
+  and otherwise refilled, as the tables are; it is a seventh texture unit, and
+  ``hr`` and ``hw`` are the pass's only float uniforms, so ``glUniform1f`` and
+  ``glUniform3f`` are declared with ``c_float`` arguments (undeclared, ctypes
+  refuses a Python float).
 * The spike's printing and its query of the preferred read-back format are
   gone; the four-byte upload and three-byte read-back it tried are too.
 
@@ -52,7 +59,7 @@ from __future__ import annotations
 import ctypes
 import os
 import time
-from ctypes import POINTER, byref, c_char_p, c_int, c_uint, c_void_p
+from ctypes import POINTER, byref, c_char_p, c_float, c_int, c_uint, c_void_p
 
 import numpy as np
 
@@ -67,7 +74,7 @@ GL_RGBA8, GL_RGB8, GL_RGB32F, GL_R32F, GL_R16F = 0x8058, 0x8051, 0x8815, 0x822E,
 GL_NEAREST, GL_CLAMP = 0x2600, 0x812F
 GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 = 0x8D40, 0x8CE0
 # The textures a pass reads besides the frame; all must be loaded before one.
-LOADED = ("chan", "tone", "lut", "gain", "tile")
+LOADED = ("chan", "tone", "lut", "gain", "tile", "glow")
 
 
 def open_device() -> EglDevice:
@@ -114,6 +121,8 @@ def _declare(egl, gl) -> None:
     gl.glTexSubImage3D.argtypes = [c_uint, c_int, c_int, c_int, c_int, c_int, c_int, c_int,
                                    c_uint, c_uint, c_void_p]
     gl.glReadPixels.argtypes = [c_int, c_int, c_int, c_int, c_uint, c_uint, c_void_p]
+    gl.glUniform1f.argtypes = [c_int, c_float]
+    gl.glUniform3f.argtypes = [c_int, c_float, c_float, c_float]
 
 
 class EglDevice:
@@ -125,6 +134,7 @@ class EglDevice:
         self._fbo = 0
         self.max_texture = 0
         self.renderer: str | None = None
+        self.glow_size = (0, 0)         # (width, height) of the glow's texture
         try:
             self._open()
         except BaseException:
@@ -264,6 +274,29 @@ class EglDevice:
         self.tile_size = size
         self._check_load("the tile", "tile")
 
+    def load_glow(self, glow: np.ndarray | None) -> None:
+        """The halation glow, ``(h, w, 3)`` float32, per photograph; None is one
+        zero texel (no halation). Made again only for another size."""
+        self._require_open()
+        if glow is None:
+            glow = np.zeros((1, 1, 3), np.float32)
+        if (glow.ndim != 3 or glow.shape[2] != 3 or glow.dtype != np.float32
+                or min(glow.shape[:2]) < 1 or max(glow.shape[:2]) > self.max_texture):
+            raise GpuError(f"the glow is {glow.dtype} {glow.shape}, not (h, w, 3) float32 "
+                           f"of at most {self.max_texture}")
+        gl = self.gl
+        height, width = glow.shape[:2]
+        data = np.ascontiguousarray(glow)
+        if "glow" in self.textures and self.glow_size == (width, height):
+            gl.glBindTexture(GL_TEXTURE_2D, self.textures["glow"])
+        else:
+            self.glow_size = (0, 0)
+            self._texture("glow", GL_TEXTURE_2D)
+            gl.glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGB32F, width, height)
+            self.glow_size = (width, height)
+        gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGB, GL_FLOAT, ptr(data))
+        self._check_load("the glow", "glow")
+
     def load_lut(self, table: np.ndarray) -> None:
         self._require_open()
         n = table.shape[0]
@@ -334,9 +367,11 @@ class EglDevice:
 
     def run(self, rgb_u8: np.ndarray, *, use_tone: bool,
             placement: tuple[int, int, int] | None,
-            timings: dict | None = None) -> np.ndarray:
+            timings: dict | None = None,
+            halation: tuple[float, np.ndarray] | None = None) -> np.ndarray:
         """One pass. ``placement`` is (oy, ox, orientation) or None for no
-        grain. Returns the read-back buffer, four bytes a pixel."""
+        grain. ``halation`` is (headroom, mix) with the glow already loaded,
+        or None for none. Returns the read-back buffer, four bytes a pixel."""
         self._require_open()
         if rgb_u8.dtype != np.uint8 or rgb_u8.ndim != 3 or rgb_u8.shape[2] != 3:
             raise GpuError(f"the frame is {rgb_u8.dtype} {rgb_u8.shape}, not (H, W, 3) bytes")
@@ -361,7 +396,8 @@ class EglDevice:
         gl.glUseProgram(program)
         units = (("img", GL_TEXTURE_2D, "in"), ("chan", GL_TEXTURE_2D, "chan"),
                  ("tone", GL_TEXTURE_2D, "tone"), ("lut", GL_TEXTURE_3D, "lut"),
-                 ("gain", GL_TEXTURE_2D, "gain"), ("tile", GL_TEXTURE_2D, "tile"))
+                 ("gain", GL_TEXTURE_2D, "gain"), ("tile", GL_TEXTURE_2D, "tile"),
+                 ("glow", GL_TEXTURE_2D, "glow"))
         for unit, (uniform, target, name) in enumerate(units):
             gl.glActiveTexture(0x84C0 + unit)
             gl.glBindTexture(target, self.textures[name])
@@ -370,9 +406,13 @@ class EglDevice:
         oy, ox, orientation = (int(v) for v in placement or (0, 0, 0))
         for uniform, value in (("n", self.n), ("S", self.tile_size), ("orient", orientation),
                                ("use_tone", int(use_tone)),
-                               ("use_grain", int(placement is not None))):
+                               ("use_grain", int(placement is not None)),
+                               ("use_halation", int(halation is not None))):
             gl.glUniform1i(gl.glGetUniformLocation(program, uniform.encode()), value)
         gl.glUniform2i(gl.glGetUniformLocation(program, b"offset"), ox, oy)
+        headroom, mix = halation if halation is not None else (0.0, (0.0, 0.0, 0.0))
+        gl.glUniform1f(gl.glGetUniformLocation(program, b"hr"), float(headroom))
+        gl.glUniform3f(gl.glGetUniformLocation(program, b"hw"), *(float(v) for v in mix))
         gl.glDrawArrays(0x0004, 0, 3)
         gl.glFinish()
         shader = time.perf_counter() - t
@@ -393,6 +433,7 @@ class EglDevice:
         self._dpy = self._ctx = None
         self.textures = {}
         self.size = (0, 0)
+        self.glow_size = (0, 0)
         self._fbo = 0
         if egl is None or not dpy:
             return
