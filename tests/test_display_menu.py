@@ -30,6 +30,7 @@ ROWS = (
     MenuRow("halation", "HALATION", "OFF", True),
     MenuRow("ae_constraint", "AE CONSTRAINT", "HIGHLIGHT", True),
     MenuRow("ae_metering", "AE METERING", "CENTRE", True),
+    MenuRow("image", "IMAGE", ">", True),
     MenuRow("upload", "UPLOAD", "TAP TO UPLOAD", True),
     MenuRow("eth", "ETH", "-", False),
     MenuRow("wlan", "WLAN", "192.168.178.56", False),
@@ -172,7 +173,7 @@ def test_the_fullest_page_fits_on_the_panel(scale):
     """Every row the viewfinder can show (``ROWS`` is all of them): the last one
     ends above the panel's foot, and every row is hit at its centre."""
     bottom = ROW_Y0 + len(ROWS) * ROW_HEIGHT
-    assert len(ROWS) == 9 and bottom <= HEIGHT
+    assert len(ROWS) == 10 and bottom <= HEIGHT
     pixels = _pixels(scale=scale)
     # The last row (RESET) is drawn: its value has white ink.
     last = pixels[(bottom - ROW_HEIGHT) * scale:bottom * scale, 150 * scale:ROW_X1 * scale]
@@ -180,3 +181,50 @@ def test_the_fullest_page_fits_on_the_panel(scale):
     for index in range(len(ROWS)):
         y = ROW_Y0 + index * ROW_HEIGHT + ROW_HEIGHT // 2
         assert menu_hit(ROW_X0 * scale + 1, y * scale, len(ROWS), scale) == index
+
+
+# -- the second page: a title, then its rows -------------------------------------
+
+IMAGE_ROWS = (
+    MenuRow("sharpness", "SHARPNESS", "1.0", True),
+    MenuRow("contrast", "CONTRAST", "1.25", True),
+    MenuRow("saturation", "SATURATION", "-", False),
+    MenuRow("image_reset", "RESET", "TAP TWICE", True),
+    MenuRow("back", "BACK", "", True),
+)
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_a_titled_page_hits_its_rows_one_line_lower(scale):
+    x = (ROW_X0 + ROW_X1) // 2
+    for index in range(len(IMAGE_ROWS)):
+        y = ROW_Y0 + (index + 1) * ROW_HEIGHT + ROW_HEIGHT // 2
+        assert menu_hit(x * scale, y * scale, len(IMAGE_ROWS), scale, title=True) == index
+    # The title is not a row, and nothing lies below the last one.
+    title_y = ROW_Y0 + ROW_HEIGHT // 2
+    assert menu_hit(x * scale, title_y * scale, len(IMAGE_ROWS), scale, title=True) is None
+    below = ROW_Y0 + (len(IMAGE_ROWS) + 1) * ROW_HEIGHT + 1
+    assert menu_hit(x * scale, below * scale, len(IMAGE_ROWS), scale, title=True) is None
+    cx, cy = SHUTTER_CENTRE
+    assert menu_hit(cx * scale, cy * scale, len(IMAGE_ROWS), scale, title=True) == DONE
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_a_titled_page_draws_the_title_amber_and_stays_clear_of_done(scale):
+    pixels = np.asarray(render_menu(IMAGE_ROWS, scale=scale, title="IMAGE")).astype(int)
+    title = pixels[ROW_Y0 * scale:(ROW_Y0 + ROW_HEIGHT) * scale, ROW_X0 * scale:80 * scale]
+    reds = title[..., 0] - title[..., 2]
+    assert reds.max() > 150  # amber ink: red well above blue
+    assert pixels[:, 249 * scale:253 * scale].max() == 0
+    bottom = ROW_Y0 + (len(IMAGE_ROWS) + 1) * ROW_HEIGHT
+    assert bottom <= HEIGHT
+    assert pixels[(bottom + 1) * scale:].max() == 0
+    # The rows moved down a line: the last one (BACK) is drawn where it is hit.
+    back = pixels[(bottom - ROW_HEIGHT) * scale:bottom * scale, ROW_X0 * scale:60 * scale]
+    assert back.max() > 60
+
+
+def test_a_titled_page_is_cached_apart_from_an_untitled_one():
+    titled = render_menu(IMAGE_ROWS, scale=1, title="IMAGE")
+    assert titled is render_menu(IMAGE_ROWS, scale=1, title="IMAGE")
+    assert titled is not render_menu(IMAGE_ROWS, scale=1)

@@ -15,6 +15,10 @@ Design intent:
   Each row is drawn on a tile that ends at x 248, so no long value can spill
   towards ``DONE`` either; the value is also cut with ``...`` to the room the
   label leaves it.
+- A second page (the camera's image controls) has a title on its first line,
+  amber and not a row: the rows start one line lower, and a tap on the title
+  lands on nothing. Ten lines (a title and nine rows, or ten rows) end at y 208,
+  inside the 240-unit page at every scale, since the geometry is in base units.
 
 Drawing reuses the live view's canvas, fonts, colours and supersampling, so the
 page reads as the same instrument. Geometry is in 320x240 base units at the
@@ -63,7 +67,7 @@ from .liveview import (
 class MenuRow:
     """One line of the menu: ``value`` is already formatted for display."""
 
-    key: str      # "save_dng", "halation", "ae_constraint", "upload", "eth", ...
+    key: str      # "save_dng", "halation", "image", "contrast", "back", "eth", ...
     label: str    # "SAVE DNG", ...
     value: str    # "ON", "UPLOADING 0:42", ...
     active: bool  # False: a dim label, and taps on it are ignored
@@ -119,6 +123,15 @@ def _row_tile(row: MenuRow, scale: int) -> Image.Image:
     return canvas.finish()
 
 
+@lru_cache(maxsize=8)
+def _title_tile(title: str, scale: int) -> Image.Image:
+    """A page's title, drawn as row 0: amber, in the value's weight, no separator."""
+    canvas = _Canvas(_ROW_BOX, scale)
+    canvas.text((ROW_X0, ROW_Y0 + ROW_HEIGHT / 2), title, canvas.font(SEMIBOLD, VALUE_SIZE),
+                AMBER, tracking=LABEL_TRACKING)
+    return canvas.finish()
+
+
 @lru_cache(maxsize=4)
 def _done_tile(pressed: bool, scale: int) -> Image.Image:
     """``DONE`` in the shutter button's ring style; filled amber while pressed."""
@@ -134,9 +147,15 @@ def _done_tile(pressed: bool, scale: int) -> Image.Image:
 
 
 @lru_cache(maxsize=16)
-def _render(rows: tuple[MenuRow, ...], scale: int, done_pressed: bool) -> Image.Image:
+def _render(rows: tuple[MenuRow, ...], scale: int, done_pressed: bool,
+            title: str | None = None) -> Image.Image:
     img = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), BLACK)
-    for index, row in enumerate(rows):
+    first = 0
+    if title is not None:
+        tile = _title_tile(title, scale)
+        img.paste(tile, (ROW_X0 * scale, ROW_Y0 * scale), tile)
+        first = 1
+    for index, row in enumerate(rows, start=first):
         tile = _row_tile(row, scale)
         img.paste(tile, (ROW_X0 * scale, (ROW_Y0 + index * ROW_HEIGHT) * scale), tile)
     tile = _done_tile(done_pressed, scale)
@@ -145,16 +164,22 @@ def _render(rows: tuple[MenuRow, ...], scale: int, done_pressed: bool) -> Image.
 
 
 def render_menu(rows: Sequence[MenuRow], *, scale: int = 1,
-                done_pressed: bool = False) -> Image.Image:
-    """The menu page: RGB, ``(320 * scale, 240 * scale)``. Shared; do not draw on it."""
-    return _render(tuple(rows), scale, done_pressed)
+                done_pressed: bool = False, title: str | None = None) -> Image.Image:
+    """The menu page: RGB, ``(320 * scale, 240 * scale)``. Shared; do not draw on it.
+
+    ``title`` puts a page title on the first line and the rows below it."""
+    return _render(tuple(rows), scale, done_pressed, title)
 
 
-def menu_hit(x: int, y: int, row_count: int, scale: int = 1) -> int | str | None:
-    """``DONE``, the index of the row under a panel pixel, or None."""
+def menu_hit(x: int, y: int, row_count: int, scale: int = 1, *,
+             title: bool = False) -> int | str | None:
+    """``DONE``, the index of the row under a panel pixel, or None.
+
+    With ``title`` the first line is the page's title, which is not a row."""
     x, y = x // scale, y // scale
     if math.hypot(x - SHUTTER_CENTRE[0], y - SHUTTER_CENTRE[1]) <= SHUTTER_HIT_RADIUS:
         return DONE
-    if ROW_X0 <= x < ROW_X1 and ROW_Y0 <= y < ROW_Y0 + row_count * ROW_HEIGHT:
-        return (y - ROW_Y0) // ROW_HEIGHT
+    top = ROW_Y0 + (ROW_HEIGHT if title else 0)
+    if ROW_X0 <= x < ROW_X1 and top <= y < top + row_count * ROW_HEIGHT:
+        return (y - top) // ROW_HEIGHT
     return None
