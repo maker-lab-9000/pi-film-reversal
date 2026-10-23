@@ -190,6 +190,8 @@ def install_picamera(monkeypatch):
         with_analogue_gain_mode=False,
         ae_controls=("AeConstraintMode", "AeMeteringMode", "AeExposureMode"),
         image_controls=("Sharpness", "Contrast", "Saturation"),
+        captured_metadata=None,
+        capture_metadata_error=None,
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
 
@@ -233,6 +235,7 @@ def install_picamera(monkeypatch):
                 self.configured_controls = []
                 self.switch_calls = []
                 self.switch_mode_calls = []
+                self.metadata_waits = []
                 self.configure_count = 0
                 self.start_count = 0
                 self.capture_count = 0
@@ -329,6 +332,12 @@ def install_picamera(monkeypatch):
 
             def switch_mode(self, config, wait=None):
                 self.switch_mode_calls.append((config, wait))
+
+            def capture_metadata(self, wait=None):
+                self.metadata_waits.append(wait)
+                if capture_metadata_error is not None:
+                    raise capture_metadata_error
+                return dict(captured_metadata or {})
 
             def autofocus_cycle(self):
                 self.autofocus_cycle_count += 1
@@ -3016,4 +3025,413 @@ def test_runtime_changes_keep_each_configurations_noise_reduction(install_picame
     assert still["controls"]["NoiseReductionMode"] == _NoiseReductionModeEnum.HighQuality
     (restart, _wait), = inst.switch_mode_calls
     assert restart["controls"]["NoiseReductionMode"] == _NoiseReductionModeEnum.Minimal
+    camera.close()
+
+
+# -- bursts (the frames of a multi-frame photograph) ---------------------------
+
+SMALL_SIZE = (64, 48)
+
+
+def _small_configuration():
+    return {
+        "main": {"size": SMALL_SIZE, "format": "RGB888", "stride": 192},
+        "raw": {"size": SMALL_SIZE, "format": RAW_FORMAT, "stride": 80},
+        "sensor": {"output_size": SMALL_SIZE, "bit_depth": 10},
+        "buffer_count": 2,
+        "queue": False,
+    }
+
+
+def _burst_camera(install_picamera, *, preview=True, save_dng=False, **kwargs):
+    """A camera with a small sensor, the libcamera 0.5 exposure modes by default."""
+    kwargs.setdefault("with_exposure_time_mode", True)
+    kwargs.setdefault("with_analogue_gain_mode", True)
+    state = install_picamera(actual=_small_configuration(), sensor_resolution=SMALL_SIZE,
+                             **kwargs)
+    camera = Picamera2Camera(preview=preview or None, save_dng=save_dng)
+    return camera, state.instance
+
+
+def _live_frame(camera, inst, metadata):
+    """One live view frame read with ``metadata``, as the viewfinder reads them."""
+    inst.capture_request = lambda wait=None: FakeRequest(
+        np.zeros((480, 640, 3), np.uint8), metadata=dict(metadata))
+    camera.read(full=False)
+
+
+def _record_burst(inst, *, fail_at=None, switch_fail=None):
+    """Replace the camera's switch and capture with ones that log what happens:
+    each switch with the controls of the configuration it applies, each capture.
+    Frame i is filled with the value i and reports ExposureTime 1000 + i."""
+    log = []
+
+    def switch_mode(config, wait=None):
+        which = "preview" if "preview" in config else "still"
+        log.append(("switch", which, dict(config["controls"]), wait))
+        if switch_fail is not None and switch_fail[0] == which:
+            raise switch_fail[1]
+
+    def capture_request(wait=None):
+        index = sum(1 for entry in log if entry[0] == "capture")
+        log.append(("capture", wait))
+        if fail_at == index:
+            raise TimeoutError()
+        array = np.full((SMALL_SIZE[1], SMALL_SIZE[0], 3), index, np.uint8)
+        return FakeRequest(array, metadata={"ExposureTime": 1000 + index,
+                                            "AnalogueGain": 2.0, "FocusFoM": index})
+
+    inst.switch_mode = switch_mode
+    inst.capture_request = capture_request
+    return log
+
+
+def test_a_burst_switches_once_takes_n_frames_and_returns_to_the_live_view(install_picamera):
+    camera, inst = _burst_camera(install_picamera)
+    log = _record_burst(inst)
+    frames, info = camera.read_burst(3, split_exposure=False)
+    assert [entry[0] for entry in log] == ["switch", "capture", "capture", "capture", "switch"]
+    assert log[0][1] == "still" and log[-1][1] == "preview"
+    assert log[0][3] == pytest.approx(30.0) and log[-1][3] == pytest.approx(30.0)
+    assert all(entry[1] == pytest.approx(30.0) for entry in log if entry[0] == "capture")
+    # Not switch_mode_and_capture_request, which would switch twice per frame.
+    assert inst.switch_calls == []
+    assert [int(f.rgb[0, 0, 0]) for f in frames] == [0, 1, 2]
+    assert [f.metadata["FocusFoM"] for f in frames] == [0, 1, 2]
+    assert all(f.rgb.shape == (48, 64, 3) and f.source == "picamera2" for f in frames)
+    assert all(set(f.timings) == {"request", "array"} for f in frames)
+    assert info == {"exposure_us": 1000, "gain": 2.0, "split": False}
+    camera.close()
+
+
+def test_a_split_burst_shares_the_live_exposure_between_the_frames(install_picamera):
+    camera, inst = _burst_camera(install_picamera, analogue_gain=(1.0, 16.0, 1.0))
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.5})
+    still_before = dict(inst.created_config["controls"])
+    preview_before = dict(inst.preview_config["controls"])
+    log = _record_burst(inst)
+    frames, info = camera.read_burst(4, split_exposure=True)
+    assert len(frames) == 4
+    assert info == {"exposure_us": 10_000, "gain": pytest.approx(6.0), "split": True}
+    burst = log[0][2]
+    assert burst["ExposureTimeMode"] == _ExposureTimeModeEnum.Manual
+    assert burst["ExposureTime"] == 10_000
+    assert burst["AnalogueGainMode"] == _AnalogueGainModeEnum.Manual
+    assert burst["AnalogueGain"] == pytest.approx(6.0)
+    # Everything else in the still configuration is as it was.
+    for name, value in still_before.items():
+        if name not in ("ExposureTimeMode", "AnalogueGainMode"):
+            assert burst[name] == value
+    # Afterwards: the live view's own controls, both configurations as before,
+    # and the viewfinder's selection untouched.
+    assert log[-1][1] == "preview" and log[-1][2] == preview_before
+    assert inst.created_config["controls"] == still_before
+    assert inst.preview_config["controls"] == preview_before
+    assert (camera.shutter_us, camera.iso) == (None, None)
+    camera.close()
+
+
+def test_a_split_burst_caps_the_gain_at_the_sensor_limit(install_picamera):
+    camera, inst = _burst_camera(install_picamera, analogue_gain=(1.0, 16.0, 1.0))
+    _live_frame(camera, inst, {"ExposureTime": 30_000, "AnalogueGain": 6.0})
+    log = _record_burst(inst)
+    _, info = camera.read_burst(6, split_exposure=True)
+    assert info == {"exposure_us": 5000, "gain": 16.0, "split": True}
+    assert log[0][2]["AnalogueGain"] == 16.0
+    camera.close()
+
+
+def test_a_split_burst_without_a_known_gain_limit_is_not_capped(install_picamera):
+    camera, inst = _burst_camera(install_picamera)
+    _live_frame(camera, inst, {"ExposureTime": 30_001, "AnalogueGain": 6.0})
+    _record_burst(inst)
+    _, info = camera.read_burst(2, split_exposure=True)
+    assert info == {"exposure_us": 15_000, "gain": 12.0, "split": True}
+    camera.close()
+
+
+def test_a_split_burst_on_legacy_libcamera_sets_and_drops_plain_values(install_picamera):
+    camera, inst = _burst_camera(install_picamera, with_exposure_time_mode=False,
+                                 with_analogue_gain_mode=False)
+    _live_frame(camera, inst, {"ExposureTime": 20_000, "AnalogueGain": 2.0})
+    still_before = dict(inst.created_config["controls"])
+    assert "ExposureTime" not in still_before and "AnalogueGain" not in still_before
+    log = _record_burst(inst)
+    camera.read_burst(2, split_exposure=True)
+    assert (log[0][2]["ExposureTime"], log[0][2]["AnalogueGain"]) == (10_000, 4.0)
+    assert "ExposureTimeMode" not in log[0][2]
+    assert inst.created_config["controls"] == still_before
+    camera.close()
+
+
+def test_a_split_burst_widens_no_frame_limits_and_restores_them(install_picamera):
+    camera, inst = _burst_camera(
+        install_picamera, frame_limits={"still": (100, 200_000), "preview": (100, 33_333)},
+    )
+    _live_frame(camera, inst, {"ExposureTime": 100_000, "AnalogueGain": 1.0})
+    log = _record_burst(inst)
+    camera.read_burst(2, split_exposure=True)
+    assert log[0][2]["FrameDurationLimits"] == (100, 200_000)
+    assert inst.created_config["controls"]["FrameDurationLimits"] == (100, 200_000)
+    camera.close()
+
+
+@pytest.mark.parametrize("fixed", [{"shutter": 8000}, {"iso": 400},
+                                   {"shutter": 8000, "iso": 400}])
+def test_a_fixed_shutter_or_iso_is_used_unchanged_without_a_split(install_picamera, fixed):
+    camera, inst = _burst_camera(install_picamera, analogue_gain=(1.0, 16.0, 1.0))
+    if "shutter" in fixed:
+        camera.set_shutter(fixed["shutter"])
+    if "iso" in fixed:
+        camera.set_iso(fixed["iso"])
+    _live_frame(camera, inst, {"ExposureTime": 8000, "AnalogueGain": 4.0})
+    still_before = dict(inst.created_config["controls"])
+    log = _record_burst(inst)
+    _, info = camera.read_burst(4, split_exposure=True)
+    assert info["split"] is False
+    assert log[0][2] == still_before
+    assert inst.created_config["controls"] == still_before
+    assert (camera.shutter_us, camera.iso) == (fixed.get("shutter"), fixed.get("iso"))
+    camera.close()
+
+
+def test_a_burst_without_split_exposure_keeps_the_auto_exposure(install_picamera):
+    camera, inst = _burst_camera(install_picamera)
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.5})
+    still_before = dict(inst.created_config["controls"])
+    log = _record_burst(inst)
+    _, info = camera.read_burst(4, split_exposure=False)
+    assert info["split"] is False and log[0][2] == still_before
+    camera.close()
+
+
+def test_a_single_frame_burst_is_never_split(install_picamera):
+    camera, inst = _burst_camera(install_picamera)
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.5})
+    _record_burst(inst)
+    frames, info = camera.read_burst(1, split_exposure=True)
+    assert len(frames) == 1 and info["split"] is False
+    camera.close()
+
+
+def test_ae_lock_burst_is_never_split(install_picamera):
+    install_picamera(actual=_small_configuration(), sensor_resolution=SMALL_SIZE,
+                     with_exposure_time_mode=True, with_analogue_gain_mode=True)
+    camera = Picamera2Camera(preview=True, save_dng=False, ae_lock=True)
+    camera_inst = camera._camera
+    _live_frame(camera, camera_inst, {"ExposureTime": 40_000, "AnalogueGain": 1.5})
+    _record_burst(camera_inst)
+    _, info = camera.read_burst(4, split_exposure=True)
+    assert info["split"] is False
+    assert camera_inst.metadata_waits == []
+    camera.close()
+
+
+def test_the_live_metadata_is_used_before_capturing_any(install_picamera):
+    camera, inst = _burst_camera(
+        install_picamera, captured_metadata={"ExposureTime": 99_000, "AnalogueGain": 9.0},
+    )
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.0})
+    _record_burst(inst)
+    _, info = camera.read_burst(2, split_exposure=True)
+    assert info["exposure_us"] == 20_000 and inst.metadata_waits == []
+    camera.close()
+
+
+def test_a_headless_burst_without_a_split_switches_nothing(install_picamera):
+    camera, inst = _burst_camera(install_picamera, preview=False)
+    log = _record_burst(inst)
+    frames, info = camera.read_burst(3, split_exposure=False)
+    assert [entry[0] for entry in log] == ["capture"] * 3
+    assert len(frames) == 3 and info["split"] is False
+    camera.close()
+
+
+def test_a_headless_split_takes_the_metadata_once_in_still_mode(install_picamera):
+    camera, inst = _burst_camera(
+        install_picamera, preview=False, analogue_gain=(1.0, 16.0, 1.0),
+        captured_metadata={"ExposureTime": 30_000, "AnalogueGain": 2.0},
+    )
+    still_before = dict(inst.created_config["controls"])
+    live_calls = len(inst.set_controls_calls)
+    log = _record_burst(inst)
+    frames, info = camera.read_burst(3, split_exposure=True)
+    assert inst.metadata_waits == [pytest.approx(30.0)]
+    assert info == {"exposure_us": 10_000, "gain": 6.0, "split": True}
+    # The burst's exposure goes in by a switch, so it holds from the first frame.
+    assert [entry[0] for entry in log] == ["switch", "capture", "capture", "capture"]
+    assert log[0][1] == "still" and log[0][2]["ExposureTime"] == 10_000
+    # The configuration gets its controls back and the running camera its auto modes.
+    assert inst.created_config["controls"] == still_before
+    assert len(inst.set_controls_calls) == live_calls + 1
+    restored = inst.set_controls_calls[-1]
+    assert restored["ExposureTimeMode"] == _ExposureTimeModeEnum.Auto
+    assert restored["AnalogueGainMode"] == _AnalogueGainModeEnum.Auto
+    assert "ExposureTime" not in restored and "AnalogueGain" not in restored
+    camera.close()
+
+
+def test_a_headless_split_restores_a_fixed_selection_on_legacy_libcamera(install_picamera):
+    camera, inst = _burst_camera(install_picamera, preview=False,
+                                 with_exposure_time_mode=False, with_analogue_gain_mode=False,
+                                 captured_metadata={"ExposureTime": 30_000,
+                                                    "AnalogueGain": 2.0})
+    _record_burst(inst)
+    camera.read_burst(3, split_exposure=True)
+    assert inst.set_controls_calls[-1] == {"ExposureTime": 0, "AnalogueGain": 0.0}
+    camera.close()
+
+
+@pytest.mark.parametrize("error", [TimeoutError(), RuntimeError("no metadata")])
+def test_no_metadata_to_split_from_means_no_split(install_picamera, capsys, error):
+    camera, inst = _burst_camera(install_picamera, preview=False,
+                                 capture_metadata_error=error)
+    still_before = dict(inst.created_config["controls"])
+    log = _record_burst(inst)
+    frames, info = camera.read_burst(2, split_exposure=True)
+    assert len(frames) == 2 and info["split"] is False
+    assert [entry[0] for entry in log] == ["capture", "capture"]
+    assert inst.created_config["controls"] == still_before
+    assert inst.cancel_count == (1 if isinstance(error, TimeoutError) else 0)
+    assert "burst: no frame metadata to split the exposure from" in capsys.readouterr().err
+    camera.close()
+
+
+def test_metadata_without_exposure_and_gain_means_no_split(install_picamera, capsys):
+    camera, inst = _burst_camera(install_picamera, captured_metadata={"Lux": 400.0})
+    _live_frame(camera, inst, {"Lux": 400.0})
+    _record_burst(inst)
+    _, info = camera.read_burst(2, split_exposure=True)
+    assert info["split"] is False and inst.metadata_waits == [pytest.approx(30.0)]
+    assert "no exposure time and gain" in capsys.readouterr().err
+    camera.close()
+
+
+def test_a_burst_that_stalls_restores_everything_and_releases_the_locks(install_picamera):
+    camera, inst = _burst_camera(install_picamera, analogue_gain=(1.0, 16.0, 1.0))
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.5})
+    still_before = dict(inst.created_config["controls"])
+    preview_before = dict(inst.preview_config["controls"])
+    log = _record_burst(inst, fail_at=1)
+    with pytest.raises(CameraStalled, match="no still frame within 30.0 s"):
+        camera.read_burst(4, split_exposure=True)
+    assert inst.cancel_count == 1
+    assert [entry[0] for entry in log] == ["switch", "capture", "capture", "switch"]
+    assert log[-1][1] == "preview" and log[-1][2] == preview_before
+    assert inst.created_config["controls"] == still_before
+    assert (camera.shutter_us, camera.iso) == (None, None)
+    # Both locks were released: a control can be set and a frame read.
+    camera.set_shutter(4000)
+    _live_frame(camera, inst, {"ExposureTime": 4000, "AnalogueGain": 1.0})
+    camera.close()
+
+
+def test_a_headless_split_that_stalls_restores_the_running_controls(install_picamera):
+    camera, inst = _burst_camera(install_picamera, preview=False,
+                                 captured_metadata={"ExposureTime": 30_000,
+                                                    "AnalogueGain": 2.0})
+    still_before = dict(inst.created_config["controls"])
+    _record_burst(inst, fail_at=0)
+    with pytest.raises(CameraStalled):
+        camera.read_burst(3, split_exposure=True)
+    assert inst.created_config["controls"] == still_before
+    assert inst.set_controls_calls[-1]["ExposureTimeMode"] == _ExposureTimeModeEnum.Auto
+    camera.close()
+
+
+def test_a_switch_that_stalls_still_tries_the_way_back(install_picamera):
+    camera, inst = _burst_camera(install_picamera)
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.5})
+    still_before = dict(inst.created_config["controls"])
+    log = _record_burst(inst, switch_fail=("still", TimeoutError()))
+    with pytest.raises(CameraStalled, match="no still frame"):
+        camera.read_burst(2, split_exposure=True)
+    assert [(entry[0], entry[1]) for entry in log] == [("switch", "still"),
+                                                        ("switch", "preview")]
+    assert inst.created_config["controls"] == still_before
+    camera.close()
+
+
+def test_a_failed_return_to_the_live_view_is_reported(install_picamera):
+    camera, inst = _burst_camera(install_picamera)
+    _record_burst(inst, switch_fail=("preview", TimeoutError()))
+    with pytest.raises(CameraStalled, match="no live view after the burst"):
+        camera.read_burst(2, split_exposure=False)
+    camera.close()
+
+
+def test_a_failed_return_does_not_hide_the_first_failure(install_picamera):
+    camera, inst = _burst_camera(install_picamera)
+    _record_burst(inst, fail_at=0, switch_fail=("preview", RuntimeError("gone")))
+    with pytest.raises(CameraStalled, match="no still frame"):
+        camera.read_burst(2, split_exposure=False)
+    camera.close()
+
+
+def test_each_burst_frame_keeps_its_dng_when_saving_is_on(install_picamera):
+    camera, inst = _burst_camera(install_picamera, save_dng=True)
+    _record_burst(inst)
+    frames, _ = camera.read_burst(2, split_exposure=False)
+    assert all(f.dng == b"II*\x00fake-dng-payload" for f in frames)
+    assert all("dng" in f.timings for f in frames)
+    camera.close()
+
+
+def test_an_auto_focus_cycles_once_per_burst(install_picamera):
+    install_picamera(actual=_small_configuration(), sensor_resolution=SMALL_SIZE)
+    camera = Picamera2Camera(preview=True, save_dng=False, autofocus="auto")
+    inst = camera._camera
+    _record_burst(inst)
+    camera.read_burst(3, split_exposure=False)
+    assert inst.autofocus_cycle_count == 1
+    camera.close()
+
+
+def test_burst_frames_do_not_become_the_live_metadata(install_picamera):
+    camera, inst = _burst_camera(install_picamera)
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.0})
+    _record_burst(inst)
+    camera.read_burst(2, split_exposure=False)
+    _record_burst(inst)
+    _, info = camera.read_burst(2, split_exposure=True)
+    assert info["exposure_us"] == 20_000
+    camera.close()
+
+
+@pytest.mark.parametrize("bad", [0, -2, 2.5, True, "4"])
+def test_a_picamera_burst_needs_a_whole_number_of_frames(install_picamera, bad):
+    camera, inst = _burst_camera(install_picamera)
+    log = _record_burst(inst)
+    with pytest.raises(CameraError, match="whole number of frames"):
+        camera.read_burst(bad, split_exposure=False)
+    assert log == []
+    camera.close()
+
+
+def test_a_burst_on_a_closed_camera_is_an_error(install_picamera):
+    camera, _ = _burst_camera(install_picamera)
+    camera.close()
+    with pytest.raises(CameraError, match="closed"):
+        camera.read_burst(2, split_exposure=False)
+
+
+def test_a_control_setter_waits_for_a_burst(install_picamera):
+    """A split burst writes the still configuration and puts it back; a setter
+    landing in between would have its value overwritten by the restore."""
+    camera, inst = _burst_camera(install_picamera)
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.5})
+    inst.switch_mode = lambda config, wait=None: None
+    held = _HeldCapture(inst, "capture_request", FakeRequest(
+        np.zeros((SMALL_SIZE[1], SMALL_SIZE[0], 3), np.uint8)))
+    burst_done, burst_errors = _in_thread(lambda: camera.read_burst(2, split_exposure=True))
+    try:
+        assert held.inside.wait(2.0)
+        set_done, set_errors = _in_thread(lambda: camera.set_shutter(4000))
+        assert not set_done.wait(0.2), "set_shutter ran in the middle of a burst"
+    finally:
+        held.release.set()
+    assert burst_done.wait(2.0) and burst_errors == []
+    assert set_done.wait(2.0) and set_errors == []
+    assert inst.created_config["controls"]["ExposureTime"] == 4000
+    assert inst.created_config["controls"]["ExposureTimeMode"] == _ExposureTimeModeEnum.Manual
     camera.close()

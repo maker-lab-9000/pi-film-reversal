@@ -82,6 +82,16 @@ control dict like the other AE modes, and changed live by
 ``set_ae_constraint`` does. The auto-exposure then keeps the shutter short and
 raises the gain instead.
 
+A burst (``read_burst``, the frames of a multi-frame photograph) switches to
+the still configuration once and takes its frames back to back, rather than
+paying ``switch_mode_and_capture_request``'s two switches per frame. Splitting
+its exposure (``t / n`` at ``n`` times the gain, from the AE's latest values)
+writes manual exposure and gain into the still configuration only for the
+burst and puts back exactly what was there afterwards, failure included; the
+preview configuration and ``shutter_us``/``iso`` are never touched, so the live
+view returns with its own controls and the viewfinder's control check sees
+nothing change.
+
 There is no exposure compensation. ``ExposureValue`` is still sent, always 0.0, so
 every capture records the same control set as before the viewfinder's EV buttons
 were removed.
@@ -105,7 +115,8 @@ the request lock first and the configuration lock second, a preview read holds
 only the request lock, and a setter holds only the configuration lock. No
 thread ever waits for the request lock while holding the configuration lock,
 so the two cannot deadlock. ``reassert_controls`` is a setter in this respect,
-and ``restart_preview``, which stops and reconfigures the camera, is a still.
+and ``restart_preview``, which stops and reconfigures the camera, and
+``read_burst`` are stills.
 """
 
 from __future__ import annotations
@@ -124,7 +135,7 @@ import numpy as np
 
 from ..tuning import Resolved
 from ..tuning import resolve as resolve_tuning
-from .camera import CameraError, Frame, StreamInfo
+from .camera import CameraError, Frame, StreamInfo, burst_info
 from .errors import CameraStalled
 
 DEFAULT_TUNING_FILE: str | None = None  # None: libcamera picks <sensor>.json itself
@@ -297,6 +308,9 @@ class Picamera2Camera:
         self._still_config: Any | None = None
         self._preview_config: Any | None = None
         self._tuning: Resolved | None = None
+        # The metadata of the latest preview frame read, which a burst splits
+        # its exposure from (None until the live view has read one).
+        self._live_metadata: dict | None = None
 
         try:
             from picamera2 import Picamera2
@@ -518,62 +532,254 @@ class Picamera2Camera:
             except Exception as exc:
                 raise CameraError(f"Picamera2 failed to capture a request: {exc}") from exc
 
-            if full or self._preview is None:
-                expected_shape = (self._native_size[1], self._native_size[0], 3)
-            else:
-                expected_shape = (self._preview[1], self._preview[0], 3)
+            frame = self._frame_from(request, full=full, timings=timings, started=started)
+            if not full and self._preview is not None:
+                # The latest live metadata, which a burst splits its exposure from.
+                self._live_metadata = frame.metadata
+            return frame
 
-            processing_failed = False
+    def read_burst(self, n: int, *, split_exposure: bool) -> tuple[list[Frame], dict]:
+        """Take ``n`` full-size stills back to back, for a multi-frame photograph.
+
+        The camera switches to the still configuration once, captures ``n``
+        requests, and switches back to the preview (with no preview stream it
+        is already in the still configuration, and an unsplit burst switches
+        nothing). The locks and timeouts are those of ``read(full=True)``: both
+        locks for the whole burst, the still's limit for each frame and each
+        switch, and a frame or switch that does not come is ``CameraStalled``.
+        Each frame keeps its own metadata, stage timings and (when DNG saving
+        is on) its DNG, so the caller can keep the DNG of whichever frame it
+        makes the reference. An ``auto`` autofocus cycles once, before the burst.
+
+        ``split_exposure`` shares one exposure between the frames: when the
+        shutter and the ISO are both auto (and auto-exposure is not locked), the
+        exposure time ``t`` and analogue gain ``g`` the AE is using are taken
+        from the latest preview frame's metadata (with none, from one frame's
+        metadata captured from the camera as it runs, which without a preview
+        is the still mode; with none there either, nothing is split), and the
+        burst is taken at a fixed ``t / n`` and gain ``min(g * n, max_gain)``.
+        Those controls go only into the still configuration, which the switch
+        applies from the first frame; afterwards the still configuration gets
+        back exactly the controls it had and the camera the ones it ran with
+        (the preview configuration, which the burst never touches, or, with no
+        preview, the controls for the current ``shutter_us`` and ``iso`` sent
+        again), also when a frame stalls or fails. ``shutter_us`` and ``iso``
+        never change, so the viewfinder's check of each live frame against
+        the fixed shutter and ISO is not disturbed. A shutter or ISO fixed in
+        the viewfinder is used unchanged, without a split.
+
+        Returns the frames in capture order and ``{"exposure_us", "gain",
+        "split"}``: the fixed values of a split burst, else what the first
+        frame's metadata reports (None where it does not).
+        """
+        if not isinstance(n, numbers.Integral) or isinstance(n, bool) or n < 1:
+            raise CameraError(f"a burst needs a whole number of frames of 1 or more, got {n!r}")
+        n = int(n)
+        camera = self._camera
+        if camera is None:
+            raise CameraError("Cannot read from a closed Picamera2 camera")
+
+        with self._request_lock, self._config_lock:
+            if self._autofocus == "auto" and self._stream_info.autofocus != "none":
+                try:
+                    camera.autofocus_cycle()
+                except Exception as exc:
+                    raise CameraError(f"Autofocus cycle failed: {exc}") from exc
+
+            timeout = self._frame_timeout(True)
+            split: tuple[int, float] | None = None
+            if split_exposure and n > 1 and self.exposure_adjustable \
+                    and self.shutter_us is None and self.iso is None:
+                split = self._split(camera, n, timeout)
+
+            config = self._still_config
+            saved: dict[str, Any] = {}
+            if split is not None:
+                try:
+                    burst_controls = self._shutter_controls(split[0], self._frame_limits["still"])
+                    burst_controls.update(self._gain_controls(split[1]))
+                except Exception as exc:
+                    raise CameraError(
+                        f"Picamera2 failed to build the burst's exposure: {exc}"
+                    ) from exc
+                saved = {name: _config_control(config, name) for name in _EXPOSURE_CONTROLS}
+                for name, value in burst_controls.items():
+                    _set_config_control(config, name, value)
+
+            switched = False
+            frames: list[Frame] = []
+            # The first frame's "request" stage includes the switch, as a still's does.
+            started = time.perf_counter()
             try:
-                try:
-                    started = _lap(timings, "request", started)
-                    bgr = request.make_array("main")
-                    if not isinstance(bgr, np.ndarray):
-                        raise CameraError("Picamera2 main array is not a NumPy array")
-                    if bgr.dtype != np.uint8 or bgr.shape != expected_shape:
+                if self._preview is not None or split is not None:
+                    # Set before the switch: one that fails may have left the
+                    # camera anywhere, so the way back is tried all the same.
+                    switched = True
+                    try:
+                        camera.switch_mode(config, wait=timeout)
+                    except TimeoutError:
+                        raise self._stalled(camera, True, timeout) from None
+                    except Exception as exc:
                         raise CameraError(
-                            "Picamera2 main array must be "
-                            f"uint8 with shape {expected_shape}, got {bgr.dtype} {bgr.shape}"
-                        )
-                    rgb = np.array(bgr[..., ::-1], dtype=np.uint8, order="C", copy=True)
-                    metadata = serialisable_metadata(request.get_metadata())
-                    if full:
-                        # stream_info is the audit of the still (it is written
-                        # into every capture record), so only a still may set
-                        # its measured rate: in preview mode the cheap reads
-                        # come from the binned viewfinder stream and would
-                        # otherwise make a record claim the wrong frame rate.
-                        self._update_fps({"FrameDuration": metadata.get("FrameDuration", 0)})
-                    started = _lap(timings, "array", started)
-                    dng = None
-                    if full and self._save_dng:
-                        # The ".dng" suffix is load-bearing: PiDNG (used by save_dng)
-                        # appends ".dng" to a path that lacks it, which would write
-                        # the payload to a different file than this one and leave
-                        # this handle's read empty.
-                        with tempfile.NamedTemporaryFile(suffix=".dng", delete=True) as tmp:
-                            request.save_dng(tmp.name)
-                            tmp.seek(0)
-                            dng = tmp.read()
-                        _lap(timings, "dng", started)
-                    return Frame(
-                        rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng,
-                        timings=timings if full else None,
-                    )
-                except CameraError:
-                    processing_failed = True
-                    raise
-                except Exception as exc:
-                    processing_failed = True
-                    raise CameraError(f"Picamera2 failed while reading a frame: {exc}") from exc
-            finally:
-                try:
-                    request.release()
-                except Exception as exc:
-                    if not processing_failed:
-                        raise CameraError(
-                            f"Picamera2 failed to release a capture request: {exc}"
+                            f"Picamera2 failed to switch to the still configuration: {exc}"
                         ) from exc
+                for index in range(n):
+                    if index:
+                        started = time.perf_counter()
+                    try:
+                        request = camera.capture_request(wait=timeout)
+                    except TimeoutError:
+                        raise self._stalled(camera, True, timeout) from None
+                    except Exception as exc:
+                        raise CameraError(
+                            f"Picamera2 failed to capture a request: {exc}"
+                        ) from exc
+                    frames.append(
+                        self._frame_from(request, full=True, timings={}, started=started)
+                    )
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    self._end_burst(camera, switched, saved, timeout)
+                raise
+            self._end_burst(camera, switched, saved, timeout)
+
+        if split is not None:
+            info = {"exposure_us": split[0], "gain": split[1], "split": True}
+        else:
+            info = burst_info(frames)
+        return frames, info
+
+    def _split(self, camera: Any, n: int, timeout: float) -> tuple[int, float] | None:
+        """The fixed exposure time and gain of a split burst of ``n``, or None.
+
+        From the latest preview frame's metadata, else one frame's metadata
+        captured now; a camera that cannot say what its AE is using is not
+        split. Called with both locks held."""
+        metadata = self._live_metadata
+        if _exposure_of(metadata) is None:
+            try:
+                metadata = serialisable_metadata(camera.capture_metadata(wait=timeout))
+            except Exception as exc:
+                if isinstance(exc, TimeoutError):
+                    # The timed-out job stays queued inside Picamera2, as for a frame.
+                    with contextlib.suppress(Exception):
+                        camera.cancel_all_and_flush()
+                print(
+                    f"burst: no frame metadata to split the exposure from ({exc!r}); "
+                    "the frames keep the auto exposure",
+                    file=sys.stderr,
+                )
+                return None
+        exposure = _exposure_of(metadata)
+        if exposure is None:
+            print("burst: the frame metadata has no exposure time and gain; "
+                  "the frames keep the auto exposure", file=sys.stderr)
+            return None
+        t, g = exposure
+        gain = g * n
+        if self.max_gain is not None:
+            gain = min(gain, self.max_gain)
+        return max(1, int(round(t / n))), gain
+
+    def _end_burst(
+        self, camera: Any, switched: bool, saved: dict[str, Any], timeout: float,
+    ) -> None:
+        """Put back what a burst changed: the still configuration's exposure
+        controls, then the camera's mode (the preview) or, with no preview, its
+        exposure controls. Raises on failure; a burst that already failed
+        suppresses it, so the first error is the one reported."""
+        config = self._still_config
+        for name, value in saved.items():
+            if value is _ABSENT:
+                _drop_config_control(config, name)
+            else:
+                _set_config_control(config, name, value)
+        if self._preview_config is not None:
+            if switched:
+                try:
+                    camera.switch_mode(self._preview_config, wait=timeout)
+                except TimeoutError:
+                    raise self._stalled(
+                        camera, True, timeout, "live view after the burst",
+                    ) from None
+                except Exception as exc:
+                    raise CameraError(
+                        f"Picamera2 failed to return to the live view: {exc}"
+                    ) from exc
+        elif saved:
+            try:
+                controls = self._shutter_controls(self.shutter_us, self._frame_limits["still"])
+                controls.update(self._iso_controls(self.iso))
+                camera.set_controls(controls)
+            except Exception as exc:
+                raise CameraError(
+                    f"Picamera2 failed to restore the exposure after a burst: {exc}"
+                ) from exc
+
+    def _frame_from(
+        self, request: Any, *, full: bool, timings: dict[str, float], started: float,
+    ) -> Frame:
+        """Copy one captured request into a ``Frame`` and release it, always.
+
+        ``full`` is a still (full-size array, measured rate, DNG when on, stage
+        timings); otherwise the preview stream's frame. ``started`` is when the
+        request was asked for, so ``timings["request"]`` covers the capture."""
+        if full or self._preview is None:
+            expected_shape = (self._native_size[1], self._native_size[0], 3)
+        else:
+            expected_shape = (self._preview[1], self._preview[0], 3)
+
+        processing_failed = False
+        try:
+            try:
+                started = _lap(timings, "request", started)
+                bgr = request.make_array("main")
+                if not isinstance(bgr, np.ndarray):
+                    raise CameraError("Picamera2 main array is not a NumPy array")
+                if bgr.dtype != np.uint8 or bgr.shape != expected_shape:
+                    raise CameraError(
+                        "Picamera2 main array must be "
+                        f"uint8 with shape {expected_shape}, got {bgr.dtype} {bgr.shape}"
+                    )
+                rgb = np.array(bgr[..., ::-1], dtype=np.uint8, order="C", copy=True)
+                metadata = serialisable_metadata(request.get_metadata())
+                if full:
+                    # stream_info is the audit of the still (it is written
+                    # into every capture record), so only a still may set
+                    # its measured rate: in preview mode the cheap reads
+                    # come from the binned viewfinder stream and would
+                    # otherwise make a record claim the wrong frame rate.
+                    self._update_fps({"FrameDuration": metadata.get("FrameDuration", 0)})
+                started = _lap(timings, "array", started)
+                dng = None
+                if full and self._save_dng:
+                    # The ".dng" suffix is load-bearing: PiDNG (used by save_dng)
+                    # appends ".dng" to a path that lacks it, which would write
+                    # the payload to a different file than this one and leave
+                    # this handle's read empty.
+                    with tempfile.NamedTemporaryFile(suffix=".dng", delete=True) as tmp:
+                        request.save_dng(tmp.name)
+                        tmp.seek(0)
+                        dng = tmp.read()
+                    _lap(timings, "dng", started)
+                return Frame(
+                    rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng,
+                    timings=timings if full else None,
+                )
+            except CameraError:
+                processing_failed = True
+                raise
+            except Exception as exc:
+                processing_failed = True
+                raise CameraError(f"Picamera2 failed while reading a frame: {exc}") from exc
+        finally:
+            try:
+                request.release()
+            except Exception as exc:
+                if not processing_failed:
+                    raise CameraError(
+                        f"Picamera2 failed to release a capture request: {exc}"
+                    ) from exc
 
     def _frame_timeout(self, still: bool) -> float:
         base = _STILL_TIMEOUT_S if still else _PREVIEW_TIMEOUT_S
@@ -945,14 +1151,18 @@ class Picamera2Camera:
         return controls
 
     def _iso_controls(self, iso: int | None) -> dict[str, Any]:
+        return self._gain_controls(None if iso is None else iso / 100)
+
+    def _gain_controls(self, gain: float | None) -> dict[str, Any]:
+        """A fixed analogue gain, or auto with ``None`` (ISO 100 is gain 1.0)."""
         if self._iso_mode == "mode":
             from libcamera import controls as _lc
 
             mode = _lc.AnalogueGainModeEnum
-            if iso is None:
+            if gain is None:
                 return {"AnalogueGainMode": mode.Auto}
-            return {"AnalogueGainMode": mode.Manual, "AnalogueGain": iso / 100}
-        return {"AnalogueGain": 0.0 if iso is None else iso / 100}
+            return {"AnalogueGainMode": mode.Manual, "AnalogueGain": gain}
+        return {"AnalogueGain": 0.0 if gain is None else gain}
 
     def close(self) -> None:
         camera = self._camera
@@ -1053,6 +1263,33 @@ def _iso(value: Any) -> int:
     if not low <= iso <= high:
         raise CameraError(f"ISO must be within {low}-{high}, got {iso}")
     return iso
+
+
+# The controls a split burst writes into the still configuration, and puts back.
+_EXPOSURE_CONTROLS = (
+    "ExposureTimeMode", "ExposureTime", "FrameDurationLimits", "AnalogueGainMode", "AnalogueGain",
+)
+_ABSENT = object()
+
+
+def _config_control(config: Any, name: str) -> Any:
+    """One control of a Picamera2 configuration, or ``_ABSENT``."""
+    try:
+        return config["controls"].get(name, _ABSENT)
+    except (TypeError, KeyError, IndexError, AttributeError):  # no controls dict
+        return _ABSENT
+
+
+def _exposure_of(metadata: dict | None) -> tuple[float, float] | None:
+    """The (exposure time in us, analogue gain) a frame's metadata reports, or None."""
+    if not metadata:
+        return None
+    t, g = metadata.get("ExposureTime"), metadata.get("AnalogueGain")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (t, g)):
+        return None
+    if not (math.isfinite(t) and math.isfinite(g) and t > 0 and g > 0):
+        return None
+    return float(t), float(g)
 
 
 def _set_config_control(config: Any, name: str, value: Any) -> None:
