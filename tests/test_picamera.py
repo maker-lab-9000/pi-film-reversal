@@ -107,6 +107,7 @@ class _NoiseReductionModeEnum:
     """Mimics ``libcamera.controls.draft.NoiseReductionModeEnum``."""
 
     HighQuality = "NoiseReductionMode.HighQuality"
+    Minimal = "NoiseReductionMode.Minimal"
 
 
 class _AeConstraintModeEnum:
@@ -1384,9 +1385,11 @@ def test_neutral_controls_travel_with_both_configurations(install_picamera):
         "AeMeteringMode": _AeMeteringModeEnum.CentreWeighted,
         "ExposureValue": 0.0,
     }
+    # The one difference: the live view's own (Picamera2's preview) noise reduction.
+    preview = {**neutral, "NoiseReductionMode": _NoiseReductionModeEnum.Minimal}
     assert inst.created_config["controls"] == neutral
-    assert inst.preview_config["controls"] == neutral
-    assert inst.configured_controls == [neutral, neutral]
+    assert inst.preview_config["controls"] == preview
+    assert inst.configured_controls == [neutral, preview]
     camera.close()
 
 
@@ -2790,3 +2793,70 @@ def test_both_records_of_a_double_carry_the_image_values_of_their_shutter(
     records = _image_records(tmp_path)
     assert [r["double"]["index"] for r in records] == [1, 2]
     assert [_image_fields(r) for r in records] == [(1.0, 1.0, 1.0), (1.0, 1.5, 1.0)]
+
+
+
+# --- noise reduction: HighQuality for stills, Minimal for the live view ------------
+
+
+def test_the_preview_takes_minimal_noise_reduction_and_the_still_high_quality(
+    install_picamera,
+):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    assert inst.created_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.HighQuality)
+    assert inst.preview_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.Minimal)
+    # The camera runs the preview, so it is started with the preview's mode.
+    assert inst.set_controls_calls[0]["NoiseReductionMode"] == _NoiseReductionModeEnum.Minimal
+    camera.close()
+
+
+def test_without_a_preview_the_camera_runs_high_quality(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    assert state.instance.set_controls_calls[0]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.HighQuality)
+    camera.close()
+
+
+def test_an_older_libcamera_leaves_both_configurations_without_noise_reduction(
+    install_picamera,
+):
+    state = install_picamera(with_noise_reduction=False)
+    camera = Picamera2Camera(preview=True)
+    assert "NoiseReductionMode" not in state.instance.created_config["controls"]
+    assert "NoiseReductionMode" not in state.instance.preview_config["controls"]
+    assert "NoiseReductionMode" not in state.instance.set_controls_calls[0]
+    camera.close()
+
+
+def test_runtime_changes_keep_each_configurations_noise_reduction(install_picamera):
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(big), with_exposure_time_mode=True,
+                             with_analogue_gain_mode=True)
+    camera = Picamera2Camera(preview=True, save_dng=False)
+    camera.set_ae_constraint("highlight")
+    camera.set_ae_metering("spot")
+    camera.set_image_control("contrast", 1.25)
+    camera.set_shutter(10_000)
+    camera.set_iso(400)
+    camera.set_colour_temperature(5600)
+    camera.reassert_controls()
+    camera.restart_preview()
+    inst = state.instance
+    for sent in inst.set_controls_calls[1:]:
+        assert "NoiseReductionMode" not in sent
+    assert inst.created_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.HighQuality)
+    assert inst.preview_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.Minimal)
+    # A still from the live view is configured with the still's own mode.
+    camera.read(full=True)
+    (still,) = inst.switch_calls
+    assert still["controls"]["NoiseReductionMode"] == _NoiseReductionModeEnum.HighQuality
+    (restart, _wait), = inst.switch_mode_calls
+    assert restart["controls"]["NoiseReductionMode"] == _NoiseReductionModeEnum.Minimal
+    camera.close()

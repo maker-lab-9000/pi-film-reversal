@@ -57,7 +57,18 @@ shot. The ISP's image controls (Sharpness, Contrast, Saturation, 1.0 unless
 the menu moved them) therefore travel inside *both* configurations, not only
 through ``set_controls``; otherwise the still would be taken with the ISP's
 default sharpening and saturation and the viewfinder would come back without
-them. A runtime control change has to reach those dicts as well as the live
+them.
+
+Noise reduction is the one control the two configurations do not share: the
+still keeps ``HighQuality`` and the live view takes ``Minimal``, Picamera2's own
+preview default, which a shared dict would otherwise override (the cheaper
+mode; a 640-pixel viewfinder does not need the stronger denoise).
+The still configuration is what ``switch_mode_and_capture_request`` configures
+for a shot, so a photograph taken from the live view is still denoised at
+``HighQuality``; the setters below write only their own control, so neither
+mode leaks into the other configuration. Records do not name the mode.
+
+A runtime control change has to reach those dicts as well as the live
 camera for the same reason: ``set_image_control`` does so for the image
 controls, ``set_shutter`` for a fixed exposure time (shutter priority), and
 also widens and restores ``FrameDurationLimits``; ``set_iso`` for a fixed
@@ -405,11 +416,13 @@ class Picamera2Camera:
             for key in self.image_controls_supported:
                 setattr(self._stream_info, key, getattr(self, key))
             self._still_config = config
+            running = controls
             if self._preview is not None:
+                running = _preview_controls(controls)
                 preview_config = camera.create_preview_configuration(
                     main={"size": self._preview, "format": _MAIN_FORMAT},
                     raw={"size": _binned_mode(self._native_size)},
-                    controls=dict(controls),
+                    controls=dict(running),
                 )
                 camera.configure(preview_config)
                 self._preview_config = preview_config
@@ -422,7 +435,9 @@ class Picamera2Camera:
                 for key, config in (("still", self._still_config),
                                     ("preview", self._preview_config))
             }
-            camera.set_controls(controls)
+            # What the configuration in force holds: with a preview, the live
+            # view's own noise reduction, not the still's.
+            camera.set_controls(running)
             start_attempted = True
             camera.start()
             self._started = True
@@ -740,8 +755,9 @@ class Picamera2Camera:
         The contract of ``set_ae_constraint``: the control goes to the running
         camera and into both configurations (so the live view shows it at once
         and the next still, which configures twice, keeps it), and nothing
-        changes if it is refused or this camera does not list the control. On
-        success the value also goes into ``stream_info``, which every later
+        changes if it is refused or this camera does not list the control. Only
+        that one control is written, so each configuration keeps its own noise
+        reduction. On success the value also goes into ``stream_info``, which every later
         record copies when its photograph is taken.
         """
         control = _IMAGE_CONTROLS.get(key)
@@ -1138,6 +1154,25 @@ def _warn_missing_image_control(control: str, key: str, requested: float) -> Non
     )
 
 
+def _preview_controls(controls: dict) -> dict:
+    """The still's controls with the live view's noise reduction.
+
+    Stills keep ``HighQuality``; the preview takes ``Minimal``, Picamera2's own
+    preview default, which the shared dict would otherwise override. Where
+    libcamera has no such enum the still's dict has no ``NoiseReductionMode``
+    either, and the preview is left without one too.
+    """
+    preview = dict(controls)
+    if "NoiseReductionMode" in preview:
+        try:
+            from libcamera import controls as _lc
+
+            preview["NoiseReductionMode"] = _lc.draft.NoiseReductionModeEnum.Minimal
+        except (AttributeError, ImportError):
+            preview.pop("NoiseReductionMode")
+    return preview
+
+
 def _camera_controls(
     autofocus: str,
     af_range: str,
@@ -1150,7 +1185,8 @@ def _camera_controls(
     image: dict[str, float] | None = None,
 ) -> dict:
     """The ISP's image controls, noise reduction, autofocus and AE shaping, as
-    one control dict.
+    one control dict for the still configuration (``_preview_controls`` makes
+    the live view's from it).
 
     Returned rather than applied so the same set can be handed to
     ``create_still_configuration`` and ``create_preview_configuration`` as well

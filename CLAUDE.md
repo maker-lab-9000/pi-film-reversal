@@ -183,6 +183,8 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   attached sensor via `Picamera2.sensor_resolution`/libcamera's automatic tuning, not hard-coded
   per model). An optional `preview` mode adds a second, cheap stream for the LCD viewfinder;
   `read(full=True)` switches to the still configuration, captures, and returns to preview.
+  Noise reduction is the one control the two configurations do not share: `HighQuality` for
+  stills, `Minimal` (Picamera2's preview default) for the live view.
   `set_shutter` gives shutter priority (`ExposureTimeMode` on libcamera 0.5, legacy `ExposureTime`
   otherwise), written into both configurations so a later configure does not undo it.
   `set_iso` fixes the analogue gain the same way (ISO 100 is gain 1.0; `AnalogueGainMode` on
