@@ -177,6 +177,7 @@ message screens keep the default font.
 | Developing count (amber number on a dark patch, right of the battery tag) | How many photographs are still being graded behind the shutter; see [Developing count](#developing-count). Absent at zero and with `--grade inline` | — |
 | `TUNING` tag (amber word on a dark patch, last in the top-left row) | The camera's libcamera tuning differs from the one the look was trained under; see [Tuning warning](#tuning-warning). Absent otherwise | — |
 | `PHOTOS NN%` / `SD NN%` tags (amber on a dark patch, top, between the top-left row and the shutter button) | The photo volume or the system SD card is at or above `--disk-warn-percent` (90 by default); see [Disk-space warning](#disk-space-warning). Absent otherwise | — |
+| `IMG` tag (amber on a dark patch, first in the same place as the disk tags) | Sharpness, contrast or saturation is not 1.0; see [Image page](#settings-menu). Absent otherwise | — |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Review screen | Full-screen quick grade (the frame reduced by a whole factor to about 1,000 pixels on the long side, four times each way for the IMX477, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
@@ -270,6 +271,7 @@ returns to the live view. Nothing in it needs sudo.
 | `HALATION` | `ON` / `OFF`; a dim `-` when the look has no halation | Picamera2 | from the next photograph |
 | `AE CONSTRAINT` | `NORMAL` / `HIGHLIGHT` / `SHADOWS` | the camera reports `AeConstraintMode`, and no `--ae-lock` | at once |
 | `AE METERING` | `CENTRE` / `SPOT` / `MATRIX` | the camera reports `AeMeteringMode`, and no `--ae-lock` | at once |
+| `IMAGE` | `>`; a dim `-` when the camera can change none of the three | a settings file (always on Picamera2; dim under `--fake`) | opens the image page |
 | `UPLOAD` | see below | `--nextcloud-env` given | starts a Nextcloud sync |
 | `ETH` | the Ethernet IPv4 address, or `-` | always | read-only |
 | `WLAN` | the Wi-Fi IPv4 address (the hotspot's own `10.42.0.1` included), or `-` | always | read-only |
@@ -282,8 +284,31 @@ menu logs one line such as `settings: ae-metering matrix`. A dark scene at the
 exposure limits (the longest shutter and the top gain) looks the same in every mode.
 
 A row the camera cannot use is left out and the rows below move up. A USB camera
-(V4L2) runs without the display, so it has no menu at all; under `--fake` only
-`UPLOAD`, the addresses and `LOOK` are there.
+(V4L2) runs without the display, so it has no menu at all; under `--fake` only a dim
+`IMAGE`, `UPLOAD`, the addresses and `LOOK` are there.
+
+**Image page.** `IMAGE` opens a second page titled IMAGE with the camera's own
+image controls, which libcamera applies before pifilm's look:
+
+| Row | Values | Effect |
+| --- | --- | --- |
+| `SHARPNESS` | `0.5` / `0.75` / `1.0` / `1.25` / `1.5` | at once, live view and photographs |
+| `CONTRAST` | the same | at once |
+| `SATURATION` | the same | at once |
+| `RESET` | `TAP TWICE` | puts only these three back to 1.0 |
+| `BACK` | | back to the first page |
+
+A tap steps to the next value; `1.5` wraps to `0.5`. 1.0 is the camera's normal
+rendering. `DONE` closes the menu from this page too, and the menu always opens on
+the first page. A control the camera does not report is dim with `-`. Each
+photograph's record has `sharpness`, `contrast` and `saturation` right after
+`ae_metering`, the values it was taken with. While any of the three is not 1.0 the
+live view shows an amber `IMG` tag.
+
+Every look so far was trained on photographs taken at 1.0. At another value the
+look grades a picture it was not trained on, so the result can differ from the
+look's examples. Put them back to 1.0 for photographs you want the look to grade as
+trained, and for photographs meant as training sources.
 
 **Halation.** `OFF` leaves the look's halation out of the photographs that follow,
 `ON` puts it back. A photograph keeps the value it was taken with, even if its
@@ -293,16 +318,17 @@ taken with it off says `"halation": "off"` where `halation_sha1` would be, and
 `pifilm-process` then regrades it without halation too. With a look that has no
 halation the row shows `-` and ignores taps, and records are as before.
 
-**Remembered.** The four settings are written to `settings.json` beside the
+**Remembered.** The seven settings are written to `settings.json` beside the
 pending-grades directory (`~/.local/state/pifilm/settings.json` by default, the
 parent of `--state-dir`) after every change, atomically, and read at the next
 start before the camera opens. A saved value wins over the unit's flag
 (`--no-dng`, `--ae-constraint`, `--ae-metering`; halation has no flag and the unit
-says on), and the journal then says so in one line, for example
+says on, and sharpness, contrast and saturation have none and the unit says 1.0), and the journal then says so in one line, for example
 `settings: ae-constraint shadows (saved in the menu; the unit says ae-constraint highlight)`.
 A file that cannot be read, is not JSON or has another version is ignored with one
 line and left in place; an unknown or invalid key is ignored with one line. Neither
-stops the service. Only these four settings are stored; every other flag, the
+stops the service. An older build ignores the three image keys with one line each and
+shoots at 1.0. Only these seven settings are stored; every other flag, the
 screen's rotation included, still comes from the unit alone.
 
 **Reset.** The first tap on `RESET` changes it to `TAP AGAIN` for 3 s. A second tap
@@ -769,6 +795,8 @@ With the service running with `--nextcloud-env` and the panel in live view:
 | 6 | `ETH`/`WLAN` show the addresses (unplug the cable: `ETH` turns to `-` within about 10 s), and the live view no longer shows them. `LOOK` shows the deployed look's folder name, or `starter (bundled)` | Not yet run |
 | 7 | `RESET`, tapped twice: the unit's flags are back and `settings.json` is gone | Not yet run |
 | 8 | A GPIO button press while the menu is open takes a photograph, and the menu stays open | Not yet run |
+| 9 | `IMAGE` opens the image page. Step `SATURATION` to `0.5`: the live view loses colour at once and the amber `IMG` tag shows. Do the same with `CONTRAST` (flatter at `0.5`) and `SHARPNESS` (softer at `0.5`, crisper at `1.5`; easiest seen at `2x`). Take a photograph: it shows the same change, and its record has `sharpness`, `contrast` and `saturation` after `ae_metering` with the values shown. The journal has a `settings: saturation 0.5` line per change | Not yet run |
+| 10 | The image page's `RESET`, tapped twice: the three are back to `1.0`, the `IMG` tag goes, and the other settings are unchanged. `BACK` returns to the first page; `DONE` from the image page returns to the live view. Restart with a value saved: the journal has the `settings: ... (saved in the menu; the unit says ...)` line and the live view shows it | Not yet run |
 
 ## 8. Troubleshooting
 

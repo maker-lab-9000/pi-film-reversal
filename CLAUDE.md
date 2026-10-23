@@ -198,6 +198,10 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   `ae_constraint` / `ae_metering` follow `tuning_sha1` in records: the modes pifilm sent (set at
   open, updated by `set_ae_constraint`/`set_ae_metering` in `stream_info`, which each record
   copies when its photo is taken), left out for a mode the camera does not support.
+  `sharpness` / `contrast` / `saturation` follow `ae_metering` the same way: the ISP's image
+  controls (1.0 is normal; the menu's IMAGE page), sent in both configurations at open and
+  changed live by `set_image_control(key, value)`; a control the camera does not list is sent
+  at 1.0, refused at runtime and left out of records.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
   captures-only display (`--show-captures`, shows TV colour bars while processing), and headless
   terminal. `--display waveshare35dsi` (or `waveshare28`) runs the LCD viewfinder instead of any
@@ -250,10 +254,14 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   address of `eth0` and `wlan0` while sysfs reports them up (`SIOCGIFADDR` ioctl; the hotspot's
   address counts), logs `network:` lines on each change and feeds `CaptureSession.network`
   (`(label, address)` pairs, `ETH` then `WLAN`), which the settings menu shows.
-- `settings.py`: the four settings the LCD menu changes (DNG saving, halation, AE constraint, AE
-  metering; halation has no flag and defaults to on, the look's own), in `settings.json` beside the state directory; read at start-up before the camera
+- `settings.py`: the seven settings the LCD menu changes (DNG saving, halation, AE constraint, AE
+  metering, and sharpness, contrast, saturation in `IMAGE_STEPS` 0.5 to 1.5; halation has no
+  flag and defaults to on, the look's own; the image three have none and default to 1.0), in
+  `settings.json` beside the state directory (still version 1); read at start-up before the camera
   opens, a saved value wins over the unit's flag on Picamera2 only (one `settings:` line), and
-  `SettingsControl` applies, saves atomically and resets them. `upload.py`: `Upload`, the menu's
+  `SettingsControl` applies, saves atomically and resets them (`reset_image` only the image
+  three). Looks were trained at 1.0, so a value away from it grades a picture the look never
+  saw. `upload.py`: `Upload`, the menu's
   UPLOAD row, runs `python -m pifilm.nextcloud` as a child (`--nextcloud-env PATH`, never read
   by the service; the token stripped from its environment) and reads its last line for the status.
 - Double exposure: `CaptureSession` owns the mode and pending first frame; `pifilm/double.py`
@@ -309,11 +317,15 @@ top right, meter dots, `2x`, battery, the developing count (an amber number righ
 battery tag: `LiveState.developing`, from the snapshot's `pending_grades` at every frame,
 absent at zero), an amber `TUNING` tag last in that row (`LiveState.tuning_mismatch`, from the
 snapshot's `tuning_mismatch`), amber `PHOTOS NN%`/`SD NN%` tags in their own tile between that
-row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning`), a `MENU`
+row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning`), an amber
+`IMG` tag first in that tile while sharpness, contrast or saturation is not 1.0
+(`LiveState.image_adjusted`, from the viewfinder's own settings, not the snapshot), a `MENU`
 key under `-` that opens the settings menu, and focus gauge, from cached anti-aliased tiles in the
 bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
 holds only the review, processing and message screens; `menu.py` draws the settings menu page
-(rows, `DONE` where the shutter is) and hit-tests it. Both work in 320×240 base units at an
+(rows, `DONE` where the shutter is) and hit-tests it; a titled page (the second, IMAGE page:
+SHARPNESS, CONTRAST, SATURATION, its own RESET, BACK; opened by the first page's IMAGE row,
+dim on a camera that takes none of them) puts its title on the first line. Both work in 320×240 base units at an
 integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW/MENU state machine
 (it also lights `+`/`-`/shutter while a finger is on them) and takes the scale from the display's
 width. Under `run()` it reads preview frames on a `pifilm-frames` thread (touch is on `pifilm-touch`)

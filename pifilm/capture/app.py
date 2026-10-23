@@ -189,13 +189,14 @@ The settings menu
 directory once the backend is known and before the panel or the camera is opened,
 so a saved value is in effect from the first frame: the unit's flags are the
 defaults, a value saved in the menu wins, and each ``settings:`` line says so in
-the journal. Only a real Picamera2 takes them (DNG saving and the two
-auto-exposure modes are its controls); under ``--fake`` or V4L2 the arguments
-stay as given, so a saved value can never trip the Picamera2-only check and stop
-the service starting. The ``SettingsControl`` gets one applier per row the
-backend can change, and the viewfinder gets the rows the camera supports (none of
-the auto-exposure ones under ``--ae-lock``, whose setters would change nothing),
-the look's name (the ``--artifacts`` folder) and, with ``--nextcloud-env`` and a
+the journal. Only a real Picamera2 takes them (DNG saving, the two auto-exposure
+modes and the ISP's sharpness, contrast and saturation are its controls); under
+``--fake`` or V4L2 the arguments stay as given, so a saved value can never trip
+the Picamera2-only check and stop the service starting. The ``SettingsControl``
+gets one applier per row the backend can change, and the viewfinder gets the rows
+the camera supports (none of the auto-exposure ones under ``--ae-lock``, whose
+setters would change nothing, and only the image controls the camera lists), the
+look's name (the ``--artifacts`` folder) and, with ``--nextcloud-env`` and a
 panel, an ``Upload`` that ``main`` closes beside the network monitor. Only the
 viewfinder's loop thread sets or resets a setting; the control has no lock.
 

@@ -112,6 +112,13 @@ service sets no controls, so auto exposure and auto white balance are on at
 capture time; leave them on for the shoot too, and give each frame a second to
 settle before pressing.
 
+On a Pi camera, keep the viewfinder menu's IMAGE page at 1.0 (no amber `IMG` tag
+in the live view). Sharpness, contrast and saturation change the frame before
+pifilm sees it, and every look so far was trained at 1.0. When choosing frames
+from earlier captures, use only those whose `captures.jsonl` record has
+`sharpness`, `contrast` and `saturation` all at 1.0, or none of those fields
+(taken before the page existed, always at 1.0).
+
 Do **not** lock one white balance across different lighting. What absorbs
 tungsten versus daylight is either the pipeline's per-frame white balance,
 applied identically in training and at capture, or — when the artifact turns it
