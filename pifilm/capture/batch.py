@@ -34,6 +34,17 @@ real capture folder, which holds ``<time>_original.jpg`` next to
   ``pifilm.pipeline``). The tool says so once per run. Records graded on the
   CPU, and records from before the field existed, reproduce as closely as the
   original allows (exactly for a USB camera, above).
+* **A multi-frame photograph.** Its record's ``stack`` lists the burst's
+  files, the reference first (``<time>_original.jpg``, then
+  ``<time>_frame2.jpg`` and on), and the Pi graded their merge. The regrade
+  merges the same files with ``pifilm.stack.merge(frames, reference=0)``, as the
+  Pi's grade worker does, then grades the merge with the logged EV and seed, so
+  it reproduces the Pi's file as closely as the frames on disk allow (exactly
+  for a grade the Pi recovered from those JPEGs). A listed frame missing from
+  the folder leaves the reference to be graded alone, and the run says how
+  many. ``--ignore-log`` grades the reference alone. The ``_frameN`` files are
+  never inputs themselves, whatever ``--all`` says: each is part of a
+  photograph, not one.
 * **Clobbering.** ``a.jpg`` and ``a.png`` would produce the same output
   name, and re-running would silently overwrite. Same-stem inputs get their
   extension folded into the output name, existing outputs are skipped unless
@@ -45,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from collections.abc import Sequence
@@ -56,9 +68,12 @@ import numpy as np
 from ..artifacts import Artifacts, ArtifactsError
 from ..imageio import list_images, load_rgb, save_jpeg
 from ..pipeline import Pipeline
+from ..stack import merge
 
 GRADED_SUFFIXES = ("_graded",)
 SOURCE_SUFFIXES = ("_original", "_ungraded")
+# A multi-frame burst's other frames (``<time>_frame2`` and on): never an input.
+BURST_FRAME = re.compile(r"_frame\d+$")
 
 
 CAPTURE_LOG = "captures.jsonl"
@@ -74,6 +89,8 @@ class BatchResult:
     doubles: int = 0
     gpu_graded: int = 0  # regraded here on the CPU, graded by the Pi on its GPU
     halation_off: int = 0  # regraded without the look's halation, as the Pi graded them
+    stacks: int = 0  # multi-frame photographs regraded from the merge of their frames
+    stack_frames_missing: int = 0  # multi-frame photographs graded from the reference alone
     bad_log_lines: int = 0
 
 
@@ -84,6 +101,22 @@ class LogEntry:
     double: bool = False
     gpu: bool = False  # the Pi graded this record on its GPU
     halation: bool = True  # False: the record says the look's halation was left out
+    # A multi-frame record's file names, the reference first; None for one frame.
+    frames: tuple[str, ...] | None = None
+
+
+def _stack_frames(record: dict) -> tuple[str, ...] | None:
+    stack = record.get("stack")
+    if stack is None:
+        return None
+    frames = stack.get("frames") if isinstance(stack, dict) else None
+    if (not isinstance(frames, list) or not frames
+            or not all(isinstance(name, str) and name for name in frames)):
+        raise ValueError(f"bad stack: {stack!r}")
+    # Names only, in the record's own folder: never a path out of it.
+    if any(Path(name).name != name for name in frames):
+        raise ValueError(f"bad stack frame names: {frames!r}")
+    return tuple(frames)
 
 
 def _log_entry(record: dict) -> LogEntry:
@@ -101,7 +134,7 @@ def _log_entry(record: dict) -> LogEntry:
     return LogEntry(float(record.get("ev_comp") or 0.0),
                     int(seed) if seed is not None else None,
                     gpu=isinstance(backend, str) and backend.startswith("gpu"),
-                    halation=halation)
+                    halation=halation, frames=_stack_frames(record))
 
 
 def load_capture_log(in_dir: Path) -> tuple[dict[str, LogEntry], int]:
@@ -130,13 +163,18 @@ def _is_graded(path: Path) -> bool:
     return any(path.stem.endswith(s) for s in GRADED_SUFFIXES)
 
 
+def _is_burst_frame(path: Path) -> bool:
+    return BURST_FRAME.search(path.stem) is not None
+
+
 def _is_source(path: Path) -> bool:
     return any(path.stem.endswith(s) for s in SOURCE_SUFFIXES)
 
 
 def select_inputs(paths: Sequence[Path], all_files: bool = False) -> list[Path]:
-    """Graded outputs are never inputs; capture folders default to their originals."""
-    candidates = [p for p in paths if not _is_graded(p)]
+    """Graded outputs and a burst's other frames are never inputs; capture
+    folders default to their originals."""
+    candidates = [p for p in paths if not _is_graded(p) and not _is_burst_frame(p)]
     if all_files:
         return candidates
     sources = [p for p in candidates if _is_source(p)]
@@ -196,6 +234,14 @@ def process_dir(
             if entry.seed is not None:
                 rng = np.random.default_rng(entry.seed)
         rgb, _meta = load_rgb(src)
+        if entry is not None and entry.frames is not None and len(entry.frames) > 1:
+            others = [in_dir / name for name in entry.frames[1:]]
+            if entry.frames[0] == src.name and all(p.is_file() for p in others):
+                # As the Pi's grade worker: the reference first, merged onto it.
+                rgb, _merged = merge([rgb] + [load_rgb(p)[0] for p in others], reference=0)
+                result.stacks += 1
+            else:
+                result.stack_frames_missing += 1
         graded, _info = pipeline.process(rgb, grain=grain, rng=rng, ev=ev, halation=halation)
         result.written.append(save_jpeg(graded, dest))
     return result
@@ -219,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ignore-log", action="store_true",
         help=f"grade every frame at EV 0 with fresh grain and the look's halation, "
-             f"ignoring {CAPTURE_LOG}",
+             f"and a multi-frame photograph from its reference alone, ignoring {CAPTURE_LOG}",
     )
     args = parser.parse_args(argv)
 
@@ -249,6 +295,11 @@ def main(argv: list[str] | None = None) -> int:
         notes.append(f"{result.from_log} from {CAPTURE_LOG} ({result.ev_applied} with EV)")
     if result.doubles:
         notes.append(f"{result.doubles} double-exposure frames graded singly")
+    if result.stacks:
+        notes.append(f"{result.stacks} multi-frame merged")
+    if result.stack_frames_missing:
+        notes.append(f"{result.stack_frames_missing} multi-frame with frames missing, "
+                     "reference graded alone")
     if result.halation_off:
         notes.append(f"{result.halation_off} without halation, as shot")
     if result.bad_log_lines:

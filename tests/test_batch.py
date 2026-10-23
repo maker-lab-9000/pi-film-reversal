@@ -336,3 +336,106 @@ def test_only_an_off_value_turns_halation_off(tmp_path):
     assert bad == 0
     assert [log[f"12000{i}_original.jpg"].halation for i in range(1, 5)] == [
         False, True, True, False]
+
+
+# --- multi-frame photographs (a record's ``stack``) ---------------------------
+
+
+def _burst_scene(seed=0, h=96, w=128):
+    """A smooth scene, so the frames align, plus each frame's own noise."""
+    from pifilm._cv2 import require_cv2
+
+    cv2 = require_cv2()
+    rng = np.random.default_rng(100)
+    base = cv2.GaussianBlur(rng.random((h, w, 3), dtype=np.float32), (0, 0), 4)
+    base = 128.0 + 60.0 * (base - base.mean()) / base.std()
+    noise = np.random.default_rng(seed).normal(0.0, 12.0, (h, w, 3))
+    return np.clip(base + noise, 0, 255).astype(np.uint8)
+
+
+def _stack_dir(tmp_path, n=3, missing=()):
+    d = tmp_path / "day"
+    d.mkdir()
+    names = ["120001_original.jpg"] + [f"120001_frame{i}.jpg" for i in range(2, n + 1)]
+    for i, name in enumerate(names):
+        if name not in missing:
+            save_jpeg(_burst_scene(i), d / name)
+    save_jpeg(_img(9), d / "120001_graded.jpg")
+    record = {"original": "120001_original.jpg", "ev_comp": -0.33, "grain_seed": 77,
+              "shutter_delay_s": 0.0,
+              "stack": {"frames": names, "reference": names[0], "exposure_us": 5000,
+                        "gain": 2.0, "split": True, "method": "ecc-euclidean"}}
+    (d / "captures.jsonl").write_text(json.dumps(record) + "\n")
+    return d, names
+
+
+def _graded(rgb, *, ev, seed, tmp_path):
+    want, _ = Pipeline(Artifacts.resolve(None)).process(
+        rgb, rng=np.random.default_rng(seed), ev=ev)
+    return load_rgb(save_jpeg(want, tmp_path / "want.jpg"))[0]
+
+
+def test_a_stack_regrades_the_merge_of_its_frames(tmp_path, capsys):
+    from pifilm.stack import merge
+
+    d, names = _stack_dir(tmp_path)
+    result = process_dir(d, tmp_path / "out")
+    assert [p.name for p in result.written] == ["120001_original_graded.jpg"]
+    assert result.stacks == 1 and result.stack_frames_missing == 0
+    merged, info = merge([load_rgb(d / n)[0] for n in names], reference=0)
+    assert all(f["used"] for f in info["frames"])  # a real merge, not the reference alone
+    got = load_rgb(tmp_path / "out" / "120001_original_graded.jpg")[0]
+    assert np.array_equal(got, _graded(merged, ev=-0.33, seed=77, tmp_path=tmp_path))
+    alone = _graded(load_rgb(d / names[0])[0], ev=-0.33, seed=77, tmp_path=tmp_path)
+    assert not np.array_equal(got, alone)
+    assert main([str(d), str(tmp_path / "out2")]) == 0
+    assert "1 multi-frame merged" in capsys.readouterr().out
+
+
+def test_a_stack_with_a_frame_missing_grades_the_reference_alone(tmp_path, capsys):
+    d, names = _stack_dir(tmp_path, n=4, missing=("120001_frame3.jpg",))
+    result = process_dir(d, tmp_path / "out")
+    assert result.stacks == 0 and result.stack_frames_missing == 1
+    got = load_rgb(tmp_path / "out" / "120001_original_graded.jpg")[0]
+    want = _graded(load_rgb(d / names[0])[0], ev=-0.33, seed=77, tmp_path=tmp_path)
+    assert np.array_equal(got, want)  # the logged EV and seed still apply
+    assert main([str(d), str(tmp_path / "out2")]) == 0
+    assert "1 multi-frame with frames missing, reference graded alone" in (
+        capsys.readouterr().out)
+
+
+def test_ignore_log_grades_a_stack_reference_alone(tmp_path):
+    d, names = _stack_dir(tmp_path)
+    # Grain is fresh without the log, so compare grain-free grades.
+    result = process_dir(d, tmp_path / "out", use_log=False, grain=False)
+    assert result.stacks == 0 and result.stack_frames_missing == 0
+    assert [p.name for p in result.written] == ["120001_original_graded.jpg"]
+    got = load_rgb(tmp_path / "out" / "120001_original_graded.jpg")[0]
+    want, _ = Pipeline(Artifacts.resolve(None)).process(load_rgb(d / names[0])[0], grain=False)
+    assert np.array_equal(got, load_rgb(save_jpeg(want, tmp_path / "w.jpg"))[0])
+
+
+def test_burst_frames_are_never_inputs(tmp_path):
+    d, _ = _stack_dir(tmp_path)
+    every = sorted(d.glob("*.jpg"))
+    for all_files in (False, True):
+        chosen = [p.name for p in select_inputs(every, all_files=all_files)]
+        assert chosen == ["120001_original.jpg"]
+    # Without any original in the folder, the frames are still not picked up.
+    (d / "120001_original.jpg").unlink()
+    save_jpeg(_img(1), d / "loose.jpg")
+    assert [p.name for p in select_inputs(sorted(d.glob("*.jpg")))] == ["loose.jpg"]
+    assert [p.name for p in process_dir(d, tmp_path / "out", all_files=True).written] == [
+        "loose_graded.jpg"]
+
+
+def test_a_bad_stack_is_an_unreadable_log_line(tmp_path):
+    d = _logged_dir(tmp_path, [
+        {"original": "120001_original.jpg", "stack": {"frames": "x"}},
+        {"original": "120002_original.jpg", "stack": {"frames": ["../a.jpg", "b.jpg"]}},
+        {"original": "120003_original.jpg", "grain_seed": 3,
+         "stack": {"frames": ["120003_original.jpg"]}},
+    ])
+    log, bad = load_capture_log(d)
+    assert bad == 2
+    assert log["120003_original.jpg"].frames == ("120003_original.jpg",)
