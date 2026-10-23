@@ -198,6 +198,24 @@ the auto-exposure ones under ``--ae-lock``, whose setters would change nothing),
 the look's name (the ``--artifacts`` folder) and, with ``--nextcloud-env`` and a
 panel, an ``Upload`` that ``main`` closes beside the network monitor. Only the
 viewfinder's loop thread sets or resets a setting; the control has no lock.
+
+The halation setting
+--------------------
+The menu's HALATION row (``halation`` in ``settings.json``; no flag, the unit's
+value is on) leaves the look's halation out of the photographs that follow, and
+puts it back. The choice is the shutter's: ``capture`` reads ``halation`` beside
+the EV and the shutter speed, and that value grades the shot's quick grade and
+its full grade, however long the grade waits while the row is tapped again. A
+background shot keeps it in its pending entry (``"halation"``), so a grade
+recovered at a later start is the one the photographer asked for; an entry from
+before the setting has none and means on, as it was graded then. A double
+exposure takes the value at its second shutter, the one that makes the
+composite. The live view has no halation either way. The record says what was
+done (the pipeline's audit fields): ``halation_sha1`` when the glow was applied,
+``"halation": "off"`` in its place when a look with halation was graded without
+it, which ``pifilm-process`` reads to regrade the same way, and neither for a
+look without halation, whose records are as they always were. Like the other
+settings it is taken only on a real Picamera2, the only backend with the menu.
 """
 
 from __future__ import annotations
@@ -307,7 +325,7 @@ class CaptureResult:
 class _GradeWork:
     """One photograph's grade: the payload of a ``GradeJob``.
 
-    The first eight fields are exactly what the pending entry holds, so a grade
+    The first nine fields are exactly what the pending entry holds, so a grade
     can be done again from the entry alone. The rest exists only for a shot taken
     by this process; a recovered grade has ``frames`` None and reads its originals
     from disk.
@@ -320,6 +338,10 @@ class _GradeWork:
     ev: float
     record: dict  # the record's capture-time fields
     double: dict | None = None  # {"ev_comp": [ev1, ev2], "method": ...} for a double
+    # The menu's HALATION as it was at the shutter: False leaves the look's glow
+    # out of both grades. An entry written before there was the setting has none,
+    # and was graded with the look's halation, so a missing value means True.
+    halation: bool = True
     frames: tuple[np.ndarray, ...] | None = None
     stages: dict[str, float] = field(default_factory=dict)
     shutter: float | None = None  # time.perf_counter() at the shutter
@@ -338,6 +360,7 @@ class _GradeWork:
             "seed": self.seed,
             "ev": self.ev,
             "double": self.double,
+            "halation": self.halation,
             "record": self.record,
         }
 
@@ -366,8 +389,11 @@ class _GradeWork:
             raise ValueError(f"pending entry has bad originals: {originals!r}")
         if not isinstance(record, dict) or not isinstance(double, dict | None):
             raise ValueError("pending entry has a bad record")
+        halation = payload.get("halation", True)
+        if not isinstance(halation, bool):
+            raise ValueError(f"pending entry has a bad halation: {halation!r}")
         return cls(day, graded, originals, int(payload["seed"]), float(payload["ev"]),
-                   record, double)
+                   record, double, halation)
 
 
 def _quick_frame(rgb: np.ndarray) -> np.ndarray:
@@ -460,6 +486,7 @@ class CaptureSession:
         queue_depth: int = 3,
         log: Callable[[str], None] = print,
         grade_backend: str = "cpu",
+        halation: bool = True,
     ) -> None:
         if grade_backend not in GRADE_BACKENDS:
             raise ValueError(
@@ -487,6 +514,10 @@ class CaptureSession:
         self._seed_rng = seed_rng or np.random.default_rng()
         self._package_version = package_version
         self._save_dng = save_dng
+        # The menu's HALATION (see "The halation setting" in the module docstring):
+        # True grades with the look's halation, False leaves it out. Set by the
+        # viewfinder's thread, read once per shot at the shutter.
+        self.halation = bool(halation)
         # Double exposure: touched only on the controller's worker thread. Memory
         # only, so a restart always begins with the mode off at 0/2.
         self.double_exposure = False
@@ -601,21 +632,27 @@ class CaptureSession:
         wb_k = getattr(self.camera, "colour_temperature_k", None)
         # And the manual ISO (None = auto).
         iso = getattr(self.camera, "iso", None)
+        # And the menu's HALATION: the photograph is graded as it was set now,
+        # whenever its grade runs.
+        halation = self.halation
         frame = self.camera.read()
         stages = _capture_stages(frame, shutter)
         if self.double_exposure:
             return self._capture_double(
                 frame, ev, shutter, stages, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
+                halation=halation,
             )
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
         if self._queue is not None:
             return self._capture_background(
                 frame, ev, shutter, stages, seed, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
+                halation=halation,
             )
         t0 = time.perf_counter()
         graded, info = self.pipeline.process(
             frame.rgb, rng=np.random.default_rng(seed), ev=ev, timings=stages,
+            halation=halation,
         )
         pipeline_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -650,7 +687,7 @@ class CaptureSession:
 
     def _capture_background(
         self, frame: Frame, ev: float, shutter: float, stages: dict[str, float], seed: int, *,
-        shutter_us: int | None, wb_k: int | None, iso: int | None,
+        shutter_us: int | None, wb_k: int | None, iso: int | None, halation: bool,
     ) -> CaptureResult:
         """A single shot graded behind the shutter: everything up to handing it over."""
         day_dir, stem, t, original, dng_name = self._write_original(frame, stages)
@@ -676,7 +713,7 @@ class CaptureSession:
         }
         work = _GradeWork(
             day_dir.name, graded.name, [self._relative(original)], seed, ev, fields,
-            frames=(frame.rgb,), stages=stages, shutter=shutter,
+            halation=halation, frames=(frame.rgb,), stages=stages, shutter=shutter,
         )
         return self._hand_over(work, stem, original, graded, exposure=None)
 
@@ -727,7 +764,8 @@ class CaptureSession:
         with _stage(work.stages, "preview"):
             small = [_quick_frame(rgb) for rgb in work.frames]
             rgb = composite(small[0], small[1]) if len(small) == 2 else small[0]
-            quick, _ = self.pipeline.process(rgb, grain=False, ev=work.ev)
+            quick, _ = self.pipeline.process(rgb, grain=False, ev=work.ev,
+                                             halation=work.halation)
             path = save_jpeg(quick, self._private_dir() / f"preview-{stem}.jpg")
         # The same name can come round again on another day; the older file is
         # then already replaced and must not be deleted as if it were old.
@@ -802,7 +840,8 @@ class CaptureSession:
         used: dict = {}
         gpu = {"grader": self._grader, "used": used} if self._grader is not None else {}
         graded, info = self.pipeline.process(
-            rgb, rng=np.random.default_rng(work.seed), ev=work.ev, timings=stages, **gpu,
+            rgb, rng=np.random.default_rng(work.seed), ev=work.ev, timings=stages,
+            halation=work.halation, **gpu,
         )
         if "gpu_error" in used:
             self._say(f"gpu grade failed ({work.graded}): {used['gpu_error']}; "
@@ -916,7 +955,7 @@ class CaptureSession:
 
     def _capture_double(
         self, frame: Frame, ev: float, shutter: float, stages: dict[str, float], *,
-        shutter_us: int | None, wb_k: int | None, iso: int | None,
+        shutter_us: int | None, wb_k: int | None, iso: int | None, halation: bool,
     ) -> CaptureResult:
         # The pending frame is taken off the session before anything that can fail, so
         # any failure from here on returns the count to 0/2 (spec section 5). A camera
@@ -972,8 +1011,10 @@ class CaptureSession:
                     "originals": originals, "ev_comp": [pending.ev, ev],
                 },
             }
+            # The composite is graded with HALATION as it was at this, the
+            # second, shutter: the one that makes the photograph.
             work = _GradeWork(
-                day_dir.name, graded.name, originals, seed, 0.0, fields, double,
+                day_dir.name, graded.name, originals, seed, 0.0, fields, double, halation,
                 frames=(pending.rgb, frame.rgb), stages=stages, shutter=shutter,
             )
             return self._hand_over(work, stem, original, graded, exposure=(2, 2))
@@ -983,6 +1024,7 @@ class CaptureSession:
             combined = composite(pending.rgb, frame.rgb)
         graded, info = self.pipeline.process(
             combined, rng=np.random.default_rng(seed), ev=0.0, timings=stages,
+            halation=halation,
         )
         pipeline_ms = (time.perf_counter() - t0) * 1000.0
         with _stage(stages, "save_graded"):
@@ -1637,7 +1679,7 @@ def _no_signal(*_: object) -> None:
 def _run_viewfinder(
     camera, controller, display_pair, power, args, *,
     settings: SettingsControl | None = None, upload: Upload | None = None,
-    look: str = "", menu_rows: tuple[str, ...] | None = None,
+    look: str = "", menu_rows: tuple[str, ...] | None = None, look_halation: bool = False,
 ) -> int:
     display, touch = display_pair
     stop = threading.Event()
@@ -1652,6 +1694,7 @@ def _run_viewfinder(
         upload=upload,
         look=look,
         menu_rows=menu_rows,
+        look_halation=look_halation,
     )
     print("LCD viewfinder running. Tap the shutter to capture; Ctrl-C to stop.")
     failure: DisplayError | None = None
@@ -2008,16 +2051,18 @@ def _main(argv: list[str] | None) -> int:
         background=args.grade == "background",
         state_dir=args.state_dir,
         grade_backend=args.grade_backend,
+        halation=effective.halation if backend == "picamera2" else True,
     )
     settings = SettingsControl(settings_path, settings_defaults, overrides, log=print)
     menu_rows: tuple[str, ...] | None = None
     if backend == "picamera2":
         settings.register("save_dng", lambda on: setattr(session, "save_dng", on))
+        settings.register("halation", lambda on: setattr(session, "halation", on))
         settings.register("ae_constraint", lambda name: camera.set_ae_constraint(name))
         settings.register("ae_metering", lambda name: camera.set_ae_metering(name))
         # Under --ae-lock the AE setters would succeed and change nothing.
         exposure = getattr(camera, "exposure_adjustable", True) is not False
-        menu_rows = ("save_dng",) + (
+        menu_rows = ("save_dng", "halation") + (
             ("ae_constraint",)
             if exposure and getattr(camera, "ae_constraint_supported", False) else ()
         ) + (
@@ -2025,6 +2070,9 @@ def _main(argv: list[str] | None) -> int:
             if exposure and getattr(camera, "ae_metering_supported", False) else ()
         )
     look = _look_name(args.artifacts)
+    # Whether the HALATION row has anything to turn off.
+    halation_params = getattr(getattr(pipeline, "artifacts", None), "halation", None)
+    look_halation = bool(getattr(halation_params, "active", False))
     upload: Upload | None = None
     controller: CaptureController | None = None
     remote: RemoteCaptureServer | None = None
@@ -2049,7 +2097,8 @@ def _main(argv: list[str] | None) -> int:
             network.start()
         if args.nextcloud_env is not None and display_pair is not None:
             upload = Upload(args.nextcloud_env.expanduser(), log=print)
-        menu = {"settings": settings, "upload": upload, "look": look, "menu_rows": menu_rows}
+        menu = {"settings": settings, "upload": upload, "look": look, "menu_rows": menu_rows,
+                "look_halation": look_halation}
         if args.shutter_gpio is not None:
             try:
                 button = open_shutter_button(args.shutter_gpio)

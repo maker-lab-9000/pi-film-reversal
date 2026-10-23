@@ -1,11 +1,17 @@
 """The settings the LCD menu changes, remembered in ``settings.json``.
 
-Why only these three (DNG saving, the auto-exposure constraint and metering
-mode): they are the ones a photographer wants to change in the field, away from
-a keyboard, and each can be applied to a running session at once. Every other
-flag (the look, the camera, the network, where photographs go, the display's
-rotation) is set up once and stays with the systemd unit alone; a ``rotate`` key
-left in an older file is an unknown key, ignored with one line.
+Why only these four (DNG saving, the look's halation, the auto-exposure
+constraint and metering mode): they are the ones a photographer wants to change
+in the field, away from a keyboard, and each can be applied to a running session
+at once. Every other flag (the look, the camera, the network, where photographs
+go, the display's rotation) is set up once and stays with the systemd unit alone;
+a ``rotate`` key left in an older file is an unknown key, ignored with one line.
+
+``halation`` has no flag: its unit value is True, "as the look says", and False
+leaves the glow out of the photographs of a look that has one (a look without
+halation has nothing to leave out). It was added without a new ``VERSION``: an
+older build reads a file with it as an unknown key, ignored with one line, and
+keeps the look's halation, which is what it always did.
 
 Why a saved value wins over the unit's flag: a setting changed in the menu has to
 survive a restart, a power cut or a reboot, or the menu is a trap that undoes
@@ -42,20 +48,22 @@ SETTINGS_FILE = "settings.json"
 VERSION = 1
 AE_CONSTRAINTS = ("normal", "highlight", "shadows")
 AE_METERINGS = ("centre", "spot", "matrix")
-KEYS = ("save_dng", "ae_constraint", "ae_metering")
+KEYS = ("save_dng", "halation", "ae_constraint", "ae_metering")
 
 
 @dataclass(frozen=True)
 class Settings:
-    """The three values the menu can change."""
+    """The four values the menu can change. ``halation`` defaults to True, the
+    look's own halation, because no flag sets it."""
 
     save_dng: bool
     ae_constraint: str
     ae_metering: str
+    halation: bool = True
 
 
 def _valid(key: str, value: object) -> bool:
-    if key == "save_dng":
+    if key in ("save_dng", "halation"):
         return isinstance(value, bool)
     if key == "ae_constraint":
         return isinstance(value, str) and value in AE_CONSTRAINTS
@@ -65,9 +73,11 @@ def _valid(key: str, value: object) -> bool:
 
 
 def _describe(key: str, value: object) -> str:
-    """``ae-constraint shadows``, ``dng off``."""
+    """``ae-constraint shadows``, ``dng off``, ``halation off``."""
     if key == "save_dng":
         return f"dng {'on' if value else 'off'}"
+    if key == "halation":
+        return f"halation {'on' if value else 'off'}"
     return f"{key.replace('_', '-')} {value}"
 
 
@@ -146,11 +156,12 @@ def save(path: Path, overrides: Mapping[str, object]) -> None:
 
 
 class SettingsControl:
-    """The menu's view of the three settings: apply, remember, reset.
+    """The menu's view of the four settings: apply, remember, reset.
 
     An applier puts a value into effect in the running session (send the camera
-    a control, start or stop saving DNGs). It runs before anything is remembered,
-    so a value the session refused is never saved for the next start.
+    a control, start or stop saving DNGs or applying halation). It runs before
+    anything is remembered, so a value the session refused is never saved for
+    the next start.
     """
 
     def __init__(

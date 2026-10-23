@@ -2472,7 +2472,7 @@ def test_a_shot_refused_by_a_closing_queue_is_graded_inline(tmp_path, pipeline, 
 class _CheapPipeline:
     """Returns the frame as given: for tests about sizes and files, not about colour."""
 
-    def process(self, rgb, *, grain=True, rng=None, ev=0.0, timings=None):
+    def process(self, rgb, *, grain=True, rng=None, ev=0.0, timings=None, halation=True):
         return rgb, {"wb_gains": [1.0, 1.0, 1.0], "ev_comp": ev}
 
 
@@ -3945,18 +3945,18 @@ def test_the_menu_appliers_reach_the_camera_and_the_session(camera_cli, monkeypa
     assert camera.calls == [
         ("ae_constraint", "shadows"), ("ae_metering", "spot"), ("save_dng", False),
     ]
-    assert seen["menu_rows"] == ("save_dng", "ae_constraint", "ae_metering")
+    assert seen["menu_rows"] == ("save_dng", "halation", "ae_constraint", "ae_metering")
 
 
 def test_menu_rows_leave_out_what_the_camera_cannot_use(camera_cli, monkeypatch, tmp_path):
     seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera(constraint=False))
-    assert seen["menu_rows"] == ("save_dng", "ae_metering")
+    assert seen["menu_rows"] == ("save_dng", "halation", "ae_metering")
 
 
 def test_menu_rows_leave_out_the_ae_rows_under_ae_lock(camera_cli, monkeypatch, tmp_path):
     seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera(adjustable=False),
                       "--ae-lock")
-    assert seen["menu_rows"] == ("save_dng",)
+    assert seen["menu_rows"] == ("save_dng", "halation")
 
 
 def test_fake_has_no_optional_menu_rows_and_an_empty_look(tmp_path, monkeypatch):
@@ -4053,3 +4053,235 @@ def test_a_look_without_halation_records_none(tmp_path, grade):
     assert session.close_grades(timeout=5)
     (record,) = _lines(session.out_root)
     assert "halation_sha1" not in record and "halation" not in record["stage_ms"]
+
+
+# --- the menu's HALATION, taken at the shutter ---------------------------------
+
+
+class _SpyPipeline(_HeldPipeline):
+    """A held pipeline that also records what each call asked of halation."""
+
+    def __init__(self, inner):
+        super().__init__(inner)
+        self.artifacts = inner.artifacts
+        self.calls = []  # (full grade?, halation asked)
+
+    def process(self, rgb, *, grain=True, halation=True, **kwargs):
+        self.calls.append((grain, halation))
+        return super().process(rgb, grain=grain, halation=halation, **kwargs)
+
+    def warm(self, shape):
+        return None
+
+
+def _halation_session(tmp_path, pipe, *, grade="background", frames=1, **kwargs):
+    camera = FakeCamera([synthetic_frame(90, 160) for _ in range(frames)])
+    return CaptureSession(camera, pipe, tmp_path / "shots", now=lambda: FIXED,
+                          seed_rng=np.random.default_rng(0),
+                          background=grade == "background", state_dir=tmp_path / "state",
+                          log=lambda _: None, **kwargs)
+
+
+def _off_record_checks(record, pipe):
+    keys = list(record)
+    assert "halation_sha1" not in record and record["halation"] == "off"
+    assert keys.index("halation") == keys.index("normalize_sha1") + 1
+    assert "halation" not in record["stage_ms"]
+    assert pipe.artifacts.halation.active
+
+
+def test_halation_off_at_the_shutter_holds_when_the_setting_flips_before_the_grade(tmp_path):
+    spy = _SpyPipeline(_halation_pipeline())
+    session = _halation_session(tmp_path, spy, halation=False)
+    result = session.capture()
+    spy.wait_entered()
+    session.halation = True  # the row tapped again while the grade waits
+    ((_, payload),) = read_entries(tmp_path / "state")
+    assert payload["halation"] is False
+    spy.release()
+    assert session.close_grades(timeout=5)
+    # The quick grade and the full grade both left it out.
+    assert spy.calls == [(False, False), (True, False)]
+    (record,) = _lines(session.out_root)
+    _off_record_checks(record, spy)
+    # The file is the inline grade with halation off.
+    inline = _halation_session(tmp_path / "inline", _halation_pipeline(), grade="inline",
+                               halation=False).capture()
+    assert result.graded.read_bytes() == inline.pifilm.read_bytes()
+
+
+def test_halation_on_at_the_shutter_holds_when_the_setting_flips_off(tmp_path):
+    spy = _SpyPipeline(_halation_pipeline())
+    session = _halation_session(tmp_path, spy)
+    session.capture()
+    spy.wait_entered()
+    session.halation = False
+    ((_, payload),) = read_entries(tmp_path / "state")
+    assert payload["halation"] is True
+    spy.release()
+    assert session.close_grades(timeout=5)
+    assert spy.calls == [(False, True), (True, True)]
+    (record,) = _lines(session.out_root)
+    assert record["halation_sha1"] == spy.artifacts.halation.sha1 and "halation" not in record
+
+
+def test_halation_off_inline(tmp_path):
+    pipe = _halation_pipeline()
+    session = _halation_session(tmp_path, pipe, grade="inline", halation=False)
+    session.capture()
+    (record,) = _lines(session.out_root)
+    _off_record_checks(record, pipe)
+
+
+@pytest.mark.parametrize("grade", ["inline", "background"])
+def test_halation_off_for_a_look_without_halation_changes_no_record(tmp_path, grade):
+    records = []
+    for halation in (True, False):
+        session = _halation_session(tmp_path / str(halation), _halation_pipeline(enabled=False),
+                                    grade=grade, halation=halation)
+        session.capture()
+        assert session.close_grades(timeout=5)
+        (record,) = _lines(session.out_root)
+        assert "halation_sha1" not in record and "halation" not in record
+        records.append(record)
+    timing = {"pipeline_ms", "shutter_to_saved_ms", "shutter_to_ready_ms", "stage_ms"}
+    on, off = ({k: v for k, v in r.items() if k not in timing} for r in records)
+    assert list(on) == list(off) and on == off
+
+
+@pytest.mark.parametrize(("stored", "applied"), [(None, True), (True, True), (False, False)])
+def test_a_recovered_grade_uses_the_halation_of_its_entry(tmp_path, stored, applied):
+    spy = _SpyPipeline(_halation_pipeline())
+    first = _halation_session(tmp_path, spy)
+    result = first.capture()
+    spy.wait_entered()
+    ((path, payload),) = read_entries(tmp_path / "state")
+    spy.release()
+    assert first.close_grades(timeout=5)
+    # Put the shot back as a power cut would have left it, the entry as given.
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    if stored is None:
+        del payload["halation"]  # an entry written before the setting existed
+    else:
+        payload["halation"] = stored
+    path.write_text(json.dumps(payload))
+
+    pipe = _halation_pipeline()
+    again = _halation_session(tmp_path, pipe, halation=not applied)  # the menu now differs
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    (record,) = _lines(again.out_root)
+    assert record["recovered"] is True
+    if applied:
+        assert record["halation_sha1"] == pipe.artifacts.halation.sha1
+        assert "halation" not in record
+    else:
+        _off_record_checks(record, pipe)
+
+
+def test_a_recovered_entry_with_a_bad_halation_fails(tmp_path):
+    from pifilm.capture.app import _GradeWork
+    payload = {"day": "2026-09-03", "graded": "x_graded.jpg", "originals": ["a/b.jpg"],
+               "seed": 1, "ev": 0.0, "double": None, "record": {}, "halation": "off"}
+    with pytest.raises(ValueError, match="halation"):
+        _GradeWork.from_entry(payload)
+    del payload["halation"]
+    assert _GradeWork.from_entry(payload).halation is True
+
+
+@pytest.mark.parametrize("grade", ["inline", "background"])
+def test_a_double_takes_halation_from_its_second_shutter(tmp_path, grade):
+    spy = _SpyPipeline(_halation_pipeline())
+    spy.release(10)
+    session = _halation_session(tmp_path, spy, grade=grade, frames=2)
+    session.set_double_exposure(True)
+    session.capture()  # exposure 1, with halation on
+    session.halation = False
+    session.capture()  # exposure 2 makes the photograph
+    assert session.close_grades(timeout=5)
+    assert all(halation is False for _, halation in spy.calls)
+    assert spy.calls[-1] == (True, False)
+    record = _lines(session.out_root)[-1]
+    assert record["double"]["index"] == 2
+    _off_record_checks(record, spy)
+
+
+def test_the_live_view_has_no_halation_whatever_the_menu_says(tmp_path):
+    spy = _SpyPipeline(_halation_pipeline())
+    session = _halation_session(tmp_path, spy, grade="inline")
+    session.preview_frame()
+    assert spy.calls == [(False, False)]
+
+
+def test_the_halation_row_is_offered_and_its_applier_reaches_the_session(
+    camera_cli, monkeypatch, tmp_path,
+):
+    made = []
+    real = camera_cli.CaptureSession
+
+    def recording(*args, **kwargs):
+        made.append(real(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(camera_cli, "CaptureSession", recording)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera())
+    assert seen["menu_rows"][:2] == ("save_dng", "halation")
+    assert seen["look_halation"] is False  # camera_cli's pipeline has no look
+    (session,) = made
+    assert session.halation is True
+    assert seen["settings"].set("halation", False)
+    assert session.halation is False
+    seen["settings"].reset()
+    assert session.halation is True
+
+
+def test_a_saved_halation_off_reaches_the_session(camera_cli, monkeypatch, tmp_path, capsys):
+    _save_settings(halation=False)
+    made = []
+    real = camera_cli.CaptureSession
+
+    def recording(*args, **kwargs):
+        made.append(real(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(camera_cli, "CaptureSession", recording)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera())
+    assert made[0].halation is False and seen["settings"].current.halation is False
+    assert ("settings: halation off (saved in the menu; the unit says halation on)"
+            in capsys.readouterr().out)
+
+
+def test_a_saved_halation_off_is_not_taken_under_fake(camera_cli, monkeypatch, tmp_path):
+    _save_settings(halation=False)
+    made = []
+    real = camera_cli.CaptureSession
+
+    def recording(*args, **kwargs):
+        made.append(real(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(camera_cli, "CaptureSession", recording)
+    assert camera_cli.main(["--fake", "--no-preview", "--out", str(tmp_path / "s")]) == 0
+    assert made[0].halation is True
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_the_viewfinder_is_told_whether_the_look_has_halation(tmp_path, monkeypatch, enabled):
+    from pifilm.capture import app
+
+    look = dataclasses.replace(Artifacts.default(), halation=HalationParams(enabled=enabled))
+    monkeypatch.setattr(app.Artifacts, "resolve", lambda _: look)
+    seen = {}
+
+    class LoopDouble:
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+
+        def run(self, stop):
+            return None
+
+    monkeypatch.setattr(app, "ViewfinderLoop", LoopDouble)
+    out = tmp_path / "shots"
+    assert app.main(["--fake", "--display", "fake", "--no-preview", "--out", str(out)]) == 0
+    assert seen["look_halation"] is enabled

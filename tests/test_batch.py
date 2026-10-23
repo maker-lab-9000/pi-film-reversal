@@ -270,3 +270,69 @@ def test_a_backend_that_is_not_text_is_not_a_gpu_record(tmp_path):
     ])
     log, bad = load_capture_log(d)
     assert bad == 0 and not any(entry.gpu for entry in log.values())
+
+
+# --- halation switched off in the menu ----------------------------------------
+
+
+def _halation_look_dir(tmp_path):
+    from pifilm.artifacts import write_artifact
+    from pifilm.halation import HalationParams
+
+    art = Artifacts.default()
+    return write_artifact(tmp_path / "look", art.lut, art.normalize, art.grain,
+                          halation=HalationParams(enabled=True))
+
+
+def _with_a_lamp(seed=0):
+    """A frame with a bright patch, so a glow shows."""
+    rgb = np.full((48, 64, 3), 40, np.uint8)
+    rgb[:24] = 70
+    rgb[19:29, 27:37] = 255
+    return rgb
+
+
+def test_a_record_with_halation_off_is_regraded_without_it(tmp_path, capsys):
+    look = _halation_look_dir(tmp_path)
+    d = tmp_path / "day"
+    d.mkdir()
+    for name in ("120001_original.jpg", "120002_original.jpg"):
+        save_jpeg(_with_a_lamp(), d / name)
+    (d / "captures.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        {"original": "120001_original.jpg", "ev_comp": 0.0, "grain_seed": 5,
+         "halation": "off"},
+        {"original": "120002_original.jpg", "ev_comp": 0.0, "grain_seed": 5,
+         "halation_sha1": "x"},
+    ]) + "\n")
+    result = process_dir(d, tmp_path / "out", look)
+    assert result.halation_off == 1
+    pipe = Pipeline(Artifacts.resolve(look))
+    rgb, _ = load_rgb(d / "120001_original.jpg")
+    for name, halation in (("120001", False), ("120002", True)):
+        want, _ = pipe.process(rgb, rng=np.random.default_rng(5), halation=halation)
+        save_jpeg(want, tmp_path / "want.jpg")
+        got = load_rgb(tmp_path / "out" / f"{name}_original_graded.jpg")[0]
+        assert np.array_equal(got, load_rgb(tmp_path / "want.jpg")[0])
+    # The two differ: the glow is the look's and was left out of one.
+    a = load_rgb(tmp_path / "out" / "120001_original_graded.jpg")[0].astype(int)
+    b = load_rgb(tmp_path / "out" / "120002_original_graded.jpg")[0].astype(int)
+    assert np.abs(a - b).max() > 5
+    # --ignore-log keeps the look's halation for both.
+    ignored = process_dir(d, tmp_path / "ignored", look, use_log=False)
+    assert ignored.halation_off == 0
+    assert main([str(d), str(tmp_path / "out2"), "--artifacts", str(look)]) == 0
+    assert "1 without halation, as shot" in capsys.readouterr().out
+
+
+def test_only_an_off_value_turns_halation_off(tmp_path):
+    d = _logged_dir(tmp_path, [
+        {"original": "120001_original.jpg", "grain_seed": 5, "halation": "off"},
+        {"original": "120002_original.jpg", "grain_seed": 6},
+        {"original": "120003_original.jpg", "grain_seed": 7, "halation": False},
+        {"original": "120004_original.jpg", "double": {"index": 2, "ev_comp": [0, 0]},
+         "halation": "off"},
+    ])
+    log, bad = load_capture_log(d)
+    assert bad == 0
+    assert [log[f"12000{i}_original.jpg"].halation for i in range(1, 5)] == [
+        False, True, True, False]

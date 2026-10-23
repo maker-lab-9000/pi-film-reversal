@@ -19,6 +19,9 @@ pushed only when its rows or ``DONE``'s press change (an upload's elapsed time
 changes once a second, and an identical page would only occupy the SPI bus), and
 the idle dim and screen-off apply as in LIVE. ``RESET`` takes two taps within
 ``RESET_ARM_SECONDS``, so one stray touch cannot undo every setting.
+The ``HALATION`` row is shown only to a camera with the setting rows, and it is
+dim with ``-`` for a look without halation (``look_halation`` False): there is
+nothing to turn off, so a tap on it does nothing, as on the rows that only show.
 The live screen (``liveview.py``) is select-and-adjust: a tap on one of the strip's
 three cells (SHUTTER, ISO, WB) selects it, and one ``+``/``-`` pair steps whichever
 is selected. While a job is processing the colour bars hide the cells and the
@@ -267,7 +270,7 @@ class ViewfinderLoop:
         off_after: float = OFF_AFTER, full_backlight: int = FULL_BACKLIGHT,
         touch_period: float = 0.02, settings: SettingsControl | None = None,
         upload: Any | None = None, look: str = "",
-        menu_rows: tuple[str, ...] | None = None,
+        menu_rows: tuple[str, ...] | None = None, look_halation: bool = False,
     ) -> None:
         self._camera, self._controller = camera, controller
         self._display, self._touch = display, touch
@@ -374,14 +377,17 @@ class ViewfinderLoop:
         )
         self._backlight: int | None = None
         # The settings menu. ``menu_rows`` names the optional setting rows this
-        # camera supports (``save_dng``, ``ae_constraint``, ``ae_metering``); the
-        # caller decides, because only it knows the backend. The page last pushed,
-        # as (rows, DONE pressed), or None to force the next push; and the time
-        # until which RESET is armed for its second tap. RESET needs setting rows
+        # camera supports (``save_dng``, ``halation``, ``ae_constraint``,
+        # ``ae_metering``); the caller decides, because only it knows the backend,
+        # and ``look_halation`` whether the look has a halation for the HALATION
+        # row to turn off. The page last pushed, as (rows, DONE pressed), or None
+        # to force the next push; and the time until which RESET is armed for its
+        # second tap. RESET needs setting rows
         # too: without them (``--fake``) it would only delete the real camera's
         # saved settings.
         self._settings, self._upload, self._look = settings, upload, look
         self._menu_optional = tuple(menu_rows or ())
+        self._look_halation = bool(look_halation)
         self._menu_resettable = settings is not None and menu_rows is not None
         self._menu_shown: tuple[tuple[MenuRow, ...], bool] | None = None
         self._reset_until: float | None = None
@@ -1007,6 +1013,12 @@ class ViewfinderLoop:
             if "save_dng" in self._menu_optional:
                 rows.append(MenuRow("save_dng", "SAVE DNG",
                                     "ON" if current.save_dng else "OFF", True))
+            if "halation" in self._menu_optional:
+                if self._look_halation:
+                    rows.append(MenuRow("halation", "HALATION",
+                                        "ON" if current.halation else "OFF", True))
+                else:
+                    rows.append(MenuRow("halation", "HALATION", "-", False))
             if "ae_constraint" in self._menu_optional:
                 rows.append(MenuRow("ae_constraint", "AE CONSTRAINT",
                                     current.ae_constraint.upper(), True))
@@ -1043,6 +1055,8 @@ class ViewfinderLoop:
                 self._reset_until = now + RESET_ARM_SECONDS
         elif key == "save_dng":
             settings.set(key, not settings.current.save_dng)
+        elif key == "halation":
+            settings.set(key, not settings.current.halation)
         elif key == "ae_constraint":
             settings.set(key, self._next(AE_CONSTRAINTS, settings.current.ae_constraint))
         elif key == "ae_metering":

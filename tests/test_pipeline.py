@@ -351,8 +351,13 @@ def test_halation_false_and_a_look_without_it_are_todays_grade():
                                                    timings=timings)
     assert np.array_equal(a, b)
     assert "halation" not in timings
-    # The audit names the look's halation even when this call left it out.
-    assert b_info["halation_sha1"] == _halation_look().halation.sha1
+    # The audit says the look's halation was left out, where its hash would be.
+    assert "halation_sha1" not in b_info and b_info["halation"] == "off"
+    assert list(b_info).index("halation") == list(b_info).index("normalize_sha1") + 1
+    # A look without halation says neither, whatever the call asked.
+    _, c_info = plain.process(frame, grain=False, halation=False)
+    assert "halation_sha1" not in c_info and "halation" not in c_info
+    assert c_info == info
 
 
 def test_halation_with_ev_compensation_uses_the_frame_the_lut_gets():
@@ -387,11 +392,15 @@ def test_the_gpu_path_is_given_halation():
     assert info == cpu_info
     diff = np.abs(out[..., :3].astype(int) - cpu.astype(int))
     assert diff.mean() < 1.25
-    # halation=False reaches the grader too.
-    timings = {}
-    pipe.process(frame, rng=np.random.default_rng(3), timings=timings, halation=False,
-                 grader=grader)
+    # halation=False reaches the grader too, and its audit is the CPU's.
+    timings, used = {}, {}
+    _, off_info = pipe.process(frame, rng=np.random.default_rng(3), timings=timings,
+                               halation=False, grader=grader, used=used)
+    assert used["backend"] == BACKEND
     assert device.runs[-1]["halation"] is None and "halation" not in timings
+    assert "halation_sha1" not in off_info and off_info["halation"] == "off"
+    _, cpu_off_info = pipe.process(frame, rng=np.random.default_rng(3), halation=False)
+    assert off_info == cpu_off_info
 
 
 def test_the_grader_is_told_whether_halation_will_run():

@@ -3506,3 +3506,74 @@ def test_a_menu_page_the_display_refused_is_pushed_again(controller, tmp_path):
     before = len(display.images)
     loop.step()
     assert len(display.images) == before + 1
+
+
+# -- the HALATION row -------------------------------------------------------------
+
+HALATION_ROWS = ("save_dng", "halation", "ae_constraint", "ae_metering")
+
+
+def _halation_settings(tmp_path, applied):
+    control = _settings(tmp_path)
+    for key in HALATION_ROWS:
+        control.register(key, lambda value, key=key: applied.append((key, value)))
+    return control
+
+
+def test_the_halation_row_follows_save_dng_and_toggles(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    applied = []
+    control = _halation_settings(tmp_path, applied)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
+                                             menu_rows=HALATION_ROWS, look_halation=True,
+                                             upload=FakeUpload())
+    _open_menu(loop, touch, clock)
+    rows = pages[-1][0]
+    assert [row.key for row in rows] == [
+        "save_dng", "halation", "ae_constraint", "ae_metering", "upload", "eth", "wlan",
+        "look", "reset"]
+    assert rows[1].label == "HALATION" and rows[1].value == "ON" and rows[1].active
+    _tap(loop, touch, clock, _row_xy(1))
+    assert applied == [("halation", False)] and control.current.halation is False
+    assert _values_by_key(pages[-1])["halation"] == "OFF"
+    saved = json.loads((tmp_path / "state" / "settings.json").read_text())
+    assert saved == {"version": 1, "halation": False}
+    _tap(loop, touch, clock, _row_xy(1))
+    assert applied[-1] == ("halation", True)
+    assert _values_by_key(pages[-1])["halation"] == "ON"
+
+
+def test_reset_puts_the_halation_row_back_on(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    applied = []
+    control = _halation_settings(tmp_path, applied)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
+                                             menu_rows=HALATION_ROWS, look_halation=True)
+    _open_menu(loop, touch, clock)
+    _tap(loop, touch, clock, _row_xy(1))
+    assert _values_by_key(pages[-1])["halation"] == "OFF"
+    reset = len(pages[-1][0]) - 1
+    _tap(loop, touch, clock, _row_xy(reset))
+    clock.t += 1.0
+    _tap(loop, touch, clock, _row_xy(reset))
+    assert control.current.halation is True and applied[-1] == ("halation", True)
+    assert _values_by_key(pages[-1])["halation"] == "ON"
+
+
+def test_the_halation_row_is_dim_and_ignores_taps_without_a_look_halation(
+        controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    applied = []
+    control = _halation_settings(tmp_path, applied)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
+                                             menu_rows=HALATION_ROWS)
+    _open_menu(loop, touch, clock)
+    row = pages[-1][0][1]
+    assert (row.key, row.label, row.value, row.active) == ("halation", "HALATION", "-", False)
+    _tap(loop, touch, clock, _row_xy(1))
+    assert applied == [] and control.current.halation is True
+    assert loop.state == "MENU"
+    assert not (tmp_path / "state" / "settings.json").exists()

@@ -77,6 +77,9 @@ def test_load_partial_keys(tmp_path):
         ("save_dng", 0),
         ("save_dng", 1),
         ("save_dng", None),
+        ("halation", "off"),
+        ("halation", 0),
+        ("halation", None),
         ("ae_constraint", "bright"),
         ("ae_constraint", 3),
         ("ae_constraint", True),
@@ -95,6 +98,46 @@ def test_load_ignores_an_invalid_value_and_keeps_the_others(tmp_path, key, value
     assert getattr(current, other) == other_value
     assert lines[0] == f"settings: ignoring {key} in {path}"
     assert len(lines) == 2  # the ignore line, then the summary
+
+
+def test_halation_defaults_to_the_looks_own():
+    assert DEFAULTS.halation is True
+    assert settings_mod.KEYS.index("halation") == settings_mod.KEYS.index("save_dng") + 1
+
+
+def test_load_a_saved_halation_off(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    _write(path, {"version": 1, "halation": False})
+    current, overrides, lines = load(path, DEFAULTS)
+    assert current.halation is False and current.save_dng is True
+    assert overrides == {"halation": False}
+    assert lines == [
+        "settings: halation off (saved in the menu; the unit says halation on)"
+    ]
+
+
+def test_set_halation_off_saves_and_back_on_removes_the_key(tmp_path):
+    control, path, _ = _control(tmp_path)
+    seen = []
+    control.register("halation", seen.append)
+    assert control.set("halation", False) is True
+    assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1, "halation": False}
+    assert load(path, DEFAULTS)[0].halation is False
+    assert control.set("halation", True) is True
+    assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1}
+    assert seen == [False, True]
+
+
+def test_reset_puts_halation_back_on(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    save(path, {"halation": False})
+    control = SettingsControl(path, DEFAULTS, {"halation": False}, log=lambda _: None)
+    calls = []
+    control.register("halation", calls.append)
+    control.reset()
+    assert calls == [True]
+    assert control.current.halation is True
+    assert not path.exists()
 
 
 def test_load_ignores_an_unknown_key(tmp_path):
@@ -229,6 +272,8 @@ def test_set_calls_the_applier_then_saves(tmp_path):
         ("ae_constraint", "shadows", "settings: ae-constraint shadows"),
         ("save_dng", False, "settings: dng off"),
         ("save_dng", True, "settings: dng on"),
+        ("halation", False, "settings: halation off"),
+        ("halation", True, "settings: halation on"),
     ],
 )
 def test_set_logs_one_line_for_the_change(tmp_path, key, value, line):
@@ -306,6 +351,8 @@ def test_set_the_same_value_applies_and_saves_again(tmp_path):
     [
         ("save_dng", "yes"),
         ("save_dng", 1),
+        ("halation", "on"),
+        ("halation", 1),
         ("ae_constraint", 3),
         ("ae_metering", "average"),
         ("brightness", 3),
