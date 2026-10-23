@@ -22,6 +22,11 @@ real capture folder, which holds ``<time>_original.jpg`` next to
   graded: mean 0.7 to 2.1, at most 18 to 27).
   Double-exposure frames are regraded singly, with their own EV and fresh
   grain, because their logged seed belongs to the composite.
+* **Halation switched off.** The viewfinder's menu can leave a look's halation
+  out of a photograph, and its record then says ``"halation": "off"`` where
+  ``halation_sha1`` would be. Such a frame is regraded without halation too, or
+  the regrade would add a glow the Pi's file never had. ``--ignore-log`` grades
+  with the look's halation, as it ignores the rest of the log.
 * **A file the Pi graded on its GPU.** The regrade here is always the CPU's.
   A record whose ``pipeline_backend`` starts with ``gpu`` was graded by the
   one-pass shader, which does not round between its stages as the CPU does,
@@ -68,6 +73,7 @@ class BatchResult:
     ev_applied: int = 0
     doubles: int = 0
     gpu_graded: int = 0  # regraded here on the CPU, graded by the Pi on its GPU
+    halation_off: int = 0  # regraded without the look's halation, as the Pi graded them
     bad_log_lines: int = 0
 
 
@@ -77,9 +83,11 @@ class LogEntry:
     seed: int | None
     double: bool = False
     gpu: bool = False  # the Pi graded this record on its GPU
+    halation: bool = True  # False: the record says the look's halation was left out
 
 
 def _log_entry(record: dict) -> LogEntry:
+    halation = record.get("halation") != "off"
     double = record.get("double")
     if isinstance(double, dict):
         evs = double.get("ev_comp")
@@ -87,12 +95,13 @@ def _log_entry(record: dict) -> LogEntry:
             "ev_comp")
         # Not marked as a GPU record: a double's frame is regraded singly, which
         # is a different picture from the Pi's composite whatever graded that.
-        return LogEntry(float(ev or 0.0), None, double=True)
+        return LogEntry(float(ev or 0.0), None, double=True, halation=halation)
     seed = record.get("grain_seed")
     backend = record.get("pipeline_backend")
     return LogEntry(float(record.get("ev_comp") or 0.0),
                     int(seed) if seed is not None else None,
-                    gpu=isinstance(backend, str) and backend.startswith("gpu"))
+                    gpu=isinstance(backend, str) and backend.startswith("gpu"),
+                    halation=halation)
 
 
 def load_capture_log(in_dir: Path) -> tuple[dict[str, LogEntry], int]:
@@ -176,17 +185,18 @@ def process_dir(
             result.skipped_existing += 1
             continue
         entry = log.get(src.name)
-        ev, rng = 0.0, None
+        ev, rng, halation = 0.0, None, True
         if entry is not None:
             result.from_log += 1
             result.ev_applied += entry.ev != 0.0
             result.doubles += entry.double
             result.gpu_graded += entry.gpu
-            ev = entry.ev
+            result.halation_off += not entry.halation
+            ev, halation = entry.ev, entry.halation
             if entry.seed is not None:
                 rng = np.random.default_rng(entry.seed)
         rgb, _meta = load_rgb(src)
-        graded, _info = pipeline.process(rgb, grain=grain, rng=rng, ev=ev)
+        graded, _info = pipeline.process(rgb, grain=grain, rng=rng, ev=ev, halation=halation)
         result.written.append(save_jpeg(graded, dest))
     return result
 
@@ -208,7 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overwrite", action="store_true", help="replace existing outputs")
     parser.add_argument(
         "--ignore-log", action="store_true",
-        help=f"grade every frame at EV 0 with fresh grain, ignoring {CAPTURE_LOG}",
+        help=f"grade every frame at EV 0 with fresh grain and the look's halation, "
+             f"ignoring {CAPTURE_LOG}",
     )
     args = parser.parse_args(argv)
 
@@ -238,6 +249,8 @@ def main(argv: list[str] | None = None) -> int:
         notes.append(f"{result.from_log} from {CAPTURE_LOG} ({result.ev_applied} with EV)")
     if result.doubles:
         notes.append(f"{result.doubles} double-exposure frames graded singly")
+    if result.halation_off:
+        notes.append(f"{result.halation_off} without halation, as shot")
     if result.bad_log_lines:
         notes.append(f"{result.bad_log_lines} unreadable {CAPTURE_LOG} lines ignored")
     if result.skipped_graded:
