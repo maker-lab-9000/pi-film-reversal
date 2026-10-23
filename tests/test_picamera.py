@@ -126,6 +126,13 @@ class _AeMeteringModeEnum:
     Matrix = "AeMeteringMode.Matrix"
 
 
+class _AeExposureModeEnum:
+    """Mimics ``libcamera.controls.AeExposureModeEnum``."""
+
+    Normal = "AeExposureMode.Normal"
+    Short = "AeExposureMode.Short"
+
+
 class _ExposureTimeModeEnum:
     Auto = "exposure-time-auto"
     Manual = "exposure-time-manual"
@@ -146,6 +153,7 @@ def _fake_libcamera_module(
     if with_ae_enums:
         controls_ns.AeConstraintModeEnum = _AeConstraintModeEnum
         controls_ns.AeMeteringModeEnum = _AeMeteringModeEnum
+        controls_ns.AeExposureModeEnum = _AeExposureModeEnum
     if with_exposure_time_mode:
         controls_ns.ExposureTimeModeEnum = _ExposureTimeModeEnum
     if with_analogue_gain_mode:
@@ -180,7 +188,7 @@ def install_picamera(monkeypatch):
         control_frame_limits=None,
         with_colour_temperature=True,
         with_analogue_gain_mode=False,
-        ae_controls=("AeConstraintMode", "AeMeteringMode"),
+        ae_controls=("AeConstraintMode", "AeMeteringMode", "AeExposureMode"),
         image_controls=("Sharpness", "Contrast", "Saturation"),
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
@@ -383,6 +391,7 @@ def test_constructor_uses_explicit_native_still_configuration(install_picamera):
         "sharpness": 1.0,
         "contrast": 1.0,
         "saturation": 1.0,
+        "short_exposure": False,
         "autofocus": "continuous",
     }
     camera.close()
@@ -845,6 +854,7 @@ def test_default_construction_applies_neutral_rendering_and_continuous_af(instal
         "AfRange": _AfRangeEnum.Normal,
         "AeConstraintMode": _AeConstraintModeEnum.Normal,
         "AeMeteringMode": _AeMeteringModeEnum.CentreWeighted,
+        "AeExposureMode": _AeExposureModeEnum.Normal,
         "ExposureValue": 0.0,
     }]
     camera.close()
@@ -1383,6 +1393,7 @@ def test_neutral_controls_travel_with_both_configurations(install_picamera):
         "AfRange": _AfRangeEnum.Normal,
         "AeConstraintMode": _AeConstraintModeEnum.Normal,
         "AeMeteringMode": _AeMeteringModeEnum.CentreWeighted,
+        "AeExposureMode": _AeExposureModeEnum.Normal,
         "ExposureValue": 0.0,
     }
     # The one difference: the live view's own (Picamera2's preview) noise reduction.
@@ -2794,6 +2805,152 @@ def test_both_records_of_a_double_carry_the_image_values_of_their_shutter(
     assert [r["double"]["index"] for r in records] == [1, 2]
     assert [_image_fields(r) for r in records] == [(1.0, 1.0, 1.0), (1.0, 1.5, 1.0)]
 
+
+
+# --- short exposure: libcamera's AeExposureMode -----------------------------------
+
+
+def test_short_exposure_opens_in_both_configurations(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True, short_exposure=True)
+    inst = state.instance
+    for controls in (inst.created_config["controls"], inst.preview_config["controls"],
+                     inst.set_controls_calls[0]):
+        assert controls["AeExposureMode"] == _AeExposureModeEnum.Short
+    assert camera.short_exposure is True
+    assert camera.short_exposure_supported is True
+    assert camera.stream_info.short_exposure is True
+    camera.close()
+
+
+def test_short_exposure_is_off_by_default(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    assert state.instance.set_controls_calls[0]["AeExposureMode"] == _AeExposureModeEnum.Normal
+    assert camera.short_exposure is False
+    assert camera.stream_info.to_dict()["short_exposure"] is False
+    camera.close()
+
+
+@pytest.mark.parametrize(("on", "expected"), [
+    (True, _AeExposureModeEnum.Short), (False, _AeExposureModeEnum.Normal),
+])
+def test_set_short_exposure_sends_it_and_writes_both_configurations(
+    install_picamera, on, expected,
+):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True, short_exposure=not on)
+    camera.set_short_exposure(on)
+    inst = state.instance
+    assert inst.set_controls_calls[-1] == {"AeExposureMode": expected}
+    for config in (inst.created_config, inst.preview_config):
+        assert config["controls"]["AeExposureMode"] == expected
+    # Only that control: each configuration keeps its own noise reduction.
+    assert inst.preview_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.Minimal)
+    assert inst.created_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.HighQuality)
+    assert camera.short_exposure is on
+    assert camera.stream_info.short_exposure is on
+    camera.close()
+
+
+def test_a_rejected_short_exposure_changes_nothing(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    preview_before = dict(state.instance.preview_config["controls"])
+    still_before = dict(state.instance.created_config["controls"])
+
+    def boom(controls):
+        raise RuntimeError("control rejected")
+
+    state.instance.set_controls = boom
+    with pytest.raises(CameraError, match="failed to set the AE exposure mode"):
+        camera.set_short_exposure(True)
+    assert camera.short_exposure is False
+    assert camera.stream_info.short_exposure is False
+    assert state.instance.preview_config["controls"] == preview_before
+    assert state.instance.created_config["controls"] == still_before
+    camera.close()
+
+
+@pytest.mark.parametrize("bad", ["on", 1, None])
+def test_a_short_exposure_that_is_not_a_bool_is_refused(install_picamera, bad):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    sent = len(state.instance.set_controls_calls)
+    with pytest.raises(CameraError, match="True or False"):
+        camera.set_short_exposure(bad)
+    assert len(state.instance.set_controls_calls) == sent
+    camera.close()
+
+
+def test_a_short_exposure_on_a_closed_camera_is_an_error(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera()
+    camera.close()
+    with pytest.raises(CameraError, match="closed"):
+        camera.set_short_exposure(True)
+
+
+def test_a_camera_without_ae_exposure_mode_refuses_it_and_leaves_it_out(install_picamera):
+    state = install_picamera(ae_controls=("AeConstraintMode", "AeMeteringMode"))
+    camera = Picamera2Camera(short_exposure=True)
+    assert camera.short_exposure_supported is False
+    assert camera.stream_info.short_exposure is None
+    assert "short_exposure" not in camera.stream_info.to_dict()
+    sent = len(state.instance.set_controls_calls)
+    with pytest.raises(CameraError, match="no AeExposureMode"):
+        camera.set_short_exposure(False)
+    assert len(state.instance.set_controls_calls) == sent
+    camera.close()
+
+
+def test_a_missing_ae_exposure_enum_warns_only_when_short_was_asked_for(
+    install_picamera, capsys,
+):
+    state = install_picamera(with_ae_enums=False)
+    camera = Picamera2Camera(short_exposure=True)
+    assert "AeExposureMode" not in state.instance.set_controls_calls[-1]
+    assert camera.short_exposure_supported is False
+    assert ("warning: this libcamera has no AeExposureMode, so short-exposure on was not "
+            "applied; the camera keeps its default (off)") in capsys.readouterr().err
+    with pytest.raises(CameraError):
+        camera.set_short_exposure(False)
+    camera.close()
+
+    install_picamera(with_ae_enums=False)
+    camera = Picamera2Camera()
+    assert "AeExposureMode" not in capsys.readouterr().err
+    camera.close()
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_a_record_carries_short_exposure_right_after_saturation(
+    install_picamera, tmp_path, background,
+):
+    array = np.broadcast_to(
+        np.array([[[10, 40, 230]]], dtype=np.uint8), (NATIVE_SIZE[1], NATIVE_SIZE[0], 3),
+    )
+    install_picamera(request=FakeRequest(array))
+    camera = Picamera2Camera(save_dng=False)
+    session = _image_session(tmp_path, camera, background=background,
+                             state_dir=tmp_path / "state")
+    try:
+        first = session.capture()
+        camera.set_short_exposure(True)
+        second = session.capture()
+        # A later change does not reach a photo already taken.
+        camera.set_short_exposure(False)
+        assert session.close_grades(timeout=30)
+    finally:
+        camera.close()
+    assert (first.record["short_exposure"], second.record["short_exposure"]) == (False, True)
+    records = _image_records(tmp_path)
+    assert [r["short_exposure"] for r in records] == [False, True]
+    for record in records:
+        keys = list(record)
+        assert keys[keys.index("saturation") + 1] == "short_exposure"
 
 
 # --- noise reduction: HighQuality for stills, Minimal for the live view ------------

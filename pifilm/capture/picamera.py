@@ -30,7 +30,7 @@ only when the camera advertises them, the recorded ``autofocus`` becomes ``"none
 and asking for a non-default ``autofocus``/``af_range`` on such a sensor is an
 error rather than a silently ignored request.
 
-Auto-exposure shaping (constraint mode, metering mode) is exposed as constructor
+Auto-exposure shaping (constraint, metering and exposure mode) is exposed as constructor
 arguments whose defaults are libcamera's own defaults, so an unflagged capture
 behaves exactly as it did before they existed.
 
@@ -74,6 +74,13 @@ controls, ``set_shutter`` for a fixed exposure time (shutter priority), and
 also widens and restores ``FrameDurationLimits``; ``set_iso`` for a fixed
 analogue gain (with both fixed the camera is in full manual);
 ``set_colour_temperature`` for a fixed white balance.
+
+Short exposure (the menu's help against camera shake) is libcamera's
+``AeExposureMode``: ``Short`` when it is on, ``Normal`` when off, in the shared
+control dict like the other AE modes, and changed live by
+``set_short_exposure``, which writes it into both configurations as
+``set_ae_constraint`` does. The auto-exposure then keeps the shutter short and
+raises the gain instead.
 
 There is no exposure compensation. ``ExposureValue`` is still sent, always 0.0, so
 every capture records the same control set as before the viewfinder's EV buttons
@@ -214,6 +221,7 @@ class Picamera2Camera:
         sharpness: float = IMAGE_NORMAL,
         contrast: float = IMAGE_NORMAL,
         saturation: float = IMAGE_NORMAL,
+        short_exposure: bool = False,
     ) -> None:
         if autofocus not in _AUTOFOCUS_MODES:
             raise CameraError(
@@ -279,6 +287,10 @@ class Picamera2Camera:
         self.contrast = image["contrast"]
         self.saturation = image["saturation"]
         self.image_controls_supported: frozenset[str] = frozenset()
+        # libcamera's Short exposure mode in force, changed live by
+        # ``set_short_exposure``; refused unless the flag (set at open) is True.
+        self.short_exposure = bool(short_exposure)
+        self.short_exposure_supported = False
         self._shutter_mode = "legacy"
         self._iso_mode = "legacy"
         self._frame_limits: dict[str, tuple[int, int] | None] = {"still": None, "preview": None}
@@ -360,6 +372,9 @@ class Picamera2Camera:
             self.ae_metering_supported = _ae_supported(
                 camera.camera_controls, "AeMeteringMode", _ae_metering_value, "centre",
             )
+            self.short_exposure_supported = _ae_supported(
+                camera.camera_controls, "AeExposureMode", _ae_exposure_value, "normal",
+            )
             self.image_controls_supported = frozenset(
                 key for key, control in _IMAGE_CONTROLS.items()
                 if control in camera.camera_controls
@@ -383,6 +398,7 @@ class Picamera2Camera:
             controls = _camera_controls(
                 autofocus, af_range, ae_lock, awb_lock, colour_gains,
                 ae_constraint, ae_metering, has_autofocus=has_autofocus,
+                short_exposure=self.short_exposure,
                 image={control: getattr(self, key) for key, control in _IMAGE_CONTROLS.items()},
             )
             if "ColourTemperature" not in camera.camera_controls:
@@ -415,6 +431,8 @@ class Picamera2Camera:
                 self._stream_info.ae_metering = ae_metering
             for key in self.image_controls_supported:
                 setattr(self._stream_info, key, getattr(self, key))
+            if self.short_exposure_supported:
+                self._stream_info.short_exposure = self.short_exposure
             self._still_config = config
             running = controls
             if self._preview is not None:
@@ -729,6 +747,19 @@ class Picamera2Camera:
                           self.ae_metering_supported, "the AE metering mode")
         self.ae_metering = name
         self._stream_info.ae_metering = name
+
+    def set_short_exposure(self, on: bool) -> None:
+        """Ask the auto-exposure for libcamera's Short exposure mode, or Normal.
+
+        The same contract as ``set_ae_constraint``, for ``AeExposureMode``.
+        """
+        if not isinstance(on, bool):
+            raise CameraError(f"short_exposure must be True or False, got {on!r}")
+        self._set_ae_mode("AeExposureMode", _ae_exposure_value,
+                          "short" if on else "normal",
+                          self.short_exposure_supported, "the AE exposure mode")
+        self.short_exposure = on
+        self._stream_info.short_exposure = on
 
     def _set_ae_mode(
         self, control: str, lookup: Any, name: str, supported: bool, what: str,
@@ -1183,6 +1214,7 @@ def _camera_controls(
     ae_metering: str,
     has_autofocus: bool,
     image: dict[str, float] | None = None,
+    short_exposure: bool = False,
 ) -> dict:
     """The ISP's image controls, noise reduction, autofocus and AE shaping, as
     one control dict for the still configuration (``_preview_controls`` makes
@@ -1235,6 +1267,13 @@ def _camera_controls(
         cam_controls["AeMeteringMode"] = _ae_metering_value(ae_metering)
     except AttributeError:
         _warn_missing_ae_enum("AeMeteringMode", "--ae-metering", ae_metering, "centre")
+    # Normal is libcamera's default; Short is the menu's short exposure.
+    exposure_mode = "short" if short_exposure else "normal"
+    try:
+        cam_controls["AeExposureMode"] = _ae_exposure_value(exposure_mode)
+    except AttributeError:
+        _warn_missing_ae_enum("AeExposureMode", "short-exposure",
+                              "on" if short_exposure else "off", "off")
     # 0.0 is neutral and nothing changes it any more (exposure compensation was
     # removed with the viewfinder's EV buttons), but it is still set so every
     # capture records the same control set as the ones taken before.
@@ -1271,6 +1310,17 @@ def _ae_metering_value(name: str) -> Any:
     enum = _lc.AeMeteringModeEnum
     return {"centre": enum.CentreWeighted, "spot": enum.Spot,
             "matrix": enum.Matrix}[name]
+
+
+def _ae_exposure_value(name: str) -> Any:
+    """libcamera's ``AeExposureModeEnum`` member for ``"normal"`` or ``"short"``.
+
+    ``AttributeError`` when this libcamera has no such enum.
+    """
+    from libcamera import controls as _lc
+
+    enum = _lc.AeExposureModeEnum
+    return {"normal": enum.Normal, "short": enum.Short}[name]
 
 
 def _ae_supported(camera_controls: Any, control: str, lookup: Any, probe: str) -> bool:

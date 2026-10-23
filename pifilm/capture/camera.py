@@ -77,6 +77,9 @@ class StreamInfo:
     sharpness: float | None = None
     contrast: float | None = None
     saturation: float | None = None
+    # Whether pifilm asked the auto-exposure for libcamera's Short exposure mode
+    # (Picamera2 only; None where the camera has no AeExposureMode).
+    short_exposure: bool | None = None
 
     def to_dict(self) -> dict:
         values = {
@@ -102,6 +105,8 @@ class StreamInfo:
             value = getattr(self, name)
             if value is not None:
                 values[name] = float(value)
+        if self.short_exposure is not None:
+            values["short_exposure"] = bool(self.short_exposure)
         if self.autofocus is not None:
             values["autofocus"] = self.autofocus
         return values

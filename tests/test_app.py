@@ -4369,3 +4369,47 @@ def test_saved_image_values_do_not_reach_a_fake_camera(tmp_path, monkeypatch):
     _save_settings(contrast=1.25)
     kwargs = _viewfinder_kwargs(monkeypatch, tmp_path, [])
     assert kwargs["menu_rows"] is None
+
+
+class _StabiliseMenuCamera(_MenuCamera):
+    """A Picamera2 double with the short-exposure setter."""
+
+    def set_short_exposure(self, on):
+        self.calls.append(("short_exposure", on))
+
+
+def test_the_short_exposure_flag_defaults_to_off(camera_cli, monkeypatch, tmp_path):
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _StabiliseMenuCamera())
+    assert seen["camera_kwargs"]["short_exposure"] is False
+
+
+def test_a_saved_short_exposure_reaches_the_picamera2_constructor(
+    camera_cli, monkeypatch, tmp_path, capsys,
+):
+    _save_settings(short_exposure=True, shutter_delay=0.5, multi_frame=4)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _StabiliseMenuCamera())
+    assert seen["camera_kwargs"]["short_exposure"] is True
+    current = seen["settings"].current
+    assert (current.short_exposure, current.shutter_delay, current.multi_frame) == (
+        True, 0.5, 4,
+    )
+    assert ("settings: short-exposure on, shutter-delay 0.5, multi-frame 4 (saved in the "
+            "menu; the unit says short-exposure off, shutter-delay 0.0, multi-frame 1)"
+            ) in capsys.readouterr().out
+
+
+def test_the_short_exposure_applier_reaches_the_camera(camera_cli, monkeypatch, tmp_path):
+    camera = _StabiliseMenuCamera()
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, camera)
+    control = seen["settings"]
+    assert control.set("short_exposure", True)
+    # Stored only for now: nothing in the session acts on these yet.
+    assert control.set("shutter_delay", 0.2)
+    assert control.set("multi_frame", 2)
+    assert camera.calls == [("short_exposure", True)]
+
+
+def test_saved_stabilise_values_with_fake_start_as_usual(camera_cli, capsys):
+    _save_settings(short_exposure=True, multi_frame=6)
+    assert camera_cli.main(["--fake", "--no-preview"]) == 0
+    assert "cannot be used with --fake" not in capsys.readouterr().err
