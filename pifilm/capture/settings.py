@@ -292,18 +292,26 @@ class SettingsControl:
                 self._current = replace(self._current, **{key: default})
                 self._overrides.pop(key, None)
 
-    def reset_image(self) -> None:
-        """Put only sharpness, contrast and saturation back to 1.0 and save.
-
-        The image page's own reset: the other settings and their saved values
-        stay as they are.
-        """
-        self._restore(IMAGE_KEYS)
-        self._log("settings: sharpness, contrast, saturation reset to 1.0")
+    def _reset_page(self, keys: tuple[str, ...], line: str) -> None:
+        """A menu page's own reset: put ``keys`` back to their defaults and save;
+        the other settings and their saved values stay as they are."""
+        self._restore(keys)
+        self._log(line)
         try:
             save(self._path, self._overrides)
         except OSError as exc:
             self._log(f"settings: cannot save ({exc})")
+
+    def reset_image(self) -> None:
+        """Put only sharpness, contrast and saturation back to 1.0 and save (the
+        IMAGE page's reset)."""
+        self._reset_page(IMAGE_KEYS, "settings: sharpness, contrast, saturation reset to 1.0")
+
+    def reset_stabilise(self) -> None:
+        """Put only short exposure, shutter delay and multi-frame back to off and
+        save (the STABILISE page's reset)."""
+        self._reset_page(STABILISE_KEYS,
+                         "settings: short exposure, shutter delay, multi-frame reset to off")
 
     def reset(self) -> None:
         """Put every setting back to the unit's flags and delete the file."""

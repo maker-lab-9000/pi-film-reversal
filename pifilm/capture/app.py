@@ -2319,7 +2319,10 @@ def _main(argv: list[str] | None) -> int:
         ) + tuple(
             key for key in IMAGE_KEYS
             if key in getattr(camera, "image_controls_supported", ())
-        )
+        ) + (
+            ("short_exposure",)
+            if exposure and getattr(camera, "short_exposure_supported", False) else ()
+        ) + ("shutter_delay", "multi_frame")
     # Read at each button press (see "The settings menu"); 0.0 off Picamera2.
     def shutter_delay() -> float:
         return settings.current.shutter_delay if backend == "picamera2" else 0.0

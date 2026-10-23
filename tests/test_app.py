@@ -3994,18 +3994,20 @@ def test_the_menu_appliers_reach_the_camera_and_the_session(camera_cli, monkeypa
     assert camera.calls == [
         ("ae_constraint", "shadows"), ("ae_metering", "spot"), ("save_dng", False),
     ]
-    assert seen["menu_rows"] == ("save_dng", "halation", "ae_constraint", "ae_metering")
+    assert seen["menu_rows"] == ("save_dng", "halation", "ae_constraint", "ae_metering",
+                                 "shutter_delay", "multi_frame")
 
 
 def test_menu_rows_leave_out_what_the_camera_cannot_use(camera_cli, monkeypatch, tmp_path):
     seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera(constraint=False))
-    assert seen["menu_rows"] == ("save_dng", "halation", "ae_metering")
+    assert seen["menu_rows"] == ("save_dng", "halation", "ae_metering", "shutter_delay",
+                                 "multi_frame")
 
 
 def test_menu_rows_leave_out_the_ae_rows_under_ae_lock(camera_cli, monkeypatch, tmp_path):
     seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera(adjustable=False),
                       "--ae-lock")
-    assert seen["menu_rows"] == ("save_dng", "halation")
+    assert seen["menu_rows"] == ("save_dng", "halation", "shutter_delay", "multi_frame")
 
 
 def test_fake_has_no_optional_menu_rows_and_an_empty_look(tmp_path, monkeypatch):
@@ -4411,6 +4413,7 @@ def test_the_image_appliers_reach_the_camera_and_the_rows_follow_support(
     assert camera.calls == [("sharpness", 1.5), ("saturation", 0.75)]
     assert seen["menu_rows"] == (
         "save_dng", "halation", "ae_constraint", "ae_metering", "sharpness", "saturation",
+        "shutter_delay", "multi_frame",
     )
 
 
@@ -4456,6 +4459,22 @@ def test_the_short_exposure_applier_reaches_the_camera(camera_cli, monkeypatch, 
     assert control.set("shutter_delay", 0.2)
     assert control.set("multi_frame", 2)
     assert camera.calls == [("short_exposure", True)]
+
+
+@pytest.mark.parametrize(("supported", "extra", "rows"), [
+    (True, (), ("short_exposure", "shutter_delay", "multi_frame")),
+    (False, (), ("shutter_delay", "multi_frame")),
+    # Under --ae-lock short exposure would change nothing: its row is dim.
+    (True, ("--ae-lock",), ("shutter_delay", "multi_frame")),
+])
+def test_the_stabilise_rows_follow_support_and_the_ae_lock(
+    camera_cli, monkeypatch, tmp_path, supported, extra, rows,
+):
+    camera = _StabiliseMenuCamera(adjustable=not extra)
+    camera.short_exposure_supported = supported
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, camera, *extra)
+    assert seen["menu_rows"][-len(rows):] == rows
+    assert ("short_exposure" in seen["menu_rows"]) is ("short_exposure" in rows)
 
 
 def test_saved_stabilise_values_with_fake_start_as_usual(camera_cli, capsys):

@@ -397,7 +397,7 @@ def test_developing_and_the_tuning_flag_are_the_last_fields_with_off_defaults():
     # New fields go on the end, so an older positional construction keeps its meaning.
     assert LiveState(cells=_cells()).developing == 0
     assert LiveState(cells=_cells()).tuning_mismatch is False
-    assert list(LiveState.__dataclass_fields__)[-4:-2] == ["developing", "tuning_mismatch"]
+    assert list(LiveState.__dataclass_fields__)[-5:-3] == ["developing", "tuning_mismatch"]
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -625,7 +625,7 @@ def test_canvas_shapes_that_round_to_no_pixels_draw_nothing(box):
 
 def test_the_disk_warning_is_a_late_field_and_empty_by_default():
     assert LiveState(cells=_cells()).disk_warning == ()
-    assert list(LiveState.__dataclass_fields__)[-2] == "disk_warning"
+    assert list(LiveState.__dataclass_fields__)[-3] == "disk_warning"
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -826,9 +826,9 @@ def test_the_menu_key_is_an_outlined_pill_with_a_white_label(scale):
 
 # The IMG reminder: an image control is not 1.0. First in the disk tags' tile.
 
-def test_the_image_flag_is_the_last_field_and_off_by_default():
+def test_the_image_flag_is_a_late_field_and_off_by_default():
     assert LiveState(cells=_cells()).image_adjusted is False
-    assert list(LiveState.__dataclass_fields__)[-1] == "image_adjusted"
+    assert list(LiveState.__dataclass_fields__)[-2] == "image_adjusted"
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -861,3 +861,53 @@ def test_the_img_tag_sits_first_in_the_disk_tile(scale):
     assert both[2] < liveview._DISK_BOX[2] - 1
     assert both[2] < SHUTTER_CENTRE[0] - SHUTTER_HIT_RADIUS
     _assert_clear_of_every_control(both, scale)
+
+
+# The STAB reminder: a help against camera shake is on. Right after IMG.
+
+def test_the_stabilise_flag_is_the_last_field_and_off_by_default():
+    assert LiveState(cells=_cells()).stabilise_on is False
+    assert list(LiveState.__dataclass_fields__)[-1] == "stabilise_on"
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_no_stabilise_flag_draws_nothing(scale):
+    for image in (False, True):
+        for warning in ((), WIDEST_DISK):
+            assert np.array_equal(
+                _pixels(_state(disk_warning=warning, image_adjusted=image), scale=scale),
+                _pixels(_state(disk_warning=warning, image_adjusted=image,
+                               stabilise_on=False), scale=scale))
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_stab_tag_sits_after_img_and_everything_still_fits(scale):
+    full_row = dict(double=(True, 1), developing=99, tuning_mismatch=True)
+    reading = dict(battery_percent=100, external_power=True)
+    plain = _pixels(_state(**full_row), scale=scale, **reading)
+    alone = _changed_box(plain, _pixels(_state(**full_row, stabilise_on=True), scale=scale,
+                                        **reading), scale)
+    img = _changed_box(plain, _pixels(_state(**full_row, image_adjusted=True), scale=scale,
+                                      **reading), scale)
+    stab = _pixels(_state(**full_row, stabilise_on=True), scale=scale, **reading)
+    assert _near(_crop(stab, alone, scale), AMBER, 60).any()
+    # Alone it is first in the tile, where IMG would be; with IMG it follows it.
+    assert alone[0] == img[0]
+    assert DOUBLE_BOX[1] <= alone[1] and alone[3] <= DOUBLE_BOX[3]
+    _assert_clear_of_every_control(alone, scale)
+    both = _changed_box(plain, _pixels(_state(**full_row, image_adjusted=True,
+                                              stabilise_on=True), scale=scale, **reading),
+                        scale)
+    assert both[0] == img[0] and both[2] > img[2]
+    # Everything at once: IMG, STAB and the widest disk warning end short of the
+    # tile's edge and of the shutter's hit circle.
+    every = _changed_box(plain, _pixels(_state(**full_row, image_adjusted=True,
+                                               stabilise_on=True, disk_warning=WIDEST_DISK),
+                                        scale=scale, **reading), scale)
+    disk_and_img = _changed_box(plain, _pixels(_state(**full_row, image_adjusted=True,
+                                                      disk_warning=WIDEST_DISK),
+                                               scale=scale, **reading), scale)
+    assert every[2] > disk_and_img[2]
+    assert every[2] < liveview._DISK_BOX[2] - 1
+    assert every[2] < SHUTTER_CENTRE[0] - SHUTTER_HIT_RADIUS
+    _assert_clear_of_every_control(every, scale)

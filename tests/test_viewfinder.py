@@ -3334,13 +3334,13 @@ def test_the_upload_row_starts_an_upload_and_shows_its_status(controller, tmp_pa
     _open_menu(loop, touch, clock)
     rows = pages[-1][0]
     assert [row.key for row in rows] == [
-        "save_dng", "ae_constraint", "ae_metering", "image", "upload", "eth", "wlan", "look",
-        "reset"]
+        "save_dng", "ae_constraint", "ae_metering", "image", "stabilise", "upload", "eth",
+        "wlan", "look", "reset"]
     assert [row.label for row in rows] == [
-        "SAVE DNG", "AE CONSTRAINT", "AE METERING", "IMAGE", "UPLOAD", "ETH", "WLAN", "LOOK",
-        "RESET"]
+        "SAVE DNG", "AE CONSTRAINT", "AE METERING", "IMAGE", "STABILISE", "UPLOAD", "ETH",
+        "WLAN", "LOOK", "RESET"]
     assert _values_by_key(pages[-1])["upload"] == "LAST 12:04 OK"
-    _tap(loop, touch, clock, _row_xy(4))
+    _tap(loop, touch, clock, _row_xy(5))
     assert upload.starts == 1
 
 
@@ -3389,17 +3389,18 @@ def test_rows_are_left_out_when_their_part_is_missing(controller, tmp_path, monk
     # delete the real camera's saved settings. IMAGE stays, dim.
     loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path))
     _open_menu(loop, touch, clock)
-    assert [row.key for row in pages[-1][0]] == ["image", "eth", "wlan", "look"]
-    assert pages[-1][0][0].active is False
+    assert [row.key for row in pages[-1][0]] == ["image", "stabilise", "eth", "wlan", "look"]
+    assert pages[-1][0][0].active is False and pages[-1][0][1].active is False
     loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path),
                                         menu_rows=())
     _open_menu(loop, touch, clock)
-    assert [row.key for row in pages[-1][0]] == ["image", "eth", "wlan", "look", "reset"]
+    assert [row.key for row in pages[-1][0]] == ["image", "stabilise", "eth", "wlan", "look",
+                                                 "reset"]
     loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path),
                                         menu_rows=("ae_metering",))
     _open_menu(loop, touch, clock)
     assert [row.key for row in pages[-1][0]] == [
-        "ae_metering", "image", "eth", "wlan", "look", "reset"]
+        "ae_metering", "image", "stabilise", "eth", "wlan", "look", "reset"]
     loop, touch, display, clock = _loop(camera, ctl, menu_rows=ALL_ROWS, upload=FakeUpload())
     _open_menu(loop, touch, clock)
     assert [row.key for row in pages[-1][0]] == ["upload", "eth", "wlan", "look"]
@@ -3535,8 +3536,8 @@ def test_the_halation_row_follows_save_dng_and_toggles(controller, tmp_path, mon
     _open_menu(loop, touch, clock)
     rows = pages[-1][0]
     assert [row.key for row in rows] == [
-        "save_dng", "halation", "ae_constraint", "ae_metering", "image", "upload", "eth",
-        "wlan", "look", "reset"]
+        "save_dng", "halation", "ae_constraint", "ae_metering", "image", "stabilise",
+        "upload", "eth", "wlan", "look", "reset"]
     assert rows[1].label == "HALATION" and rows[1].value == "ON" and rows[1].active
     _tap(loop, touch, clock, _row_xy(1))
     assert applied == [("halation", False)] and control.current.halation is False
@@ -3792,6 +3793,223 @@ def test_no_img_tag_where_the_camera_takes_no_image_controls(controller, tmp_pat
                                         menu_rows=("saturation",))
     loop.step()
     assert states[-1].image_adjusted is True
+
+
+# -- the STABILISE page ------------------------------------------------------------
+
+STABILISE = ("short_exposure", "shutter_delay", "multi_frame")
+STABILISE_MENU_ROWS = ALL_ROWS + STABILISE
+STABILISE_ROW = 4  # SAVE DNG, AE CONSTRAINT, AE METERING, IMAGE, STABILISE
+
+
+def _stabilise_settings(tmp_path, applied, overrides=None):
+    control = _settings(tmp_path, applied, overrides=overrides)
+    for key in STABILISE:
+        control.register(key, lambda value, key=key: applied.append((key, value)))
+    return control
+
+
+def _open_stabilise_page(loop, touch, clock, pages):
+    _open_menu(loop, touch, clock)
+    assert pages[-1][0][STABILISE_ROW].key == "stabilise"
+    _tap(loop, touch, clock, _row_xy(STABILISE_ROW))
+    assert pages[-1][1]["title"] == "STABILISE"
+
+
+def test_the_stabilise_row_opens_the_stabilise_page(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _menu_loop(
+        camera, ctl, tmp_path, settings=_stabilise_settings(tmp_path, []),
+        menu_rows=STABILISE_MENU_ROWS)
+    _open_menu(loop, touch, clock)
+    row = pages[-1][0][STABILISE_ROW]
+    assert (row.label, row.value, row.active) == ("STABILISE", ">", True)
+    _tap(loop, touch, clock, _row_xy(STABILISE_ROW))
+    rows, kwargs = pages[-1]
+    assert kwargs["title"] == "STABILISE"
+    assert display.images[-1] is viewfinder.render_menu(
+        rows, scale=1, done_pressed=False, title="STABILISE")
+    assert [row.key for row in rows] == [
+        "short_exposure", "shutter_delay", "multi_frame", "stabilise_reset", "back"]
+    assert [row.label for row in rows] == [
+        "SHORT EXPOSURE", "SHUTTER DELAY", "MULTI-FRAME", "RESET", "BACK"]
+    assert [row.value for row in rows[:3]] == ["OFF", "OFF", "OFF"]
+    assert all(row.active for row in rows)
+
+
+@pytest.mark.parametrize("index, key, shown, values", [
+    (0, "short_exposure", ["ON", "OFF"], [True, False]),
+    (1, "shutter_delay", ["0.2 S", "0.5 S", "OFF"], [0.2, 0.5, 0.0]),
+    (2, "multi_frame", ["2", "4", "6", "OFF"], [2, 4, 6, 1]),
+])
+def test_a_stabilise_row_steps_and_wraps(controller, tmp_path, monkeypatch, index, key,
+                                         shown, values):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    applied = []
+    control = _stabilise_settings(tmp_path, applied)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
+                                             menu_rows=STABILISE_MENU_ROWS)
+    _open_stabilise_page(loop, touch, clock, pages)
+    seen = []
+    for _ in shown:
+        _tap(loop, touch, clock, _page2_xy(index))
+        seen.append(_values_by_key(pages[-1])[key])
+    assert seen == shown
+    assert applied == [(key, v) for v in values]
+    _tap(loop, touch, clock, _page2_xy(index))
+    saved = json.loads((tmp_path / "state" / "settings.json").read_text())
+    assert saved == {"version": 1, key: values[0]}
+
+
+def test_the_stabilise_pages_reset_puts_back_only_the_three(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    applied = []
+    control = _stabilise_settings(tmp_path, applied, overrides={
+        "short_exposure": True, "multi_frame": 4, "save_dng": False})
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
+                                             menu_rows=STABILISE_MENU_ROWS)
+    _open_stabilise_page(loop, touch, clock, pages)
+    assert _values_by_key(pages[-1])["multi_frame"] == "4"
+    assert _values_by_key(pages[-1])["stabilise_reset"] == "TAP TWICE"
+    _tap(loop, touch, clock, _page2_xy(3))
+    assert _values_by_key(pages[-1])["stabilise_reset"] == "TAP AGAIN"
+    assert applied == []
+    clock.t += 1.0
+    _tap(loop, touch, clock, _page2_xy(3))
+    assert sorted(applied) == [("multi_frame", 1), ("short_exposure", False)]
+    current = control.current
+    assert (current.short_exposure, current.shutter_delay, current.multi_frame) == (
+        False, 0.0, 1)
+    assert current.save_dng is False
+    assert _values_by_key(pages[-1])["stabilise_reset"] == "TAP TWICE"
+    assert loop.state == "MENU" and pages[-1][1]["title"] == "STABILISE"
+
+
+def test_back_and_done_leave_the_stabilise_page(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _menu_loop(
+        camera, ctl, tmp_path, settings=_stabilise_settings(tmp_path, []),
+        menu_rows=STABILISE_MENU_ROWS)
+    _open_stabilise_page(loop, touch, clock, pages)
+    _tap(loop, touch, clock, _page2_xy(3))  # arm the page's RESET
+    _tap(loop, touch, clock, _page2_xy(4))  # BACK
+    assert loop.state == "MENU" and pages[-1][1].get("title") is None
+    _tap(loop, touch, clock, _row_xy(STABILISE_ROW))
+    assert _values_by_key(pages[-1])["stabilise_reset"] == "TAP TWICE"
+    _tap(loop, touch, clock, SHUTTER_CENTRE)  # DONE
+    assert loop.state == "LIVE"
+    _open_menu(loop, touch, clock)
+    assert pages[-1][1].get("title") is None
+
+
+def test_the_first_pages_reset_puts_the_stabilise_settings_back_too(
+        controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    applied = []
+    control = _stabilise_settings(tmp_path, applied, overrides={
+        "shutter_delay": 0.5, "multi_frame": 6})
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
+                                             menu_rows=STABILISE_MENU_ROWS)
+    _open_menu(loop, touch, clock)
+    reset = len(pages[-1][0]) - 1
+    assert pages[-1][0][reset].key == "reset"
+    _tap(loop, touch, clock, _row_xy(reset))
+    clock.t += 1.0
+    _tap(loop, touch, clock, _row_xy(reset))
+    assert sorted(applied) == [("multi_frame", 1), ("shutter_delay", 0.0)]
+    assert control.current == UNIT
+
+
+def test_the_stabilise_row_is_dim_on_a_camera_without_setting_rows(
+        controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    # V4L2 and --fake: settings but no setting rows.
+    loop, touch, display, clock = _loop(camera, ctl, settings=_stabilise_settings(tmp_path, []))
+    _open_menu(loop, touch, clock)
+    rows = pages[-1][0]
+    index = [row.key for row in rows].index("stabilise")
+    assert (rows[index].value, rows[index].active) == ("-", False)
+    _tap(loop, touch, clock, _row_xy(index))
+    assert loop.state == "MENU" and pages[-1][1].get("title") is None
+
+
+def test_short_exposure_is_dim_where_the_camera_cannot_use_it(
+        controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    applied = []
+    control = _stabilise_settings(tmp_path, applied)
+    # Under --ae-lock (or without libcamera's exposure modes) main leaves it out.
+    loop, touch, display, clock = _menu_loop(
+        camera, ctl, tmp_path, settings=control,
+        menu_rows=ALL_ROWS + ("shutter_delay", "multi_frame"))
+    _open_stabilise_page(loop, touch, clock, pages)
+    rows = {row.key: row for row in pages[-1][0]}
+    assert (rows["short_exposure"].value, rows["short_exposure"].active) == ("-", False)
+    assert rows["shutter_delay"].active and rows["multi_frame"].active
+    assert rows["stabilise_reset"].active
+    _tap(loop, touch, clock, _page2_xy(0))
+    assert applied == [] and control.current.short_exposure is False
+
+
+# -- the STAB tag ----------------------------------------------------------------
+
+
+def test_the_live_view_shows_stab_while_a_stabilise_setting_is_on(
+        controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    pages = _spy_menu(monkeypatch)
+    control = _stabilise_settings(tmp_path, [])
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
+                                             menu_rows=STABILISE_MENU_ROWS)
+    loop.step()
+    assert states[-1].stabilise_on is False
+    _open_stabilise_page(loop, touch, clock, pages)
+    _tap(loop, touch, clock, _page2_xy(2))  # multi-frame 2
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    clock.t += 0.1
+    loop.step()
+    assert loop.state == "LIVE" and states[-1].stabilise_on is True
+    assert states[-1].image_adjusted is False
+    control.set("multi_frame", 1)
+    clock.t += 0.1
+    loop.step()
+    assert states[-1].stabilise_on is False
+    for key, value in (("short_exposure", True), ("shutter_delay", 0.2)):
+        control.set(key, value)
+        clock.t += 0.1
+        loop.step()
+        assert states[-1].stabilise_on is True
+        control.reset_stabilise()
+
+
+def test_no_stab_tag_where_the_camera_takes_no_stabilise_settings(
+        controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    # Saved values this camera does not apply (V4L2, fake).
+    control = _stabilise_settings(tmp_path, [], overrides={"short_exposure": True,
+                                                           "multi_frame": 4})
+    loop, touch, display, clock = _loop(camera, ctl, settings=control, menu_rows=None)
+    loop.step()
+    assert states[-1].stabilise_on is False
+    # Short exposure saved but not usable here (AE lock): no tag from it alone.
+    control = _stabilise_settings(tmp_path, [], overrides={"short_exposure": True})
+    loop, touch, display, clock = _loop(camera, ctl, settings=control,
+                                        menu_rows=("shutter_delay", "multi_frame"))
+    loop.step()
+    assert states[-1].stabilise_on is False
+    loop, touch, display, clock = _loop(camera, ctl, settings=control,
+                                        menu_rows=("short_exposure",))
+    loop.step()
+    assert states[-1].stabilise_on is True
 
 
 # -- the shutter delay -------------------------------------------------------

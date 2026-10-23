@@ -36,7 +36,7 @@ it changes between frames, so the screen is assembled from small tiles:
   they show: the strip background, one tile per cell, the shutter, ``+``/``-`` and
   ``MENU`` keys (keyed by which is pressed), and the ``2x`` and battery tags with the
   count of photographs still developing and the ``TUNING`` warning, and the
-  ``IMG`` reminder with the ``PHOTOS``/``SD`` disk-space tags (a tile of their
+  ``IMG`` and ``STAB`` reminders with the ``PHOTOS``/``SD`` disk-space tags (a tile of their
   own, keyed by what they show);
 - dynamic tiles: the lit meter dot and the lux/clip text (cached too, they repeat)
   and the focus gauge (drawn every frame; it is 7 units wide).
@@ -132,6 +132,14 @@ DISK_X0 = 127
 # changes every photograph (and that no look was trained with) is not forgotten.
 # The tag row has no room left after TUNING; this tile has (see the tests).
 IMAGE_LABEL = "IMG"
+# A help against camera shake is on (the menu's STABILISE page): amber STAB right
+# after IMG, for the same reason: it changes every photograph (a shorter exposure
+# at a higher gain, a wait, a merge of several frames) until it is turned off.
+STABILISE_LABEL = "STAB"
+# IMG and STAB are short words, so they take half the battery tag's padding: with
+# both of them and the widest disk warning ("PHOTOS 100%", "SD 100%") the full
+# padding would run about 6 units past the tile, into the shutter's hit circle.
+REMINDER_PADDING = TAG_PADDING / 2
 FOCUS_TRACK = (6, 22, 9, 198)
 FOCUS_TICK_X = (4, 11)
 FOCUS_TICK_HEIGHT = 1.5
@@ -208,6 +216,7 @@ class LiveState:
     tuning_mismatch: bool = False            # camera tuning differs from the look's; draws TUNING
     disk_warning: tuple[tuple[str, int], ...] = ()  # (label, percent) per low filesystem
     image_adjusted: bool = False             # an image control is not 1.0; draws IMG
+    stabilise_on: bool = False               # a help against shake is on; draws STAB
 
 
 @lru_cache(maxsize=4)
@@ -519,9 +528,10 @@ def _tags_tile(double: tuple[bool, int] | None, battery: str | None, scale: int,
 
 @lru_cache(maxsize=16)
 def _disk_tile(warning: tuple[tuple[str, int], ...], scale: int,
-               image: bool = False) -> Image.Image:
-    """``IMG`` when ``image``, then one amber tag per filesystem low on space, left
-    to right from ``DISK_X0``.
+               image: bool = False, stabilise: bool = False) -> Image.Image:
+    """``IMG`` when ``image``, ``STAB`` when ``stabilise``, then one amber tag per
+    filesystem low on space, left to right from ``DISK_X0``; IMG and STAB with
+    ``REMINDER_PADDING``, so all four fit together.
 
     Styled as the TUNING tag: amber text, the battery tag's padding, the count's
     dark patch, no outline (a warning, not a key). Keyed by what it shows; a
@@ -530,11 +540,13 @@ def _disk_tile(warning: tuple[tuple[str, int], ...], scale: int,
     canvas = _Canvas(_DISK_BOX, scale)
     font = canvas.font(SEMIBOLD, TAG_SIZE)
     left = float(DISK_X0)
-    texts = ([IMAGE_LABEL] if image else []) + [
-        f"{label} {percent}%" for label, percent in warning]
-    for text in texts:
+    reminders = [IMAGE_LABEL] if image else []
+    reminders += [STABILISE_LABEL] if stabilise else []
+    texts = [(text, REMINDER_PADDING) for text in reminders] + [
+        (f"{label} {percent}%", TAG_PADDING) for label, percent in warning]
+    for text, padding in texts:
         box = (left, DOUBLE_BOX[1],
-               min(left + canvas.text_width(text, font) + 2 * TAG_PADDING, _DISK_BOX[2] - 1),
+               min(left + canvas.text_width(text, font) + 2 * padding, _DISK_BOX[2] - 1),
                DOUBLE_BOX[3])
         canvas.pill(box, TAG_RADIUS, fill=DEVELOPING_FILL)
         canvas.text(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), text, font, AMBER,
@@ -619,9 +631,10 @@ def render_live(
     tuning = bool(state.tuning_mismatch)
     if state.double is not None or battery is not None or developing or tuning:
         paste(_tags_tile(state.double, battery, scale, developing, tuning), *_TAGS_BOX[:2])
-    if state.disk_warning or state.image_adjusted:
+    if state.disk_warning or state.image_adjusted or state.stabilise_on:
         disk = tuple((str(label), int(percent)) for label, percent in state.disk_warning)
-        paste(_disk_tile(disk, scale, bool(state.image_adjusted)), *_DISK_BOX[:2])
+        paste(_disk_tile(disk, scale, bool(state.image_adjusted), bool(state.stabilise_on)),
+              *_DISK_BOX[:2])
     if reading.focus is not None:
         paste(_focus_tile(reading.focus, reading.focus_peak, scale), *_FOCUS_BOX[:2])
     return img

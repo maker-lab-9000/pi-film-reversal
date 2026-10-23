@@ -722,3 +722,23 @@ def test_reset_image_leaves_the_stabilise_settings(tmp_path):
     control.reset_image()
     assert control.current.short_exposure is True
     assert json.loads(path.read_text()) == {"version": 1, "short_exposure": True}
+
+
+def test_reset_stabilise_puts_back_only_the_three(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    overrides = {"short_exposure": True, "multi_frame": 6, "contrast": 1.5,
+                 "save_dng": False}
+    save(path, overrides)
+    lines: list[str] = []
+    control = SettingsControl(path, DEFAULTS, overrides, log=lines.append)
+    calls = []
+    for key in settings_mod.KEYS:
+        control.register(key, lambda value, key=key: calls.append((key, value)))
+    control.reset_stabilise()
+    assert calls == [("short_exposure", False), ("multi_frame", 1)]
+    current = control.current
+    assert (current.short_exposure, current.shutter_delay, current.multi_frame) == (
+        False, 0.0, 1)
+    assert current.contrast == 1.5 and current.save_dng is False
+    assert json.loads(path.read_text()) == {"version": 1, "contrast": 1.5, "save_dng": False}
+    assert lines == ["settings: short exposure, shutter delay, multi-frame reset to off"]
