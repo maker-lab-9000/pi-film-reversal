@@ -106,8 +106,11 @@ class Pipeline:
         from and a duration is not reproducible.
 
         ``halation=False`` leaves the look's halation out, as ``grain=False`` its
-        grain (the live view does both); the audit still names the look's
-        halation (``halation_sha1``, when it has one), as it names its LUT.
+        grain (the live view does both, and the menu's HALATION row turns it off
+        for a photograph). The audit says which: ``halation_sha1`` when the
+        glow was applied, ``"halation": "off"`` when the look has halation and
+        this call left it out, so a regrade reproduces either; a look without
+        halation gets neither.
 
         ``grader``, when given and able to take this frame, grades it on the GPU
         (see the module docstring); the stages are then ``normalize`` (the
@@ -152,7 +155,7 @@ class Pipeline:
                     timings.update(gpu_timings)
                 if used is not None:
                     used["backend"] = BACKEND
-                return graded, self._audit(gains, ev)
+                return graded, self._audit(gains, ev, with_halation)
         started = time.perf_counter()
         if ev != 0.0:
             rgb_u8 = _ev_table(-ev)[rgb_u8]
@@ -169,12 +172,14 @@ class Pipeline:
         if with_grain:
             graded = add_grain(graded, self.artifacts.grain, rng)
             _lap(timings, "grain", started)
-        return graded, self._audit(gains, ev)
+        return graded, self._audit(gains, ev, with_halation)
 
-    def _audit(self, gains: Gains, ev: float) -> dict:
+    def _audit(self, gains: Gains, ev: float, halation: bool) -> dict:
         """The record's audit fields. The same for the same gains, whichever
-        path graded. ``halation_sha1`` follows ``normalize_sha1`` only for a
-        look with halation, so a look without it records what it always did."""
+        path graded. For a look with halation, ``halation_sha1`` follows
+        ``normalize_sha1`` when the glow was applied and ``"halation": "off"``
+        takes its place when it was left out; a look without halation records
+        what it always did."""
         audit = {
             "wb_gains": [round(float(g), 4) for g in gains.wb],
             "exposure_gain": round(float(gains.exposure), 4),
@@ -187,8 +192,10 @@ class Pipeline:
             "lut_sha1": self.artifacts.lut_sha1,
             "normalize_sha1": self.normalize_sha1,
         }
-        if self.artifacts.halation.active:
+        if halation:
             audit["halation_sha1"] = self.artifacts.halation.sha1
+        elif self.artifacts.halation.active:
+            audit["halation"] = "off"
         audit["ev_comp"] = ev
         return audit
 
