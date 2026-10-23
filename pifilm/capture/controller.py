@@ -1,4 +1,16 @@
-"""Serialized, idempotent capture jobs shared by local and remote triggers."""
+"""Serialized, idempotent capture jobs shared by local and remote triggers.
+
+The shutter delay. A press on the LCD's shutter or the GPIO button moves the
+camera, so those triggers can ask for a delay (``submit(..., delay_s=)``, the
+menu's SHUTTER DELAY) and the worker waits that long before the capture starts,
+letting the hand that pressed stop moving. A Stick request asks for none: the
+Stick is already away from the camera. The job is accepted at the press and
+stays active through the wait, so a second press is answered ``busy`` as during
+the capture itself. The wait is on an event that ``close`` sets, so stopping the
+service never sits out a delay: a job still waiting then fails as ``closed`` and
+its capture never runs. The session is told the delay it waited
+(``capture(delay_s=)``) and writes it into the photograph's record.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +27,7 @@ JobState = Literal["queued", "processing", "complete", "failed"]
 class CaptureCallable(Protocol):
     camera: object
 
-    def capture(self) -> object: ...
+    def capture(self, *, delay_s: float = 0.0) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,12 @@ class _DoubleToggle:
     enabled: bool
 
 
+@dataclass(frozen=True)
+class _Capture:
+    request_id: str
+    delay_s: float = 0.0
+
+
 class CaptureController:
     """Own one camera session in one worker, accepting at most one job at a time."""
 
@@ -87,19 +105,24 @@ class CaptureController:
         self._last_finished_job: JobSnapshot | None = None
         self._closed = False
         self._double = self._read_double()
-        self._work: queue.Queue[str | _DoubleToggle | None] = queue.Queue()
+        # Set by ``close``: ends a shutter delay that is being waited out.
+        self._stopping = threading.Event()
+        self._work: queue.Queue[_Capture | _DoubleToggle | None] = queue.Queue()
         self._worker = threading.Thread(
             target=self._run, name="pifilm-capture-worker", daemon=True,
         )
         self._worker.start()
 
-    def submit(self, request_id: str) -> JobSnapshot:
+    def submit(self, request_id: str, *, delay_s: float = 0.0) -> JobSnapshot:
         """Accept ``request_id`` once, or return its current immutable snapshot.
 
         A second, distinct request is not accepted while a capture is active.  It
         receives a standalone failed snapshot with ``busy`` so a transport can
         translate it to its own conflict response without creating a fake job.
+        ``delay_s`` is the shutter delay the worker waits before the capture (see
+        the module docstring); a repeated ``request_id`` keeps its first one.
         """
+        delay_s = max(0.0, float(delay_s))
         with self._lock:
             if request_id in self._jobs:
                 return self._jobs[request_id]
@@ -110,7 +133,7 @@ class CaptureController:
             job = JobSnapshot(request_id, "queued")
             self._jobs[request_id] = job
             self._active_request_id = request_id
-            self._work.put(request_id)
+            self._work.put(_Capture(request_id, delay_s))
             return job
 
     def set_double_exposure(self, enabled: bool) -> None:
@@ -156,11 +179,16 @@ class CaptureController:
             )
 
     def close(self) -> None:
-        """Finish an in-flight capture, then close the camera on its worker thread."""
+        """Finish an in-flight capture, then close the camera on its worker thread.
+
+        A capture still waiting out its shutter delay is not started: it fails as
+        ``closed`` at once.
+        """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            self._stopping.set()
             self._work.put(None)
         self._worker.join()
 
@@ -173,10 +201,14 @@ class CaptureController:
                 if isinstance(item, _DoubleToggle):
                     self._apply_toggle(item.enabled)
                     continue
-                request_id = item
+                request_id = item.request_id
                 self._set_processing(request_id)
+                if item.delay_s > 0.0 and self._stopping.wait(item.delay_s):
+                    self._finish(request_id, "failed", error_code="closed",
+                                 error_message="closed during the shutter delay")
+                    continue
                 try:
-                    result = self._session.capture()
+                    result = self._session.capture(delay_s=item.delay_s)
                 except CameraError as exc:
                     self._finish(
                         request_id, "failed", error_code="camera_error", error_message=str(exc),

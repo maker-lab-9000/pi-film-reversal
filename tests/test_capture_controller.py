@@ -23,7 +23,7 @@ class BlockingSession:
         self.calls = 0
         self.camera = Mock()
 
-    def capture(self) -> Result:
+    def capture(self, *, delay_s=0.0) -> Result:
         self.calls += 1
         self.started.set()
         self.release.wait(timeout=2)
@@ -108,7 +108,7 @@ def test_camera_error_finishes_job_and_allows_a_later_request():
             self.calls = 0
             self.camera = Mock()
 
-        def capture(self):
+        def capture(self, *, delay_s=0.0):
             self.calls += 1
             if self.calls == 1:
                 raise CameraError("dropped frame")
@@ -152,7 +152,7 @@ class _Session:
         self.camera = None
         self.fail = fail
 
-    def capture(self):
+    def capture(self, *, delay_s=0.0):
         if self.fail:
             raise CameraError("boom")
         return "result"
@@ -216,7 +216,7 @@ class DoubleSession:
         if not enabled:
             self.taken = 0
 
-    def capture(self):
+    def capture(self, *, delay_s=0.0):
         self.started.set()
         self.release.wait(timeout=2)
         if self.enabled:
@@ -338,7 +338,7 @@ class GradingSession:
         self.pending_grades = 0
         self.fail_close = fail_close
 
-    def capture(self):
+    def capture(self, *, delay_s=0.0):
         return Result("saved")
 
     def close_grades(self, timeout=None):
@@ -566,3 +566,61 @@ def test_a_raising_network_reports_none():
         assert controller.snapshot().network == ()
     finally:
         controller.close()
+
+
+class DelaySession:
+    """Records the delay it was told and when its capture began."""
+
+    def __init__(self) -> None:
+        self.camera = Mock()
+        self.delays: list[float] = []
+        self.started_at: float | None = None
+        self.started = threading.Event()
+
+    def capture(self, *, delay_s=0.0):
+        self.started_at = time.monotonic()
+        self.delays.append(delay_s)
+        self.started.set()
+        return Result("saved")
+
+
+def test_the_worker_waits_the_shutter_delay_and_tells_the_session():
+    session = DelaySession()
+    controller = CaptureController(session)
+    try:
+        pressed = time.monotonic()
+        controller.submit("delayed", delay_s=0.2)
+        # Active through the wait: a second press is busy, not queued.
+        assert controller.snapshot().active_job.request_id == "delayed"
+        assert controller.submit("second").error_code == "busy"
+        assert not session.started.is_set()
+        wait_for(controller, "delayed", "complete")
+        assert session.started_at - pressed >= 0.2
+        assert session.delays == [0.2]
+    finally:
+        controller.close()
+
+
+def test_a_request_without_a_delay_tells_the_session_none():
+    session = DelaySession()
+    controller = CaptureController(session)
+    try:
+        controller.submit("now")
+        wait_for(controller, "now", "complete")
+        assert session.delays == [0.0]
+    finally:
+        controller.close()
+
+
+def test_closing_during_the_delay_ends_promptly_without_the_capture():
+    session = DelaySession()
+    controller = CaptureController(session)
+    controller.submit("waiting", delay_s=30.0)
+    wait_for(controller, "waiting", "processing")
+    began = time.monotonic()
+    controller.close()
+    assert time.monotonic() - began < 2.0
+    assert session.delays == []
+    job = controller.status("waiting")
+    assert (job.state, job.error_code) == ("failed", "closed")
+    assert session.camera.close.called

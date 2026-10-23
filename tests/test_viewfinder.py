@@ -133,10 +133,10 @@ class GatedSession:
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def capture(self):
+    def capture(self, *, delay_s=0.0):
         self.started.set()
         assert self.release.wait(5.0), "capture was never released"
-        return self._session.capture()
+        return self._session.capture(delay_s=delay_s)
 
     def __getattr__(self, name):
         # Only called for attributes the wrapper lacks: double_state and
@@ -316,7 +316,7 @@ def test_failed_job_shows_a_message_in_review(tmp_path, monkeypatch):
     class Boom:
         camera = None
 
-        def capture(self):
+        def capture(self, *, delay_s=0.0):
             raise CameraError("lens cap")
 
     ctl = CaptureController(Boom())
@@ -656,7 +656,7 @@ def test_a_tap_on_a_dark_screen_only_wakes_it_and_lights_nothing(controller, mon
     states = _spy_states(monkeypatch)
     loop, touch, display, clock = _idle_loop(camera, ctl)
     submitted = []
-    monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
+    monkeypatch.setattr(ctl, "submit", lambda rid, **kw: submitted.append(rid))
     clock.t = 300.0
     loop.step()
     assert display.levels[-1] == 0
@@ -676,7 +676,7 @@ def test_a_tap_on_a_dimmed_screen_restores_it_and_acts(controller, monkeypatch):
     camera, ctl = controller
     loop, touch, display, clock = _idle_loop(camera, ctl)
     submitted = []
-    monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
+    monkeypatch.setattr(ctl, "submit", lambda rid, **kw: submitted.append(rid))
     clock.t = 60.0
     loop.step()
     assert display.levels[-1] == 40
@@ -1395,7 +1395,7 @@ def test_a_tap_keeps_its_key_lit_for_the_flash_after_the_finger_is_up(
     """A tap can be over before a frame is drawn; the key must still be seen to react."""
     camera, ctl = controller
     states = _spy_states(monkeypatch)
-    monkeypatch.setattr(ctl, "submit", lambda rid: None)
+    monkeypatch.setattr(ctl, "submit", lambda rid, **kw: None)
     loop, touch, display, clock = _loop(camera, ctl)
     _tap(loop, touch, clock, key)             # the second step saw no finger
     assert states[-1].pressed is action
@@ -1536,7 +1536,7 @@ def test_a_shutter_tap_during_processing_still_reaches_the_controller(tmp_path, 
         ctl.submit("busy")
         _until(lambda: session.started.is_set())
         submitted = []
-        monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
+        monkeypatch.setattr(ctl, "submit", lambda rid, **kw: submitted.append(rid))
         _tap(loop, touch, clock, SHUTTER_CENTRE)
         assert len(submitted) == 1
     finally:
@@ -1762,7 +1762,7 @@ def test_taps_are_hit_tested_at_the_display_scale(controller, monkeypatch):
     camera, ctl = controller
     loop, touch, display, clock = _loop(camera, ctl, display=BigDisplay())
     submitted = []
-    monkeypatch.setattr(ctl, "submit", lambda rid: submitted.append(rid))
+    monkeypatch.setattr(ctl, "submit", lambda rid, **kw: submitted.append(rid))
     cx, cy = SHUTTER_CENTRE
     _tap(loop, touch, clock, (2 * cx, 2 * cy))
     assert len(submitted) == 1
@@ -2113,12 +2113,12 @@ def test_the_step_that_takes_the_photo_asks_for_no_preview_frame(tmp_path):
     loop, _, _, _ = _loop(camera, ctl, touch=touch, clock=HeldClock())
     real_submit = ctl.submit
 
-    def submit(request_id):
+    def submit(request_id, **kwargs):
         # The read in flight returns while this step is still running, so the
         # frame thread is idle and would take a request made later in the step.
         gate.release()
         _until(lambda: gate.returned == 2)
-        return real_submit(request_id)
+        return real_submit(request_id, **kwargs)
 
     ctl.submit = submit
     running = Running(loop)
@@ -3792,3 +3792,57 @@ def test_no_img_tag_where_the_camera_takes_no_image_controls(controller, tmp_pat
                                         menu_rows=("saturation",))
     loop.step()
     assert states[-1].image_adjusted is True
+
+
+# -- the shutter delay -------------------------------------------------------
+
+
+def _shutter_delays(ctl, monkeypatch):
+    """Record the delay each submit asks for, without starting a capture."""
+    asked = []
+    monkeypatch.setattr(ctl, "submit",
+                        lambda rid, *, delay_s=0.0: asked.append(delay_s))
+    return asked
+
+
+def test_a_shutter_tap_asks_for_the_menus_delay_read_at_the_tap(
+    controller, tmp_path, monkeypatch,
+):
+    camera, ctl = controller
+    asked = _shutter_delays(ctl, monkeypatch)
+    control = _settings(tmp_path, overrides={"shutter_delay": 0.5})
+    loop, touch, display, clock = _loop(camera, ctl, settings=control, menu_rows=ALL_ROWS)
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    assert control.set("shutter_delay", 0.2)
+    clock.t += 1.0
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    assert asked == [0.5, 0.2]
+
+
+@pytest.mark.parametrize("with_settings", [True, False])
+def test_no_delay_without_the_setting_rows(controller, tmp_path, monkeypatch, with_settings):
+    """A fake camera has no setting rows, and a value saved on the Pi delays nothing."""
+    camera, ctl = controller
+    asked = _shutter_delays(ctl, monkeypatch)
+    control = _settings(tmp_path, overrides={"shutter_delay": 0.5}) if with_settings else None
+    loop, touch, display, clock = _loop(camera, ctl, settings=control, menu_rows=None)
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    assert asked == [0.0]
+
+
+def test_a_tap_during_the_delay_is_busy_and_the_delay_shows_as_processing(
+    controller, tmp_path, monkeypatch,
+):
+    camera, ctl = controller
+    bars = _spy_processing(monkeypatch)
+    control = _settings(tmp_path, overrides={"shutter_delay": 0.5})
+    loop, touch, display, clock = _loop(camera, ctl, settings=control, menu_rows=ALL_ROWS)
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    job = ctl.snapshot().active_job
+    assert job is not None
+    assert ctl.submit("second").error_code == "busy"
+    loop.step()
+    assert bars["n"] >= 1
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    assert ctl.snapshot().last_finished_job.request_id == job.request_id
+    assert ctl.snapshot().last_finished_job.state == "complete"

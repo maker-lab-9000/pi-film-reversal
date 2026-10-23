@@ -194,13 +194,24 @@ modes, the ISP's sharpness, contrast and saturation and the short exposure mode
 are its controls); under ``--fake`` or V4L2 the arguments stay as given, so a
 saved value can never trip the Picamera2-only check and stop the service
 starting. The ``SettingsControl`` gets one applier per row the backend can
-change (none yet for the shutter delay and multi-frame, which are stored but not
-acted on), and the viewfinder gets the rows the camera supports (none of the
-auto-exposure ones under ``--ae-lock``, whose setters would change nothing, and
-only the image controls the camera lists), the look's name (the ``--artifacts``
-folder) and, with ``--nextcloud-env`` and a panel, an ``Upload`` that ``main``
-closes beside the network monitor. Only the viewfinder's loop thread sets or
-resets a setting; the control has no lock.
+change (none for the shutter delay, which is read at each press, and none yet
+for multi-frame, which is stored but not acted on), and the viewfinder gets
+the rows the camera supports (none of the auto-exposure ones under
+``--ae-lock``, whose setters would change nothing, and only the image controls
+the camera lists), the look's name (the ``--artifacts`` folder) and, with
+``--nextcloud-env`` and a panel, an ``Upload`` that ``main`` closes beside the
+network monitor. Only the viewfinder's loop thread sets or resets a setting; the
+control has no lock.
+
+The shutter delay (``shutter_delay``) has no applier because nothing in the
+session holds it: the LCD's shutter and the GPIO button read it at each press and
+pass it to ``CaptureController.submit``, whose worker waits it out before the
+capture; the Stick and the keyboard never wait. The viewfinder reads it from its
+``SettingsControl`` only with setting rows (Picamera2), and the button through a
+getter ``main`` gives it that answers 0.0 on any other backend, so a value saved
+on the Pi never delays a ``--fake`` or V4L2 shot. The record's
+``shutter_delay_s`` (Picamera2 records only, right after the camera's stream
+fields, and kept in a background shot's pending entry) is the delay waited.
 
 The halation setting
 --------------------
@@ -458,6 +469,16 @@ def _stage(stages: dict[str, float], name: str):
         stages[name] = round((time.perf_counter() - started) * 1000.0, 1)
 
 
+def _delay_fields(frame: Frame, delay_s: float) -> dict[str, float]:
+    """``shutter_delay_s`` for a Picamera2 frame, nothing for any other.
+
+    The shutter delay is a setting, and settings apply on Picamera2 only, so a
+    V4L2 or fake record never carries it. It is the delay waited for this shot
+    (0.0 for the Stick and the keyboard), not the menu's value at the time.
+    """
+    return {"shutter_delay_s": float(delay_s)} if frame.source == "picamera2" else {}
+
+
 def _capture_stages(frame: Frame, shutter: float) -> dict[str, float]:
     """Start a capture's stage timings (``stage_ms`` in its record) with the camera.
 
@@ -624,8 +645,12 @@ class CaptureSession:
         if not self.double_exposure:
             self._pending = None
 
-    def capture(self) -> CaptureResult:
+    def capture(self, *, delay_s: float = 0.0) -> CaptureResult:
+        """Take one shot. ``delay_s`` is the shutter delay the controller waited
+        before calling (0.0 for the Stick); a Picamera2 record carries it as
+        ``shutter_delay_s``, right after the camera's stream fields."""
         shutter = time.perf_counter()
+        delay = float(delay_s)
         # Read before the frame: the EV the exposure was made at. The grade has to
         # re-apply it, or normalisation cancels it (see ``pifilm.pipeline``).
         ev = float(getattr(self.camera, "ev", 0.0))
@@ -643,14 +668,14 @@ class CaptureSession:
         if self.double_exposure:
             return self._capture_double(
                 frame, ev, shutter, stages, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
-                halation=halation,
+                halation=halation, delay_s=delay,
             )
 
         seed = int(self._seed_rng.integers(0, 2**31 - 1))
         if self._queue is not None:
             return self._capture_background(
                 frame, ev, shutter, stages, seed, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
-                halation=halation,
+                halation=halation, delay_s=delay,
             )
         t0 = time.perf_counter()
         graded, info = self.pipeline.process(
@@ -677,6 +702,7 @@ class CaptureSession:
             "params_version": PARAMS_VERSION,
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
+            **_delay_fields(frame, delay),
             **self._tuning_fields,
             "pipeline_ms": round(pipeline_ms, 1),
             "shutter_to_saved_ms": round(shutter_to_saved_ms, 1),
@@ -691,6 +717,7 @@ class CaptureSession:
     def _capture_background(
         self, frame: Frame, ev: float, shutter: float, stages: dict[str, float], seed: int, *,
         shutter_us: int | None, wb_k: int | None, iso: int | None, halation: bool,
+        delay_s: float,
     ) -> CaptureResult:
         """A single shot graded behind the shutter: everything up to handing it over."""
         day_dir, stem, t, original, dng_name = self._write_original(frame, stages)
@@ -710,6 +737,7 @@ class CaptureSession:
             "params_version": PARAMS_VERSION,
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
+            **_delay_fields(frame, delay_s),
             **self._tuning_fields,
             **({"camera_metadata": frame.metadata} if frame.metadata else {}),
             **({"dng": dng_name} if dng_name else {}),
@@ -959,6 +987,7 @@ class CaptureSession:
     def _capture_double(
         self, frame: Frame, ev: float, shutter: float, stages: dict[str, float], *,
         shutter_us: int | None, wb_k: int | None, iso: int | None, halation: bool,
+        delay_s: float,
     ) -> CaptureResult:
         # The pending frame is taken off the session before anything that can fail, so
         # any failure from here on returns the count to 0/2 (spec section 5). A camera
@@ -972,6 +1001,7 @@ class CaptureSession:
             "colour_temperature_k": wb_k,
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
+            **_delay_fields(frame, delay_s),
             **self._tuning_fields,
             **({"camera_metadata": frame.metadata} if frame.metadata else {}),
             **({"dng": dng_name} if dng_name else {}),
@@ -1777,15 +1807,18 @@ def _gpio_pin(text: str) -> int:
     return pin
 
 
-def _button_capture(controller: CaptureController) -> None:
+def _button_capture(
+    controller: CaptureController, delay: Callable[[], float] = lambda: 0.0,
+) -> None:
     """One press of the GPIO shutter button: the same request an LCD tap makes.
 
     Runs on gpiozero's callback thread. ``submit`` only takes the controller's
-    lock and queues the job, so the press returns at once; a capture already in
-    progress (or a controller that is shutting down) answers with a failed
-    snapshot, and the press is dropped, never queued.
+    lock and queues the job, so the press returns at once (the shutter delay,
+    ``delay()`` read now, is waited on the controller's worker); a capture
+    already in progress (or a controller that is shutting down) answers with a
+    failed snapshot, and the press is dropped, never queued.
     """
-    job = controller.submit(str(uuid.uuid4()))
+    job = controller.submit(str(uuid.uuid4()), delay_s=delay())
     if job.state == "failed":
         print(f"button: press ignored ({job.error_code})")
     else:
@@ -2086,6 +2119,10 @@ def _main(argv: list[str] | None) -> int:
             key for key in IMAGE_KEYS
             if key in getattr(camera, "image_controls_supported", ())
         )
+    # Read at each button press (see "The settings menu"); 0.0 off Picamera2.
+    def shutter_delay() -> float:
+        return settings.current.shutter_delay if backend == "picamera2" else 0.0
+
     look = _look_name(args.artifacts)
     # Whether the HALATION row has anything to turn off.
     halation_params = getattr(getattr(pipeline, "artifacts", None), "halation", None)
@@ -2132,7 +2169,7 @@ def _main(argv: list[str] | None) -> int:
             controller = controller or CaptureController(session)
         if button is not None:
             assert controller is not None
-            button.on_press(functools.partial(_button_capture, controller))
+            button.on_press(functools.partial(_button_capture, controller, shutter_delay))
             print(f"Shutter button on BCM {args.shutter_gpio}.")
         if args.remote_listen:
             assert controller is not None

@@ -4,7 +4,9 @@ Every shot goes through the shared ``CaptureController`` exactly like a Stick
 request, so the LCD is one more trigger and one more screen, never a second
 owner of the camera. A finished job is noticed through the controller's
 ``finished_count``, which is how a Stick shot appears here without the
-controller knowing about displays.
+controller knowing about displays. Unlike a Stick request, a shutter tap asks
+for the menu's shutter delay (``shutter_delay``, read at the tap; none without
+the setting rows), which the controller's worker waits out before the capture.
 Double exposure adds a third state, NOTICE: after exposure 1 of a pair there is
 nothing developed to review, so a short "Exposure 1/2" message replaces the
 review and the loop returns to LIVE for the second exposure.
@@ -412,6 +414,18 @@ class ViewfinderLoop:
         self._reset_until: float | None = None
         # The page shown in MENU: "main", or "image" for the image controls.
         self._menu_page = "main"
+
+    def _shutter_delay(self) -> float:
+        """The menu's shutter delay for a press of the shutter key, read now.
+
+        Only a camera with the setting rows (Picamera2) takes settings, so without
+        them (``--fake``) a value saved on the Pi delays nothing. The controller's
+        worker waits it out; the job is active meanwhile, so the colour bars show
+        and a second tap is answered busy.
+        """
+        if self._settings is None or not self._menu_resettable:
+            return 0.0
+        return float(self._settings.current.shutter_delay)
 
     # -- plumbing -------------------------------------------------------------
 
@@ -1243,7 +1257,7 @@ class ViewfinderLoop:
                 self._menu_step(snap, None, now)
                 return
             if action is Action.SHUTTER:
-                self._controller.submit(str(uuid.uuid4()))
+                self._controller.submit(str(uuid.uuid4()), delay_s=self._shutter_delay())
                 # The still waits for the camera behind any preview read, so
                 # this step asks the frame thread for none: at a 1 s shutter a
                 # read started now would add a second of shutter lag.

@@ -456,7 +456,7 @@ def test_capture_display_polls_controller_and_shows_loading_before_result(
     started = threading.Event()
     release = threading.Event()
 
-    def delayed_capture():
+    def delayed_capture(*, delay_s=0.0):
         started.set()
         assert release.wait(timeout=1)
         return capture()
@@ -502,7 +502,7 @@ def test_external_capture_updates_pi_display(
     release = threading.Event()
     finished = threading.Event()
 
-    def delayed_capture():
+    def delayed_capture(*, delay_s=0.0):
         assert release.wait(timeout=2)
         result = capture()
         finished.set()
@@ -559,7 +559,7 @@ def test_capture_display_keeps_last_photo_after_failed_capture(
     capture = session.capture
     attempts = 0
 
-    def flaky_capture():
+    def flaky_capture(*, delay_s=0.0):
         nonlocal attempts
         attempts += 1
         if attempts == failed_attempt:
@@ -1254,7 +1254,7 @@ def test_no_dng_flag_disables_dng_on_backend_and_session(camera_cli, monkeypatch
             session_kwargs.update(kwargs)
             self.camera = camera
 
-        def capture(self):
+        def capture(self, *, delay_s=0.0):
             raise AssertionError("capture should not be called in this test")
 
     monkeypatch.setattr(camera_cli, "Picamera2Camera", open_picamera, raising=False)
@@ -1722,9 +1722,11 @@ class _ControllerDouble:
     def __init__(self, answer):
         self.answer = answer
         self.requests = []
+        self.delays = []
 
-    def submit(self, request_id):
+    def submit(self, request_id, *, delay_s=0.0):
         self.requests.append(request_id)
+        self.delays.append(delay_s)
         return self.answer
 
 
@@ -1737,6 +1739,17 @@ def test_a_press_submits_one_new_request(capsys):
     assert len(controller.requests) == 2
     assert controller.requests[0] != controller.requests[1]
     assert "button: capture requested" in capsys.readouterr().out
+
+
+def test_a_press_asks_for_the_shutter_delay_read_at_the_press():
+    from pifilm.capture import app
+
+    controller = _ControllerDouble(SimpleNamespace(state="queued", error_code=None))
+    delay = iter([0.5, 0.2])
+    app._button_capture(controller)
+    app._button_capture(controller, lambda: next(delay))
+    app._button_capture(controller, lambda: next(delay))
+    assert controller.delays == [0.0, 0.5, 0.2]
 
 
 def test_a_press_while_busy_is_ignored_and_logged(capsys):
@@ -2667,7 +2680,7 @@ def test_grade_flag_reaches_the_session(camera_cli, monkeypatch, tmp_path, argv,
             session_kwargs.update(kwargs)
             self.camera = camera
 
-        def capture(self):
+        def capture(self, *, delay_s=0.0):
             raise AssertionError("capture should not be called in this test")
 
     monkeypatch.setattr(camera_cli, "CaptureSession", RecordingSession)
@@ -4403,7 +4416,7 @@ def test_the_short_exposure_applier_reaches_the_camera(camera_cli, monkeypatch, 
     seen = _menu_main(camera_cli, monkeypatch, tmp_path, camera)
     control = seen["settings"]
     assert control.set("short_exposure", True)
-    # Stored only for now: nothing in the session acts on these yet.
+    # No appliers: the delay is read at each press, and multi-frame is stored only.
     assert control.set("shutter_delay", 0.2)
     assert control.set("multi_frame", 2)
     assert camera.calls == [("short_exposure", True)]
@@ -4413,3 +4426,106 @@ def test_saved_stabilise_values_with_fake_start_as_usual(camera_cli, capsys):
     _save_settings(short_exposure=True, multi_frame=6)
     assert camera_cli.main(["--fake", "--no-preview"]) == 0
     assert "cannot be used with --fake" not in capsys.readouterr().err
+
+
+# -- the shutter delay -------------------------------------------------------
+
+
+def _delay_camera(source="picamera2"):
+    return FakeCamera([synthetic_frame(90, 160)], source=source,
+                      stream_info=_image_info(1.0, 1.0, 1.0))
+
+
+def _after_stream(record):
+    keys = list(record)
+    return keys[keys.index("saturation") + 1]
+
+
+def test_an_inline_record_carries_the_delay_after_the_stream_fields(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline, camera=_delay_camera())
+    result = session.capture(delay_s=0.5)
+    (record,) = _lines(session.out_root)
+    assert record["shutter_delay_s"] == 0.5 and result.record["shutter_delay_s"] == 0.5
+    assert _after_stream(record) == "shutter_delay_s"
+    session.capture()
+    assert _lines(session.out_root)[-1]["shutter_delay_s"] == 0.0
+
+
+@pytest.mark.parametrize("source", ["fake", "raw-mjpeg", "decoded"])
+def test_a_record_off_picamera2_has_no_delay(tmp_path, pipeline, source):
+    session = _session(tmp_path, pipeline, camera=_delay_camera(source))
+    session.capture(delay_s=0.2)
+    assert "shutter_delay_s" not in _lines(session.out_root)[0]
+
+
+def test_a_double_exposure_records_each_exposures_delay(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline, camera=_delay_camera())
+    session.set_double_exposure(True)
+    session.capture(delay_s=0.2)
+    session.capture(delay_s=0.5)
+    first, second = _lines(session.out_root)
+    assert (first["shutter_delay_s"], second["shutter_delay_s"]) == (0.2, 0.5)
+    assert _after_stream(first) == _after_stream(second) == "shutter_delay_s"
+
+
+def test_a_background_and_a_recovered_record_carry_the_delay(tmp_path):
+    tuned = _tuned_pipeline(tmp_path)
+    held = _HeldPipeline(tuned)
+    held.artifacts = tuned.artifacts
+    first = _tuned_session(tmp_path, _delay_camera(), held, background=True,
+                           state_dir=tmp_path / "state")
+    result = first.capture(delay_s=0.2)
+    assert result.record["shutter_delay_s"] == 0.2
+    held.wait_entered()
+    ((path, payload),) = read_entries(tmp_path / "state")
+    assert payload["record"]["shutter_delay_s"] == 0.2
+    text = path.read_text()
+    held.release()
+    assert first.close_grades(timeout=5)
+    (finished,) = _lines(first.out_root)
+    assert finished["shutter_delay_s"] == 0.2 and _after_stream(finished) == "shutter_delay_s"
+    # Put the shot back as a power cut would have left it.
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+
+    again = _tuned_session(tmp_path, _delay_camera(), tuned, background=True,
+                           state_dir=tmp_path / "state")
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    (recovered,) = _lines(again.out_root)
+    assert recovered["recovered"] is True
+    assert recovered["shutter_delay_s"] == 0.2 and _after_stream(recovered) == "shutter_delay_s"
+
+
+def _press_delay(camera_cli, monkeypatch):
+    """Point ``_button_capture`` at a recorder; return what each press asked for."""
+    asked = []
+    monkeypatch.setattr(camera_cli, "_button_capture",
+                        lambda controller, delay: asked.append(delay()))
+    return asked
+
+
+def test_the_button_reads_the_saved_delay_at_each_press_on_picamera2(
+    camera_cli, monkeypatch, tmp_path,
+):
+    _save_settings(shutter_delay=0.5)
+    button = _ButtonDouble()
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: button)
+    asked = _press_delay(camera_cli, monkeypatch)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _StabiliseMenuCamera(),
+                      "--shutter-gpio", "21")
+    button.callback()
+    assert seen["settings"].set("shutter_delay", 0.2)
+    button.callback()
+    assert asked == [0.5, 0.2]
+
+
+def test_the_button_never_delays_under_fake(camera_cli, monkeypatch):
+    _save_settings(shutter_delay=0.5)
+    button = _ButtonDouble()
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: button)
+    asked = _press_delay(camera_cli, monkeypatch)
+    assert camera_cli.main(["--fake", "--no-preview", "--shutter-gpio", "21"]) == 0
+    button.callback()
+    assert asked == [0.0]

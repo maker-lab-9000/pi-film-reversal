@@ -28,8 +28,10 @@ class BlockingSession:
         self.started = threading.Event()
         self.release = threading.Event()
         self.result = result
+        self.delays: list[float] = []
 
-    def capture(self):
+    def capture(self, *, delay_s=0.0):
+        self.delays.append(delay_s)
         self.started.set()
         self.release.wait(timeout=2)
         return self.result
@@ -174,7 +176,7 @@ def test_expired_job_is_not_reused_after_the_bounded_registry_forgets_it():
     class ImmediateSession:
         camera = type("Camera", (), {"close": lambda _self: None})()
 
-        def capture(self):
+        def capture(self, *, delay_s=0.0):
             return SavedCapture(None)
 
     controller = CaptureController(ImmediateSession())
@@ -293,3 +295,12 @@ def test_exposure_one_image_is_the_card(tmp_path):
     finally:
         server.close()
         controller.close()
+
+
+def test_a_stick_capture_never_waits_a_shutter_delay(remote):
+    """The Stick is already away from the camera: its request asks for no delay."""
+    server, session = remote
+    body = json.dumps({"request_id": str(uuid.uuid4())}).encode()
+    assert _json(server, "POST", "/v1/captures", body)[0] == 202
+    assert session.started.wait(timeout=1)
+    assert session.delays == [0.0]
