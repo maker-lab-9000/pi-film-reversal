@@ -29,6 +29,7 @@ to 1.0 (two taps, like the first page's), and BACK to the first page. ``DONE``
 closes the menu from either page, and the menu always opens on the first. The
 IMAGE row is dim with ``-`` when the camera can change none of the three (a
 V4L2 or fake camera), and a control the camera does not list is dim on the page.
+While any of the three is not 1.0 the live view shows an amber ``IMG`` tag.
 The live screen (``liveview.py``) is select-and-adjust: a tap on one of the strip's
 three cells (SHUTTER, ISO, WB) selects it, and one ``+``/``-`` pair steps whichever
 is selected. While a job is processing the colour bars hide the cells and the
@@ -115,6 +116,7 @@ from ..capture.settings import (
     AE_CONSTRAINTS,
     AE_METERINGS,
     IMAGE_KEYS,
+    IMAGE_NORMAL,
     IMAGE_STEPS,
     SettingsControl,
     format_step,
@@ -1023,6 +1025,17 @@ class ViewfinderLoop:
     def _reset_armed(self, now: float) -> bool:
         return self._reset_until is not None and now < self._reset_until
 
+    def _image_adjusted(self) -> bool:
+        """True while a sharpness, contrast or saturation this camera takes is not
+        1.0: the live view's IMG tag. A camera that takes none (V4L2, fake) never
+        shows it, since its saved values are not applied."""
+        settings = self._settings
+        if settings is None:
+            return False
+        current = settings.current
+        return any(getattr(current, key) != IMAGE_NORMAL
+                   for key in IMAGE_KEYS if key in self._menu_optional)
+
     def _menu_title(self) -> str | None:
         return IMAGE_TITLE if self._menu_page == "image" else None
 
@@ -1323,6 +1336,9 @@ class ViewfinderLoop:
                 tuning_mismatch=getattr(snap, "tuning_mismatch", False) is True,
                 # Changes at most once a minute; read like the count all the same.
                 disk_warning=getattr(snap, "disk_warning", ()),
+                # From the menu's own settings, not the snapshot: the session
+                # does not hold them. Cheap enough to read at every redraw.
+                image_adjusted=self._image_adjusted(),
             ),
             scale=self._scale,
         ))

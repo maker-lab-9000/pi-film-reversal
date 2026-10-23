@@ -3750,3 +3750,45 @@ def test_an_image_control_the_camera_lacks_is_dim_on_the_page(
     assert (rows["contrast"].value, rows["contrast"].active) == ("1.0", True)
     _tap(loop, touch, clock, _page2_xy(0))
     assert applied == [] and control.current.sharpness == 1.0
+
+
+# -- the IMG tag -----------------------------------------------------------------
+
+
+def test_the_live_view_shows_img_while_an_image_control_is_not_one(
+        controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    pages = _spy_menu(monkeypatch)
+    control = _image_settings(tmp_path, [])
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
+                                             menu_rows=IMAGE_MENU_ROWS)
+    loop.step()
+    assert states[-1].image_adjusted is False
+    _open_image_page(loop, touch, clock, pages)
+    _tap(loop, touch, clock, _page2_xy(1))  # contrast 1.25
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    clock.t += 0.1
+    loop.step()
+    assert loop.state == "LIVE" and states[-1].image_adjusted is True
+    control.set("contrast", 1.0)
+    clock.t += 0.1
+    loop.step()
+    assert states[-1].image_adjusted is False
+
+
+def test_no_img_tag_where_the_camera_takes_no_image_controls(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    states = _spy_states(monkeypatch)
+    # A saved value away from 1.0 that this camera does not apply (V4L2, fake).
+    control = _image_settings(tmp_path, [], overrides={"saturation": 1.5})
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control)
+    loop.step()
+    assert states[-1].image_adjusted is False
+    loop, touch, display, clock = _loop(camera, ctl, settings=control, menu_rows=None)
+    loop.step()
+    assert states[-1].image_adjusted is False
+    loop, touch, display, clock = _loop(camera, ctl, settings=control,
+                                        menu_rows=("saturation",))
+    loop.step()
+    assert states[-1].image_adjusted is True
