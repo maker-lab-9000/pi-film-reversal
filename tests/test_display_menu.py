@@ -27,6 +27,7 @@ SHUTTER_HIT_RADIUS = 34
 
 ROWS = (
     MenuRow("save_dng", "SAVE DNG", "ON", True),
+    MenuRow("halation", "HALATION", "OFF", True),
     MenuRow("ae_constraint", "AE CONSTRAINT", "HIGHLIGHT", True),
     MenuRow("ae_metering", "AE METERING", "CENTRE", True),
     MenuRow("upload", "UPLOAD", "TAP TO UPLOAD", True),
@@ -164,3 +165,18 @@ def test_menu_row_is_frozen_and_hashable():
 def test_the_rows_stay_clear_of_dones_hit_circle():
     assert menu.ROW_X1 < SHUTTER_CENTRE[0] - SHUTTER_HIT_RADIUS
     assert menu.VALUE_RIGHT == ROW_X1 - 4
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_fullest_page_fits_on_the_panel(scale):
+    """Every row the viewfinder can show (``ROWS`` is all of them): the last one
+    ends above the panel's foot, and every row is hit at its centre."""
+    bottom = ROW_Y0 + len(ROWS) * ROW_HEIGHT
+    assert len(ROWS) == 9 and bottom <= HEIGHT
+    pixels = _pixels(scale=scale)
+    # The last row (RESET) is drawn: its value has white ink.
+    last = pixels[(bottom - ROW_HEIGHT) * scale:bottom * scale, 150 * scale:ROW_X1 * scale]
+    assert last.max() > 150
+    for index in range(len(ROWS)):
+        y = ROW_Y0 + index * ROW_HEIGHT + ROW_HEIGHT // 2
+        assert menu_hit(ROW_X0 * scale + 1, y * scale, len(ROWS), scale) == index
