@@ -3377,6 +3377,31 @@ def test_each_burst_frame_keeps_its_dng_when_saving_is_on(install_picamera):
     camera.close()
 
 
+def test_a_burst_without_dngs_writes_none_even_with_saving_on(install_picamera):
+    """A multi-frame photograph saves no DNG: each one is written between two
+    requests, a long gap (and more hand movement) between the frames."""
+    camera, inst = _burst_camera(install_picamera, save_dng=True)
+    requests = []
+    log = _record_burst(inst)
+    capture = inst.capture_request
+
+    def recording_capture(wait=None):
+        request = capture(wait=wait)
+        requests.append(request)
+        return request
+
+    inst.capture_request = recording_capture
+    frames, _ = camera.read_burst(3, split_exposure=False, dng=False)
+    assert len(log) == 5 and len(requests) == 3
+    assert all(r.save_dng_calls == 0 for r in requests)
+    assert all(f.dng is None and "dng" not in f.timings for f in frames)
+    # A single still afterwards still has its DNG: saving is unchanged.
+    inst.switch_mode_and_capture_request = lambda config, wait=None: FakeRequest(
+        np.zeros((SMALL_SIZE[1], SMALL_SIZE[0], 3), np.uint8))
+    assert camera.read(full=True).dng == b"II*\x00fake-dng-payload"
+    camera.close()
+
+
 def test_an_auto_focus_cycles_once_per_burst(install_picamera):
     install_picamera(actual=_small_configuration(), sensor_resolution=SMALL_SIZE)
     camera = Picamera2Camera(preview=True, save_dng=False, autofocus="auto")

@@ -135,7 +135,7 @@ import numpy as np
 
 from ..tuning import Resolved
 from ..tuning import resolve as resolve_tuning
-from .camera import CameraError, Frame, StreamInfo, burst_info
+from .camera import CameraError, Frame, StreamInfo, burst_count, burst_info
 from .errors import CameraStalled
 
 DEFAULT_TUNING_FILE: str | None = None  # None: libcamera picks <sensor>.json itself
@@ -538,7 +538,9 @@ class Picamera2Camera:
                 self._live_metadata = frame.metadata
             return frame
 
-    def read_burst(self, n: int, *, split_exposure: bool) -> tuple[list[Frame], dict]:
+    def read_burst(
+        self, n: int, *, split_exposure: bool, dng: bool = True,
+    ) -> tuple[list[Frame], dict]:
         """Take ``n`` full-size stills back to back, for a multi-frame photograph.
 
         The camera switches to the still configuration once, captures ``n``
@@ -547,9 +549,13 @@ class Picamera2Camera:
         nothing). The locks and timeouts are those of ``read(full=True)``: both
         locks for the whole burst, the still's limit for each frame and each
         switch, and a frame or switch that does not come is ``CameraStalled``.
-        Each frame keeps its own metadata, stage timings and (when DNG saving
-        is on) its DNG, so the caller can keep the DNG of whichever frame it
-        makes the reference. An ``auto`` autofocus cycles once, before the burst.
+        Each frame keeps its own metadata and stage timings. With ``dng`` (the
+        default) and DNG saving on, each frame also carries its DNG, so the
+        caller can keep the DNG of whichever frame it makes the reference;
+        ``dng=False`` writes none, because each 12 MP DNG is written between
+        two requests and would put a long gap, and more hand movement, between
+        the frames (a multi-frame photograph saves no DNG). An ``auto``
+        autofocus cycles once, before the burst.
 
         ``split_exposure`` shares one exposure between the frames: when the
         shutter and the ISO are both auto (and auto-exposure is not locked), the
@@ -572,9 +578,7 @@ class Picamera2Camera:
         "split"}``: the fixed values of a split burst, else what the first
         frame's metadata reports (None where it does not).
         """
-        if not isinstance(n, numbers.Integral) or isinstance(n, bool) or n < 1:
-            raise CameraError(f"a burst needs a whole number of frames of 1 or more, got {n!r}")
-        n = int(n)
+        n = burst_count(n)
         camera = self._camera
         if camera is None:
             raise CameraError("Cannot read from a closed Picamera2 camera")
@@ -635,7 +639,8 @@ class Picamera2Camera:
                             f"Picamera2 failed to capture a request: {exc}"
                         ) from exc
                     frames.append(
-                        self._frame_from(request, full=True, timings={}, started=started)
+                        self._frame_from(request, full=True, timings={}, started=started,
+                                         dng=dng)
                     )
             except BaseException:
                 with contextlib.suppress(Exception):
@@ -718,11 +723,13 @@ class Picamera2Camera:
 
     def _frame_from(
         self, request: Any, *, full: bool, timings: dict[str, float], started: float,
+        dng: bool = True,
     ) -> Frame:
         """Copy one captured request into a ``Frame`` and release it, always.
 
         ``full`` is a still (full-size array, measured rate, DNG when on, stage
-        timings); otherwise the preview stream's frame. ``started`` is when the
+        timings); otherwise the preview stream's frame. ``dng=False`` writes no
+        DNG even when saving is on. ``started`` is when the
         request was asked for, so ``timings["request"]`` covers the capture."""
         if full or self._preview is None:
             expected_shape = (self._native_size[1], self._native_size[0], 3)
@@ -751,8 +758,8 @@ class Picamera2Camera:
                     # otherwise make a record claim the wrong frame rate.
                     self._update_fps({"FrameDuration": metadata.get("FrameDuration", 0)})
                 started = _lap(timings, "array", started)
-                dng = None
-                if full and self._save_dng:
+                dng_bytes = None
+                if full and dng and self._save_dng:
                     # The ".dng" suffix is load-bearing: PiDNG (used by save_dng)
                     # appends ".dng" to a path that lacks it, which would write
                     # the payload to a different file than this one and leave
@@ -760,10 +767,10 @@ class Picamera2Camera:
                     with tempfile.NamedTemporaryFile(suffix=".dng", delete=True) as tmp:
                         request.save_dng(tmp.name)
                         tmp.seek(0)
-                        dng = tmp.read()
+                        dng_bytes = tmp.read()
                     _lap(timings, "dng", started)
                 return Frame(
-                    rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng,
+                    rgb=rgb, jpeg=None, source="picamera2", metadata=metadata, dng=dng_bytes,
                     timings=timings if full else None,
                 )
             except CameraError:

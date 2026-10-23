@@ -546,3 +546,19 @@ def test_v4l2_burst_reads_n_frames_without_a_split(fake_capture):
     assert len(frames) == 3 and all(f.jpeg == data for f in frames)
     assert info == {"exposure_us": None, "gain": None, "split": False}
     cam.close()
+
+
+def test_fake_and_v4l2_bursts_accept_and_ignore_dng(fake_capture):
+    frames, _ = FakeCamera([synthetic_frame(8, 8)]).read_burst(
+        2, split_exposure=False, dng=False)
+    assert len(frames) == 2 and all(f.dng is None for f in frames)
+    fake_capture(buffers=[_jpeg_bytes(synthetic_frame(48, 64))] * 6)
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    frames, _ = cam.read_burst(2, split_exposure=False, dng=False)
+    assert len(frames) == 2 and all(f.dng is None for f in frames)
+    cam.close()
+
+
+def test_a_burst_count_accepts_any_whole_number_type():
+    assert camera_module.burst_count(np.int64(3)) == 3
+    assert type(camera_module.burst_count(np.int64(3))) is int

@@ -37,6 +37,7 @@ result is recorded in ``StreamInfo`` for the capture log.
 from __future__ import annotations
 
 import glob
+import numbers
 import re
 from dataclasses import dataclass
 from typing import Protocol
@@ -130,7 +131,9 @@ class Camera(Protocol):
 
     def read(self, *, full: bool = True) -> Frame: ...
 
-    def read_burst(self, n: int, *, split_exposure: bool) -> tuple[list[Frame], dict]: ...
+    def read_burst(
+        self, n: int, *, split_exposure: bool, dng: bool = True,
+    ) -> tuple[list[Frame], dict]: ...
 
     def close(self) -> None: ...
 
@@ -143,10 +146,11 @@ def burst_info(frames: list[Frame]) -> dict:
             "split": False}
 
 
-def _burst_count(n: object) -> int:
-    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+def burst_count(n: object) -> int:
+    """A burst's frame count as an int: a whole number of 1 or more, not a bool."""
+    if not isinstance(n, numbers.Integral) or isinstance(n, bool) or n < 1:
         raise CameraError(f"a burst needs a whole number of frames of 1 or more, got {n!r}")
-    return n
+    return int(n)
 
 
 def is_valid_jpeg(buf: bytes) -> bool:
@@ -239,11 +243,13 @@ class FakeCamera:
             metadata=self._metadata,
         )
 
-    def read_burst(self, n: int, *, split_exposure: bool) -> tuple[list[Frame], dict]:
+    def read_burst(
+        self, n: int, *, split_exposure: bool, dng: bool = True,
+    ) -> tuple[list[Frame], dict]:
         # Mirrors Picamera2Camera.read_burst: n reads, never a split exposure
-        # (there is no exposure to split).
+        # (there is no exposure to split) and never a DNG (``dng`` is ignored).
         frames = []
-        for i in range(_burst_count(n)):
+        for i in range(burst_count(n)):
             frame = self.read(full=True)
             shift = i * self._burst_shift
             if shift:
@@ -462,10 +468,13 @@ class V4L2Camera:
             return Frame(cv2.cvtColor(data, cv2.COLOR_BGR2RGB), None, "decoded")
         raise CameraError("Failed to read a frame after 3 attempts")
 
-    def read_burst(self, n: int, *, split_exposure: bool) -> tuple[list[Frame], dict]:
+    def read_burst(
+        self, n: int, *, split_exposure: bool, dng: bool = True,
+    ) -> tuple[list[Frame], dict]:
         """``n`` frames from ``read()``. The camera runs its own exposure, so
-        ``split_exposure`` has nothing to split and the report says ``split: False``."""
-        frames = [self.read(full=True) for _ in range(_burst_count(n))]
+        ``split_exposure`` has nothing to split and the report says ``split: False``;
+        a USB camera has no DNG, so ``dng`` is ignored."""
+        frames = [self.read(full=True) for _ in range(burst_count(n))]
         return frames, burst_info(frames)
 
     def close(self) -> None:
