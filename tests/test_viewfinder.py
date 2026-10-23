@@ -3830,19 +3830,35 @@ def test_no_delay_without_the_setting_rows(controller, tmp_path, monkeypatch, wi
     assert asked == [0.0]
 
 
-def test_a_tap_during_the_delay_is_busy_and_the_delay_shows_as_processing(
-    controller, tmp_path, monkeypatch,
+def test_the_live_view_goes_on_through_the_delay_and_bars_come_with_the_capture(
+    tmp_path, monkeypatch,
 ):
-    camera, ctl = controller
-    bars = _spy_processing(monkeypatch)
-    control = _settings(tmp_path, overrides={"shutter_delay": 0.5})
-    loop, touch, display, clock = _loop(camera, ctl, settings=control, menu_rows=ALL_ROWS)
-    _tap(loop, touch, clock, SHUTTER_CENTRE)
-    job = ctl.snapshot().active_job
-    assert job is not None
-    assert ctl.submit("second").error_code == "busy"
-    loop.step()
-    assert bars["n"] >= 1
-    _until(lambda: ctl.snapshot().finished_count == 1)
-    assert ctl.snapshot().last_finished_job.request_id == job.request_id
-    assert ctl.snapshot().last_finished_job.state == "complete"
+    """The photographer holds the framing through the wait: no colour bars until
+    the camera is taken, a second tap is busy, and the live frames keep coming."""
+    camera, ctl, session = _gated_controller(tmp_path)
+    try:
+        bars = _spy_processing(monkeypatch)
+        reads = _count_reads(camera)
+        control = _settings(tmp_path, overrides={"shutter_delay": 0.5})
+        loop, touch, display, clock = _loop(camera, ctl, settings=control,
+                                            menu_rows=ALL_ROWS)
+        loop.step()
+        _tap(loop, touch, clock, SHUTTER_CENTRE)
+        snap = ctl.snapshot()
+        assert snap.active_job is not None and snap.delaying is True
+        assert ctl.submit("second").error_code == "busy"
+        before = reads["n"]
+        loop.step()
+        loop.step()
+        assert loop.state == "LIVE" and bars["n"] == 0
+        assert reads["n"] >= before + 2
+        assert not session.started.is_set()
+        _until(lambda: session.started.is_set())
+        loop.step()
+        assert bars["n"] == 1
+        session.release.set()
+        _until(lambda: ctl.snapshot().finished_count == 1)
+        assert ctl.snapshot().last_finished_job.state == "complete"
+    finally:
+        session.release.set()
+        ctl.close()

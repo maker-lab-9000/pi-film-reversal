@@ -7,6 +7,9 @@ owner of the camera. A finished job is noticed through the controller's
 controller knowing about displays. Unlike a Stick request, a shutter tap asks
 for the menu's shutter delay (``shutter_delay``, read at the tap; none without
 the setting rows), which the controller's worker waits out before the capture.
+Through the wait the snapshot says ``delaying`` and the live view stays up, keys
+and all, since the photographer is holding the framing; the colour bars come
+when the capture starts.
 Double exposure adds a third state, NOTICE: after exposure 1 of a pair there is
 nothing developed to review, so a short "Exposure 1/2" message replaces the
 review and the loop returns to LIVE for the second exposure.
@@ -1238,9 +1241,13 @@ class ViewfinderLoop:
                 self._processing_shown = False
                 self._restart_rate_window()
             return
+        # A job waiting out its shutter delay is not capturing yet: the live view
+        # stays up through the wait, because the photographer is holding the
+        # framing, and its keys still act.
+        capturing = snap.active_job is not None and not getattr(snap, "delaying", False)
         if tap is not None:
             action = hit(tap.x, tap.y, self._scale)
-            if snap.active_job is not None and action is not Action.SHUTTER:
+            if capturing and action is not Action.SHUTTER:
                 # While a job runs the colour bars hide the cells, the keys and
                 # the 2x toggle (spec section 5), so a tap there was not aimed at
                 # them: no step, no selection, no toggle and no flash. Only the
@@ -1257,11 +1264,13 @@ class ViewfinderLoop:
                 self._menu_step(snap, None, now)
                 return
             if action is Action.SHUTTER:
-                self._controller.submit(str(uuid.uuid4()), delay_s=self._shutter_delay())
+                delay = self._shutter_delay()
+                self._controller.submit(str(uuid.uuid4()), delay_s=delay)
                 # The still waits for the camera behind any preview read, so
                 # this step asks the frame thread for none: at a 1 s shutter a
-                # read started now would add a second of shutter lag.
-                ask = False
+                # read started now would add a second of shutter lag. With a
+                # shutter delay the live view goes on through the wait, so it asks.
+                ask = delay > 0.0
             elif action in SELECT_ACTIONS:
                 # hit() knows nothing of the camera: a grey cell still reports
                 # its tap, and is ignored here.
@@ -1272,7 +1281,7 @@ class ViewfinderLoop:
                 self._step_selected(action is Action.PLUS)
             elif action is Action.DOUBLE_TOGGLE:
                 self._controller.set_double_exposure(not snap.double_exposure)
-        if snap.active_job is not None:
+        if capturing:
             # The grade takes about three seconds, and the camera belongs to the
             # capture worker for the still in front of it: show the same colour
             # bars the Stick and the OpenCV window show rather than a stale live

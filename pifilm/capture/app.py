@@ -206,7 +206,9 @@ control has no lock.
 The shutter delay (``shutter_delay``) has no applier because nothing in the
 session holds it: the LCD's shutter and the GPIO button read it at each press and
 pass it to ``CaptureController.submit``, whose worker waits it out before the
-capture; the Stick and the keyboard never wait. The viewfinder reads it from its
+capture (the job stays ``queued`` and the snapshot says ``delaying``, so the
+viewfinder keeps its live view and the captures-only window its last picture
+until the capture starts); the Stick and the keyboard never wait. The viewfinder reads it from its
 ``SettingsControl`` only with setting rows (Picamera2), and the button through a
 getter ``main`` gives it that answers 0.0 on any other backend, so a value saved
 on the Pi never delays a ``--fake`` or V4L2 shot. The record's
@@ -1372,6 +1374,7 @@ def run_preview_loop(
             cv2.waitKey(50)
             captured_frame = None  # Keep the full-resolution photo for subsequent display resizes.
             active_request_id = None
+            loading_request_id = None  # the job the loading screen was last drawn for
             displayed_request_id = None
         except cv2.error:
             return False
@@ -1411,11 +1414,16 @@ def run_preview_loop(
                             cv2.imshow(window_name, displayed_frame)
                     active = snapshot.active_job
                     if active is not None:
-                        if active.request_id != active_request_id or resized or new_photo:
+                        # A button press waiting out its shutter delay has not
+                        # started capturing: the loading screen waits for it.
+                        if not snapshot.delaying and (
+                            active.request_id != loading_request_id or resized or new_photo
+                        ):
                             cv2.imshow(window_name, _capture_loading_screen(display_size))
+                            loading_request_id = active.request_id
                         active_request_id = active.request_id
                     else:
-                        active_request_id = None
+                        active_request_id = loading_request_id = None
                 if not captures_only:
                     frame = session.preview_frame(graded)
                     cv2.imshow(window_name, _fit_display(
@@ -1441,7 +1449,8 @@ def run_preview_loop(
                         if job.error_code is not None:
                             print(f"error: {job.error_message or job.error_code}")
                             continue
-                        active_request_id = job.request_id
+                        # SPACE asks for no shutter delay: the capture starts now.
+                        active_request_id = loading_request_id = job.request_id
                         cv2.imshow(window_name, _capture_loading_screen(display_size))
                         # imshow queues a repaint; pump GUI events before blocking on capture.
                         cv2.waitKey(1)

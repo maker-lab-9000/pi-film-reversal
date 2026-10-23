@@ -549,6 +549,42 @@ def test_external_capture_updates_pi_display(
         controller.close()
 
 
+def test_capture_display_waits_for_a_shutter_delay_before_the_loading_screen(
+    tmp_path, pipeline, monkeypatch, capture_gui,
+):
+    """A GPIO press waiting out its delay is not capturing yet: no loading screen."""
+    import cv2
+
+    from pifilm.capture.controller import CaptureController
+
+    session = _session(tmp_path, pipeline)
+    controller = CaptureController(session)
+    waits = 0
+    shown = []
+
+    def wait_key(delay):
+        nonlocal waits
+        if delay in (1, 50):
+            return -1
+        waits += 1
+        if waits == 1:
+            shown.append(len(capture_gui))
+            assert controller.submit("button-shot", delay_s=30.0).state == "queued"
+            return -1
+        if waits < 4:
+            assert controller.snapshot().delaying is True
+            return -1
+        assert len(capture_gui) == shown[0]  # nothing drawn over the last picture
+        return ord("q")
+
+    monkeypatch.setattr(cv2, "waitKey", wait_key)
+    try:
+        assert run_preview_loop(session, captures_only=True, controller=controller)
+    finally:
+        controller.close()
+    assert controller.status("button-shot").error_code == "closed"
+
+
 @pytest.mark.parametrize("failed_attempt", [1, 2])
 def test_capture_display_keeps_last_photo_after_failed_capture(
     tmp_path, pipeline, monkeypatch, capture_gui, capsys, failed_attempt,
