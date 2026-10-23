@@ -275,6 +275,41 @@ over and clip before the LUT's shoulder could act. Each frame keeps the EV it wa
 shot at, so a frame shot darker contributes less light. The composite is graded at
 EV 0, and normalisation sets the pair's overall exposure.
 
+### Multi-frame photographs
+
+The STABILISE page's MULTI-FRAME (2, 4 or 6) replaces one exposure with a burst
+of shorter ones (`Picamera2Camera.read_burst`). With SHUTTER and ISO on auto, each
+of n frames gets 1/n of the exposure auto exposure chose and n times the gain, so
+each frame moves less under a shaking hand and is noisier. The frames are merged
+into one image (`pifilm/stack.py`) before the steps above, which then grade it like
+any frame.
+
+1. **Reference.** The frame with the highest `FocusFoM` (the sharpest) is the
+   reference. The merge has its geometry, and where anything moved, its content.
+2. **Alignment.** Each other frame is aligned to the reference with OpenCV's ECC
+   (enhanced correlation coefficient), a Euclidean motion: a shift and a roll,
+   which is what a hand does in a fraction of a second. ECC runs on luma reduced
+   by a whole factor to about 1,000 px on the long side (four times for the
+   IMX477), then the fit is mapped back to full size and the frame warped once.
+   A frame is left out when ECC fails, its correlation ends under 0.5, it moved
+   more than 5 % of the width, or it rolled more than 2°. A merge of fewer frames
+   is noisier; a misaligned one would be broken.
+3. **Merge.** The frames are averaged in linear light, as light adds. Each pixel of
+   another frame is weighted `exp(-(d / 0.05)²)`, d its linear luma difference from
+   the reference; the reference has weight 1. Where the frames differ only by
+   noise the weights are near 1 and the noise averages down by about 1/√n. Where
+   something moved, d is large, the weight near 0, and the reference alone shows
+   it, so a moving subject does not appear several times. The work runs in bands
+   of rows, so memory stays near the frames themselves.
+
+Six 12 MP frames take about 1.8 s on the Mac (0.84 s align, 0.90 s merge) and
+PI4_MERGE_TIMING_TBD on the Pi 4. The merge runs on the grade worker, behind the
+shutter; the review shows the reference frame's quick grade at once. With four
+6-frame shots queued the service peaks at about 1.5 GB on the 8 GB Pi 4.
+`pifilm-process` merges the frames on disk the same way to regrade a multi-frame
+record; as the Pi merged frames from memory and the files are JPEGs, the result
+is close, not byte for byte.
+
 ## At training time, on the Mac
 
 `pifilm-train` (`pifilm/train/`) turns two folders of images into that LUT:

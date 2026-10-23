@@ -391,3 +391,27 @@ field and were graded at EV 0 whatever the buttons said.
 
 Workaround: regrade such a file from Python with
 `Pipeline(Artifacts.default()).process(rgb, ev=<ev_comp>)`.
+
+## Multi-frame merge: limits not yet checked on the Pi's frames
+
+The merge (`pifilm/stack.py`) was tuned on synthetic frames. Three limits are
+known and left as they are until real bursts show whether they matter.
+
+- **Ghosts are found by luma only.** A moving subject is caught by its brightness
+  difference from the reference. Something that changes colour at the same
+  brightness (a red and a green car of equal luma passing) is averaged and can
+  appear faintly twice.
+- **`MIN_CORRELATION` (0.5) is untuned.** A frame whose ECC fit ends under it is
+  dropped. A scene with little texture (sky, a plain wall) at high gain may fall
+  under it, and the photograph is then the reference alone or a merge of fewer
+  frames. This is a safe failure: noisier, never misaligned. The record's
+  `stack.aligned` shows which frames were used.
+- **Ghost weighting limits the noise drop at high gain.** `GHOST_SCALE` (0.05
+  linear luma) assumes the noise between two frames is a few hundredths. At high
+  gain in the dark the noise can approach it, so frames weigh less than 1 where
+  only noise differs, and the noise falls by less than 1/√n.
+
+How to check: take multi-frame shots of a still scene in dim light (high gain) and
+of a plain wall, read `stack.aligned` and compare the merge's noise with a single
+frame at the same exposure. Changing either constant changes pixels, so a
+regrade of older records would differ.

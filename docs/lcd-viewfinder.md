@@ -178,6 +178,7 @@ message screens keep the default font.
 | `TUNING` tag (amber word on a dark patch, last in the top-left row) | The camera's libcamera tuning differs from the one the look was trained under; see [Tuning warning](#tuning-warning). Absent otherwise | — |
 | `PHOTOS NN%` / `SD NN%` tags (amber on a dark patch, top, between the top-left row and the shutter button) | The photo volume or the system SD card is at or above `--disk-warn-percent` (90 by default); see [Disk-space warning](#disk-space-warning). Absent otherwise | — |
 | `IMG` tag (amber on a dark patch, first in the same place as the disk tags) | Sharpness, contrast or saturation is not 1.0; see [Image page](#settings-menu). Absent otherwise | — |
+| `STAB` tag (amber on a dark patch, right after `IMG`) | Short exposure, a shutter delay or multi-frame is on; see [Stabilise page](#settings-menu). Absent otherwise. `IMG` and `STAB` have half the other tags' padding (3 units a side), so both fit beside the widest disk warning (`PHOTOS 100%`, `SD 100%`) | — |
 | Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Review screen | Full-screen quick grade (the frame reduced by a whole factor to about 1,000 pixels on the long side, four times each way for the IMX477, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
@@ -272,6 +273,7 @@ returns to the live view. Nothing in it needs sudo.
 | `AE CONSTRAINT` | `NORMAL` / `HIGHLIGHT` / `SHADOWS` | the camera reports `AeConstraintMode`, and no `--ae-lock` | at once |
 | `AE METERING` | `CENTRE` / `SPOT` / `MATRIX` | the camera reports `AeMeteringMode`, and no `--ae-lock` | at once |
 | `IMAGE` | `>`; a dim `-` when the camera can change none of the three | a settings file (always on Picamera2; dim under `--fake`) | opens the image page |
+| `STABILISE` | `>`; a dim `-` without setting rows (`--fake`) | a settings file (always on Picamera2; dim under `--fake`) | opens the stabilise page |
 | `UPLOAD` | see below | `--nextcloud-env` given | starts a Nextcloud sync |
 | `ETH` | the Ethernet IPv4 address, or `-` | always | read-only |
 | `WLAN` | the Wi-Fi IPv4 address (the hotspot's own `10.42.0.1` included), or `-` | always | read-only |
@@ -285,7 +287,7 @@ exposure limits (the longest shutter and the top gain) looks the same in every m
 
 A row the camera cannot use is left out and the rows below move up. A USB camera
 (V4L2) runs without the display, so it has no menu at all; under `--fake` only a dim
-`IMAGE`, `UPLOAD`, the addresses and `LOOK` are there.
+`IMAGE`, a dim `STABILISE`, `UPLOAD`, the addresses and `LOOK` are there.
 
 **Image page.** `IMAGE` opens a second page titled IMAGE with the camera's own
 image controls, which libcamera applies before pifilm's look:
@@ -310,6 +312,45 @@ look grades a picture it was not trained on, so the result can differ from the
 look's examples. Put them back to 1.0 for photographs you want the look to grade as
 trained, and for photographs meant as training sources.
 
+**Stabilise page.** `STABILISE` opens a third page, titled STABILISE, with three
+ways to fight camera shake. With its `STABILISE` row the first page has at most
+eleven rows, the last ending at y 228.
+
+| Row | Values | Effect |
+| --- | --- | --- |
+| `SHORT EXPOSURE` | `ON` / `OFF` | at once: libcamera's `AeExposureMode` `Short`, so auto exposure prefers a shorter shutter and more gain. Dim with `-` under `--ae-lock` or when the camera does not list the control |
+| `SHUTTER DELAY` | `OFF` / `0.2 S` / `0.5 S` | from the next press: the photograph is taken this long after the shutter is released |
+| `MULTI-FRAME` | `OFF` / `2` / `4` / `6` | from the next photograph: a burst of that many frames, aligned and merged into one |
+| `RESET` | `TAP TWICE` | puts only these three back to off |
+| `BACK` | | back to the first page |
+
+A tap steps to the next value and wraps. While any of the three is on, the live
+view shows an amber `STAB` tag right after `IMG`. Each Picamera2 record has
+`short_exposure` right after `saturation` (when the camera lists the control),
+then `shutter_delay_s` (the delay actually waited) after the last camera field.
+
+*Shutter delay* applies to the LCD's shutter button and the GPIO button only. The
+Stick and the keyboard never wait. The live view keeps running during the wait (the
+job is `queued`, the controller's snapshot says `delaying`), so the colour bars only
+appear once the capture starts; a second press during the wait is busy. The delay
+lets the shake of the press die down before the exposure.
+
+*Multi-frame* takes a burst in one go and merges it on the grade worker; see
+[how it works](how-it-works.md#multi-frame-photographs). When SHUTTER and ISO are
+both `AUTO` (and no `--ae-lock`), the burst shares the one exposure auto exposure
+chose: each frame gets 1/n of the time at n times the gain (capped at the sensor's
+largest gain, which leaves a gain-capped burst darker before normalisation; the
+camera also lengthens an exposure below its minimum, and the record keeps both what
+was asked for and what the reference frame got). With either fixed, every frame
+gets the fixed values. The frame with the highest focus figure is the reference,
+saved as `HHMMSS_original.jpg`; the others are `HHMMSS_frame2.jpg` and on. No DNG
+is saved for a multi-frame photograph, and a double exposure is always one frame
+per exposure. The record has a `stack` block after `shutter_delay_s`: the frame
+names (reference first), the reference frame's exposure and gain, the requested
+ones, `split`, the merge `method`, `aligned` (each frame's shift, roll and `used`),
+and `align_ms` / `merge_ms`. The review shows the reference frame's quick grade;
+the merged, graded file follows a few seconds later.
+
 **Halation.** `OFF` leaves the look's halation out of the photographs that follow,
 `ON` puts it back. A photograph keeps the value it was taken with, even if its
 grade runs later or after a power cut. For a double exposure the second shutter
@@ -318,17 +359,18 @@ taken with it off says `"halation": "off"` where `halation_sha1` would be, and
 `pifilm-process` then regrades it without halation too. With a look that has no
 halation the row shows `-` and ignores taps, and records are as before.
 
-**Remembered.** The seven settings are written to `settings.json` beside the
+**Remembered.** The ten settings are written to `settings.json` beside the
 pending-grades directory (`~/.local/state/pifilm/settings.json` by default, the
 parent of `--state-dir`) after every change, atomically, and read at the next
 start before the camera opens. A saved value wins over the unit's flag
 (`--no-dng`, `--ae-constraint`, `--ae-metering`; halation has no flag and the unit
-says on, and sharpness, contrast and saturation have none and the unit says 1.0), and the journal then says so in one line, for example
+says on, sharpness, contrast and saturation have none and the unit says 1.0, and the
+three stabilise settings have none and the unit says off), and the journal then says so in one line, for example
 `settings: ae-constraint shadows (saved in the menu; the unit says ae-constraint highlight)`.
 A file that cannot be read, is not JSON or has another version is ignored with one
 line and left in place; an unknown or invalid key is ignored with one line. Neither
 stops the service. An older build ignores the three image keys with one line each and
-shoots at 1.0. Only these seven settings are stored; every other flag, the
+shoots at 1.0, and the three stabilise keys likewise and shoots without them. Only these ten settings are stored; every other flag, the
 screen's rotation included, still comes from the unit alone.
 
 **Reset.** The first tap on `RESET` changes it to `TAP AGAIN` for 3 s. A second tap
@@ -797,6 +839,23 @@ With the service running with `--nextcloud-env` and the panel in live view:
 | 8 | A GPIO button press while the menu is open takes a photograph, and the menu stays open | Not yet run |
 | 9 | `IMAGE` opens the image page. Step `SATURATION` to `0.5`: the live view loses colour at once and the amber `IMG` tag shows. Do the same with `CONTRAST` (flatter at `0.5`) and `SHARPNESS` (softer at `0.5`, crisper at `1.5`; easiest seen at `2x`). Take a photograph: it shows the same change, and its record has `sharpness`, `contrast` and `saturation` after `ae_metering` with the values shown. The journal has a `settings: saturation 0.5` line per change | Not yet run |
 | 10 | The image page's `RESET`, tapped twice: the three are back to `1.0`, the `IMG` tag goes, and the other settings are unchanged. `BACK` returns to the first page; `DONE` from the image page returns to the live view. Restart with a value saved: the journal has the `settings: ... (saved in the menu; the unit says ...)` line and the live view shows it | Not yet run |
+
+#### Stabilise
+
+Not yet run on hardware. The branch is `feat/stabilise`. With the service running
+and the panel in live view, SHUTTER and ISO on `AUTO`:
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | `STABILISE` opens the page; each row steps and wraps; the amber `STAB` tag shows while any is on and goes when all are off. With `IMG`, `STAB` and a disk warning all showing (`--disk-warn-percent 1`), the tags fit between the top-left row and the shutter button | Not yet run |
+| 2 | `SHUTTER DELAY` `0.5 S`: after the shutter button is released the live view stays up for about half a second, then the colour bars; the delay is felt. Same with the GPIO button. A Stick shot is taken at once. Records: `shutter_delay_s` 0.5 for the panel and button shots, 0.0 for the Stick's | Not yet run |
+| 3 | `SHORT EXPOSURE` `ON` in indoor light: the shutter read-out gets shorter, and the next photograph's `camera_metadata` `ExposureTime` is lower than a shot just before with it off (gain higher); the record has `short_exposure: true`. Under `--ae-lock` the row is dim | Not yet run |
+| 4 | `MULTI-FRAME` `4`, handheld in dim light (about 1/15 s at auto): the graded file is sharper than a single shot taken just before, and less noisy than one frame at the same short exposure. The folder has `HHMMSS_original.jpg` and three `HHMMSS_frameN.jpg`, no `.dng`; the record's `stack.split` is true and `stack.exposure_us` about a quarter of the single shot's `ExposureTime` | Not yet run |
+| 5 | After a burst the live view comes back and its auto exposure settles within a second or two (no stuck short shutter or high gain); the shutter, ISO and WB cells read as before | Not yet run |
+| 6 | Check each multi-frame record's `stack.aligned`: on a steady handheld scene every frame has `used: true`. Note any `used: false` (a dropped frame) and the scene: a plain wall or sky may fall under the correlation threshold | Not yet run |
+| 7 | Six frames, four shots as fast as the camera allows: all four graded files appear; `stage_ms` has `burst`, `save_frames` and `merge`; peak memory stays near 1.5 GB (`systemctl status pifilm-capture`) | Not yet run |
+| 8 | `scripts/bench_stack.py --folder ~/Pictures/pifilm/<day> --shot <HHMMSS>` on a 6-frame shot prints align, merge and total times; compare with `merge` in the record | Not yet run |
+| 9 | The stabilise page's `RESET`, tapped twice: the three are off, `STAB` goes, the image settings are unchanged. Restart with a value saved: the journal has the `settings: multi-frame 4` style line | Not yet run |
 
 ## 8. Troubleshooting
 
