@@ -26,6 +26,16 @@ highly correlated, so a "held-out" pixel drawn from a training image leaks
 almost everything about its neighbours, and the reported improvement would
 be inflated in a way no seed average would reveal.
 
+Weighting images
+----------------
+A ``weights.json`` beside the images (``{"file.jpg": 3}``) takes that many
+times ``pixels_per_image`` from the files it names; every other image counts
+once. It exists for a reference set where a few images are the look itself
+(one's own scans of the film) and the rest are a broader family. Copying
+those files instead would put copies on both sides of the split by image
+and leak them into the held-out evaluation. The weights are part of the
+corpus identity, so changing them changes ``corpus_sha1``.
+
 Diagnostics travel with the pool
 --------------------------------
 ``PixelPool`` carries the white balance and exposure gains applied to each
@@ -38,6 +48,7 @@ visible rather than silent.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -55,6 +66,37 @@ cv2 = require_cv2()
 
 class CorpusTooSmall(ValueError):
     """A corpus has too few images for a statistically meaningful fit."""
+
+
+WEIGHTS_FILE = "weights.json"
+MAX_WEIGHT = 10.0
+
+
+def load_weights(dir_path: str | Path) -> dict[str, float]:
+    """Read ``weights.json`` from an image folder; ``{}`` when there is none.
+
+    Every name must be an image in the folder and every weight a number in
+    (0, MAX_WEIGHT]: a typo would otherwise silently weight nothing.
+    """
+    path = Path(dir_path) / WEIGHTS_FILE
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a JSON object of file name to weight")
+    names = {p.name for p in list_images(dir_path)}
+    weights: dict[str, float] = {}
+    for name, w in data.items():
+        if name not in names:
+            raise ValueError(f"{path}: {name!r} is not in {dir_path}")
+        if isinstance(w, bool) or not isinstance(w, (int, float)):
+            raise ValueError(f"{path}: the weight of {name!r} must be a number")
+        if not w > 0:
+            raise ValueError(f"{path}: the weight of {name!r} must be positive")
+        if w > MAX_WEIGHT:
+            raise ValueError(f"{path}: the weight of {name!r} must be at most {MAX_WEIGHT:g}")
+        weights[name] = float(w)
+    return weights
 
 
 @dataclass
@@ -107,6 +149,7 @@ class CorpusSplit:
     train_pool: PixelPool
     val_pool: PixelPool
     corpus_sha1: str
+    weights: dict[str, float] = field(default_factory=dict)
 
 
 def crop_and_resize(rgb_u8: np.ndarray, crop_frac: float, max_side: int) -> np.ndarray:
@@ -157,6 +200,7 @@ def build_pool(
     normalize_params: NormalizeParams,
     cfg: SampleConfig,
     progress: Callable[[str], None] | None = None,
+    weights: dict[str, float] | None = None,
 ) -> PixelPool:
     rng = np.random.default_rng(cfg.seed)
     chunks: list[np.ndarray] = []
@@ -171,7 +215,8 @@ def build_pool(
         wb_gains.append([round(float(g), 4) for g in gains.wb])
         exposure_gains.append(round(float(gains.exposure), 4))
         clamped += int(any(gains.clamped.values()))
-        chunks.append(sample_pixels(prepared, cfg.pixels_per_image, cfg.l_min, cfg.l_max, rng))
+        n = int(round(cfg.pixels_per_image * (weights or {}).get(Path(path).name, 1.0)))
+        chunks.append(sample_pixels(prepared, n, cfg.l_min, cfg.l_max, rng))
         if progress and i % 100 == 0:
             progress(f"  {i}/{len(paths)} images sampled")
 
@@ -188,12 +233,18 @@ def build_pool(
     )
 
 
-def corpus_sha1(paths: Sequence[Path]) -> str:
-    """Hash the bytes of every file, so equal names with different content differ."""
+def corpus_sha1(paths: Sequence[Path], weights: dict[str, float] | None = None) -> str:
+    """Hash the bytes of every file, so equal names with different content differ.
+
+    Weights, when there are any, are hashed too; without them the value is
+    what it always was, so older artifacts keep their identity.
+    """
     h = hashlib.sha1()
     for p in sorted(Path(x) for x in paths):
         h.update(p.name.encode())
         h.update(hashlib.sha1(p.read_bytes()).digest())
+    if weights:
+        h.update(json.dumps(weights, sort_keys=True).encode())
     return h.hexdigest()
 
 
@@ -206,11 +257,9 @@ def build_corpus(
     allow_small: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> CorpusSplit:
-    paths = (
-        list_images(dir_or_paths)
-        if isinstance(dir_or_paths, (str, Path))
-        else [Path(p) for p in dir_or_paths]
-    )
+    is_dir = isinstance(dir_or_paths, (str, Path))
+    paths = list_images(dir_or_paths) if is_dir else [Path(p) for p in dir_or_paths]
+    weights = load_weights(dir_or_paths) if is_dir else {}
     if len(paths) < minimum and not allow_small:
         raise CorpusTooSmall(
             f"{label} corpus has {len(paths)} images, fewer than the {minimum} needed for a "
@@ -219,10 +268,13 @@ def build_corpus(
     train_paths, val_paths = split_paths(paths, cfg.val_fraction, cfg.seed)
     if progress:
         progress(f"{label}: {len(train_paths)} train, {len(val_paths)} validation images")
+        if weights:
+            progress(f"{label}: {len(weights)} images weighted by {WEIGHTS_FILE}")
     return CorpusSplit(
         train_paths=train_paths,
         val_paths=val_paths,
-        train_pool=build_pool(train_paths, normalize_params, cfg, progress),
-        val_pool=build_pool(val_paths, normalize_params, cfg, progress),
-        corpus_sha1=corpus_sha1(paths),
+        train_pool=build_pool(train_paths, normalize_params, cfg, progress, weights),
+        val_pool=build_pool(val_paths, normalize_params, cfg, progress, weights),
+        corpus_sha1=corpus_sha1(paths, weights),
+        weights=weights,
     )
