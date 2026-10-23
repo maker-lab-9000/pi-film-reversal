@@ -29,7 +29,9 @@ Capture semantics
 -----------------
 ``SPACE`` acquires one fresh frame and saves exactly that frame; the
 displayed frame is not re-used. ``capture()`` calls ``camera.read()`` once,
-so the saved original and the graded image always come from one acquisition.
+so the saved original and the graded image always come from one acquisition
+(a multi-frame photograph is one ``camera.read_burst()`` instead; see
+"Multi-frame photographs").
 
 Output layout
 -------------
@@ -194,8 +196,7 @@ modes, the ISP's sharpness, contrast and saturation and the short exposure mode
 are its controls); under ``--fake`` or V4L2 the arguments stay as given, so a
 saved value can never trip the Picamera2-only check and stop the service
 starting. The ``SettingsControl`` gets one applier per row the backend can
-change (none for the shutter delay, which is read at each press, and none yet
-for multi-frame, which is stored but not acted on), and the viewfinder gets
+change (none for the shutter delay, which is read at each press), and the viewfinder gets
 the rows the camera supports (none of the auto-exposure ones under
 ``--ae-lock``, whose setters would change nothing, and only the image controls
 the camera lists), the look's name (the ``--artifacts`` folder) and, with
@@ -232,6 +233,45 @@ done (the pipeline's audit fields): ``halation_sha1`` when the glow was applied,
 it, which ``pifilm-process`` reads to regrade the same way, and neither for a
 look without halation, whose records are as they always were. Like the other
 settings it is taken only on a real Picamera2, the only backend with the menu.
+
+Multi-frame photographs
+-----------------------
+The menu's MULTI-FRAME (``multi_frame`` in ``settings.json``: 1, 2, 4 or 6; 1 is
+off) is the session's ``multi_frame``, read at the shutter like ``halation``.
+Above 1, ``capture`` takes a burst (``camera.read_burst(n, split_exposure=True,
+dng=False)``: the one exposure shared between the frames, so each is shorter and
+sharper under shake) and the photograph is the frames aligned and merged
+(``pifilm.stack.merge``), graded like any frame. The reference frame, the one the
+others are aligned to, is the one with the highest ``FocusFoM`` (frame 0 when
+none says). It is saved as ``HHMMSS_original.jpg``; the others as
+``HHMMSS_frame2.jpg`` to ``HHMMSS_frameN.jpg``, numbered in capture order without
+the reference. Every frame is written before ``capture`` returns, so a power cut
+cannot lose part of the shot; nothing is synced there, as for any original. No
+DNG is saved: each would be written between two frames and widen the gaps the
+hand moves in.
+
+Behind the shutter the capture side writes the frames and an entry whose
+``originals`` are the reference and then the others, with ``"stack":
+{"reference_index": i}`` (the reference's place in capture order); the worker
+syncs them, merges them with the first as the reference, frees the frames and
+grades the merge. A recovered grade does the same from the JPEGs on disk, so it
+is close to, not the same as, the grade from memory. An entry without ``stack``
+is one frame, as every entry before this was. The quick grade is the reference
+frame's alone: the merge is seconds of work, and the screen needs a picture now.
+Inline, the frames are written, merged and graded in turn.
+
+A double exposure never takes a burst: each of its exposures is one frame (it
+already adds two frames, and pairing two bursts is not worth its complexity), and
+its records say nothing about a stack. A multi-frame record has, after
+``shutter_delay_s``, ``stack``: ``frames`` (the names, the reference first),
+``reference``, ``exposure_us`` and ``gain`` (what the reference frame's metadata
+says), ``requested_exposure_us`` and ``requested_gain`` (what the burst asked
+for: the split values, else the first frame's), ``split``, then what the merge
+reports: ``method``, ``aligned`` (per frame in ``frames`` order: ``dx``, ``dy``,
+``angle_deg``, ``used``), ``align_ms`` and ``merge_ms``. Its ``stage_ms`` has
+``burst`` (the whole burst) in place of ``capture``, ``save_frames``, and
+``merge``, which is outside ``pipeline_ms``. ``camera_metadata`` is the reference
+frame's.
 """
 
 from __future__ import annotations
@@ -252,7 +292,7 @@ import tty
 import uuid
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from threading import current_thread, main_thread
@@ -268,6 +308,7 @@ from ..double import COMPOSITE_METHOD, composite
 from ..gpu.grader import GpuGrader
 from ..imageio import load_rgb, save_jpeg
 from ..pipeline import Pipeline
+from ..stack import merge
 from ..tuning import check as check_tuning
 from .button import (
     MAX_PIN,
@@ -341,7 +382,7 @@ class CaptureResult:
 class _GradeWork:
     """One photograph's grade: the payload of a ``GradeJob``.
 
-    The first nine fields are exactly what the pending entry holds, so a grade
+    The first ten fields are exactly what the pending entry holds, so a grade
     can be done again from the entry alone. The rest exists only for a shot taken
     by this process; a recovered grade has ``frames`` None and reads its originals
     from disk.
@@ -349,7 +390,10 @@ class _GradeWork:
 
     day: str  # the day folder's name; the graded file and its record go there
     graded: str  # the graded file's name
-    originals: list[str]  # relative to out_root; two for a double, exposure 1 first
+    # Relative to out_root: two for a double, exposure 1 first; a burst's frames
+    # for a multi-frame photograph, the reference first, then the others in
+    # capture order; one otherwise.
+    originals: list[str]
     seed: int
     ev: float
     record: dict  # the record's capture-time fields
@@ -358,6 +402,10 @@ class _GradeWork:
     # out of both grades. An entry written before there was the setting has none,
     # and was graded with the look's halation, so a missing value means True.
     halation: bool = True
+    # A multi-frame photograph: {"reference_index": i}, the reference's place in
+    # capture order. The grade merges ``originals`` with the first as the
+    # reference. None (and an entry written before multi-frame) is one frame.
+    stack: dict | None = None
     frames: tuple[np.ndarray, ...] | None = None
     stages: dict[str, float] = field(default_factory=dict)
     shutter: float | None = None  # time.perf_counter() at the shutter
@@ -377,6 +425,7 @@ class _GradeWork:
             "ev": self.ev,
             "double": self.double,
             "halation": self.halation,
+            "stack": self.stack,
             "record": self.record,
         }
 
@@ -390,6 +439,16 @@ class _GradeWork:
         """
         day, graded = payload["day"], payload["graded"]
         originals, record, double = payload["originals"], payload["record"], payload.get("double")
+        stack = payload.get("stack")
+        if stack is not None:
+            index = stack.get("reference_index") if isinstance(stack, dict) else None
+            if (
+                double is not None or not isinstance(originals, list) or len(originals) < 2
+                or not isinstance(index, int) or isinstance(index, bool)
+                or not 0 <= index < len(originals)
+            ):
+                raise ValueError(f"pending entry has a bad stack: {stack!r}")
+            stack = {"reference_index": int(index)}
         for name in (day, graded):
             if (
                 not isinstance(name, str) or not name or Path(name).name != name
@@ -398,7 +457,7 @@ class _GradeWork:
                 raise ValueError(f"pending entry has a bad name: {name!r}")
         if (
             not isinstance(originals, list)
-            or len(originals) != (2 if double is not None else 1)
+            or (stack is None and len(originals) != (2 if double is not None else 1))
             or not all(isinstance(name, str) and name for name in originals)
             or any(Path(name).is_absolute() or ".." in Path(name).parts for name in originals)
         ):
@@ -409,7 +468,7 @@ class _GradeWork:
         if not isinstance(halation, bool):
             raise ValueError(f"pending entry has a bad halation: {halation!r}")
         return cls(day, graded, originals, int(payload["seed"]), float(payload["ev"]),
-                   record, double, halation)
+                   record, double, halation, stack)
 
 
 def _quick_frame(rgb: np.ndarray) -> np.ndarray:
@@ -459,6 +518,49 @@ class _PendingExposure:
     rgb: np.ndarray
     original: str  # relative to out_root, e.g. "2026-09-30/120000_original.jpg"
     ev: float
+
+
+@dataclass
+class _Burst:
+    """A multi-frame photograph's burst, between the camera and the files."""
+
+    frames: list[Frame]  # in capture order
+    reference: int  # the reference frame's place in ``frames``
+    info: dict  # what ``read_burst`` reports: ``exposure_us``, ``gain``, ``split``
+
+    @property
+    def ordered(self) -> tuple[np.ndarray, ...]:
+        """The frames as merged and as the pending entry lists them: the
+        reference first, then the others in capture order."""
+        return (self.frames[self.reference].rgb,) + tuple(
+            frame.rgb for i, frame in enumerate(self.frames) if i != self.reference
+        )
+
+
+def _reference_index(frames: list[Frame]) -> int:
+    """The burst frame to merge onto: the highest ``FocusFoM`` (the camera's
+    sharpness figure, so the frame shake blurred least), the first of equals;
+    frame 0 when no frame reports one."""
+    best, best_fom = 0, None
+    for i, frame in enumerate(frames):
+        fom = (frame.metadata or {}).get("FocusFoM")
+        if isinstance(fom, int | float) and not isinstance(fom, bool) and (
+            best_fom is None or fom > best_fom
+        ):
+            best, best_fom = i, fom
+    return best
+
+
+def _stack_record(stack: dict, merged: dict) -> dict:
+    """The record's ``stack`` once merged: the capture side's fields, then what
+    ``pifilm.stack.merge`` reports (per frame in ``frames`` order)."""
+    return {
+        **stack,
+        "method": merged["method"],
+        "aligned": merged["frames"],
+        "align_ms": merged["align_ms"],
+        "merge_ms": merged["merge_ms"],
+    }
 
 
 @contextlib.contextmanager
@@ -513,6 +615,7 @@ class CaptureSession:
         log: Callable[[str], None] = print,
         grade_backend: str = "cpu",
         halation: bool = True,
+        multi_frame: int = 1,
     ) -> None:
         if grade_backend not in GRADE_BACKENDS:
             raise ValueError(
@@ -544,6 +647,10 @@ class CaptureSession:
         # True grades with the look's halation, False leaves it out. Set by the
         # viewfinder's thread, read once per shot at the shutter.
         self.halation = bool(halation)
+        # The menu's MULTI-FRAME (see "Multi-frame photographs"): the frames a
+        # shot merges, 1 for one frame. Set by the viewfinder's thread, read once
+        # per shot at the shutter.
+        self.multi_frame = int(multi_frame)
         # Double exposure: touched only on the controller's worker thread. Memory
         # only, so a restart always begins with the mode off at 0/2.
         self.double_exposure = False
@@ -665,8 +772,20 @@ class CaptureSession:
         # And the menu's HALATION: the photograph is graded as it was set now,
         # whenever its grade runs.
         halation = self.halation
-        frame = self.camera.read()
-        stages = _capture_stages(frame, shutter)
+        # And MULTI-FRAME, which a double exposure never uses (both its exposures
+        # are one frame each: the double already adds two frames).
+        count = 1 if self.double_exposure else self.multi_frame
+        burst: _Burst | None = None
+        if count > 1:
+            # No DNG: each would be written between two frames of the burst.
+            frames, burst_info = self.camera.read_burst(count, split_exposure=True, dng=False)
+            stages = {"burst": round((time.perf_counter() - shutter) * 1000.0, 1)}
+            burst = _Burst(frames, _reference_index(frames), dict(burst_info))
+            # A multi-frame photograph saves no DNG, whatever the camera handed back.
+            frame = replace(frames[burst.reference], dng=None)
+        else:
+            frame = self.camera.read()
+            stages = _capture_stages(frame, shutter)
         if self.double_exposure:
             return self._capture_double(
                 frame, ev, shutter, stages, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
@@ -677,16 +796,26 @@ class CaptureSession:
         if self._queue is not None:
             return self._capture_background(
                 frame, ev, shutter, stages, seed, shutter_us=shutter_us, wb_k=wb_k, iso=iso,
-                halation=halation, delay_s=delay,
+                halation=halation, delay_s=delay, burst=burst,
             )
+        stack_fields: dict = {}
+        rgb = frame.rgb
+        if burst is not None:
+            # Every frame on disk before the merge, as behind the shutter.
+            day_dir, stem, t, original, dng_name = self._write_original(frame, stages)
+            _, stack = self._write_burst(burst, day_dir, stem, original, stages)
+            with _stage(stages, "merge"):
+                rgb, merged = merge(burst.ordered, reference=0)
+            stack_fields = {"stack": _stack_record(stack, merged)}
         t0 = time.perf_counter()
         graded, info = self.pipeline.process(
-            frame.rgb, rng=np.random.default_rng(seed), ev=ev, timings=stages,
+            rgb, rng=np.random.default_rng(seed), ev=ev, timings=stages,
             halation=halation,
         )
         pipeline_ms = (time.perf_counter() - t0) * 1000.0
 
-        day_dir, stem, t, original, dng_name = self._write_original(frame, stages)
+        if burst is None:
+            day_dir, stem, t, original, dng_name = self._write_original(frame, stages)
         with _stage(stages, "save_graded"):
             pifilm = save_jpeg(graded, day_dir / f"{stem}_graded.jpg")
         shutter_to_saved_ms = (time.perf_counter() - shutter) * 1000.0
@@ -705,6 +834,7 @@ class CaptureSession:
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
             **_delay_fields(frame, delay),
+            **stack_fields,
             **self._tuning_fields,
             "pipeline_ms": round(pipeline_ms, 1),
             "shutter_to_saved_ms": round(shutter_to_saved_ms, 1),
@@ -719,10 +849,19 @@ class CaptureSession:
     def _capture_background(
         self, frame: Frame, ev: float, shutter: float, stages: dict[str, float], seed: int, *,
         shutter_us: int | None, wb_k: int | None, iso: int | None, halation: bool,
-        delay_s: float,
+        delay_s: float, burst: _Burst | None = None,
     ) -> CaptureResult:
-        """A single shot graded behind the shutter: everything up to handing it over."""
+        """A single shot graded behind the shutter: everything up to handing it over.
+
+        A multi-frame shot (``burst``) writes every frame here, before the camera
+        is free; the worker merges them (see "Multi-frame photographs")."""
         day_dir, stem, t, original, dng_name = self._write_original(frame, stages)
+        originals = [self._relative(original)]
+        stack_fields: dict = {}
+        if burst is not None:
+            others, stack = self._write_burst(burst, day_dir, stem, original, stages)
+            originals += [self._relative(path) for path in others]
+            stack_fields = {"stack": stack}
         graded = day_dir / f"{stem}_graded.jpg"
         # The inline record without what grading adds. ``ev_comp`` marks where the
         # pipeline's fields go, so the finished record keeps the inline order.
@@ -740,13 +879,16 @@ class CaptureSession:
             "package_version": self._package_version,
             **self.camera.stream_info.to_dict(),
             **_delay_fields(frame, delay_s),
+            **stack_fields,
             **self._tuning_fields,
             **({"camera_metadata": frame.metadata} if frame.metadata else {}),
             **({"dng": dng_name} if dng_name else {}),
         }
         work = _GradeWork(
-            day_dir.name, graded.name, [self._relative(original)], seed, ev, fields,
-            halation=halation, frames=(frame.rgb,), stages=stages, shutter=shutter,
+            day_dir.name, graded.name, originals, seed, ev, fields, halation=halation,
+            stack=None if burst is None else {"reference_index": burst.reference},
+            frames=(frame.rgb,) if burst is None else burst.ordered,
+            stages=stages, shutter=shutter,
         )
         return self._hand_over(work, stem, original, graded, exposure=None)
 
@@ -795,8 +937,11 @@ class CaptureSession:
         """The picture for the screen and the Stick: reduced, no grain, never under ``out_root``."""
         assert work.frames is not None
         with _stage(work.stages, "preview"):
-            small = [_quick_frame(rgb) for rgb in work.frames]
-            rgb = composite(small[0], small[1]) if len(small) == 2 else small[0]
+            # A double's two frames make its picture; a multi-frame shot's quick
+            # grade is its reference frame alone (the first), never a merge.
+            small = [_quick_frame(rgb) for rgb in
+                     (work.frames if work.double is not None else work.frames[:1])]
+            rgb = composite(small[0], small[1]) if work.double is not None else small[0]
             quick, _ = self.pipeline.process(rgb, grain=False, ev=work.ev,
                                              halation=work.halation)
             path = save_jpeg(quick, self._private_dir() / f"preview-{stem}.jpg")
@@ -861,12 +1006,20 @@ class CaptureSession:
         else:
             with _stage(stages, "sync_original"):
                 self._sync_originals(work, day_dir)
+        merged: dict | None = None
+        if work.stack is not None:
+            # Outside ``pipeline_ms``: the merge is not the look. The reference is
+            # first in ``originals``, however the burst was ordered.
+            with _stage(stages, "merge"):
+                rgb, merged = merge(frames, reference=0)
+            # Up to six full frames: let them go before the grade needs its memory.
+            frames, work.frames = (rgb,), None
         t0 = time.perf_counter()
         if work.double is not None:
             with _stage(stages, "composite"):
                 rgb = composite(frames[0], frames[1])
         else:
-            rgb = frames[0]
+            rgb = frames[0]  # never written to: it may be a frame the merge handed back
         # Offered only when there is one, so the call without a GPU is the call
         # there always was. On the capture thread (a refused shot) the grader
         # says no by thread and the CPU grades.
@@ -899,6 +1052,8 @@ class CaptureSession:
         for key, value in work.record.items():
             if key == "ev_comp":
                 record.update(info)
+            elif key == "stack" and merged is not None:
+                record[key] = _stack_record(value, merged)
             elif key not in closing:
                 record[key] = value
         record.update(info)  # an entry without ``ev_comp`` still gets them; no reorder otherwise
@@ -1130,6 +1285,41 @@ class CaptureSession:
                 dng_path.write_bytes(frame.dng)
             dng_name = dng_path.name
         return day_dir, stem, t, original, dng_name
+
+    def _write_burst(
+        self, burst: _Burst, day_dir: Path, stem: str, original: Path,
+        stages: dict[str, float],
+    ) -> tuple[list[Path], dict]:
+        """Write a burst's other frames beside its original (the reference, which
+        ``_write_original`` wrote); return their paths and the record's ``stack``
+        as far as the capture side knows it.
+
+        The others are ``<stem>_frame2.jpg`` to ``<stem>_frameN.jpg``, numbered in
+        capture order without the reference. Not synced, as the original is not.
+        """
+        paths: list[Path] = []
+        with _stage(stages, "save_frames"):
+            for i, frame in enumerate(burst.frames):
+                if i == burst.reference:
+                    continue
+                path = day_dir / f"{stem}_frame{len(paths) + 2}.jpg"
+                if frame.jpeg is not None:
+                    path.write_bytes(frame.jpeg)
+                else:
+                    save_jpeg(frame.rgb, path)
+                paths.append(path)
+        # The exposure the reference frame reports, beside what the burst asked for.
+        metadata = burst.frames[burst.reference].metadata or {}
+        stack = {
+            "frames": [original.name] + [path.name for path in paths],
+            "reference": original.name,
+            "exposure_us": metadata.get("ExposureTime"),
+            "gain": metadata.get("AnalogueGain"),
+            "requested_exposure_us": burst.info.get("exposure_us"),
+            "requested_gain": burst.info.get("gain"),
+            "split": bool(burst.info.get("split", False)),
+        }
+        return paths, stack
 
     def _relative(self, path: Path) -> str:
         """``YYYY-MM-DD/name`` under ``out_root``: a pair can straddle midnight, so the
@@ -2103,12 +2293,14 @@ def _main(argv: list[str] | None) -> int:
         state_dir=args.state_dir,
         grade_backend=args.grade_backend,
         halation=effective.halation if backend == "picamera2" else True,
+        multi_frame=effective.multi_frame if backend == "picamera2" else 1,
     )
     settings = SettingsControl(settings_path, settings_defaults, overrides, log=print)
     menu_rows: tuple[str, ...] | None = None
     if backend == "picamera2":
         settings.register("save_dng", lambda on: setattr(session, "save_dng", on))
         settings.register("halation", lambda on: setattr(session, "halation", on))
+        settings.register("multi_frame", lambda n: setattr(session, "multi_frame", n))
         settings.register("ae_constraint", lambda name: camera.set_ae_constraint(name))
         settings.register("ae_metering", lambda name: camera.set_ae_metering(name))
         for key in IMAGE_KEYS:
