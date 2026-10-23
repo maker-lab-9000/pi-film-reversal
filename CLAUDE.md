@@ -202,8 +202,10 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   OpenCV window. Output:
   `~/Pictures/pifilm/YYYY-MM-DD/HHMMSS_{original|ungraded,graded|double_graded}.jpg` plus an audit
   line in `captures.jsonl` (LUT hash, normalisation hash, halation hash and grain seed allow
-  regenerating the graded file; `halation_sha1` follows `normalize_sha1` only for a look with
-  halation on; `params_version` is the build's `PARAMS_VERSION`, 5, whatever the look's). `--grade background` (the default) splits a shot into two sides: the
+  regenerating the graded file; `halation_sha1` follows `normalize_sha1` only when the glow was
+  applied, and `"halation": "off"` takes its place when a look with halation was graded without
+  it (the menu's HALATION row, read at the shutter and kept in the pending entry; a double takes
+  it from its second shutter); `params_version` is the build's `PARAMS_VERSION`, 5, whatever the look's). `--grade background` (the default) splits a shot into two sides: the
   capture side saves the original, writes a pending entry, makes a quick grade (reduced by a whole
   factor to about 1,000 px on the long side, no grain; what the review screen and the Stick show) and frees the camera;
   the grade side (`_run_grade`, on the queue's worker) grades at full size, saves the graded
@@ -246,8 +248,8 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   address of `eth0` and `wlan0` while sysfs reports them up (`SIOCGIFADDR` ioctl; the hotspot's
   address counts), logs `network:` lines on each change and feeds `CaptureSession.network`
   (`(label, address)` pairs, `ETH` then `WLAN`), which the settings menu shows.
-- `settings.py`: the three settings the LCD menu changes (DNG saving, AE constraint, AE
-  metering), in `settings.json` beside the state directory; read at start-up before the camera
+- `settings.py`: the four settings the LCD menu changes (DNG saving, halation, AE constraint, AE
+  metering; halation has no flag and defaults to on, the look's own), in `settings.json` beside the state directory; read at start-up before the camera
   opens, a saved value wins over the unit's flag on Picamera2 only (one `settings:` line), and
   `SettingsControl` applies, saves atomically and resets them. `upload.py`: `Upload`, the menu's
   UPLOAD row, runs `python -m pifilm.nextcloud` as a child (`--nextcloud-env PATH`, never read
@@ -285,7 +287,8 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   original is a quality-95 JPEG of the frame the Pi graded (1 to 2 levels on average).
   It always grades on the CPU, so a record the Pi graded on its GPU (`pipeline_backend` starting
   `gpu`) is reproduced closely, not byte for byte; the tool prints one note per run when it
-  regrades such records.
+  regrades such records. A record with `"halation": "off"` is regraded without halation
+  (`--ignore-log` keeps the look's).
 
 ### Display (`pifilm/display/`)
 

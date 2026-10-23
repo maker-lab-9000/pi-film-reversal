@@ -62,7 +62,9 @@ and off unless the look turns it on; a look without it has the other three only.
    It is set in the look's `halation` section of `params.json` (params version
    5; `scripts/stamp_halation.py` writes it), and chosen by eye: see
    [the write-up](experiments/2026-10-17-halation.md). The live view leaves it
-   out, as it leaves out grain; the quick grade and the photograph have it.
+   out, as it leaves out grain; the quick grade and the photograph have it,
+   unless the viewfinder menu's `HALATION` row was off when the photograph was
+   taken.
 3. **The 3D LUT** (`pifilm/lut.py`). Trilinear interpolation over the 35,937
    nodes, executed by Pillow's `ImageFilter.Color3DLUT` in C with 16-bit fixed
    point. A NumPy reference implementation exists for tests and the trainer.
@@ -215,7 +217,9 @@ or `cpu`. The number is the shader's version and rises with any change that can
 move pixels: it was `gpu-1` until halation was added, for every photograph the GPU
 graded. A photograph graded with halation also has `halation_sha1` (a SHA-1 of the
 look's `halation` section, after `normalize_sha1`) on either path, and a
-`halation` stage in `stage_ms`; without halation the record is as before. A GPU grade adds the stages `gpu`, `gpu_upload`, `gpu_shader` and
+`halation` stage in `stage_ms`; one whose look has halation but was taken with the
+menu's `HALATION` off has `"halation": "off"` in its place and no such stage;
+without halation in the look the record is as before. A GPU grade adds the stages `gpu`, `gpu_upload`, `gpu_shader` and
 `gpu_readback` to `stage_ms` and has no `lut` or `grain` stage. `gpu` is the whole
 GPU grade, so it includes `halation` (the glow, made on the CPU) as it includes the
 three `gpu_` stages: summing a GPU record's `stage_ms` counts them twice.
@@ -236,7 +240,7 @@ levels on a real photograph with the trained IMX477 look on the Pi, and up to 20
 synthetic saturated frames with the bundled starter look. `pifilm-process` says so
 once when the folder's log has such records. `pifilm-process` grades with the
 artifact's halation, so a record graded with halation is reproduced by the same
-artifact. The grain lands in the same place on
+artifact, and a record with `"halation": "off"` is regraded without it. The grain lands in the same place on
 both paths.
 
 **The switch.** `--grade-backend auto` (the default) uses the GPU when it can.

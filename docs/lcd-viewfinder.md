@@ -267,6 +267,7 @@ returns to the live view. Nothing in it needs sudo.
 | Row | Values | Shown when | Effect |
 | --- | --- | --- | --- |
 | `SAVE DNG` | `ON` / `OFF` | Picamera2 | from the next photograph |
+| `HALATION` | `ON` / `OFF`; a dim `-` when the look has no halation | Picamera2 | from the next photograph |
 | `AE CONSTRAINT` | `NORMAL` / `HIGHLIGHT` / `SHADOWS` | the camera reports `AeConstraintMode`, and no `--ae-lock` | at once |
 | `AE METERING` | `CENTRE` / `SPOT` / `MATRIX` | the camera reports `AeMeteringMode`, and no `--ae-lock` | at once |
 | `UPLOAD` | see below | `--nextcloud-env` given | starts a Nextcloud sync |
@@ -284,16 +285,24 @@ A row the camera cannot use is left out and the rows below move up. A USB camera
 (V4L2) runs without the display, so it has no menu at all; under `--fake` only
 `UPLOAD`, the addresses and `LOOK` are there.
 
-**Remembered.** The three settings are written to `settings.json` beside the
+**Halation.** `OFF` leaves the look's halation out of the photographs that follow,
+`ON` puts it back. A photograph keeps the value it was taken with, even if its
+grade runs later or after a power cut. For a double exposure the second shutter
+decides. The live view never shows halation either way. The record of a photograph
+taken with it off says `"halation": "off"` where `halation_sha1` would be, and
+`pifilm-process` then regrades it without halation too. With a look that has no
+halation the row shows `-` and ignores taps, and records are as before.
+
+**Remembered.** The four settings are written to `settings.json` beside the
 pending-grades directory (`~/.local/state/pifilm/settings.json` by default, the
 parent of `--state-dir`) after every change, atomically, and read at the next
 start before the camera opens. A saved value wins over the unit's flag
-(`--no-dng`, `--ae-constraint`, `--ae-metering`), and the journal then says so in
-one line, for example
+(`--no-dng`, `--ae-constraint`, `--ae-metering`; halation has no flag and the unit
+says on), and the journal then says so in one line, for example
 `settings: ae-constraint shadows (saved in the menu; the unit says ae-constraint highlight)`.
 A file that cannot be read, is not JSON or has another version is ignored with one
 line and left in place; an unknown or invalid key is ignored with one line. Neither
-stops the service. Only these three settings are stored; every other flag, the
+stops the service. Only these four settings are stored; every other flag, the
 screen's rotation included, still comes from the unit alone.
 
 **Reset.** The first tap on `RESET` changes it to `TAP AGAIN` for 3 s. A second tap
@@ -754,11 +763,12 @@ With the service running with `--nextcloud-env` and the panel in live view:
 | --- | --- | --- |
 | 1 | `MENU` opens the menu; `DONE` returns to the live view; the shutter, `+`, `-` and the cells work as before | Not yet run |
 | 2 | `SAVE DNG` off: the next photograph has no `.dng`; on: it has one. Restart the service: the setting is kept and the journal has the `settings:` line | Not yet run |
-| 3 | `AE CONSTRAINT` and `AE METERING`: after a change in the menu the journal has `settings: ae-metering <mode>` (or `ae-constraint`), the next photograph's record has `ae_metering` / `ae_constraint` with the new mode, and after a restart the journal has the `settings: ... (saved in the menu; the unit says ...)` line | Not yet run |
-| 4 | `UPLOAD` on home Wi-Fi: `UPLOADING`, then `DONE`; the files are on Nextcloud; `journalctl -u pifilm-capture \| grep nextcloud:` shows rclone's lines. In hotspot mode: `SKIPPED: NO NEXTCLOUD`. Started while the timer's run is going: `SKIPPED: BUSY` | Not yet run |
-| 5 | `ETH`/`WLAN` show the addresses (unplug the cable: `ETH` turns to `-` within about 10 s), and the live view no longer shows them. `LOOK` shows the deployed look's folder name, or `starter (bundled)` | Not yet run |
-| 6 | `RESET`, tapped twice: the unit's flags are back and `settings.json` is gone | Not yet run |
-| 7 | A GPIO button press while the menu is open takes a photograph, and the menu stays open | Not yet run |
+| 3 | `HALATION` off (with a look that has halation): the next photograph has no glow round bright lights, and its record has `"halation": "off"` and no `halation_sha1`; on again: both back as before. Restart the service: the setting is kept and the journal has the `settings: halation off ...` line | Not yet run |
+| 4 | `AE CONSTRAINT` and `AE METERING`: after a change in the menu the journal has `settings: ae-metering <mode>` (or `ae-constraint`), the next photograph's record has `ae_metering` / `ae_constraint` with the new mode, and after a restart the journal has the `settings: ... (saved in the menu; the unit says ...)` line | Not yet run |
+| 5 | `UPLOAD` on home Wi-Fi: `UPLOADING`, then `DONE`; the files are on Nextcloud; `journalctl -u pifilm-capture \| grep nextcloud:` shows rclone's lines. In hotspot mode: `SKIPPED: NO NEXTCLOUD`. Started while the timer's run is going: `SKIPPED: BUSY` | Not yet run |
+| 6 | `ETH`/`WLAN` show the addresses (unplug the cable: `ETH` turns to `-` within about 10 s), and the live view no longer shows them. `LOOK` shows the deployed look's folder name, or `starter (bundled)` | Not yet run |
+| 7 | `RESET`, tapped twice: the unit's flags are back and `settings.json` is gone | Not yet run |
+| 8 | A GPIO button press while the menu is open takes a photograph, and the menu stays open | Not yet run |
 
 ## 8. Troubleshooting
 
