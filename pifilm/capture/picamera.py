@@ -53,14 +53,16 @@ every raw mode and costs seconds at start-up.
 
 Every ``configure`` resets Picamera2's controls to the configuration's own
 ``controls`` dict, and ``switch_mode_and_capture_request`` configures twice per
-shot. The neutral ISP set therefore travels inside *both* configurations, not
-only through ``set_controls``; otherwise the still would be taken with the
-ISP's default sharpening and saturation and the viewfinder would come back
-without them. A runtime control change has to reach those dicts as well as the
-live camera for the same reason: ``set_shutter`` does so for a fixed exposure time
-(shutter priority), and also widens and restores ``FrameDurationLimits``;
-``set_iso`` does so for a fixed analogue gain (with both fixed the camera is in
-full manual); ``set_colour_temperature`` for a fixed white balance.
+shot. The ISP's image controls (Sharpness, Contrast, Saturation, 1.0 unless
+the menu moved them) therefore travel inside *both* configurations, not only
+through ``set_controls``; otherwise the still would be taken with the ISP's
+default sharpening and saturation and the viewfinder would come back without
+them. A runtime control change has to reach those dicts as well as the live
+camera for the same reason: ``set_image_control`` does so for the image
+controls, ``set_shutter`` for a fixed exposure time (shutter priority), and
+also widens and restores ``FrameDurationLimits``; ``set_iso`` for a fixed
+analogue gain (with both fixed the camera is in full manual);
+``set_colour_temperature`` for a fixed white balance.
 
 There is no exposure compensation. ``ExposureValue`` is still sent, always 0.0, so
 every capture records the same control set as before the viewfinder's EV buttons
@@ -113,6 +115,10 @@ _AUTOFOCUS_MODES = ("continuous", "auto", "manual")
 _AF_RANGES = ("normal", "macro", "full")
 _AE_CONSTRAINTS = ("normal", "highlight", "shadows")
 _AE_METERING = ("centre", "spot", "matrix")
+# The ISP's image controls, by the name pifilm uses for each (settings, records).
+# 1.0 is libcamera's normal for all three; 0 is no sharpening, or greyscale.
+_IMAGE_CONTROLS = {"sharpness": "Sharpness", "contrast": "Contrast", "saturation": "Saturation"}
+IMAGE_NORMAL = 1.0
 _SHUTTER_RANGE_US = (100, 1_000_000)
 # A fixed exposure longer than a frame period is clipped by the sensor unless the
 # frame is allowed to last at least that long, plus readout headroom.
@@ -194,6 +200,9 @@ class Picamera2Camera:
         ae_metering: str = "centre",
         preview: bool | tuple[int, int] | None = None,
         colour_temperature: int | None = None,
+        sharpness: float = IMAGE_NORMAL,
+        contrast: float = IMAGE_NORMAL,
+        saturation: float = IMAGE_NORMAL,
     ) -> None:
         if autofocus not in _AUTOFOCUS_MODES:
             raise CameraError(
@@ -209,6 +218,12 @@ class Picamera2Camera:
             raise CameraError(
                 f"Unknown ae_metering {ae_metering!r}; expected one of {_AE_METERING}"
             )
+
+        image = {
+            key: _image_value(key, value)
+            for key, value in (("sharpness", sharpness), ("contrast", contrast),
+                               ("saturation", saturation))
+        }
 
         if colour_temperature is not None:
             if awb_lock or colour_gains is not None:
@@ -247,6 +262,12 @@ class Picamera2Camera:
         self.ae_metering = ae_metering
         self.ae_constraint_supported = False
         self.ae_metering_supported = False
+        # The ISP's image controls in force, changed live by ``set_image_control``;
+        # a control the camera does not list stays at 1.0 and is refused.
+        self.sharpness = image["sharpness"]
+        self.contrast = image["contrast"]
+        self.saturation = image["saturation"]
+        self.image_controls_supported: frozenset[str] = frozenset()
         self._shutter_mode = "legacy"
         self._iso_mode = "legacy"
         self._frame_limits: dict[str, tuple[int, int] | None] = {"still": None, "preview": None}
@@ -328,6 +349,14 @@ class Picamera2Camera:
             self.ae_metering_supported = _ae_supported(
                 camera.camera_controls, "AeMeteringMode", _ae_metering_value, "centre",
             )
+            self.image_controls_supported = frozenset(
+                key for key, control in _IMAGE_CONTROLS.items()
+                if control in camera.camera_controls
+            )
+            for key, control in _IMAGE_CONTROLS.items():
+                if key not in self.image_controls_supported:
+                    _warn_missing_image_control(control, key, getattr(self, key))
+                    setattr(self, key, IMAGE_NORMAL)
             gain = camera.camera_controls.get("AnalogueGain")
             if isinstance(gain, (tuple, list)) and len(gain) >= 2:
                 self.max_gain = float(gain[1])
@@ -343,6 +372,7 @@ class Picamera2Camera:
             controls = _camera_controls(
                 autofocus, af_range, ae_lock, awb_lock, colour_gains,
                 ae_constraint, ae_metering, has_autofocus=has_autofocus,
+                image={control: getattr(self, key) for key, control in _IMAGE_CONTROLS.items()},
             )
             if "ColourTemperature" not in camera.camera_controls:
                 if colour_temperature is not None:
@@ -372,6 +402,8 @@ class Picamera2Camera:
                 self._stream_info.ae_constraint = ae_constraint
             if self.ae_metering_supported:
                 self._stream_info.ae_metering = ae_metering
+            for key in self.image_controls_supported:
+                setattr(self._stream_info, key, getattr(self, key))
             self._still_config = config
             if self._preview is not None:
                 preview_config = camera.create_preview_configuration(
@@ -701,6 +733,37 @@ class Picamera2Camera:
                 raise CameraError(f"Picamera2 failed to set {what}: {exc}") from exc
             for config in (self._still_config, self._preview_config):
                 _set_config_control(config, control, controls[control])
+
+    def set_image_control(self, key: str, value: float) -> None:
+        """Change the ISP's ``sharpness``, ``contrast`` or ``saturation`` live.
+
+        The contract of ``set_ae_constraint``: the control goes to the running
+        camera and into both configurations (so the live view shows it at once
+        and the next still, which configures twice, keeps it), and nothing
+        changes if it is refused or this camera does not list the control. On
+        success the value also goes into ``stream_info``, which every later
+        record copies when its photograph is taken.
+        """
+        control = _IMAGE_CONTROLS.get(key)
+        if control is None:
+            raise CameraError(
+                f"Unknown image control {key!r}; expected one of {tuple(_IMAGE_CONTROLS)}"
+            )
+        value = _image_value(key, value)
+        camera = self._camera
+        if camera is None:
+            raise CameraError(f"Cannot set the {key} on a closed Picamera2 camera")
+        if key not in self.image_controls_supported:
+            raise CameraError(f"Cannot set the {key}: this camera has no {control} control")
+        with self._config_lock:
+            try:
+                camera.set_controls({control: value})
+            except Exception as exc:
+                raise CameraError(f"Picamera2 failed to set the {key}: {exc}") from exc
+            for config in (self._still_config, self._preview_config):
+                _set_config_control(config, control, value)
+        setattr(self, key, value)
+        setattr(self._stream_info, key, value)
 
     def set_save_dng(self, on: bool) -> None:
         """Save a DNG with every later still, or stop. Read once per still, under
@@ -1050,6 +1113,31 @@ def _warn_missing_ae_enum(control: str, flag: str, requested: str, default: str)
     )
 
 
+def _image_value(key: str, value: Any) -> float:
+    """``value`` as a float for an image control: a finite number, 0 or more."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise CameraError(f"{key} must be a number, got {value!r}")
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise CameraError(f"{key} must be a finite number of 0 or more, got {value!r}")
+    return value
+
+
+def _warn_missing_image_control(control: str, key: str, requested: float) -> None:
+    """Report an image control this camera does not list, when it matters.
+
+    As for the AE enums: at 1.0 (normal) its absence changes nothing and stays
+    silent; a saved value away from 1.0 that cannot be applied is one line.
+    """
+    if requested == IMAGE_NORMAL:
+        return
+    print(
+        f"warning: this camera has no {control} control, so {key} {requested} was not "
+        f"applied; the camera keeps its normal ({IMAGE_NORMAL})",
+        file=sys.stderr,
+    )
+
+
 def _camera_controls(
     autofocus: str,
     af_range: str,
@@ -1059,8 +1147,10 @@ def _camera_controls(
     ae_constraint: str,
     ae_metering: str,
     has_autofocus: bool,
+    image: dict[str, float] | None = None,
 ) -> dict:
-    """Neutral ISP rendering plus autofocus and AE shaping, as one control dict.
+    """The ISP's image controls, noise reduction, autofocus and AE shaping, as
+    one control dict.
 
     Returned rather than applied so the same set can be handed to
     ``create_still_configuration`` and ``create_preview_configuration`` as well
@@ -1074,7 +1164,9 @@ def _camera_controls(
     """
     from libcamera import controls as _lc
 
+    # 1.0 is the ISP's normal rendering; the menu's image page moves them.
     cam_controls = {"Sharpness": 1.0, "Contrast": 1.0, "Saturation": 1.0}
+    cam_controls.update(image or {})
     try:
         cam_controls["NoiseReductionMode"] = _lc.draft.NoiseReductionModeEnum.HighQuality
     except AttributeError:

@@ -484,3 +484,27 @@ def test_v4l2_stream_info_has_no_ae_modes(fake_capture):
     cam = V4L2Camera(device=0, warmup_frames=0)
     assert not {"ae_constraint", "ae_metering"} & set(cam.stream_info.to_dict())
     cam.close()
+
+
+def test_stream_info_to_dict_puts_the_image_controls_after_ae_metering():
+    info = StreamInfo(
+        width=4056, height=3040, fps=10.0, fourcc="RGB888", raw_mjpeg=False,
+        tuning_file="imx477.json", tuning_sha1="a" * 40, autofocus="none",
+        ae_constraint="shadows", ae_metering="matrix",
+        sharpness=1.25, contrast=0.75, saturation=1.0,
+    )
+    values = info.to_dict()
+    assert list(values) == [
+        "width", "height", "fps", "fourcc", "raw_mjpeg", "tuning_file", "tuning_sha1",
+        "ae_constraint", "ae_metering", "sharpness", "contrast", "saturation", "autofocus",
+    ]
+    assert (values["sharpness"], values["contrast"], values["saturation"]) == (1.25, 0.75, 1.0)
+
+
+def test_fake_and_v4l2_stream_info_have_no_image_controls(fake_capture):
+    image = {"sharpness", "contrast", "saturation"}
+    assert not image & set(FakeCamera().stream_info.to_dict())
+    fake_capture(buffers=[_jpeg_bytes(synthetic_frame(48, 64))] * 4)
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    assert not image & set(cam.stream_info.to_dict())
+    cam.close()

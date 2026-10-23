@@ -469,3 +469,122 @@ def test_load_survives_a_file_where_the_state_directory_should_be(tmp_path):
     assert (current, overrides) == (DEFAULTS, {})
     assert len(lines) == 1
     assert lines[0].startswith(f"settings: ignoring {path} (cannot read: ")
+
+
+# --- the image page: sharpness, contrast, saturation ---------------------------
+
+
+def test_the_image_settings_default_to_one():
+    assert (DEFAULTS.sharpness, DEFAULTS.contrast, DEFAULTS.saturation) == (1.0, 1.0, 1.0)
+    assert settings_mod.IMAGE_KEYS == ("sharpness", "contrast", "saturation")
+    assert set(settings_mod.IMAGE_KEYS) <= set(settings_mod.KEYS)
+    assert settings_mod.IMAGE_STEPS == (0.5, 0.75, 1.0, 1.25, 1.5)
+    assert VERSION == 1
+
+
+@pytest.mark.parametrize("key", ["sharpness", "contrast", "saturation"])
+@pytest.mark.parametrize("value", [0.5, 0.75, 1.0, 1.25, 1.5, 1])
+def test_an_image_step_is_valid(key, value):
+    assert settings_mod._valid(key, value)
+
+
+@pytest.mark.parametrize("key", ["sharpness", "contrast", "saturation"])
+@pytest.mark.parametrize("value", [True, False, "1.0", None, 0.0, 2.0, 1.1, float("nan"), [1.0]])
+def test_an_image_value_off_the_steps_is_invalid(key, value):
+    assert not settings_mod._valid(key, value)
+
+
+@pytest.mark.parametrize(("key", "value", "text"), [
+    ("contrast", 1.25, "contrast 1.25"),
+    ("sharpness", 0.5, "sharpness 0.5"),
+    ("saturation", 1.0, "saturation 1.0"),
+])
+def test_describe_an_image_setting(key, value, text):
+    assert settings_mod._describe(key, value) == text
+
+
+def test_format_step():
+    assert [settings_mod.format_step(v) for v in settings_mod.IMAGE_STEPS] == [
+        "0.5", "0.75", "1.0", "1.25", "1.5",
+    ]
+
+
+def test_load_saved_image_settings(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    _write(path, {"version": 1, "contrast": 1.25, "saturation": 1, "sharpness": 3.0})
+    current, overrides, lines = load(path, DEFAULTS)
+    assert (current.sharpness, current.contrast, current.saturation) == (1.0, 1.25, 1.0)
+    assert isinstance(current.saturation, float)
+    assert overrides == {"contrast": 1.25, "saturation": 1.0}
+    assert lines == [
+        f"settings: ignoring sharpness in {path}",
+        "settings: contrast 1.25 (saved in the menu; the unit says contrast 1.0)",
+    ]
+
+
+def test_set_an_image_setting_applies_saves_and_logs(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    lines: list[str] = []
+    control = SettingsControl(path, DEFAULTS, {}, log=lines.append)
+    calls = []
+    control.register("saturation", lambda value: calls.append(value))
+    assert control.set("saturation", 1.5)
+    assert calls == [1.5]
+    assert control.current.saturation == 1.5
+    assert json.loads(path.read_text()) == {"version": 1, "saturation": 1.5}
+    assert lines == ["settings: saturation 1.5"]
+    assert load(path, DEFAULTS)[0].saturation == 1.5
+    with pytest.raises(ValueError):
+        control.set("saturation", 2.0)
+
+
+def test_reset_image_puts_back_only_the_three(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    overrides = {"sharpness": 0.5, "contrast": 1.25, "save_dng": False,
+                 "ae_metering": "spot"}
+    save(path, overrides)
+    lines: list[str] = []
+    control = SettingsControl(path, DEFAULTS, overrides, log=lines.append)
+    calls = []
+    for key in settings_mod.KEYS:
+        control.register(key, lambda value, key=key: calls.append((key, value)))
+    control.reset_image()
+    assert calls == [("sharpness", 1.0), ("contrast", 1.0)]
+    current = control.current
+    assert (current.sharpness, current.contrast, current.saturation) == (1.0, 1.0, 1.0)
+    assert current.save_dng is False and current.ae_metering == "spot"
+    assert json.loads(path.read_text()) == {
+        "version": 1, "save_dng": False, "ae_metering": "spot",
+    }
+    assert lines == ["settings: sharpness, contrast, saturation reset to 1.0"]
+
+
+def test_reset_image_keeps_a_value_whose_applier_raises(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    lines: list[str] = []
+    control = SettingsControl(path, DEFAULTS, {"contrast": 1.5, "saturation": 0.5},
+                              log=lines.append)
+
+    def broken(value):
+        raise RuntimeError("camera busy")
+
+    control.register("contrast", broken)
+    control.reset_image()
+    assert control.current.contrast == 1.5
+    assert control.current.saturation == 1.0
+    assert json.loads(path.read_text()) == {"version": 1, "contrast": 1.5}
+    assert lines[0] == "settings: cannot apply contrast 1.0 (camera busy)"
+
+
+def test_reset_puts_the_image_settings_back_too(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    overrides = {"sharpness": 1.5, "saturation": 0.75, "save_dng": False}
+    save(path, overrides)
+    control = SettingsControl(path, DEFAULTS, overrides, log=lambda _: None)
+    calls = []
+    for key in settings_mod.KEYS:
+        control.register(key, lambda value, key=key: calls.append((key, value)))
+    control.reset()
+    assert sorted(calls) == [("saturation", 1.0), ("save_dng", True), ("sharpness", 1.0)]
+    assert control.current == DEFAULTS
+    assert not path.exists()
