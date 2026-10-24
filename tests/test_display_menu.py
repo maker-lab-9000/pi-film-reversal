@@ -31,6 +31,7 @@ ROWS = (
     MenuRow("ae_constraint", "AE CONSTRAINT", "HIGHLIGHT", True),
     MenuRow("ae_metering", "AE METERING", "CENTRE", True),
     MenuRow("image", "IMAGE", ">", True),
+    MenuRow("stabilise", "STABILISE", ">", True),
     MenuRow("upload", "UPLOAD", "TAP TO UPLOAD", True),
     MenuRow("eth", "ETH", "-", False),
     MenuRow("wlan", "WLAN", "192.168.178.56", False),
@@ -173,7 +174,7 @@ def test_the_fullest_page_fits_on_the_panel(scale):
     """Every row the viewfinder can show (``ROWS`` is all of them): the last one
     ends above the panel's foot, and every row is hit at its centre."""
     bottom = ROW_Y0 + len(ROWS) * ROW_HEIGHT
-    assert len(ROWS) == 10 and bottom <= HEIGHT
+    assert len(ROWS) == 11 and bottom == 228 and bottom <= HEIGHT
     pixels = _pixels(scale=scale)
     # The last row (RESET) is drawn: its value has white ink.
     last = pixels[(bottom - ROW_HEIGHT) * scale:bottom * scale, 150 * scale:ROW_X1 * scale]
@@ -228,3 +229,38 @@ def test_a_titled_page_is_cached_apart_from_an_untitled_one():
     titled = render_menu(IMAGE_ROWS, scale=1, title="IMAGE")
     assert titled is render_menu(IMAGE_ROWS, scale=1, title="IMAGE")
     assert titled is not render_menu(IMAGE_ROWS, scale=1)
+
+
+# -- the STABILISE page: the same kind of titled page ----------------------------
+
+STABILISE_ROWS = (
+    MenuRow("short_exposure", "SHORT EXPOSURE", "OFF", True),
+    MenuRow("shutter_delay", "SHUTTER DELAY", "0.5 S", True),
+    MenuRow("multi_frame", "MULTI-FRAME", "6", True),
+    MenuRow("stabilise_reset", "RESET", "TAP AGAIN", True),
+    MenuRow("back", "BACK", "", True),
+)
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_stabilise_page_fits_and_stays_clear_of_done(scale, monkeypatch):
+    fitted = []
+    real = menu.fit_text
+
+    def spy(text, font, width):
+        fitted.append((text, real(text, font, width)))
+        return fitted[-1][1]
+
+    monkeypatch.setattr(menu, "fit_text", spy)
+    menu._row_tile.cache_clear()
+    menu._render.cache_clear()
+    pixels = np.asarray(render_menu(STABILISE_ROWS, scale=scale, title="STABILISE")).astype(int)
+    # Every value is drawn whole beside its label, the longest label included.
+    assert fitted and all(text == shown for text, shown in fitted)
+    assert pixels[:, 249 * scale:253 * scale].max() == 0
+    bottom = ROW_Y0 + (len(STABILISE_ROWS) + 1) * ROW_HEIGHT
+    assert pixels[(bottom + 1) * scale:].max() == 0
+    x = (ROW_X0 + ROW_X1) // 2
+    for index in range(len(STABILISE_ROWS)):
+        y = ROW_Y0 + (index + 1) * ROW_HEIGHT + ROW_HEIGHT // 2
+        assert menu_hit(x * scale, y * scale, len(STABILISE_ROWS), scale, title=True) == index

@@ -23,7 +23,7 @@ class BlockingSession:
         self.calls = 0
         self.camera = Mock()
 
-    def capture(self) -> Result:
+    def capture(self, *, delay_s=0.0) -> Result:
         self.calls += 1
         self.started.set()
         self.release.wait(timeout=2)
@@ -108,7 +108,7 @@ def test_camera_error_finishes_job_and_allows_a_later_request():
             self.calls = 0
             self.camera = Mock()
 
-        def capture(self):
+        def capture(self, *, delay_s=0.0):
             self.calls += 1
             if self.calls == 1:
                 raise CameraError("dropped frame")
@@ -152,7 +152,7 @@ class _Session:
         self.camera = None
         self.fail = fail
 
-    def capture(self):
+    def capture(self, *, delay_s=0.0):
         if self.fail:
             raise CameraError("boom")
         return "result"
@@ -216,7 +216,7 @@ class DoubleSession:
         if not enabled:
             self.taken = 0
 
-    def capture(self):
+    def capture(self, *, delay_s=0.0):
         self.started.set()
         self.release.wait(timeout=2)
         if self.enabled:
@@ -338,7 +338,7 @@ class GradingSession:
         self.pending_grades = 0
         self.fail_close = fail_close
 
-    def capture(self):
+    def capture(self, *, delay_s=0.0):
         return Result("saved")
 
     def close_grades(self, timeout=None):
@@ -481,7 +481,7 @@ def test_a_session_without_disk_warning_reports_none():
 def test_disk_warning_comes_before_network_and_defaults_to_empty():
     from dataclasses import fields
 
-    assert [f.name for f in fields(ControllerSnapshot)][-2] == "disk_warning"
+    assert [f.name for f in fields(ControllerSnapshot)][-3] == "disk_warning"
     assert ControllerSnapshot(None, None, False).disk_warning == ()
 
 
@@ -533,11 +533,18 @@ def test_a_session_without_network_reports_none():
         controller.close()
 
 
-def test_network_is_the_last_snapshot_field_and_defaults_to_empty():
+def test_network_comes_before_delaying_and_defaults_to_empty():
     from dataclasses import fields
 
-    assert [f.name for f in fields(ControllerSnapshot)][-1] == "network"
+    assert [f.name for f in fields(ControllerSnapshot)][-2] == "network"
     assert ControllerSnapshot(None, None, False).network == ()
+
+
+def test_delaying_is_the_last_snapshot_field_and_defaults_to_false():
+    from dataclasses import fields
+
+    assert [f.name for f in fields(ControllerSnapshot)][-1] == "delaying"
+    assert ControllerSnapshot(None, None, False).delaying is False
 
 
 @pytest.mark.parametrize("value", [
@@ -565,4 +572,94 @@ def test_a_raising_network_reports_none():
     try:
         assert controller.snapshot().network == ()
     finally:
+        controller.close()
+
+
+class DelaySession:
+    """Records the delay it was told and when its capture began."""
+
+    def __init__(self) -> None:
+        self.camera = Mock()
+        self.delays: list[float] = []
+        self.started_at: float | None = None
+        self.started = threading.Event()
+
+    def capture(self, *, delay_s=0.0):
+        self.started_at = time.monotonic()
+        self.delays.append(delay_s)
+        self.started.set()
+        return Result("saved")
+
+
+def test_the_worker_waits_the_shutter_delay_and_tells_the_session():
+    session = DelaySession()
+    controller = CaptureController(session)
+    try:
+        pressed = time.monotonic()
+        controller.submit("delayed", delay_s=0.2)
+        # Active through the wait: a second press is busy, not queued. But not
+        # capturing yet: the job is still queued and the snapshot says delaying.
+        snap = controller.snapshot()
+        assert snap.active_job.request_id == "delayed"
+        assert snap.active_job.state == "queued" and snap.delaying is True
+        assert controller.status("delayed").state == "queued"
+        assert controller.submit("second").error_code == "busy"
+        assert not session.started.is_set()
+        wait_for(controller, "delayed", "complete")
+        assert controller.snapshot().delaying is False
+        assert session.started_at - pressed >= 0.2
+        assert session.delays == [0.2]
+    finally:
+        controller.close()
+
+
+def test_a_request_without_a_delay_tells_the_session_none():
+    session = DelaySession()
+    controller = CaptureController(session)
+    try:
+        controller.submit("now")
+        wait_for(controller, "now", "complete")
+        assert session.delays == [0.0]
+    finally:
+        controller.close()
+
+
+def test_closing_during_the_delay_ends_promptly_without_the_capture():
+    session = DelaySession()
+    controller = CaptureController(session)
+    controller.submit("waiting", delay_s=30.0)
+    assert controller.snapshot().delaying is True
+    threading.Event().wait(0.05)  # the worker is now in the wait
+    began = time.monotonic()
+    controller.close()
+    assert time.monotonic() - began < 2.0
+    assert session.delays == []
+    job = controller.status("waiting")
+    assert (job.state, job.error_code) == ("failed", "closed")
+    assert session.camera.close.called
+
+
+def test_a_delayed_job_is_processing_and_not_delaying_once_the_capture_starts():
+    session = BlockingSession()
+    controller = CaptureController(session)
+    try:
+        controller.submit("delayed", delay_s=0.05)
+        assert session.started.wait(timeout=2)
+        snap = controller.snapshot()
+        assert snap.active_job.state == "processing" and snap.delaying is False
+    finally:
+        session.release.set()
+        controller.close()
+
+
+def test_a_job_without_a_delay_is_never_delaying():
+    session = BlockingSession()
+    controller = CaptureController(session)
+    try:
+        controller.submit("now")
+        assert controller.snapshot().delaying is False
+        assert session.started.wait(timeout=2)
+        assert controller.snapshot().delaying is False
+    finally:
+        session.release.set()
         controller.close()

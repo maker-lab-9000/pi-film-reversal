@@ -9,7 +9,9 @@ of the header, which neither the X728 UPS nor either LCD uses.
 A press is delivered to one callback. ``pifilm-capture`` makes that callback a
 ``CaptureController.submit``, the same call the LCD tap makes, so the button is
 one more trigger and never a second owner of the camera; a press while a capture
-is running is answered ``busy`` by the controller and dropped.
+is running is answered ``busy`` by the controller and dropped. Like the LCD tap,
+the press asks for the menu's shutter delay, which ``main`` reads at each press
+and the controller's worker waits out; this module knows nothing of it.
 
 gpiozero calls ``when_pressed`` on its backend's thread. With the lgpio backend
 that is one thread for every edge, and it has no exception handling of its own:

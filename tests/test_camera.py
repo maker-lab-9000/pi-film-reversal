@@ -508,3 +508,57 @@ def test_fake_and_v4l2_stream_info_have_no_image_controls(fake_capture):
     cam = V4L2Camera(device=0, warmup_frames=0)
     assert not image & set(cam.stream_info.to_dict())
     cam.close()
+
+
+def test_fake_camera_burst_reads_n_frames_without_a_split():
+    camera = FakeCamera([_tagged_frame(i) for i in range(3)],
+                        metadata={"ExposureTime": 8000, "AnalogueGain": 2.0})
+    frames, info = camera.read_burst(4, split_exposure=True)
+    assert [int(f.rgb[0, 0, 0]) for f in frames] == [0, 1, 2, 0]
+    assert all(f.metadata == {"ExposureTime": 8000, "AnalogueGain": 2.0} for f in frames)
+    assert info == {"exposure_us": 8000, "gain": 2.0, "split": False}
+
+
+def test_fake_camera_burst_shift_is_deterministic():
+    base = synthetic_frame(48, 64)
+    camera = FakeCamera([base], burst_shift=2)
+    frames, info = camera.read_burst(3, split_exposure=False)
+    for i, frame in enumerate(frames):
+        assert np.array_equal(frame.rgb, np.roll(base, (2 * i, 2 * i), axis=(0, 1)))
+    again, _ = FakeCamera([base], burst_shift=2).read_burst(3, split_exposure=False)
+    assert all(np.array_equal(a.rgb, b.rgb) for a, b in zip(frames, again, strict=True))
+    assert info == {"exposure_us": None, "gain": None, "split": False}
+    # The camera's own frames are untouched by the shift.
+    assert np.array_equal(camera.read().rgb, base)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.0, True, "3"])
+def test_a_burst_needs_a_whole_number_of_frames(bad):
+    with pytest.raises(CameraError, match="whole number of frames"):
+        FakeCamera().read_burst(bad, split_exposure=False)
+
+
+def test_v4l2_burst_reads_n_frames_without_a_split(fake_capture):
+    data = _jpeg_bytes(synthetic_frame(48, 64))
+    fake_capture(buffers=[data] * 8)
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    frames, info = cam.read_burst(3, split_exposure=True)
+    assert len(frames) == 3 and all(f.jpeg == data for f in frames)
+    assert info == {"exposure_us": None, "gain": None, "split": False}
+    cam.close()
+
+
+def test_fake_and_v4l2_bursts_accept_and_ignore_dng(fake_capture):
+    frames, _ = FakeCamera([synthetic_frame(8, 8)]).read_burst(
+        2, split_exposure=False, dng=False)
+    assert len(frames) == 2 and all(f.dng is None for f in frames)
+    fake_capture(buffers=[_jpeg_bytes(synthetic_frame(48, 64))] * 6)
+    cam = V4L2Camera(device=0, warmup_frames=0)
+    frames, _ = cam.read_burst(2, split_exposure=False, dng=False)
+    assert len(frames) == 2 and all(f.dng is None for f in frames)
+    cam.close()
+
+
+def test_a_burst_count_accepts_any_whole_number_type():
+    assert camera_module.burst_count(np.int64(3)) == 3
+    assert type(camera_module.burst_count(np.int64(3))) is int

@@ -33,23 +33,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from .color import linear_to_srgb, srgb_to_linear
+from .color import LINEAR16_SRGB8, LINEAR_LEVELS, SRGB8_LINEAR
 
 COMPOSITE_METHOD = "linear_mean"
 
-_ENCODE_LEVELS = 65536
+_ENCODE_LEVELS = LINEAR_LEVELS
 _ROWS_PER_CHUNK = 256
 # uint8 code -> linear light, halved (each frame one stop down).
-_HALF_LINEAR = 0.5 * srgb_to_linear(np.arange(256, dtype=np.float32) / 255.0)
+_HALF_LINEAR = 0.5 * SRGB8_LINEAR
 # Linear level index (mean scaled to [0, _ENCODE_LEVELS - 1]) -> sRGB uint8 code.
-_ENCODE = np.clip(
-    np.round(
-        linear_to_srgb(np.arange(_ENCODE_LEVELS, dtype=np.float32) / (_ENCODE_LEVELS - 1))
-        * 255.0
-    ),
-    0,
-    255,
-).astype(np.uint8)
+_ENCODE = LINEAR16_SRGB8
 
 
 def composite(first: np.ndarray, second: np.ndarray) -> np.ndarray:

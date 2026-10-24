@@ -456,7 +456,7 @@ def test_capture_display_polls_controller_and_shows_loading_before_result(
     started = threading.Event()
     release = threading.Event()
 
-    def delayed_capture():
+    def delayed_capture(*, delay_s=0.0):
         started.set()
         assert release.wait(timeout=1)
         return capture()
@@ -502,7 +502,7 @@ def test_external_capture_updates_pi_display(
     release = threading.Event()
     finished = threading.Event()
 
-    def delayed_capture():
+    def delayed_capture(*, delay_s=0.0):
         assert release.wait(timeout=2)
         result = capture()
         finished.set()
@@ -549,6 +549,42 @@ def test_external_capture_updates_pi_display(
         controller.close()
 
 
+def test_capture_display_waits_for_a_shutter_delay_before_the_loading_screen(
+    tmp_path, pipeline, monkeypatch, capture_gui,
+):
+    """A GPIO press waiting out its delay is not capturing yet: no loading screen."""
+    import cv2
+
+    from pifilm.capture.controller import CaptureController
+
+    session = _session(tmp_path, pipeline)
+    controller = CaptureController(session)
+    waits = 0
+    shown = []
+
+    def wait_key(delay):
+        nonlocal waits
+        if delay in (1, 50):
+            return -1
+        waits += 1
+        if waits == 1:
+            shown.append(len(capture_gui))
+            assert controller.submit("button-shot", delay_s=30.0).state == "queued"
+            return -1
+        if waits < 4:
+            assert controller.snapshot().delaying is True
+            return -1
+        assert len(capture_gui) == shown[0]  # nothing drawn over the last picture
+        return ord("q")
+
+    monkeypatch.setattr(cv2, "waitKey", wait_key)
+    try:
+        assert run_preview_loop(session, captures_only=True, controller=controller)
+    finally:
+        controller.close()
+    assert controller.status("button-shot").error_code == "closed"
+
+
 @pytest.mark.parametrize("failed_attempt", [1, 2])
 def test_capture_display_keeps_last_photo_after_failed_capture(
     tmp_path, pipeline, monkeypatch, capture_gui, capsys, failed_attempt,
@@ -559,7 +595,7 @@ def test_capture_display_keeps_last_photo_after_failed_capture(
     capture = session.capture
     attempts = 0
 
-    def flaky_capture():
+    def flaky_capture(*, delay_s=0.0):
         nonlocal attempts
         attempts += 1
         if attempts == failed_attempt:
@@ -1254,7 +1290,7 @@ def test_no_dng_flag_disables_dng_on_backend_and_session(camera_cli, monkeypatch
             session_kwargs.update(kwargs)
             self.camera = camera
 
-        def capture(self):
+        def capture(self, *, delay_s=0.0):
             raise AssertionError("capture should not be called in this test")
 
     monkeypatch.setattr(camera_cli, "Picamera2Camera", open_picamera, raising=False)
@@ -1722,9 +1758,11 @@ class _ControllerDouble:
     def __init__(self, answer):
         self.answer = answer
         self.requests = []
+        self.delays = []
 
-    def submit(self, request_id):
+    def submit(self, request_id, *, delay_s=0.0):
         self.requests.append(request_id)
+        self.delays.append(delay_s)
         return self.answer
 
 
@@ -1737,6 +1775,17 @@ def test_a_press_submits_one_new_request(capsys):
     assert len(controller.requests) == 2
     assert controller.requests[0] != controller.requests[1]
     assert "button: capture requested" in capsys.readouterr().out
+
+
+def test_a_press_asks_for_the_shutter_delay_read_at_the_press():
+    from pifilm.capture import app
+
+    controller = _ControllerDouble(SimpleNamespace(state="queued", error_code=None))
+    delay = iter([0.5, 0.2])
+    app._button_capture(controller)
+    app._button_capture(controller, lambda: next(delay))
+    app._button_capture(controller, lambda: next(delay))
+    assert controller.delays == [0.0, 0.5, 0.2]
 
 
 def test_a_press_while_busy_is_ignored_and_logged(capsys):
@@ -2667,7 +2716,7 @@ def test_grade_flag_reaches_the_session(camera_cli, monkeypatch, tmp_path, argv,
             session_kwargs.update(kwargs)
             self.camera = camera
 
-        def capture(self):
+        def capture(self, *, delay_s=0.0):
             raise AssertionError("capture should not be called in this test")
 
     monkeypatch.setattr(camera_cli, "CaptureSession", RecordingSession)
@@ -3945,18 +3994,20 @@ def test_the_menu_appliers_reach_the_camera_and_the_session(camera_cli, monkeypa
     assert camera.calls == [
         ("ae_constraint", "shadows"), ("ae_metering", "spot"), ("save_dng", False),
     ]
-    assert seen["menu_rows"] == ("save_dng", "halation", "ae_constraint", "ae_metering")
+    assert seen["menu_rows"] == ("save_dng", "halation", "ae_constraint", "ae_metering",
+                                 "shutter_delay", "multi_frame")
 
 
 def test_menu_rows_leave_out_what_the_camera_cannot_use(camera_cli, monkeypatch, tmp_path):
     seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera(constraint=False))
-    assert seen["menu_rows"] == ("save_dng", "halation", "ae_metering")
+    assert seen["menu_rows"] == ("save_dng", "halation", "ae_metering", "shutter_delay",
+                                 "multi_frame")
 
 
 def test_menu_rows_leave_out_the_ae_rows_under_ae_lock(camera_cli, monkeypatch, tmp_path):
     seen = _menu_main(camera_cli, monkeypatch, tmp_path, _MenuCamera(adjustable=False),
                       "--ae-lock")
-    assert seen["menu_rows"] == ("save_dng", "halation")
+    assert seen["menu_rows"] == ("save_dng", "halation", "shutter_delay", "multi_frame")
 
 
 def test_fake_has_no_optional_menu_rows_and_an_empty_look(tmp_path, monkeypatch):
@@ -4362,6 +4413,7 @@ def test_the_image_appliers_reach_the_camera_and_the_rows_follow_support(
     assert camera.calls == [("sharpness", 1.5), ("saturation", 0.75)]
     assert seen["menu_rows"] == (
         "save_dng", "halation", "ae_constraint", "ae_metering", "sharpness", "saturation",
+        "shutter_delay", "multi_frame",
     )
 
 
@@ -4369,3 +4421,583 @@ def test_saved_image_values_do_not_reach_a_fake_camera(tmp_path, monkeypatch):
     _save_settings(contrast=1.25)
     kwargs = _viewfinder_kwargs(monkeypatch, tmp_path, [])
     assert kwargs["menu_rows"] is None
+
+
+class _StabiliseMenuCamera(_MenuCamera):
+    """A Picamera2 double with the short-exposure setter."""
+
+    def set_short_exposure(self, on):
+        self.calls.append(("short_exposure", on))
+
+
+def test_the_short_exposure_flag_defaults_to_off(camera_cli, monkeypatch, tmp_path):
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _StabiliseMenuCamera())
+    assert seen["camera_kwargs"]["short_exposure"] is False
+
+
+def test_a_saved_short_exposure_reaches_the_picamera2_constructor(
+    camera_cli, monkeypatch, tmp_path, capsys,
+):
+    _save_settings(short_exposure=True, shutter_delay=0.5, multi_frame=4)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _StabiliseMenuCamera())
+    assert seen["camera_kwargs"]["short_exposure"] is True
+    current = seen["settings"].current
+    assert (current.short_exposure, current.shutter_delay, current.multi_frame) == (
+        True, 0.5, 4,
+    )
+    assert ("settings: short-exposure on, shutter-delay 0.5, multi-frame 4 (saved in the "
+            "menu; the unit says short-exposure off, shutter-delay 0.0, multi-frame 1)"
+            ) in capsys.readouterr().out
+
+
+def test_a_saved_short_exposure_is_off_under_the_ae_lock(camera_cli, monkeypatch, tmp_path):
+    _save_settings(short_exposure=True)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path,
+                      _StabiliseMenuCamera(adjustable=False), "--ae-lock")
+    assert seen["camera_kwargs"]["short_exposure"] is False
+    assert seen["camera_kwargs"]["ae_lock"] is True
+
+
+def test_the_short_exposure_applier_reaches_the_camera(camera_cli, monkeypatch, tmp_path):
+    camera = _StabiliseMenuCamera()
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, camera)
+    control = seen["settings"]
+    assert control.set("short_exposure", True)
+    # Not the camera's: the delay is read at each press, multi-frame is the session's.
+    assert control.set("shutter_delay", 0.2)
+    assert control.set("multi_frame", 2)
+    assert camera.calls == [("short_exposure", True)]
+
+
+@pytest.mark.parametrize(("supported", "extra", "rows"), [
+    (True, (), ("short_exposure", "shutter_delay", "multi_frame")),
+    (False, (), ("shutter_delay", "multi_frame")),
+    # Under --ae-lock short exposure would change nothing: its row is dim.
+    (True, ("--ae-lock",), ("shutter_delay", "multi_frame")),
+])
+def test_the_stabilise_rows_follow_support_and_the_ae_lock(
+    camera_cli, monkeypatch, tmp_path, supported, extra, rows,
+):
+    camera = _StabiliseMenuCamera(adjustable=not extra)
+    camera.short_exposure_supported = supported
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, camera, *extra)
+    assert seen["menu_rows"][-len(rows):] == rows
+    assert ("short_exposure" in seen["menu_rows"]) is ("short_exposure" in rows)
+
+
+def test_saved_stabilise_values_with_fake_start_as_usual(camera_cli, capsys):
+    _save_settings(short_exposure=True, multi_frame=6)
+    assert camera_cli.main(["--fake", "--no-preview"]) == 0
+    assert "cannot be used with --fake" not in capsys.readouterr().err
+
+
+# -- the shutter delay -------------------------------------------------------
+
+
+def _delay_camera(source="picamera2"):
+    return FakeCamera([synthetic_frame(90, 160)], source=source,
+                      stream_info=_image_info(1.0, 1.0, 1.0))
+
+
+def _after_stream(record):
+    keys = list(record)
+    return keys[keys.index("saturation") + 1]
+
+
+def test_an_inline_record_carries_the_delay_after_the_stream_fields(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline, camera=_delay_camera())
+    result = session.capture(delay_s=0.5)
+    (record,) = _lines(session.out_root)
+    assert record["shutter_delay_s"] == 0.5 and result.record["shutter_delay_s"] == 0.5
+    assert _after_stream(record) == "shutter_delay_s"
+    session.capture()
+    assert _lines(session.out_root)[-1]["shutter_delay_s"] == 0.0
+
+
+@pytest.mark.parametrize("source", ["fake", "raw-mjpeg", "decoded"])
+def test_a_record_off_picamera2_has_no_delay(tmp_path, pipeline, source):
+    session = _session(tmp_path, pipeline, camera=_delay_camera(source))
+    session.capture(delay_s=0.2)
+    assert "shutter_delay_s" not in _lines(session.out_root)[0]
+
+
+def test_a_double_exposure_records_each_exposures_delay(tmp_path, pipeline):
+    session = _session(tmp_path, pipeline, camera=_delay_camera())
+    session.set_double_exposure(True)
+    session.capture(delay_s=0.2)
+    session.capture(delay_s=0.5)
+    first, second = _lines(session.out_root)
+    assert (first["shutter_delay_s"], second["shutter_delay_s"]) == (0.2, 0.5)
+    assert _after_stream(first) == _after_stream(second) == "shutter_delay_s"
+
+
+def test_a_background_and_a_recovered_record_carry_the_delay(tmp_path):
+    tuned = _tuned_pipeline(tmp_path)
+    held = _HeldPipeline(tuned)
+    held.artifacts = tuned.artifacts
+    first = _tuned_session(tmp_path, _delay_camera(), held, background=True,
+                           state_dir=tmp_path / "state")
+    result = first.capture(delay_s=0.2)
+    assert result.record["shutter_delay_s"] == 0.2
+    held.wait_entered()
+    ((path, payload),) = read_entries(tmp_path / "state")
+    assert payload["record"]["shutter_delay_s"] == 0.2
+    text = path.read_text()
+    held.release()
+    assert first.close_grades(timeout=5)
+    (finished,) = _lines(first.out_root)
+    assert finished["shutter_delay_s"] == 0.2 and _after_stream(finished) == "shutter_delay_s"
+    # Put the shot back as a power cut would have left it.
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+
+    again = _tuned_session(tmp_path, _delay_camera(), tuned, background=True,
+                           state_dir=tmp_path / "state")
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    (recovered,) = _lines(again.out_root)
+    assert recovered["recovered"] is True
+    assert recovered["shutter_delay_s"] == 0.2 and _after_stream(recovered) == "shutter_delay_s"
+
+
+def _press_delay(camera_cli, monkeypatch):
+    """Point ``_button_capture`` at a recorder; return what each press asked for."""
+    asked = []
+    monkeypatch.setattr(camera_cli, "_button_capture",
+                        lambda controller, delay: asked.append(delay()))
+    return asked
+
+
+def test_the_button_reads_the_saved_delay_at_each_press_on_picamera2(
+    camera_cli, monkeypatch, tmp_path,
+):
+    _save_settings(shutter_delay=0.5)
+    button = _ButtonDouble()
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: button)
+    asked = _press_delay(camera_cli, monkeypatch)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _StabiliseMenuCamera(),
+                      "--shutter-gpio", "21")
+    button.callback()
+    assert seen["settings"].set("shutter_delay", 0.2)
+    button.callback()
+    assert asked == [0.5, 0.2]
+
+
+def test_the_button_never_delays_under_fake(camera_cli, monkeypatch):
+    _save_settings(shutter_delay=0.5)
+    button = _ButtonDouble()
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: button)
+    asked = _press_delay(camera_cli, monkeypatch)
+    assert camera_cli.main(["--fake", "--no-preview", "--shutter-gpio", "21"]) == 0
+    button.callback()
+    assert asked == [0.0]
+
+
+# -- multi-frame photographs -------------------------------------------------
+
+
+def _textured(seed, noise=0):
+    """A 90 x 160 frame with enough texture for ECC; ``noise`` adds a frame's own grain."""
+    from pifilm._cv2 import require_cv2
+
+    rng = np.random.default_rng(1)
+    base = require_cv2().GaussianBlur(rng.uniform(0, 255, (90, 160, 3)).astype(np.float32),
+                                      (0, 0), 3)
+    base = (base - base.min()) / (base.max() - base.min()) * 200 + 25
+    if noise:
+        base = base + np.random.default_rng(seed).normal(0, noise, base.shape)
+    return np.clip(base, 0, 255).astype(np.uint8)
+
+
+class _BurstCamera(FakeCamera):
+    """A Picamera2-like double whose bursts carry per-frame FocusFoM, exposure and
+    gain, and a DNG on every frame (which a multi-frame shot must not save)."""
+
+    def __init__(self, foms=(1.0, 5.0, 3.0, 2.0), *, split=True):
+        self.burst_frames = [_textured(i, noise=4) for i in range(len(foms))]
+        super().__init__([synthetic_frame(90, 160)], source="picamera2",
+                         stream_info=_image_info(1.0, 1.0, 1.0))
+        self.foms = foms
+        self.split = split
+        self.bursts = []
+        self.reads = 0
+
+    def read(self, *, full=True):
+        self.reads += 1
+        frame = super().read(full=full)
+        frame.dng = b"raw"
+        return frame
+
+    def read_burst(self, n, *, split_exposure, dng=True):
+        self.bursts.append((n, split_exposure, dng))
+        frames = [
+            Frame(self.burst_frames[i % len(self.burst_frames)].copy(), None, "picamera2",
+                  metadata={"FocusFoM": self.foms[i % len(self.foms)],
+                            "ExposureTime": 2500 + i, "AnalogueGain": 4.0 + i},
+                  dng=b"raw")
+            for i in range(n)
+        ]
+        info = {"exposure_us": 2500, "gain": 4.0, "split": self.split}
+        return frames, info
+
+
+STACK_KEYS = ["frames", "reference", "exposure_us", "gain", "requested_exposure_us",
+              "requested_gain", "split", "method", "aligned", "align_ms", "merge_ms"]
+ALIGNED_KEYS = ["dx", "dy", "angle_deg", "rho", "used", "reason", "exposure_us", "gain"]
+STACK_NAMES = ["210507_original.jpg", "210507_frame2.jpg", "210507_frame3.jpg",
+               "210507_frame4.jpg"]
+
+
+def _nearest(image, candidates):
+    """The index of the candidate ``image`` is closest to (mean absolute difference)."""
+    return int(np.argmin([np.abs(image.astype(int) - c.astype(int)).mean()
+                          for c in candidates]))
+
+
+def _stack_session(tmp_path, pipe, camera, *, grade="inline", **kwargs):
+    session = CaptureSession(camera, pipe, tmp_path / "shots", now=lambda: FIXED,
+                             seed_rng=np.random.default_rng(0),
+                             background=grade == "background", state_dir=tmp_path / "state",
+                             log=lambda _: None, **kwargs)
+    session.multi_frame = 4
+    return session
+
+
+def _check_stack_record(record, camera):
+    keys = list(record)
+    assert keys[keys.index("saturation") + 1] == "shutter_delay_s"
+    assert keys[keys.index("shutter_delay_s") + 1] == "stack"
+    stack = record["stack"]
+    assert list(stack) == STACK_KEYS
+    assert stack["frames"] == STACK_NAMES and stack["reference"] == STACK_NAMES[0]
+    # The reference (FocusFoM 5.0) is capture frame 1: its own exposure, the asked one beside it.
+    assert (stack["exposure_us"], stack["gain"]) == (2501, 5.0)
+    assert (stack["requested_exposure_us"], stack["requested_gain"]) == (2500, 4.0)
+    assert stack["split"] is True and stack["method"] == "ecc-euclidean-ghost-weighted-mean"
+    assert len(stack["aligned"]) == 4 and stack["aligned"][0]["used"] is True
+    assert all(list(f) == ALIGNED_KEYS for f in stack["aligned"])
+    assert all(f["reason"] is None for f in stack["aligned"] if f["used"])
+    # Each frame's own exposure, in ``frames`` order: capture frames 1, 0, 2, 3.
+    assert [(f["exposure_us"], f["gain"]) for f in stack["aligned"]] == \
+        [(2501, 5.0), (2500, 4.0), (2502, 6.0), (2503, 7.0)]
+    assert stack["aligned"][0]["rho"] is None
+    assert "dng" not in record
+    assert record["camera_metadata"]["FocusFoM"] == 5.0
+    assert {"burst", "save_original", "save_frames", "merge"} <= set(record["stage_ms"])
+    assert "capture" not in record["stage_ms"]
+    assert camera.bursts == [(4, True, False)] and camera.reads == 0
+    json.dumps(record)
+
+
+def _expected_graded(pipe, camera, seed):
+    """The graded picture: the frames merged onto the reference (capture frame 1),
+    the others in capture order, then graded with the shot's seed."""
+    from pifilm.stack import merge
+
+    frames = camera.burst_frames
+    merged, _ = merge([frames[1], frames[0], frames[2], frames[3]], reference=0)
+    return pipe.process(merged, rng=np.random.default_rng(seed))[0]
+
+
+def test_an_inline_multi_frame_shot_merges_the_burst(tmp_path, pipeline):
+    camera = _BurstCamera()
+    session = _stack_session(tmp_path, pipeline, camera)
+    result = session.capture(delay_s=0.2)
+    (record,) = _lines(session.out_root)
+    _check_stack_record(record, camera)
+    assert record["shutter_delay_s"] == 0.2
+    assert result.record["stack"] == record["stack"]
+    day = result.original.parent
+    assert result.original.name == STACK_NAMES[0]
+    assert sorted(p.name for p in day.glob("*.jpg")) == sorted(
+        STACK_NAMES + ["210507_graded.jpg"])
+    assert not list(day.glob("*.dng"))
+    # Named in capture order without the reference: frame2 is capture frame 0.
+    for name, index in zip(STACK_NAMES, (1, 0, 2, 3), strict=True):
+        assert _nearest(load_rgb(day / name)[0], camera.burst_frames) == index, name
+    # The merge is what was graded, and it is not the reference alone.
+    used = sum(f["used"] for f in record["stack"]["aligned"])
+    assert used >= 2
+    expected = _expected_graded(pipeline, camera, record["grain_seed"])
+    reference_only = pipeline.process(camera.burst_frames[1],
+                                      rng=np.random.default_rng(record["grain_seed"]))[0]
+    assert not np.array_equal(expected, reference_only)
+    on_disk = load_rgb(result.graded)[0].astype(int)
+    assert np.abs(on_disk - expected.astype(int)).mean() < \
+        np.abs(on_disk - reference_only.astype(int)).mean()
+
+
+def test_a_background_multi_frame_shot_is_the_inline_one(tmp_path, pipeline):
+    inline = _stack_session(tmp_path / "inline", pipeline, _BurstCamera()).capture()
+    camera = _BurstCamera()
+    held = _SpyPipeline(pipeline)
+    session = _stack_session(tmp_path, held, camera, grade="background")
+    result = session.capture()
+    held.wait_entered()
+    ((_, entry),) = read_entries(tmp_path / "state")
+    assert entry["originals"] == [f"2026-09-03/{name}" for name in STACK_NAMES]
+    assert entry["stack"] == {"reference_index": 1} and entry["double"] is None
+    assert list(entry["record"]["stack"]) == STACK_KEYS[:7] + ["frame_exposures"]
+    assert "dng" not in entry["record"]
+    # Every frame is on disk while the grade has not run.
+    assert all((result.original.parent / name).exists() for name in STACK_NAMES)
+    held.release()
+    assert session.close_grades(timeout=5)
+    (record,) = _lines(session.out_root)
+    _check_stack_record(record, camera)
+    assert _earlier_keys(record) == _earlier_keys(inline.record)
+    assert record["stack"]["aligned"] == inline.record["stack"]["aligned"]
+    assert result.graded.read_bytes() == inline.graded.read_bytes()
+    assert "merge" not in result.record["stage_ms"]  # the capture side never merges
+    assert read_entries(tmp_path / "state") == []
+
+
+def test_the_quick_grade_is_the_reference_frame_alone(tmp_path, pipeline, monkeypatch):
+    from pifilm.capture import app
+
+    seen = []
+    real = app._quick_frame
+    monkeypatch.setattr(app, "_quick_frame", lambda rgb: seen.append(rgb) or real(rgb))
+    camera = _BurstCamera(foms=(1.0, 2.0))  # a two-frame burst must not be composited
+    session = _stack_session(tmp_path, pipeline, camera, grade="background")
+    session.multi_frame = 2
+    result = session.capture()
+    assert session.close_grades(timeout=5)
+    assert len(seen) == 1 and np.array_equal(seen[0], camera.burst_frames[1])
+    quick = [pipeline.process(f, grain=False)[0] for f in camera.burst_frames]
+    assert _nearest(load_rgb(result.pifilm)[0], quick) == 1
+
+
+def test_a_recovered_multi_frame_grade_merges_the_saved_frames(tmp_path, pipeline):
+    camera = _BurstCamera()
+    held = _SpyPipeline(pipeline)
+    session = _stack_session(tmp_path, held, camera, grade="background")
+    result = session.capture()
+    held.wait_entered()
+    ((path, _),) = read_entries(tmp_path / "state")
+    text = path.read_text()
+    held.release()
+    assert session.close_grades(timeout=5)
+    (first,) = _lines(session.out_root)
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+
+    again = _stack_session(tmp_path, pipeline, FakeCamera([synthetic_frame(90, 160)]),
+                           grade="background")
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    assert not path.exists()
+    (record,) = _lines(again.out_root)
+    assert record["recovered"] is True
+    assert list(record["stack"]) == STACK_KEYS
+    assert record["stack"]["frames"] == STACK_NAMES
+    assert [f["used"] for f in record["stack"]["aligned"]] == \
+        [f["used"] for f in first["stack"]["aligned"]]
+    assert "merge" in record["stage_ms"]
+    # From the JPEGs on disk: close to the grade from memory, not the same.
+    expected = _expected_graded(pipeline, camera, record["grain_seed"])
+    assert np.abs(load_rgb(result.graded)[0].astype(int) - expected.astype(int)).mean() < 3.0
+
+
+def _recover_stack(tmp_path, pipeline, damage):
+    """A background multi-frame shot whose grade is then done again from its
+    entry, after ``damage(day_dir)``; returns the log lines and the record."""
+    camera = _BurstCamera()
+    held = _SpyPipeline(pipeline)
+    session = _stack_session(tmp_path, held, camera, grade="background")
+    result = session.capture()
+    held.wait_entered()
+    ((path, _),) = read_entries(tmp_path / "state")
+    text = path.read_text()
+    held.release()
+    assert session.close_grades(timeout=5)
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+    damage(result.original.parent)
+
+    lines = []
+    again = CaptureSession(FakeCamera([synthetic_frame(90, 160)]), pipeline,
+                           tmp_path / "shots", now=lambda: FIXED,
+                           seed_rng=np.random.default_rng(0), background=True,
+                           state_dir=tmp_path / "state", log=lines.append)
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    records = _lines(again.out_root) if (result.original.parent / "captures.jsonl").exists() \
+        else []
+    return path, lines, records, result
+
+
+def test_a_recovered_multi_frame_grade_merges_without_an_unreadable_frame(tmp_path, pipeline):
+    def damage(day):
+        (day / "210507_frame3.jpg").write_bytes(b"\xff\xd8 cut short")
+        (day / "210507_frame4.jpg").unlink()
+
+    path, lines, records, result = _recover_stack(tmp_path, pipeline, damage)
+    assert not path.exists()
+    (record,) = records
+    assert record["recovered"] is True
+    aligned = record["stack"]["aligned"]
+    assert len(aligned) == 4 and all(list(f) == ALIGNED_KEYS for f in aligned)
+    for i in (2, 3):
+        assert aligned[i]["used"] is False and aligned[i]["reason"] == "unreadable"
+        assert aligned[i]["rho"] is None
+    assert aligned[0]["used"] is True and aligned[1]["reason"] in (None, "low_correlation",
+                                                                   "ecc_failed", "shift",
+                                                                   "angle")
+    # The frames' exposures still come from the entry.
+    assert (aligned[3]["exposure_us"], aligned[3]["gain"]) == (2503, 7.0)
+    assert sum("210507_frame3.jpg: unreadable" in line for line in lines) == 1
+    assert sum("210507_frame4.jpg: unreadable" in line for line in lines) == 1
+    assert result.graded.exists()
+    json.dumps(record)
+
+
+def test_a_recovered_multi_frame_grade_with_only_the_reference_grades_it_alone(
+    tmp_path, pipeline,
+):
+    camera_frames = _BurstCamera().burst_frames
+
+    def damage(day):
+        for name in STACK_NAMES[1:]:
+            (day / name).unlink()
+
+    _, lines, records, result = _recover_stack(tmp_path, pipeline, damage)
+    (record,) = records
+    assert [f["used"] for f in record["stack"]["aligned"]] == [True, False, False, False]
+    assert [f["reason"] for f in record["stack"]["aligned"]] == \
+        [None, "unreadable", "unreadable", "unreadable"]
+    expected = pipeline.process(load_rgb(result.original)[0],
+                                rng=np.random.default_rng(record["grain_seed"]))[0]
+    assert np.abs(load_rgb(result.graded)[0].astype(int) - expected.astype(int)).mean() < 1.0
+    assert _nearest(load_rgb(result.original)[0], camera_frames) == 1
+
+
+def test_a_recovered_frame_of_another_size_is_left_out(tmp_path, pipeline):
+    from pifilm.imageio import save_jpeg
+
+    def damage(day):
+        save_jpeg(np.zeros((40, 60, 3), np.uint8), day / "210507_frame2.jpg")
+
+    _, lines, records, _ = _recover_stack(tmp_path, pipeline, damage)
+    (record,) = records
+    assert record["stack"]["aligned"][1]["reason"] == "unreadable"
+    assert any("210507_frame2.jpg: unreadable (size 60x40" in line for line in lines)
+
+
+def test_an_unreadable_reference_fails_the_recovered_grade(tmp_path, pipeline):
+    def damage(day):
+        (day / STACK_NAMES[0]).write_bytes(b"not a jpeg")
+
+    path, lines, records, _ = _recover_stack(tmp_path, pipeline, damage)
+    assert records == []
+    assert path.exists()  # one attempt used; the entry stays for the next start
+    assert any(line.startswith("grade failed (2026-09-03_210507.json)") for line in lines)
+    assert not any("merged without it" in line for line in lines)
+
+
+def test_an_entry_without_frame_exposures_records_none(tmp_path):
+    from pifilm.capture.app import _stack_record
+
+    merged = {"method": "m", "frames": [{"used": True}, {"used": False}],
+              "align_ms": 1.0, "merge_ms": 2.0}
+    record = _stack_record({"frames": ["a", "b"]}, merged)
+    assert [(f["exposure_us"], f["gain"]) for f in record["aligned"]] == [(None, None)] * 2
+    assert "frame_exposures" not in record
+    record = _stack_record({"frames": ["a", "b"], "frame_exposures": [[10, 2.0], [11, 2.5]]},
+                           merged)
+    assert list(record) == ["frames", "method", "aligned", "align_ms", "merge_ms"]
+    assert record["aligned"][1] == {"used": False, "exposure_us": 11, "gain": 2.5}
+
+
+@pytest.mark.parametrize("grade", ["inline", "background"])
+def test_a_double_exposure_ignores_multi_frame(tmp_path, pipeline, grade):
+    camera = _BurstCamera()
+    session = _stack_session(tmp_path, pipeline, camera, grade=grade)
+    session.set_double_exposure(True)
+    session.capture()
+    session.capture()
+    assert session.close_grades(timeout=5)
+    assert camera.bursts == [] and camera.reads == 2
+    records = _lines(session.out_root)
+    assert len(records) == 2 and not any("stack" in r for r in records)
+    assert not list(session.out_root.glob("*/*_frame*.jpg"))
+
+
+@pytest.mark.parametrize("grade", ["inline", "background"])
+def test_multi_frame_off_reads_one_frame(tmp_path, pipeline, grade):
+    camera = _BurstCamera()
+    session = _stack_session(tmp_path, pipeline, camera, grade=grade)
+    session.multi_frame = 1
+    session.capture()
+    assert session.close_grades(timeout=5)
+    assert camera.bursts == [] and camera.reads == 1
+    (record,) = _lines(session.out_root)
+    assert "stack" not in record and record["dng"] == "210507.dng"
+    assert "capture" in record["stage_ms"] and "burst" not in record["stage_ms"]
+
+
+def test_the_reference_is_frame_0_without_a_focus_figure(tmp_path, pipeline):
+    camera = _BurstCamera()
+    camera.foms = ("none",)  # not a number: no frame says how sharp it is
+    session = _stack_session(tmp_path, pipeline, camera)
+    session.capture()
+    (record,) = _lines(session.out_root)
+    assert record["stack"]["exposure_us"] == 2500  # capture frame 0's metadata
+
+
+def test_an_entry_without_a_stack_is_one_frame():
+    from pifilm.capture.app import _GradeWork
+
+    payload = {"day": "2026-09-03", "graded": "x_graded.jpg", "originals": ["a/x.jpg"],
+               "seed": 1, "ev": 0.0, "record": {}}
+    assert _GradeWork.from_entry(payload).stack is None
+    work = _GradeWork.from_entry({**payload, "stack": None})
+    assert work.stack is None and work.entry(Path("/o"))["stack"] is None
+    stacked = {**payload, "originals": ["a/x.jpg", "a/y.jpg"], "stack": {"reference_index": 1}}
+    assert _GradeWork.from_entry(stacked).stack == {"reference_index": 1}
+    # Two originals without a stack (nor a double) is no entry this build wrote.
+    with pytest.raises(ValueError):
+        _GradeWork.from_entry({**stacked, "stack": None})
+    for bad in ({"reference_index": 2}, {"reference_index": True}, {}, [1]):
+        with pytest.raises(ValueError):
+            _GradeWork.from_entry({**stacked, "stack": bad})
+    with pytest.raises(ValueError):
+        _GradeWork.from_entry({**payload, "stack": {"reference_index": 0}})  # one frame
+    with pytest.raises(ValueError):
+        _GradeWork.from_entry({**stacked, "double": {"ev_comp": [0.0, 0.0]}})
+
+
+def test_the_multi_frame_applier_reaches_the_session(camera_cli, monkeypatch, tmp_path):
+    _save_settings(multi_frame=4)
+    made = []
+    real = camera_cli.CaptureSession
+
+    def recording(*args, **kwargs):
+        made.append(real(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(camera_cli, "CaptureSession", recording)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _StabiliseMenuCamera())
+    (session,) = made
+    assert session.multi_frame == 4
+    assert seen["settings"].set("multi_frame", 6)
+    assert session.multi_frame == 6
+    seen["settings"].reset()
+    assert session.multi_frame == 1
+
+
+def test_a_saved_multi_frame_is_not_taken_under_fake(camera_cli, monkeypatch, tmp_path):
+    _save_settings(multi_frame=6)
+    made = []
+    real = camera_cli.CaptureSession
+
+    def recording(*args, **kwargs):
+        made.append(real(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(camera_cli, "CaptureSession", recording)
+    assert camera_cli.main(["--fake", "--no-preview", "--out", str(tmp_path / "s")]) == 0
+    assert made[0].multi_frame == 1

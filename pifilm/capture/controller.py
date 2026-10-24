@@ -1,4 +1,20 @@
-"""Serialized, idempotent capture jobs shared by local and remote triggers."""
+"""Serialized, idempotent capture jobs shared by local and remote triggers.
+
+The shutter delay. A press on the LCD's shutter or the GPIO button moves the
+camera, so those triggers can ask for a delay (``submit(..., delay_s=)``, the
+menu's SHUTTER DELAY) and the worker waits that long before the capture starts,
+letting the hand that pressed stop moving. A Stick request asks for none: the
+Stick is already away from the camera. The job is accepted at the press and
+stays active through the wait, so a second press is answered ``busy`` as during
+the capture itself, but it stays ``queued`` until the capture starts and the
+snapshot says ``delaying``: the photographer is holding the framing through the
+wait, so a display keeps the live view up (no colour bars) until the camera is
+actually taken, and the Stick's status API is not told a capture is under way
+before it is. The wait is on an event that ``close`` sets, so stopping the
+service never sits out a delay: a job still waiting then fails as ``closed`` and
+its capture never runs. The session is told the delay it waited
+(``capture(delay_s=)``) and writes it into the photograph's record.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +31,7 @@ JobState = Literal["queued", "processing", "complete", "failed"]
 class CaptureCallable(Protocol):
     camera: object
 
-    def capture(self) -> object: ...
+    def capture(self, *, delay_s: float = 0.0) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -67,11 +83,20 @@ class ControllerSnapshot:
     # (``CaptureSession.network``), read like the count. The viewfinder shows them
     # at the bottom left of the picture; empty when neither interface has one.
     network: tuple[tuple[str, str], ...] = ()
+    # The active job is waiting out its shutter delay: accepted (a second press is
+    # busy) but not capturing yet, so a viewfinder keeps showing the live view.
+    delaying: bool = False
 
 
 @dataclass(frozen=True)
 class _DoubleToggle:
     enabled: bool
+
+
+@dataclass(frozen=True)
+class _Capture:
+    request_id: str
+    delay_s: float = 0.0
 
 
 class CaptureController:
@@ -86,20 +111,27 @@ class CaptureController:
         self._finished_count = 0
         self._last_finished_job: JobSnapshot | None = None
         self._closed = False
+        # The request waiting out its shutter delay, if any (see ``delaying``).
+        self._delaying: str | None = None
         self._double = self._read_double()
-        self._work: queue.Queue[str | _DoubleToggle | None] = queue.Queue()
+        # Set by ``close``: ends a shutter delay that is being waited out.
+        self._stopping = threading.Event()
+        self._work: queue.Queue[_Capture | _DoubleToggle | None] = queue.Queue()
         self._worker = threading.Thread(
             target=self._run, name="pifilm-capture-worker", daemon=True,
         )
         self._worker.start()
 
-    def submit(self, request_id: str) -> JobSnapshot:
+    def submit(self, request_id: str, *, delay_s: float = 0.0) -> JobSnapshot:
         """Accept ``request_id`` once, or return its current immutable snapshot.
 
         A second, distinct request is not accepted while a capture is active.  It
         receives a standalone failed snapshot with ``busy`` so a transport can
         translate it to its own conflict response without creating a fake job.
+        ``delay_s`` is the shutter delay the worker waits before the capture (see
+        the module docstring); a repeated ``request_id`` keeps its first one.
         """
+        delay_s = max(0.0, float(delay_s))
         with self._lock:
             if request_id in self._jobs:
                 return self._jobs[request_id]
@@ -110,7 +142,9 @@ class CaptureController:
             job = JobSnapshot(request_id, "queued")
             self._jobs[request_id] = job
             self._active_request_id = request_id
-            self._work.put(request_id)
+            # Set here, not by the worker, so the press's own snapshot says so.
+            self._delaying = request_id if delay_s > 0.0 else None
+            self._work.put(_Capture(request_id, delay_s))
             return job
 
     def set_double_exposure(self, enabled: bool) -> None:
@@ -153,14 +187,20 @@ class CaptureController:
                 tuning_mismatch,
                 disk_warning,
                 network,
+                active is not None and self._delaying == active.request_id,
             )
 
     def close(self) -> None:
-        """Finish an in-flight capture, then close the camera on its worker thread."""
+        """Finish an in-flight capture, then close the camera on its worker thread.
+
+        A capture still waiting out its shutter delay is not started: it fails as
+        ``closed`` at once.
+        """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            self._stopping.set()
             self._work.put(None)
         self._worker.join()
 
@@ -173,10 +213,17 @@ class CaptureController:
                 if isinstance(item, _DoubleToggle):
                     self._apply_toggle(item.enabled)
                     continue
-                request_id = item
+                request_id = item.request_id
+                # Still ``queued`` and ``delaying`` (set by ``submit``) while it
+                # waits: nothing is captured yet.
+                if item.delay_s > 0.0:
+                    if self._stopping.wait(item.delay_s):
+                        self._finish(request_id, "failed", error_code="closed",
+                                     error_message="closed during the shutter delay")
+                        continue
                 self._set_processing(request_id)
                 try:
-                    result = self._session.capture()
+                    result = self._session.capture(delay_s=item.delay_s)
                 except CameraError as exc:
                     self._finish(
                         request_id, "failed", error_code="camera_error", error_message=str(exc),
@@ -296,6 +343,7 @@ class CaptureController:
 
     def _set_processing(self, request_id: str) -> None:
         with self._lock:
+            self._delaying = None
             self._jobs[request_id] = JobSnapshot(request_id, "processing")
 
     def _finish(
@@ -312,6 +360,7 @@ class CaptureController:
             job = JobSnapshot(request_id, state, error_code, result, error_message)
             self._jobs[request_id] = job
             self._active_request_id = None
+            self._delaying = None
             self._finished_count += 1
             self._last_finished_job = job
             if state == "complete":
