@@ -64,10 +64,19 @@ def decode_points(buf: bytes, count: int) -> list[RawPoint]:
 
 
 def to_display(point: RawPoint, rotate: int) -> TouchPoint:
+    """The landscape point for a raw portrait one, inside the 320x240 frame.
+
+    The raw coordinates are 12-bit and the controller can report a point at or
+    past the glass's edge; clamped first (as ``evtouch`` clamps its own), such a
+    point lands on the frame's edge instead of off it, where the hit tests that
+    only check one side (the strip's cells take any y below their top) would
+    still claim it."""
+    x = max(0, min(PORTRAIT_W - 1, point.x))
+    y = max(0, min(PORTRAIT_H - 1, point.y))
     if rotate == 0:
-        return TouchPoint(point.y, PORTRAIT_W - 1 - point.x, point.strength)
+        return TouchPoint(y, PORTRAIT_W - 1 - x, point.strength)
     if rotate == 180:
-        return TouchPoint(PORTRAIT_H - 1 - point.y, point.x, point.strength)
+        return TouchPoint(PORTRAIT_H - 1 - y, x, point.strength)
     raise DisplayError(f"rotate must be 0 or 180, got {rotate}")
 
 
