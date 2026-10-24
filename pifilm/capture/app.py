@@ -195,7 +195,9 @@ the journal. Only a real Picamera2 takes them (DNG saving, the two auto-exposure
 modes, the ISP's sharpness, contrast and saturation and the short exposure mode
 are its controls); under ``--fake`` or V4L2 the arguments stay as given, so a
 saved value can never trip the Picamera2-only check and stop the service
-starting. The ``SettingsControl`` gets one applier per row the backend can
+starting. Under ``--ae-lock`` a saved short exposure is not passed on (the camera
+opens with it off and records say so): there is no auto exposure to shorten. The
+``SettingsControl`` gets one applier per row the backend can
 change (none for the shutter delay, which is read at each press), and the viewfinder gets
 the rows the camera supports (none of the auto-exposure ones under
 ``--ae-lock``, whose setters would change nothing, and only the image controls
@@ -2316,7 +2318,9 @@ def _main(argv: list[str] | None) -> int:
     short_exposure = False
     if backend == "picamera2":
         image = {key: getattr(effective, key) for key in IMAGE_KEYS}
-        short_exposure = effective.short_exposure
+        # Under --ae-lock there is no auto exposure to keep short: a saved ON
+        # would be recorded true and change nothing.
+        short_exposure = effective.short_exposure and not args.ae_lock
         args.no_dng = not effective.save_dng
         args.ae_constraint = effective.ae_constraint
         args.ae_metering = effective.ae_metering

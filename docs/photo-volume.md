@@ -3,7 +3,8 @@
 The Pi boots from one SD card, and its root partition fills the card. Without a
 separate volume, photos and the operating system share one filesystem, so a
 month of 12 MP captures with DNGs (about 14 GB by 2026-09-30) grows towards
-filling root. `scripts/pi_photo_volume.py` moves `~/Pictures/pifilm` onto a
+filling root. A multi-frame photograph keeps every frame as a JPEG, so with
+MULTI-FRAME at 6 each shot is about six times a single shot's JPEG. `scripts/pi_photo_volume.py` moves `~/Pictures/pifilm` onto a
 preallocated ext4 image file mounted over the same path. Nothing that reads or
 writes photos changes: capture, the Stick, `captures.jsonl` and the Nextcloud
 sync all keep the same folder.

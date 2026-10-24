@@ -357,7 +357,8 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   (`--ignore-log` keeps the look's). A record with a `stack` merges the listed frames
   (`stack.merge`, reference first) and grades the merge: close to the Pi's in-memory merge, not
   byte-identical (exact when the Pi itself recovered the grade from the same JPEGs). With a
-  frame missing, or with `--ignore-log`, the reference is graded alone. `HHMMSS_frameN.jpg`
+  frame missing, unreadable or of another size (counted in the run's note; the run goes on), or
+  with `--ignore-log`, the reference is graded alone. `HHMMSS_frameN.jpg`
   files are never inputs, even with `--all`.
 
 ### Display (`pifilm/display/`)
@@ -393,7 +394,7 @@ opened by the `STABILISE >` row after IMAGE (page 1 then has eleven rows at most
 y 228), holds SHORT EXPOSURE (`ON`/`OFF`; dim under `--ae-lock` or when the camera lacks
 `AeExposureMode`), SHUTTER DELAY (`OFF`/`0.2 S`/`0.5 S`), MULTI-FRAME (`OFF`/`2`/`4`/`6`), its
 own RESET (these three only) and BACK; a tap steps a value and wraps. Both pages come from one
-table (`_PAGES` in `viewfinder.py`); STABILISE is dim on V4L2 and `--fake`. Both work in 320×240 base units at an
+table (`_PAGES` in `viewfinder.py`); STABILISE is dim on `--fake` (V4L2 has no menu). Both work in 320×240 base units at an
 integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW/MENU state machine
 (it also lights `+`/`-`/shutter while a finger is on them) and takes the scale from the display's
 width. Under `run()` it reads preview frames on a `pifilm-frames` thread (touch is on `pifilm-touch`)

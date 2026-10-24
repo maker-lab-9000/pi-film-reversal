@@ -400,8 +400,30 @@ def test_a_stack_with_a_frame_missing_grades_the_reference_alone(tmp_path, capsy
     want = _graded(load_rgb(d / names[0])[0], ev=-0.33, seed=77, tmp_path=tmp_path)
     assert np.array_equal(got, want)  # the logged EV and seed still apply
     assert main([str(d), str(tmp_path / "out2")]) == 0
-    assert "1 multi-frame with frames missing, reference graded alone" in (
+    assert "1 multi-frame with frames missing or unusable, reference graded alone" in (
         capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("damage", ["size", "unreadable"])
+def test_a_stack_whose_frames_cannot_merge_grades_the_reference_alone(
+    tmp_path, capsys, damage,
+):
+    d, names = _stack_dir(tmp_path, n=3)
+    if damage == "size":  # merge's ValueError: frames of different sizes
+        save_jpeg(_burst_scene(1, h=64, w=80), d / names[1])
+    else:
+        (d / names[2]).write_bytes(b"\xff\xd8 cut short")
+    # A second, ordinary photograph after it: the run goes on.
+    save_jpeg(_img(3), d / "120500_original.jpg")
+    result = process_dir(d, tmp_path / "out")
+    assert sorted(p.name for p in result.written) == [
+        "120001_original_graded.jpg", "120500_original_graded.jpg"]
+    assert result.stacks == 0 and result.stack_frames_missing == 1
+    got = load_rgb(tmp_path / "out" / "120001_original_graded.jpg")[0]
+    want = _graded(load_rgb(d / names[0])[0], ev=-0.33, seed=77, tmp_path=tmp_path)
+    assert np.array_equal(got, want)
+    assert main([str(d), str(tmp_path / "out2")]) == 0
+    assert "1 multi-frame with frames missing or unusable" in capsys.readouterr().out
 
 
 def test_ignore_log_grades_a_stack_reference_alone(tmp_path):

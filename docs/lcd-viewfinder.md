@@ -326,8 +326,8 @@ eleven rows, the last ending at y 228.
 
 A tap steps to the next value and wraps. While any of the three is on, the live
 view shows an amber `STAB` tag right after `IMG`. Each Picamera2 record has
-`short_exposure` right after `saturation` (when the camera lists the control),
-then `shutter_delay_s` (the delay actually waited) after the last camera field.
+`short_exposure` right after `saturation` (when the camera lists the control;
+always `false` under `--ae-lock`, whatever was saved), then `shutter_delay_s` (the delay actually waited) after the last camera field.
 
 *Shutter delay* applies to the LCD's shutter button and the GPIO button only. The
 Stick and the keyboard never wait. The live view keeps running during the wait (the
@@ -339,7 +339,8 @@ lets the shake of the press die down before the exposure.
 [how it works](how-it-works.md#multi-frame-photographs). When SHUTTER and ISO are
 both `AUTO` (and no `--ae-lock`), the burst shares the one exposure auto exposure
 chose: each frame gets 1/n of the time at n times the gain (capped at the sensor's
-largest gain, which leaves a gain-capped burst darker before normalisation; the
+largest gain, which leaves a gain-capped burst darker before normalisation, on
+purpose: see [known issues](known-issues.md#a-gain-capped-split-burst-saves-darker-originals-on-purpose); the
 camera also lengthens an exposure below its minimum, and the record keeps both what
 was asked for and what the reference frame got). With either fixed, every frame
 gets the fixed values. The frame with the highest focus figure is the reference,
@@ -349,8 +350,13 @@ per exposure. The record has a `stack` block after `shutter_delay_s`: the frame
 names (reference first), the reference frame's exposure and gain, the requested
 ones, `split`, the merge `method`, `aligned` (each frame's shift, roll, ECC
 correlation `rho`, `used`, the `reason` a frame was left out, and its own
-`exposure_us` and `gain`), and `align_ms` / `merge_ms`. The review shows the reference frame's quick grade;
-the merged, graded file follows a few seconds later.
+`exposure_us` and `gain`), and `align_ms` / `merge_ms`. The review shows the
+reference frame's quick grade; the merged, graded file follows a few seconds later.
+
+Every frame of a burst is kept as a JPEG, so a 6-frame photograph takes about six
+times the bytes of a single shot on the photo volume and in the Nextcloud sync
+(less the DNG it does not save), and the [disk-space warning](#disk-space-warning)
+comes that much sooner.
 
 **Halation.** `OFF` leaves the look's halation out of the photographs that follow,
 `ON` puts it back. A photograph keeps the value it was taken with, even if its

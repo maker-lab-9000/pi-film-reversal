@@ -41,8 +41,9 @@ real capture folder, which holds ``<time>_original.jpg`` next to
   Pi's grade worker does, then grades the merge with the logged EV and seed, so
   it reproduces the Pi's file as closely as the frames on disk allow (exactly
   for a grade the Pi recovered from those JPEGs). A listed frame missing from
-  the folder leaves the reference to be graded alone, and the run says how
-  many. ``--ignore-log`` grades the reference alone. The ``_frameN`` files are
+  the folder, unreadable, or of another size than the reference leaves the
+  reference to be graded alone (that photograph only; the run goes on), and
+  the run says how many. ``--ignore-log`` grades the reference alone. The ``_frameN`` files are
   never inputs themselves, whatever ``--all`` says: each is part of a
   photograph, not one.
 * **Clobbering.** ``a.jpg`` and ``a.png`` would produce the same output
@@ -90,7 +91,9 @@ class BatchResult:
     gpu_graded: int = 0  # regraded here on the CPU, graded by the Pi on its GPU
     halation_off: int = 0  # regraded without the look's halation, as the Pi graded them
     stacks: int = 0  # multi-frame photographs regraded from the merge of their frames
-    stack_frames_missing: int = 0  # multi-frame photographs graded from the reference alone
+    # Multi-frame photographs graded from the reference alone: a listed frame
+    # missing, unreadable or of another size.
+    stack_frames_missing: int = 0
     bad_log_lines: int = 0
 
 
@@ -236,9 +239,18 @@ def process_dir(
         rgb, _meta = load_rgb(src)
         if entry is not None and entry.frames is not None and len(entry.frames) > 1:
             others = [in_dir / name for name in entry.frames[1:]]
+            merged = None
             if entry.frames[0] == src.name and all(p.is_file() for p in others):
-                # As the Pi's grade worker: the reference first, merged onto it.
-                rgb, _merged = merge([rgb] + [load_rgb(p)[0] for p in others], reference=0)
+                # As the Pi's grade worker: the reference first, merged onto it. A
+                # frame that cannot be read, or of another size (merge's
+                # ValueError), costs this photograph its merge, not the run.
+                try:
+                    merged, _info = merge([rgb] + [load_rgb(p)[0] for p in others],
+                                          reference=0)
+                except (OSError, ValueError):
+                    merged = None
+            if merged is not None:
+                rgb = merged
                 result.stacks += 1
             else:
                 result.stack_frames_missing += 1
@@ -298,8 +310,8 @@ def main(argv: list[str] | None = None) -> int:
     if result.stacks:
         notes.append(f"{result.stacks} multi-frame merged")
     if result.stack_frames_missing:
-        notes.append(f"{result.stack_frames_missing} multi-frame with frames missing, "
-                     "reference graded alone")
+        notes.append(f"{result.stack_frames_missing} multi-frame with frames missing or "
+                     "unusable, reference graded alone")
     if result.halation_off:
         notes.append(f"{result.halation_off} without halation, as shot")
     if result.bad_log_lines:

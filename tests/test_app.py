@@ -4450,6 +4450,14 @@ def test_a_saved_short_exposure_reaches_the_picamera2_constructor(
             ) in capsys.readouterr().out
 
 
+def test_a_saved_short_exposure_is_off_under_the_ae_lock(camera_cli, monkeypatch, tmp_path):
+    _save_settings(short_exposure=True)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path,
+                      _StabiliseMenuCamera(adjustable=False), "--ae-lock")
+    assert seen["camera_kwargs"]["short_exposure"] is False
+    assert seen["camera_kwargs"]["ae_lock"] is True
+
+
 def test_the_short_exposure_applier_reaches_the_camera(camera_cli, monkeypatch, tmp_path):
     camera = _StabiliseMenuCamera()
     seen = _menu_main(camera_cli, monkeypatch, tmp_path, camera)

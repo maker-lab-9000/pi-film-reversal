@@ -482,8 +482,9 @@ class ViewfinderLoop:
 
         Only a camera with the setting rows (Picamera2) takes settings, so without
         them (``--fake``) a value saved on the Pi delays nothing. The controller's
-        worker waits it out; the job is active meanwhile, so the colour bars show
-        and a second tap is answered busy.
+        worker waits it out with the job accepted but ``delaying``: the live view
+        stays up (no colour bars until the capture starts) and a second tap is
+        answered busy.
         """
         if self._settings is None or not self._menu_resettable:
             return 0.0
