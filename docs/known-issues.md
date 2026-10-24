@@ -391,3 +391,48 @@ field and were graded at EV 0 whatever the buttons said.
 
 Workaround: regrade such a file from Python with
 `Pipeline(Artifacts.default()).process(rgb, ev=<ev_comp>)`.
+
+## Multi-frame merge: limits not yet checked on the Pi's frames
+
+The merge (`pifilm/stack.py`) was tuned on synthetic frames. Three limits are
+known and left as they are until real bursts show whether they matter.
+
+- **Ghosts are found by luma only.** A moving subject is caught by its brightness
+  difference from the reference. Something that changes colour at the same
+  brightness (a red and a green car of equal luma passing) is averaged and can
+  appear faintly twice.
+- **`MIN_CORRELATION` (0.5) is untuned.** A frame whose ECC fit ends under it is
+  dropped. A scene with little texture (sky, a plain wall) at high gain may fall
+  under it, and the photograph is then the reference alone or a merge of fewer
+  frames. This is a safe failure: noisier, never misaligned. The record's
+  `stack.aligned` shows which frames were used, each frame's ECC correlation
+  (`rho`) and the `reason` a frame was left out.
+- **Ghost weighting limits the noise drop at high gain.** `GHOST_SCALE` (0.05
+  linear luma) assumes the noise between two frames is a few hundredths. At high
+  gain in the dark the noise can approach it, so frames weigh less than 1 where
+  only noise differs, and the noise falls by less than 1/√n.
+
+How to check: take multi-frame shots of a still scene in dim light (high gain) and
+of a plain wall, read `stack.aligned` and compare the merge's noise with a single
+frame at the same exposure. Changing either constant changes pixels, so a
+regrade of older records would differ.
+
+## A gain-capped split burst saves darker originals (on purpose)
+
+A split burst takes each of its `n` frames at `t / n` and gain `g * n`, capped at
+the sensor's maximum analogue gain (`Picamera2Camera._split`). When the cap
+bites (dim light, a high `g` already), the frames keep `t / n` and are darker
+than a single shot would be. This is chosen: the total light over the `n` frames
+is the same as one frame at `t`, so once normalisation lifts the level the
+merged noise is roughly what an uncapped burst would give. The cost is in the
+saved `*_original.jpg` frames, which are darker and use fewer of their 8-bit
+levels (more banding in deep shadows after the lift).
+
+The alternative is to lengthen each frame at the cap, `t_b = t * g / gain_max`,
+which keeps the frames' brightness but gives back part of the shorter exposure the
+split exists for. Revisit it if capped bursts show banding on the Pi.
+
+The split reads only `ExposureTime` and `AnalogueGain` from the frame metadata;
+`DigitalGain` (which libcamera applies when the analogue gain cannot reach the
+AE's target) is ignored, so a frame the AE was lifting digitally splits slightly
+darker than it was metered.

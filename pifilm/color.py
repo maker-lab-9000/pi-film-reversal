@@ -16,6 +16,11 @@ Why these spaces
   from ``arctan2``, so in ``[-pi, pi]``).
 
 All functions accept arrays of shape ``(..., 3)`` and return ``float32``.
+
+Two lookup tables at the end serve the byte-level runtimes that add light
+(``double.py``, ``stack.py``): ``SRGB8_LINEAR`` decodes a uint8 code exactly
+(there are only 256), ``LINEAR16_SRGB8`` encodes linear light quantised to
+``LINEAR_LEVELS`` levels, well under one output code.
 """
 
 from __future__ import annotations
@@ -96,3 +101,17 @@ def lch_to_oklab(lch: np.ndarray) -> np.ndarray:
 def luminance(rgb_linear: np.ndarray) -> np.ndarray:
     """Rec. 709 luminance of linear RGB."""
     return np.asarray(rgb_linear, dtype=np.float32) @ LUMA_709
+
+
+# uint8 sRGB code -> linear light, float32.
+SRGB8_LINEAR = srgb_to_linear(np.arange(256, dtype=np.float32) / 255.0)
+LINEAR_LEVELS = 65536
+# Linear level index (linear light scaled to [0, LINEAR_LEVELS - 1]) -> sRGB uint8 code.
+LINEAR16_SRGB8 = np.clip(
+    np.round(
+        linear_to_srgb(np.arange(LINEAR_LEVELS, dtype=np.float32) / (LINEAR_LEVELS - 1))
+        * 255.0
+    ),
+    0,
+    255,
+).astype(np.uint8)

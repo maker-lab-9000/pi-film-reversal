@@ -37,6 +37,7 @@ result is recorded in ``StreamInfo`` for the capture log.
 from __future__ import annotations
 
 import glob
+import numbers
 import re
 from dataclasses import dataclass
 from typing import Protocol
@@ -77,6 +78,9 @@ class StreamInfo:
     sharpness: float | None = None
     contrast: float | None = None
     saturation: float | None = None
+    # Whether pifilm asked the auto-exposure for libcamera's Short exposure mode
+    # (Picamera2 only; None where the camera has no AeExposureMode).
+    short_exposure: bool | None = None
 
     def to_dict(self) -> dict:
         values = {
@@ -102,6 +106,8 @@ class StreamInfo:
             value = getattr(self, name)
             if value is not None:
                 values[name] = float(value)
+        if self.short_exposure is not None:
+            values["short_exposure"] = bool(self.short_exposure)
         if self.autofocus is not None:
             values["autofocus"] = self.autofocus
         return values
@@ -125,7 +131,26 @@ class Camera(Protocol):
 
     def read(self, *, full: bool = True) -> Frame: ...
 
+    def read_burst(
+        self, n: int, *, split_exposure: bool, dng: bool = True,
+    ) -> tuple[list[Frame], dict]: ...
+
     def close(self) -> None: ...
+
+
+def burst_info(frames: list[Frame]) -> dict:
+    """The per-burst report of an unsplit burst: what the first frame's metadata
+    says the exposure time and analogue gain were (None where it does not)."""
+    first = (frames[0].metadata if frames else None) or {}
+    return {"exposure_us": first.get("ExposureTime"), "gain": first.get("AnalogueGain"),
+            "split": False}
+
+
+def burst_count(n: object) -> int:
+    """A burst's frame count as an int: a whole number of 1 or more, not a bool."""
+    if not isinstance(n, numbers.Integral) or isinstance(n, bool) or n < 1:
+        raise CameraError(f"a burst needs a whole number of frames of 1 or more, got {n!r}")
+    return int(n)
 
 
 def is_valid_jpeg(buf: bytes) -> bool:
@@ -169,8 +194,12 @@ class FakeCamera:
         source: str = "decoded",
         stream_info: StreamInfo | None = None,
         metadata: dict | None = None,
+        burst_shift: int = 0,
     ) -> None:
         self._jpegs = jpeg_bytes
+        # A burst's frame i is rolled by i * burst_shift pixels down and right,
+        # a deterministic stand-in for a hand moving between frames.
+        self._burst_shift = int(burst_shift)
         self._metadata = metadata
         # Constant, as on Picamera2Camera: CaptureSession logs it as ``ev_comp``.
         self.ev = 0.0
@@ -213,6 +242,20 @@ class FakeCamera:
             source=self._source,
             metadata=self._metadata,
         )
+
+    def read_burst(
+        self, n: int, *, split_exposure: bool, dng: bool = True,
+    ) -> tuple[list[Frame], dict]:
+        # Mirrors Picamera2Camera.read_burst: n reads, never a split exposure
+        # (there is no exposure to split) and never a DNG (``dng`` is ignored).
+        frames = []
+        for i in range(burst_count(n)):
+            frame = self.read(full=True)
+            shift = i * self._burst_shift
+            if shift:
+                frame.rgb = np.roll(frame.rgb, (shift, shift), axis=(0, 1))
+            frames.append(frame)
+        return frames, burst_info(frames)
 
     def set_shutter(self, us: int | None) -> None:
         # Mirrors Picamera2Camera.set_shutter for the viewfinder's shutter control;
@@ -424,6 +467,15 @@ class V4L2Camera:
                 return Frame(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), buf, "raw-mjpeg")
             return Frame(cv2.cvtColor(data, cv2.COLOR_BGR2RGB), None, "decoded")
         raise CameraError("Failed to read a frame after 3 attempts")
+
+    def read_burst(
+        self, n: int, *, split_exposure: bool, dng: bool = True,
+    ) -> tuple[list[Frame], dict]:
+        """``n`` frames from ``read()``. The camera runs its own exposure, so
+        ``split_exposure`` has nothing to split and the report says ``split: False``;
+        a USB camera has no DNG, so ``dng`` is ignored."""
+        frames = [self.read(full=True) for _ in range(burst_count(n))]
+        return frames, burst_info(frames)
 
     def close(self) -> None:
         if self.cap is not None:

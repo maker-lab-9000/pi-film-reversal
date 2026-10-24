@@ -37,7 +37,7 @@ python3.12 -m venv .venv
 
 # Tests. pyproject sets pytest `pythonpath = ["."]` because tests import `scripts/` and
 # `firmware/sticks3/scripts/` as namespace packages from the repo root.
-.venv/bin/pytest -q -m 'not slow'                     # ~165s, ~2300 tests
+.venv/bin/pytest -q -m 'not slow'                     # ~180s, ~2650 tests
 .venv/bin/pytest -q tests/test_lut.py                 # one file
 .venv/bin/pytest -q tests/test_lut.py -k identity     # one test by name
 .venv/bin/pytest -q -m slow                           # builds a wheel, installs into a temp venv, runs pifilm-process
@@ -55,6 +55,8 @@ python3.12 -m venv .venv
 .venv/bin/pifilm-train --source data/source --target data/references --out artifacts/pifilm-v1
 .venv/bin/pifilm-fetch --category 'Category:...'                   # Wikimedia Commons corpus fetch
 .venv/bin/python scripts/stamp_halation.py --artifacts DIR [--strength S] [--sigma-mm M] [--headroom C] [--off]
+.venv/bin/python scripts/bench_stack.py --folder DAY_DIR --shot HHMMSS [--runs N]   # time a multi-frame merge
+.venv/bin/python scripts/bench_stack.py --frames REF.jpg B.jpg ...                  # (Pi or Mac; first = reference)
 
 # Experiments have no console scripts; run as modules from the repo root
 .venv/bin/python -m pifilm.experiments.{regression,candidates,train,evaluate} ...
@@ -159,6 +161,21 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   grade is not byte-identical to the CPU's: a few levels on ordinary colours, 10 to 20 on strongly
   saturated ones (the CPU rounds to bytes before the LUT). Design:
   `docs/superpowers/specs/2026-10-13-gpu-grading-design.md`.
+- `stack.py`: the multi-frame merge, before the pipeline (the merge is graded like any frame).
+  `merge(frames, reference=)` aligns each other frame to the reference with ECC
+  (`MOTION_EUCLIDEAN`: shift and roll) on luma reduced by a whole factor to about 1,000 px on the
+  long side, warps it once at full size (bilinear, reflected border, uint8), and averages in
+  linear light with each other frame's pixels weighted `exp(-(d / 0.05)^2)` (`GHOST_SCALE`, `d`
+  the linear luma difference from the reference; the reference has weight 1), in bands of rows.
+  A frame is dropped when ECC fails, its correlation is under `MIN_CORRELATION` (0.5), its shift
+  is over 5% of the width or its roll over 2 degrees; none used returns the reference itself.
+  Returns the image and an info dict (`method`, per-frame `dx`/`dy`/`angle_deg`, `rho` (ECC's
+  correlation, null for the reference and where ECC raised), `used`, `reason` (null when used,
+  else one of `REASONS`: `ecc_failed`, `low_correlation`, `shift`, `angle`, and `unreadable`,
+  which only a caller sets, through `unused_entry`), `align_ms`, `merge_ms`). Deterministic; another machine's OpenCV may differ in the last bits.
+  The sRGB/linear tables it shares with `double.py` live in `color.py`. Six 12 MP frames take
+  about 1.8 s on the Mac (align 0.84 s, merge 0.90 s) and about 9.4 s on the Pi 4 (2 frames 2.9 s, 4 frames 6.1 s)
+  (`scripts/bench_stack.py`).
 - `raw.py`: reads a Picamera2 DNG and develops it with the camera's own libcamera tuning file
   (black level, lens shading, digital gain and white balance, OpenCV demosaic, colour matrix,
   tone curve). Offline only: a look trained on developed DNGs showed no visible gain
@@ -202,6 +219,20 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   controls (1.0 is normal; the menu's IMAGE page), sent in both configurations at open and
   changed live by `set_image_control(key, value)`; a control the camera does not list is sent
   at 1.0, refused at runtime and left out of records.
+  `short_exposure` follows `saturation`: `AeExposureMode` `Short` (on) or `Normal`, in both
+  configurations, changed live by `set_short_exposure`; left out of records when the camera does
+  not list the control. `read_burst(n, split_exposure=, dng=)` takes `n` stills as one still
+  (both locks; one switch to the still configuration and back) and returns `(frames, info)`,
+  `info` = `exposure_us`, `gain`, `split`. It splits the exposure only when SHUTTER and ISO are
+  both auto and AE is not locked: from the latest live metadata while it is fresh (read within
+  `LIVE_METADATA_MAX_AGE_S`, 1 s, or two of its exposures; the viewfinder reads none with the
+  screen off, in MENU, REVIEW or a notice), else one `capture_metadata`,
+  each frame gets `t / n` and gain `min(g * n, max)`, written into the still configuration and
+  put back after the burst. A gain-capped burst is darker before normalisation, on purpose
+  (same total light; `docs/known-issues.md`); `DigitalGain` is not read; an exposure
+  below the sensor's minimum is clamped by the camera (the frames' metadata has the truth).
+  `dng=False` saves no DNG for any frame. `FakeCamera`/`V4L2Camera.read_burst` are `n` reads,
+  never split.
 - `app.py`: `CaptureSession` owns camera + pipeline + output dir. Three loops: live preview,
   captures-only display (`--show-captures`, shows TV colour bars while processing), and headless
   terminal. `--display waveshare35dsi` (or `waveshare28`) runs the LCD viewfinder instead of any
@@ -254,13 +285,34 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   address of `eth0` and `wlan0` while sysfs reports them up (`SIOCGIFADDR` ioctl; the hotspot's
   address counts), logs `network:` lines on each change and feeds `CaptureSession.network`
   (`(label, address)` pairs, `ETH` then `WLAN`), which the settings menu shows.
-- `settings.py`: the seven settings the LCD menu changes (DNG saving, halation, AE constraint, AE
-  metering, and sharpness, contrast, saturation in `IMAGE_STEPS` 0.5 to 1.5; halation has no
-  flag and defaults to on, the look's own; the image three have none and default to 1.0), in
+  Multi-frame (`CaptureSession.multi_frame`, the menu's MULTI-FRAME, read at the shutter; 1 is
+  off; Picamera2 only): `read_burst(n, split_exposure=True, dng=False)`, the reference the frame
+  with the highest `FocusFoM` (frame 0 when none says), saved as `HHMMSS_original.jpg`, the
+  others `HHMMSS_frame2.jpg` and on in capture order; all written on the capture side. The
+  pending entry lists them reference first with `"stack": {"reference_index": i}`; the worker
+  merges them (`stack.merge`, stage `merge`, outside `pipeline_ms`), frees the frames and grades
+  the merge; a recovered grade merges the JPEGs on disk, leaving out (one log line, `reason`
+  `unreadable`) any frame after the reference it cannot read or that is not the reference's size;
+  only an unreadable reference fails it. The quick grade is the reference alone.
+  No DNG for a stacked shot; a double exposure never takes a burst. Memory: one 6-frame merge
+  peaks at about 640 MB; about 1.5 GB estimated with four 6-frame shots queued, on the 4 GB Pi 4.
+  Writing the frames holds the camera about 0.47 s per frame (a 6-frame shot about 4 s). Picamera2 records gain `shutter_delay_s`
+  (the delay waited; 0.0 for the Stick) right after the last `stream_info` field and, for a
+  stack, `stack` after it: `frames` (names, reference first), `reference`, `exposure_us` and
+  `gain` (the reference frame's metadata), `requested_exposure_us`, `requested_gain`, `split`,
+  `method`, `aligned` (per frame `dx`, `dy`, `angle_deg`, `rho`, `used`, `reason`, then that
+  frame's own `exposure_us` and `gain`, null where its metadata has none), `align_ms`, `merge_ms`.
+  A stack's `stage_ms` has `burst` in place of `capture`, plus `save_frames` and `merge`;
+  `camera_metadata` is the reference frame's.
+- `settings.py`: the ten settings the LCD menu changes (DNG saving, halation, AE constraint, AE
+  metering, sharpness, contrast, saturation in `IMAGE_STEPS` 0.5 to 1.5, and the STABILISE
+  page's `short_exposure` (bool), `shutter_delay` (0.0, 0.2, 0.5 s) and `multi_frame` (1, 2, 4,
+  6); halation has no flag and defaults to on, the look's own; the others have none and default
+  to 1.0 or off), in
   `settings.json` beside the state directory (still version 1); read at start-up before the camera
   opens, a saved value wins over the unit's flag on Picamera2 only (one `settings:` line), and
   `SettingsControl` applies, saves atomically and resets them (`reset_image` only the image
-  three). Looks were trained at 1.0, so a value away from it grades a picture the look never
+  three, `reset_stabilise` only the STABILISE three). Looks were trained at 1.0, so a value away from it grades a picture the look never
   saw. `upload.py`: `Upload`, the menu's
   UPLOAD row, runs `python -m pifilm.nextcloud` as a child (`--nextcloud-env PATH`, never read
   by the service; the token stripped from its environment) and reads its last line for the status.
@@ -279,10 +331,15 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   a time, idempotent by `request_id`. Shared by the local SPACE key, the LCD, the GPIO shutter
   button and the remote API. `ControllerSnapshot.pending_grades` is read live from the session
   (it includes a recovery backlog), and closing finishes this run's grades before the camera closes.
+  `submit(request_id, delay_s=)` is the shutter delay (the menu's SHUTTER DELAY, asked for by the
+  LCD shutter and the GPIO button only; never the Stick or the keyboard): the job stays `queued`
+  with `ControllerSnapshot.delaying` True while the worker waits, so the live view keeps running
+  and a second press is `busy`; it then passes the delay to `session.capture(delay_s=)` for the
+  record. Closing during the wait fails the job `closed` without capturing.
 - `button.py`: optional physical shutter button (`--shutter-gpio BCM`, documented on BCM 21 with
   ground on physical pin 39). gpiozero `Button` with the internal pull-up, lazy import; a press
-  calls `CaptureController.submit` like an LCD tap, so a press during a capture is dropped as
-  `busy`. Pins of the X728 and of the 2.8" LCD are refused when that hardware is selected; a pin
+  calls `CaptureController.submit` like an LCD tap (with the menu's shutter delay, read at each
+  press), so a press during a capture is dropped as `busy`. Pins of the X728 and of the 2.8" LCD are refused when that hardware is selected; a pin
   that cannot be claimed is one warning line, not a failure to start.
 - `remote.py`: `RemoteCaptureServer`, a stdlib `http.server` with bearer-token auth
   (`PIFILM_REMOTE_TOKEN`). Endpoints: `GET /v1/status`, `POST /v1/captures` (`{"request_id": uuid}`,
@@ -298,7 +355,12 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   It always grades on the CPU, so a record the Pi graded on its GPU (`pipeline_backend` starting
   `gpu`) is reproduced closely, not byte for byte; the tool prints one note per run when it
   regrades such records. A record with `"halation": "off"` is regraded without halation
-  (`--ignore-log` keeps the look's).
+  (`--ignore-log` keeps the look's). A record with a `stack` merges the listed frames
+  (`stack.merge`, reference first) and grades the merge: close to the Pi's in-memory merge, not
+  byte-identical (exact when the Pi itself recovered the grade from the same JPEGs). With a
+  frame missing, unreadable or of another size (counted in the run's note; the run goes on), or
+  with `--ignore-log`, the reference is graded alone. `HHMMSS_frameN.jpg`
+  files are never inputs, even with `--all`.
 
 ### Display (`pifilm/display/`)
 
@@ -319,13 +381,21 @@ absent at zero), an amber `TUNING` tag last in that row (`LiveState.tuning_misma
 snapshot's `tuning_mismatch`), amber `PHOTOS NN%`/`SD NN%` tags in their own tile between that
 row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning`), an amber
 `IMG` tag first in that tile while sharpness, contrast or saturation is not 1.0
-(`LiveState.image_adjusted`, from the viewfinder's own settings, not the snapshot), a `MENU`
+(`LiveState.image_adjusted`, from the viewfinder's own settings, not the snapshot), an amber
+`STAB` tag right after it while short exposure, shutter delay or multi-frame is on
+(`LiveState.stabilise_on`; IMG and STAB are padded 3 units a side, half the other tags, so IMG,
+STAB and the widest disk warning fit the tile), a `MENU`
 key under `-` that opens the settings menu, and focus gauge, from cached anti-aliased tiles in the
 bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
 holds only the review, processing and message screens; `menu.py` draws the settings menu page
 (rows, `DONE` where the shutter is) and hit-tests it; a titled page (the second, IMAGE page:
 SHARPNESS, CONTRAST, SATURATION, its own RESET, BACK; opened by the first page's IMAGE row,
-dim on a camera that takes none of them) puts its title on the first line. Both work in 320×240 base units at an
+dim on a camera that takes none of them) puts its title on the first line. The STABILISE page,
+opened by the `STABILISE >` row after IMAGE (page 1 then has eleven rows at most, ending at
+y 228), holds SHORT EXPOSURE (`ON`/`OFF`; dim under `--ae-lock` or when the camera lacks
+`AeExposureMode`), SHUTTER DELAY (`OFF`/`0.2 S`/`0.5 S`), MULTI-FRAME (`OFF`/`2`/`4`/`6`), its
+own RESET (these three only) and BACK; a tap steps a value and wraps. Both pages come from one
+table (`_PAGES` in `viewfinder.py`); STABILISE is dim on `--fake` (V4L2 has no menu). Both work in 320×240 base units at an
 integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW/MENU state machine
 (it also lights `+`/`-`/shutter while a finger is on them) and takes the scale from the display's
 width. Under `run()` it reads preview frames on a `pifilm-frames` thread (touch is on `pifilm-touch`)

@@ -1,8 +1,9 @@
 """The settings the LCD menu changes, remembered in ``settings.json``.
 
-Why only these seven (DNG saving, the look's halation, the auto-exposure
-constraint and metering mode, and the camera's sharpness, contrast and
-saturation): they are the ones a photographer wants to change in the field, away
+Why only these ten (DNG saving, the look's halation, the auto-exposure
+constraint and metering mode, the camera's sharpness, contrast and saturation,
+and the three helps against camera shake: short exposure, shutter delay and
+multi-frame): they are the ones a photographer wants to change in the field, away
 from a keyboard, and each can be applied to a running session at once. Every
 other flag (the look, the camera, the network, where photographs go, the
 display's rotation) is set up once and stays with the systemd unit alone; a
@@ -21,6 +22,18 @@ so far was trained on captures taken at 1.0, so a value away from 1.0 grades a
 picture the look never saw; the live view's amber ``IMG`` tag is there so it is
 not forgotten. They too came without a new ``VERSION``: an older build ignores
 each as an unknown key with one line and shoots at 1.0.
+
+``short_exposure``, ``shutter_delay`` and ``multi_frame`` are the helps against
+camera shake, and have no flags either: each starts off (False, 0.0 seconds, 1
+frame). ``short_exposure`` asks the auto-exposure for libcamera's Short exposure
+mode, which keeps the shutter short and raises the gain instead; it is a camera
+control like the AE modes. ``shutter_delay`` is how long a shot waits after the
+press, so the hand that pressed has stopped moving, and ``multi_frame`` how many
+frames a shot merges into one photograph; both belong to the session, not the
+camera. Each takes only the values the menu steps through (0.0, 0.2 or 0.5
+seconds; 1, 2, 4 or 6 frames), so a hand-edited file cannot ask for a delay or
+a burst nobody tested. They also came without a new ``VERSION``: an older build
+ignores each as an unknown key with one line and shoots as it always did.
 
 Why a saved value wins over the unit's flag: a setting changed in the menu has to
 survive a restart, a power cut or a reboot, or the menu is a trap that undoes
@@ -62,14 +75,22 @@ AE_METERINGS = ("centre", "spot", "matrix")
 IMAGE_KEYS = ("sharpness", "contrast", "saturation")
 IMAGE_STEPS = (0.5, 0.75, 1.0, 1.25, 1.5)
 IMAGE_NORMAL = 1.0
-KEYS = ("save_dng", "halation", "ae_constraint", "ae_metering") + IMAGE_KEYS
+# The helps against camera shake and the values the menu steps through.
+SHUTTER_DELAYS = (0.0, 0.2, 0.5)  # seconds
+MULTI_FRAMES = (1, 2, 4, 6)  # frames merged into one photograph; 1 is off
+STABILISE_KEYS = ("short_exposure", "shutter_delay", "multi_frame")
+# Stored as floats whatever the JSON held (``1`` and ``1.0`` are one value).
+_FLOAT_KEYS = IMAGE_KEYS + ("shutter_delay",)
+KEYS = (
+    ("save_dng", "halation", "ae_constraint", "ae_metering") + IMAGE_KEYS + STABILISE_KEYS
+)
 
 
 @dataclass(frozen=True)
 class Settings:
-    """The seven values the menu can change. ``halation`` defaults to True, the
-    look's own halation, and the image controls to 1.0, because no flag sets
-    them."""
+    """The ten values the menu can change. ``halation`` defaults to True, the
+    look's own halation, the image controls to 1.0 and the helps against camera
+    shake to off, because no flag sets them."""
 
     save_dng: bool
     ae_constraint: str
@@ -78,6 +99,9 @@ class Settings:
     sharpness: float = IMAGE_NORMAL
     contrast: float = IMAGE_NORMAL
     saturation: float = IMAGE_NORMAL
+    short_exposure: bool = False
+    shutter_delay: float = 0.0
+    multi_frame: int = 1
 
 
 def format_step(value: float) -> str:
@@ -87,11 +111,14 @@ def format_step(value: float) -> str:
 
 
 def _valid(key: str, value: object) -> bool:
-    if key in ("save_dng", "halation"):
+    if key in ("save_dng", "halation", "short_exposure"):
         return isinstance(value, bool)
-    if key in IMAGE_KEYS:
+    if key in _FLOAT_KEYS:
+        steps = IMAGE_STEPS if key in IMAGE_KEYS else SHUTTER_DELAYS
         return (isinstance(value, (int, float)) and not isinstance(value, bool)
-                and value in IMAGE_STEPS)
+                and value in steps)
+    if key == "multi_frame":
+        return isinstance(value, int) and not isinstance(value, bool) and value in MULTI_FRAMES
     if key == "ae_constraint":
         return isinstance(value, str) and value in AE_CONSTRAINTS
     if key == "ae_metering":
@@ -100,13 +127,14 @@ def _valid(key: str, value: object) -> bool:
 
 
 def _describe(key: str, value: object) -> str:
-    """``ae-constraint shadows``, ``dng off``, ``halation off``, ``contrast 1.25``."""
+    """``ae-constraint shadows``, ``dng off``, ``halation off``, ``contrast 1.25``,
+    ``short-exposure on``, ``shutter-delay 0.2``, ``multi-frame 4``."""
     if key == "save_dng":
         return f"dng {'on' if value else 'off'}"
-    if key == "halation":
-        return f"halation {'on' if value else 'off'}"
-    if key in IMAGE_KEYS:
-        return f"{key} {format_step(value)}"
+    if key in ("halation", "short_exposure"):
+        return f"{key.replace('_', '-')} {'on' if value else 'off'}"
+    if key in _FLOAT_KEYS:
+        return f"{key.replace('_', '-')} {format_step(value)}"
     return f"{key.replace('_', '-')} {value}"
 
 
@@ -153,7 +181,7 @@ def load(path: Path, defaults: Settings) -> tuple[Settings, dict[str, object], l
         if key == "version":
             continue
         if key in KEYS and _valid(key, value):
-            overrides[key] = float(value) if key in IMAGE_KEYS else value
+            overrides[key] = float(value) if key in _FLOAT_KEYS else value
         else:
             lines.append(f"settings: ignoring {key} in {path}")
     current = replace(defaults, **overrides)
@@ -185,7 +213,7 @@ def save(path: Path, overrides: Mapping[str, object]) -> None:
 
 
 class SettingsControl:
-    """The menu's view of the seven settings: apply, remember, reset.
+    """The menu's view of the ten settings: apply, remember, reset.
 
     An applier puts a value into effect in the running session (send the camera
     a control, start or stop saving DNGs or applying halation). It runs before
@@ -234,7 +262,7 @@ class SettingsControl:
             raise ValueError(f"unknown setting {key!r}")
         if not _valid(key, value):
             raise ValueError(f"invalid value {value!r} for {key}")
-        if key in IMAGE_KEYS:
+        if key in _FLOAT_KEYS:
             value = float(value)
         if not self._apply(key, value):
             return False
@@ -264,18 +292,26 @@ class SettingsControl:
                 self._current = replace(self._current, **{key: default})
                 self._overrides.pop(key, None)
 
-    def reset_image(self) -> None:
-        """Put only sharpness, contrast and saturation back to 1.0 and save.
-
-        The image page's own reset: the other settings and their saved values
-        stay as they are.
-        """
-        self._restore(IMAGE_KEYS)
-        self._log("settings: sharpness, contrast, saturation reset to 1.0")
+    def _reset_page(self, keys: tuple[str, ...], line: str) -> None:
+        """A menu page's own reset: put ``keys`` back to their defaults and save;
+        the other settings and their saved values stay as they are."""
+        self._restore(keys)
+        self._log(line)
         try:
             save(self._path, self._overrides)
         except OSError as exc:
             self._log(f"settings: cannot save ({exc})")
+
+    def reset_image(self) -> None:
+        """Put only sharpness, contrast and saturation back to 1.0 and save (the
+        IMAGE page's reset)."""
+        self._reset_page(IMAGE_KEYS, "settings: sharpness, contrast, saturation reset to 1.0")
+
+    def reset_stabilise(self) -> None:
+        """Put only short exposure, shutter delay and multi-frame back to off and
+        save (the STABILISE page's reset)."""
+        self._reset_page(STABILISE_KEYS,
+                         "settings: short exposure, shutter delay, multi-frame reset to off")
 
     def reset(self) -> None:
         """Put every setting back to the unit's flags and delete the file."""

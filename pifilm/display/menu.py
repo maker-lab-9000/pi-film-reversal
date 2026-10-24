@@ -17,8 +17,9 @@ Design intent:
   label leaves it.
 - A second page (the camera's image controls) has a title on its first line,
   amber and not a row: the rows start one line lower, and a tap on the title
-  lands on nothing. Ten lines (a title and nine rows, or ten rows) end at y 208,
-  inside the 240-unit page at every scale, since the geometry is in base units.
+  lands on nothing. The first page at its fullest has eleven rows (its IMAGE and
+  STABILISE rows each open such a page), which end at y 228, inside the 240-unit
+  page at every scale, since the geometry is in base units.
 
 Drawing reuses the live view's canvas, fonts, colours and supersampling, so the
 page reads as the same instrument. Geometry is in 320x240 base units at the

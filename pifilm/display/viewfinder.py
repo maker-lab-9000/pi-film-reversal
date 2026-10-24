@@ -4,7 +4,12 @@ Every shot goes through the shared ``CaptureController`` exactly like a Stick
 request, so the LCD is one more trigger and one more screen, never a second
 owner of the camera. A finished job is noticed through the controller's
 ``finished_count``, which is how a Stick shot appears here without the
-controller knowing about displays.
+controller knowing about displays. Unlike a Stick request, a shutter tap asks
+for the menu's shutter delay (``shutter_delay``, read at the tap; none without
+the setting rows), which the controller's worker waits out before the capture.
+Through the wait the snapshot says ``delaying`` and the live view stays up, keys
+and all, since the photographer is holding the framing; the colour bars come
+when the capture starts.
 Double exposure adds a third state, NOTICE: after exposure 1 of a pair there is
 nothing developed to review, so a short "Exposure 1/2" message replaces the
 review and the loop returns to LIVE for the second exposure.
@@ -30,6 +35,14 @@ closes the menu from either page, and the menu always opens on the first. The
 IMAGE row is dim with ``-`` when the camera can change none of the three (a
 V4L2 or fake camera), and a control the camera does not list is dim on the page.
 While any of the three is not 1.0 the live view shows an amber ``IMG`` tag.
+The ``STABILISE`` row, after IMAGE, opens a third page the same way (one
+mechanism, ``_PAGES``), titled STABILISE: SHORT EXPOSURE (``ON``/``OFF``),
+SHUTTER DELAY (``OFF``/``0.2 S``/``0.5 S``) and MULTI-FRAME (``OFF``/``2``/``4``/
+``6``), each tap stepping to the next value and wrapping, a RESET for only those
+three, and BACK. It is dim with ``-`` on a V4L2 or fake camera (no setting rows),
+and SHORT EXPOSURE is dim on a camera without libcamera's exposure modes or under
+``--ae-lock``, where it would change nothing. While any of the three this camera
+takes is not off the live view shows an amber ``STAB`` tag beside ``IMG``.
 The live screen (``liveview.py``) is select-and-adjust: a tap on one of the strip's
 three cells (SHUTTER, ISO, WB) selects it, and one ``+``/``-`` pair steps whichever
 is selected. While a job is processing the colour bars hide the cells and the
@@ -118,6 +131,9 @@ from ..capture.settings import (
     IMAGE_KEYS,
     IMAGE_NORMAL,
     IMAGE_STEPS,
+    MULTI_FRAMES,
+    SHUTTER_DELAYS,
+    STABILISE_KEYS,
     SettingsControl,
     format_step,
 )
@@ -245,6 +261,54 @@ RESET_ARM_SECONDS = 3.0
 STARTER_LOOK = "starter (bundled)"
 # The menu's second page: the camera's image controls.
 IMAGE_TITLE = "IMAGE"
+# The menu's third page: the helps against camera shake.
+STABILISE_TITLE = "STABILISE"
+STABILISE_LABELS = {
+    "short_exposure": "SHORT EXPOSURE", "shutter_delay": "SHUTTER DELAY",
+    "multi_frame": "MULTI-FRAME",
+}
+
+# Each STABILISE setting's off value (its default): any other shows STAB.
+STABILISE_OFF = {"short_exposure": False, "shutter_delay": 0.0, "multi_frame": 1}
+
+
+def _stabilise_value(key: str, value: object) -> str:
+    """A STABILISE row's value: ON/OFF, OFF/0.2 S/0.5 S, OFF/2/4/6."""
+    if key == "short_exposure":
+        return "ON" if value else "OFF"
+    if key == "shutter_delay":
+        return f"{value:.1f} S" if value else "OFF"
+    return str(value) if value != 1 else "OFF"
+
+
+@dataclass(frozen=True)
+class _Page:
+    """A page the first page's row opens: its title, its settings, its RESET's
+    row key and the ``SettingsControl`` method that RESET calls, and how a row is
+    labelled, shown and stepped."""
+
+    title: str
+    keys: tuple[str, ...]
+    reset: str
+    reset_method: str
+    label: Callable[[str], str]
+    value: Callable[[str, object], str]
+    steps: Callable[[str], tuple]
+
+
+_PAGES = {
+    "image": _Page(IMAGE_TITLE, IMAGE_KEYS, "image_reset", "reset_image", str.upper,
+                   lambda key, value: format_step(value), lambda key: IMAGE_STEPS),
+    "stabilise": _Page(
+        STABILISE_TITLE, STABILISE_KEYS, "stabilise_reset", "reset_stabilise",
+        STABILISE_LABELS.__getitem__,
+        _stabilise_value,
+        lambda key: {"short_exposure": (False, True), "shutter_delay": SHUTTER_DELAYS,
+                     "multi_frame": MULTI_FRAMES}[key],
+    ),
+}
+_PAGE_RESETS = {page.reset: name for name, page in _PAGES.items()}
+_PAGE_KEYS = {key: name for name, page in _PAGES.items() for key in page.keys}
 
 
 @dataclass
@@ -396,22 +460,35 @@ class ViewfinderLoop:
         self._backlight: int | None = None
         # The settings menu. ``menu_rows`` names the optional setting rows this
         # camera supports (``save_dng``, ``halation``, ``ae_constraint``,
-        # ``ae_metering``, and on the IMAGE page ``sharpness``, ``contrast``,
-        # ``saturation``); the caller decides, because only it knows the backend,
-        # and ``look_halation`` whether the look has a halation for the HALATION
-        # row to turn off. The page last pushed, as (rows, DONE pressed), or None
-        # to force the next push; and the time until which RESET is armed for its
-        # second tap. RESET needs setting rows
-        # too: without them (``--fake``) it would only delete the real camera's
-        # saved settings.
+        # ``ae_metering``, on the IMAGE page ``sharpness``, ``contrast``,
+        # ``saturation``, and on the STABILISE page ``short_exposure``,
+        # ``shutter_delay``, ``multi_frame``); the caller decides, because only it
+        # knows the backend, and ``look_halation`` whether the look has a halation
+        # for the HALATION row to turn off. The page last pushed, as (rows, DONE
+        # pressed), or None to force the next push; and the time until which RESET
+        # is armed for its second tap. RESET needs setting rows too: without them
+        # (``--fake``) it would only delete the real camera's saved settings.
         self._settings, self._upload, self._look = settings, upload, look
         self._menu_optional = tuple(menu_rows or ())
         self._look_halation = bool(look_halation)
         self._menu_resettable = settings is not None and menu_rows is not None
         self._menu_shown: tuple[str | None, tuple[MenuRow, ...], bool] | None = None
         self._reset_until: float | None = None
-        # The page shown in MENU: "main", or "image" for the image controls.
+        # The page shown in MENU: "main", or a key of ``_PAGES``.
         self._menu_page = "main"
+
+    def _shutter_delay(self) -> float:
+        """The menu's shutter delay for a press of the shutter key, read now.
+
+        Only a camera with the setting rows (Picamera2) takes settings, so without
+        them (``--fake``) a value saved on the Pi delays nothing. The controller's
+        worker waits it out with the job accepted but ``delaying``: the live view
+        stays up (no colour bars until the capture starts) and a second tap is
+        answered busy.
+        """
+        if self._settings is None or not self._menu_resettable:
+            return 0.0
+        return float(self._settings.current.shutter_delay)
 
     # -- plumbing -------------------------------------------------------------
 
@@ -1036,28 +1113,52 @@ class ViewfinderLoop:
         return any(getattr(current, key) != IMAGE_NORMAL
                    for key in IMAGE_KEYS if key in self._menu_optional)
 
-    def _menu_title(self) -> str | None:
-        return IMAGE_TITLE if self._menu_page == "image" else None
+    def _stabilise_on(self) -> bool:
+        """True while a short exposure, shutter delay or multi-frame this camera
+        takes is not off: the live view's STAB tag. Never on a camera without the
+        setting rows (V4L2, fake), whose saved values are not applied."""
+        settings = self._settings
+        if settings is None:
+            return False
+        current = settings.current
+        return any(getattr(current, key) != STABILISE_OFF[key]
+                   for key in STABILISE_KEYS if key in self._menu_optional)
 
-    def _image_rows(self, now: float) -> tuple[MenuRow, ...]:
-        """The image page's rows: the three controls, RESET and BACK."""
+    def _menu_title(self) -> str | None:
+        page = _PAGES.get(self._menu_page)
+        return page.title if page is not None else None
+
+    def _page_rows(self, page: _Page, now: float) -> tuple[MenuRow, ...]:
+        """A second page's rows: its settings, its RESET and BACK. A setting this
+        camera does not take is dim with ``-``."""
         current = self._settings.current
         rows = [
-            MenuRow(key, key.upper(), format_step(getattr(current, key)), True)
-            if key in self._menu_optional else MenuRow(key, key.upper(), "-", False)
-            for key in IMAGE_KEYS
+            MenuRow(key, page.label(key), page.value(key, getattr(current, key)), True)
+            if key in self._menu_optional else MenuRow(key, page.label(key), "-", False)
+            for key in page.keys
         ]
-        any_image = any(key in self._menu_optional for key in IMAGE_KEYS)
-        rows.append(MenuRow("image_reset", "RESET",
+        rows.append(MenuRow(page.reset, "RESET",
                             "TAP AGAIN" if self._reset_armed(now) else "TAP TWICE",
-                            any_image))
+                            self._page_active(page)))
         rows.append(MenuRow("back", "BACK", "", True))
         return tuple(rows)
 
+    def _page_active(self, page: _Page) -> bool:
+        return any(key in self._menu_optional for key in page.keys)
+
+    def _page_entry(self, name: str) -> MenuRow:
+        """The first page's row that opens ``name``: ``>``, or dim with ``-``
+        when the camera takes none of its settings."""
+        page = _PAGES[name]
+        if self._page_active(page):
+            return MenuRow(name, page.title, ">", True)
+        return MenuRow(name, page.title, "-", False)
+
     def _menu_rows(self, snap: Any, now: float) -> tuple[MenuRow, ...]:
         """The menu's rows as they are now, in the spec's order."""
-        if self._menu_page == "image" and self._settings is not None:
-            return self._image_rows(now)
+        page = _PAGES.get(self._menu_page)
+        if page is not None and self._settings is not None:
+            return self._page_rows(page, now)
         rows: list[MenuRow] = []
         settings = self._settings
         if settings is not None:
@@ -1077,10 +1178,8 @@ class ViewfinderLoop:
             if "ae_metering" in self._menu_optional:
                 rows.append(MenuRow("ae_metering", "AE METERING",
                                     current.ae_metering.upper(), True))
-            if any(key in self._menu_optional for key in IMAGE_KEYS):
-                rows.append(MenuRow("image", "IMAGE", ">", True))
-            else:
-                rows.append(MenuRow("image", "IMAGE", "-", False))
+            rows.append(self._page_entry("image"))
+            rows.append(self._page_entry("stabilise"))
         if self._upload is not None:
             rows.append(MenuRow("upload", "UPLOAD", self._upload.status(), True))
         network = dict(getattr(snap, "network", ()) or ())
@@ -1117,18 +1216,19 @@ class ViewfinderLoop:
             settings.set(key, self._next(AE_CONSTRAINTS, settings.current.ae_constraint))
         elif key == "ae_metering":
             settings.set(key, self._next(AE_METERINGS, settings.current.ae_metering))
-        elif key == "image":
-            self._menu_page, self._reset_until = "image", None
+        elif key in _PAGES:
+            self._menu_page, self._reset_until = key, None
         elif key == "back":
             self._menu_page, self._reset_until = "main", None
-        elif key == "image_reset":
+        elif key in _PAGE_RESETS:
             if self._reset_armed(now):
                 self._reset_until = None
-                settings.reset_image()
+                getattr(settings, _PAGES[_PAGE_RESETS[key]].reset_method)()
             else:
                 self._reset_until = now + RESET_ARM_SECONDS
-        elif key in IMAGE_KEYS:
-            settings.set(key, self._next(IMAGE_STEPS, getattr(settings.current, key)))
+        elif key in _PAGE_KEYS:
+            steps = _PAGES[_PAGE_KEYS[key]].steps(key)
+            settings.set(key, self._next(steps, getattr(settings.current, key)))
 
     def _menu_step(self, snap: Any, tap: Tap | None, now: float) -> None:
         """One step in MENU: the tap, then the page if it changed.
@@ -1224,9 +1324,13 @@ class ViewfinderLoop:
                 self._processing_shown = False
                 self._restart_rate_window()
             return
+        # A job waiting out its shutter delay is not capturing yet: the live view
+        # stays up through the wait, because the photographer is holding the
+        # framing, and its keys still act.
+        capturing = snap.active_job is not None and not getattr(snap, "delaying", False)
         if tap is not None:
             action = hit(tap.x, tap.y, self._scale)
-            if snap.active_job is not None and action is not Action.SHUTTER:
+            if capturing and action is not Action.SHUTTER:
                 # While a job runs the colour bars hide the cells, the keys and
                 # the 2x toggle (spec section 5), so a tap there was not aimed at
                 # them: no step, no selection, no toggle and no flash. Only the
@@ -1243,11 +1347,13 @@ class ViewfinderLoop:
                 self._menu_step(snap, None, now)
                 return
             if action is Action.SHUTTER:
-                self._controller.submit(str(uuid.uuid4()))
+                delay = self._shutter_delay()
+                self._controller.submit(str(uuid.uuid4()), delay_s=delay)
                 # The still waits for the camera behind any preview read, so
                 # this step asks the frame thread for none: at a 1 s shutter a
-                # read started now would add a second of shutter lag.
-                ask = False
+                # read started now would add a second of shutter lag. With a
+                # shutter delay the live view goes on through the wait, so it asks.
+                ask = delay > 0.0
             elif action in SELECT_ACTIONS:
                 # hit() knows nothing of the camera: a grey cell still reports
                 # its tap, and is ignored here.
@@ -1258,7 +1364,7 @@ class ViewfinderLoop:
                 self._step_selected(action is Action.PLUS)
             elif action is Action.DOUBLE_TOGGLE:
                 self._controller.set_double_exposure(not snap.double_exposure)
-        if snap.active_job is not None:
+        if capturing:
             # The grade takes about three seconds, and the camera belongs to the
             # capture worker for the still in front of it: show the same colour
             # bars the Stick and the OpenCV window show rather than a stale live
@@ -1339,6 +1445,7 @@ class ViewfinderLoop:
                 # From the menu's own settings, not the snapshot: the session
                 # does not hold them. Cheap enough to read at every redraw.
                 image_adjusted=self._image_adjusted(),
+                stabilise_on=self._stabilise_on(),
             ),
             scale=self._scale,
         ))

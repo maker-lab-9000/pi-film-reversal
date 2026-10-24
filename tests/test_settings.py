@@ -588,3 +588,157 @@ def test_reset_puts_the_image_settings_back_too(tmp_path):
     assert sorted(calls) == [("saturation", 1.0), ("save_dng", True), ("sharpness", 1.0)]
     assert control.current == DEFAULTS
     assert not path.exists()
+
+
+# --- the stabilise page: short exposure, shutter delay, multi-frame ------------
+
+
+def test_the_stabilise_settings_default_to_off():
+    assert (DEFAULTS.short_exposure, DEFAULTS.shutter_delay, DEFAULTS.multi_frame) == (
+        False, 0.0, 1,
+    )
+    assert settings_mod.STABILISE_KEYS == ("short_exposure", "shutter_delay", "multi_frame")
+    assert set(settings_mod.STABILISE_KEYS) <= set(settings_mod.KEYS)
+    assert settings_mod.SHUTTER_DELAYS == (0.0, 0.2, 0.5)
+    assert settings_mod.MULTI_FRAMES == (1, 2, 4, 6)
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("short_exposure", True), ("short_exposure", False),
+    ("shutter_delay", 0.0), ("shutter_delay", 0.2), ("shutter_delay", 0.5),
+    ("shutter_delay", 0),
+    ("multi_frame", 1), ("multi_frame", 2), ("multi_frame", 4), ("multi_frame", 6),
+])
+def test_a_stabilise_value_is_valid(key, value):
+    assert settings_mod._valid(key, value)
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("short_exposure", 1), ("short_exposure", 0), ("short_exposure", "on"),
+    ("short_exposure", None),
+    ("shutter_delay", True), ("shutter_delay", False), ("shutter_delay", 0.3),
+    ("shutter_delay", 1.0), ("shutter_delay", "0.2"), ("shutter_delay", float("nan")),
+    ("shutter_delay", None),
+    ("multi_frame", True), ("multi_frame", 3), ("multi_frame", 0), ("multi_frame", 2.0),
+    ("multi_frame", "4"), ("multi_frame", None),
+])
+def test_a_stabilise_value_off_its_set_is_invalid(key, value):
+    assert not settings_mod._valid(key, value)
+
+
+@pytest.mark.parametrize(("key", "value", "text"), [
+    ("short_exposure", True, "short-exposure on"),
+    ("short_exposure", False, "short-exposure off"),
+    ("shutter_delay", 0.2, "shutter-delay 0.2"),
+    ("shutter_delay", 0.0, "shutter-delay 0.0"),
+    ("multi_frame", 4, "multi-frame 4"),
+])
+def test_describe_a_stabilise_setting(key, value, text):
+    assert settings_mod._describe(key, value) == text
+
+
+def test_load_saved_stabilise_settings(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    _write(path, {"version": 1, "short_exposure": True, "shutter_delay": 0,
+                  "multi_frame": 3})
+    current, overrides, lines = load(path, DEFAULTS)
+    assert (current.short_exposure, current.shutter_delay, current.multi_frame) == (
+        True, 0.0, 1,
+    )
+    assert isinstance(current.shutter_delay, float)
+    assert overrides == {"short_exposure": True, "shutter_delay": 0.0}
+    assert lines == [
+        f"settings: ignoring multi_frame in {path}",
+        "settings: short-exposure on (saved in the menu; the unit says short-exposure off)",
+    ]
+
+
+def test_load_names_each_differing_stabilise_setting(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    _write(path, {"version": 1, "shutter_delay": 0.5, "multi_frame": 6})
+    current, _, lines = load(path, DEFAULTS)
+    assert (current.shutter_delay, current.multi_frame) == (0.5, 6)
+    assert lines == [
+        "settings: shutter-delay 0.5, multi-frame 6 (saved in the menu; the unit says "
+        "shutter-delay 0.0, multi-frame 1)",
+    ]
+
+
+@pytest.mark.parametrize(("key", "value", "line"), [
+    ("short_exposure", True, "settings: short-exposure on"),
+    ("shutter_delay", 0.2, "settings: shutter-delay 0.2"),
+    ("multi_frame", 4, "settings: multi-frame 4"),
+])
+def test_set_a_stabilise_setting_applies_saves_and_logs(tmp_path, key, value, line):
+    path = tmp_path / SETTINGS_FILE
+    lines: list[str] = []
+    control = SettingsControl(path, DEFAULTS, {}, log=lines.append)
+    calls = []
+    control.register(key, lambda v: calls.append(v))
+    assert control.set(key, value)
+    assert calls == [value]
+    assert getattr(control.current, key) == value
+    assert json.loads(path.read_text()) == {"version": 1, key: value}
+    assert lines == [line]
+    assert getattr(load(path, DEFAULTS)[0], key) == value
+
+
+def test_set_a_stabilise_setting_without_an_applier_is_stored(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    control = SettingsControl(path, DEFAULTS, {}, log=lambda _: None)
+    assert control.set("shutter_delay", 0)
+    assert control.current.shutter_delay == 0.0
+    assert isinstance(control.current.shutter_delay, float)
+    assert control.set("multi_frame", 6)
+    assert json.loads(path.read_text()) == {"version": 1, "multi_frame": 6}
+    assert control.set("multi_frame", 1)
+    assert json.loads(path.read_text()) == {"version": 1}
+    with pytest.raises(ValueError):
+        control.set("multi_frame", 3)
+    with pytest.raises(ValueError):
+        control.set("short_exposure", 1)
+
+
+def test_reset_puts_the_stabilise_settings_back_too(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    overrides = {"short_exposure": True, "shutter_delay": 0.5, "multi_frame": 4}
+    save(path, overrides)
+    control = SettingsControl(path, DEFAULTS, overrides, log=lambda _: None)
+    calls = []
+    for key in settings_mod.KEYS:
+        control.register(key, lambda value, key=key: calls.append((key, value)))
+    control.reset()
+    assert sorted(calls) == [
+        ("multi_frame", 1), ("short_exposure", False), ("shutter_delay", 0.0),
+    ]
+    assert control.current == DEFAULTS
+    assert not path.exists()
+
+
+def test_reset_image_leaves_the_stabilise_settings(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    overrides = {"short_exposure": True, "contrast": 1.5}
+    control = SettingsControl(path, DEFAULTS, overrides, log=lambda _: None)
+    control.reset_image()
+    assert control.current.short_exposure is True
+    assert json.loads(path.read_text()) == {"version": 1, "short_exposure": True}
+
+
+def test_reset_stabilise_puts_back_only_the_three(tmp_path):
+    path = tmp_path / SETTINGS_FILE
+    overrides = {"short_exposure": True, "multi_frame": 6, "contrast": 1.5,
+                 "save_dng": False}
+    save(path, overrides)
+    lines: list[str] = []
+    control = SettingsControl(path, DEFAULTS, overrides, log=lines.append)
+    calls = []
+    for key in settings_mod.KEYS:
+        control.register(key, lambda value, key=key: calls.append((key, value)))
+    control.reset_stabilise()
+    assert calls == [("short_exposure", False), ("multi_frame", 1)]
+    current = control.current
+    assert (current.short_exposure, current.shutter_delay, current.multi_frame) == (
+        False, 0.0, 1)
+    assert current.contrast == 1.5 and current.save_dng is False
+    assert json.loads(path.read_text()) == {"version": 1, "contrast": 1.5, "save_dng": False}
+    assert lines == ["settings: short exposure, shutter delay, multi-frame reset to off"]
