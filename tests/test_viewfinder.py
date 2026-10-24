@@ -24,6 +24,7 @@ from pifilm.display.liveview import (
     DOUBLE_BOX,
     HEIGHT,
     MENU_CENTRE,
+    MENU_HIT_BOX,
     MINUS_CENTRE,
     PLUS_CENTRE,
     SHUTTER_CENTRE,
@@ -994,6 +995,28 @@ def test_plus_and_minus_change_only_the_selected_control(metered):
     assert loop.selected == SHUTTER_CELL
     _tap(loop, touch, clock, MINUS_CENTRE)
     assert _values(camera) == (5000, 800, 3200)
+
+
+def test_the_menu_key_in_the_strip_opens_the_menu_and_leaves_the_cells_alone(metered):
+    """The key sits in the strip right of WB: a tap anywhere in its box opens the
+    menu (DONE closes it) without changing the selected cell, and the cells beside
+    it still select themselves."""
+    camera, ctl = metered
+    loop, touch, display, clock = _loop(camera, ctl)
+    loop.step()
+    _tap(loop, touch, clock, _cell(WB_CELL))
+    assert loop.selected == WB_CELL
+    x0, y0, x1, y1 = MENU_HIT_BOX
+    for point in (MENU_CENTRE, (x0, y0), (x1 - 1, y1 - 1)):
+        _tap(loop, touch, clock, point)
+        assert loop.state == "MENU", point
+        _tap(loop, touch, clock, SHUTTER_CENTRE)  # DONE
+        assert loop.state == "LIVE" and loop.selected == WB_CELL
+    _tap(loop, touch, clock, (x0 - 1, (y0 + y1) // 2))  # WB's hit column's last unit
+    assert loop.state == "LIVE" and loop.selected == WB_CELL
+    _tap(loop, touch, clock, _cell(ISO_CELL))
+    assert loop.selected == ISO_CELL
+    assert _values(camera) == (None, None, None)
 
 
 @pytest.mark.parametrize("key", [PLUS_CENTRE, MINUS_CENTRE])

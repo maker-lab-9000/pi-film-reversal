@@ -14,10 +14,11 @@ Design intent:
   (31 units between the hit circles): a thumb that slips while stepping a value
   must not take a photograph. The hit regions are stated next to the drawn
   geometry, from the same constants, and never overlap.
-- A ``MENU`` key, a small pill under ``-``, opens the settings menu, so the right
-  edge above it holds only the shutter and the camera's controls. Its hit box starts
-  under ``-``'s hit circle and reaches into the strip's meter part, which has no tap
-  action, so no tap that worked before changes meaning.
+- A ``MENU`` key, a small pill in the strip between the WB cell and the meter,
+  opens the settings menu, so the right edge holds only the shutter and the
+  camera's controls, and the place under ``-`` stays empty. The cells and the
+  meter were narrowed to make room for it; its hit box lies between the cells'
+  hit columns and the meter's ``-`` end, and the meter has no tap action.
 
 Geometry is in 320x240 base units, as in ``ui.py``; every render takes the panel's
 integer ``scale`` (1 for the 2.8" SPI panel, 2 for the 640x480 DSI panel). Unlike
@@ -33,17 +34,17 @@ slow to do for the whole screen ten times a second on a Pi 4, and almost none of
 it changes between frames, so the screen is assembled from small tiles:
 
 - static tiles, cached with ``functools.lru_cache`` and keyed by exactly what
-  they show: the strip background, one tile per cell, the shutter, ``+``/``-`` and
-  ``MENU`` keys (keyed by which is pressed), and the ``2x`` and battery tags with the
-  count of photographs still developing and the ``TUNING`` warning, and the
-  ``IMG`` and ``STAB`` reminders with the ``PHOTOS``/``SD`` disk-space tags (a tile of their
-  own, keyed by what they show);
+  they show: the strip background, one tile per cell, the shutter and ``+``/``-``
+  keys (keyed by which is pressed), the ``MENU`` key (keyed by whether it is),
+  the ``2x`` and battery tags with the count of photographs still developing and
+  the ``TUNING`` warning, and the ``IMG`` and ``STAB`` reminders with the
+  ``PHOTOS``/``SD`` disk-space tags (a tile of their own, keyed by what they show);
 - dynamic tiles: the lit meter dot and the lux/clip text (cached too, they repeat)
   and the focus gauge (drawn every frame; it is 7 units wide).
 
 A frame is then the letterboxed preview plus a handful of pastes. The cells are
 separate tiles because an automatic control shows its live metered value: a
-changing shutter read-out must repaint one 61x32 tile, not the keys. Cached tiles
+changing shutter read-out must repaint one 54x32 tile, not the keys. Cached tiles
 are shared between frames and must never be drawn on.
 """
 
@@ -66,8 +67,13 @@ WIDTH, HEIGHT = 320, 240
 BAR_TOP = 208
 # Cells: text starts at CELL_X0 + CELL_PITCH * i. The hit column starts 3 units
 # further left and is one pitch wide, so the three columns tile the strip's left
-# part without gaps or overlap.
-CELL_X0, CELL_PITCH = 11, 61
+# part without gaps or overlap. The pitch was 61 until the MENU key moved into the
+# strip; 54 still holds a cell's widest contents with room between cells: the
+# selection underline is 46 units, the widest value "1/2000" is 44 (in the bundled
+# Barlow Condensed at either scale; "1/1000" 41, "7500K" 39, "AUTO" 34, "1600" 29)
+# and "SHUTTER AUTO" is 36, so the next cell's text starts 10 units after the
+# widest value ends. The columns end at x 170 (CELL_HIT_X0 + 3 * CELL_PITCH).
+CELL_X0, CELL_PITCH = 11, 54
 CELL_HIT_X0 = 8
 # Taps land a little above the strip as often as on it.
 CELL_HIT_TOP = 204
@@ -78,24 +84,33 @@ CELL_HIT_TOP = 204
 # where the approved mock-up has them, four units clear of the underline.
 CELL_LABEL_Y, CELL_VALUE_Y = 215, 226
 CELL_UNDERLINE = (0, 237, 46, 238)  # relative to the cell's text origin in x
-METER_X0, METER_X1, METER_Y = 205, 306, 226
+# The meter's right end is where it always was; its left end moved from 205 to 240
+# to make room for the MENU key, so the 13 dots are 5.5 units apart (8.4 before):
+# the lit dot (4.5 across) still has a dark gap to its neighbours' places.
+METER_X0, METER_X1, METER_Y = 240, 306, 226
 METER_DOTS = 13  # -3.0 to +3.0 stops in half stops
 METER_RANGE = 3.0
 METER_END_OFFSET = 7  # the - and + glyphs, outside the first and last dot
-METER_TEXT_CENTRE = (255.5, 215)
+# Centred over the dots. The widest text ("100000 LX   CLIP 100%") is 55 units,
+# so it runs from about 245 to 301, inside the meter's span.
+METER_TEXT_CENTRE = ((METER_X0 + METER_X1) / 2, 215)
 SHUTTER_CENTRE, SHUTTER_RADIUS = (287, 39), 28
 SHUTTER_DISC_RADIUS = 21.5
 SHUTTER_HIT_RADIUS = 34
 PLUS_CENTRE, MINUS_CENTRE, KEY_RADIUS = (287, 125), (287, 168), 17
 KEY_HIT_RADIUS = 21
-# The MENU key: a pill in the keys' style under -, drawn x 267 to 307 and y 193 to
-# 205, between -'s hit circle (it ends at y 189) and the strip (y 208). The hit box
-# is (x0, y0, x1, y1) with x0 and y0 included and x1 and y1 excluded: x 264 to 310
-# and y 190 to 214. It starts one unit under -'s hit circle and reaches into the
-# strip's right part, where only the meter is (the cells' hit columns end at x 190),
-# so the target is 25 units tall and takes no tap from anything else.
-MENU_CENTRE, MENU_SIZE = (287, 199), (40, 12)
-MENU_HIT_BOX = (264, 190, 311, 215)
+# The MENU key: a pill in the keys' style in the strip, between the WB cell and
+# the meter. Its hit box is (x0, y0, x1, y1) with x0 and y0 included and x1 and y1
+# excluded: from the end of the cells' hit columns (x 170) to MENU_METER_GAP units
+# short of the meter's - glyph (its centre is x 233, its ink starts at about
+# 231.75), and from the cells' hit top (y 204) to the bottom of the screen: 60 x 36
+# units, which nothing else claims. The pill is centred in it across, and on the
+# strip's two text lines (their middles are y 215 and 226; 221 rather than 220.5
+# keeps a 12-unit pill's edges on whole pixels at scale 1).
+MENU_METER_GAP = 3
+MENU_HIT_BOX = (CELL_HIT_X0 + 3 * CELL_PITCH, CELL_HIT_TOP,
+                METER_X0 - METER_END_OFFSET - MENU_METER_GAP, HEIGHT)
+MENU_CENTRE, MENU_SIZE = ((MENU_HIT_BOX[0] + MENU_HIT_BOX[2]) // 2, 221), (40, 12)
 MENU_LABEL = "MENU"
 DOUBLE_BOX = (6, 5, 30, 16)
 DOUBLE_HIT_MARGIN = 6
@@ -167,8 +182,9 @@ SUPERSAMPLE = 2
 # Tile boxes in base units; whole numbers, so a tile lands on whole panel pixels.
 _STRIP_BOX = (0, BAR_TOP, WIDTH, HEIGHT)
 _CELL_BOX = (CELL_HIT_X0, BAR_TOP, CELL_HIT_X0 + CELL_PITCH, HEIGHT)  # cell 0
-# Down to y 207, so the MENU pill under - is in it, and short of the strip at 208.
-_CONTROLS_BOX = (256, 8, 318, 207)
+# Down to y 188, past the - key (it ends at y 185); nothing is drawn below it
+# down to the strip, where the MENU key was until it moved into the strip.
+_CONTROLS_BOX = (256, 8, 318, 188)
 # Wide enough for "AC 100%", a two-digit count and TUNING (they end at 115.5 units
 # at scale 1, 114 at scale 2), and well short of the shutter's hit circle at 253.
 _TAGS_BOX = (0, 0, 124, 22)
@@ -176,7 +192,10 @@ _TAGS_BOX = (0, 0, 124, 22)
 # (centre 287, radius 34: its leftmost point is x 253). "PHOTOS 100%" and "SD 100%"
 # together end at about 207 units (see the tests), so there is room to spare.
 _DISK_BOX = (_TAGS_BOX[2], 0, 252, _TAGS_BOX[3])
-_METER_TEXT_BOX = (192, 209, WIDTH, 221)
+# The MENU key's tile is its hit box's columns, the strip's full height.
+_MENU_BOX = (MENU_HIT_BOX[0], BAR_TOP, MENU_HIT_BOX[2], HEIGHT)
+# From where the MENU key's tile ends, so the two never overlap.
+_METER_TEXT_BOX = (_MENU_BOX[2], 209, WIDTH, 221)
 _FOCUS_BOX = (FOCUS_TICK_X[0], FOCUS_TRACK[1], FOCUS_TICK_X[1], FOCUS_TRACK[3])
 
 
@@ -437,7 +456,7 @@ def _cell_tile(cell: Cell, selected: bool, scale: int) -> Image.Image:
 
 @lru_cache(maxsize=8)
 def _controls_tile(pressed: Action | None, scale: int) -> Image.Image:
-    """The shutter button, the MENU key and the +/- keys; the pressed one is filled amber."""
+    """The shutter button and the +/- keys; the pressed one is filled amber."""
     canvas = _Canvas(_CONTROLS_BOX, scale)
     canvas.disc(SHUTTER_CENTRE, SHUTTER_RADIUS, fill=SHUTTER_FILL,
                 outline=AMBER + (255,), width=SHUTTER_RING)
@@ -453,7 +472,14 @@ def _controls_tile(pressed: Action | None, scale: int) -> Image.Image:
             canvas.disc(centre, KEY_RADIUS, fill=KEY_FILL,
                         outline=AMBER + (255,), width=KEY_OUTLINE)
             canvas.glyph(centre, glyph, font, WHITE)
-    _menu_key(canvas, pressed is Action.MENU)
+    return canvas.finish()
+
+
+@lru_cache(maxsize=4)
+def _menu_tile(lit: bool, scale: int) -> Image.Image:
+    """The MENU key in the strip, keyed by whether it is pressed."""
+    canvas = _Canvas(_MENU_BOX, scale)
+    _menu_key(canvas, lit)
     return canvas.finish()
 
 
@@ -559,7 +585,7 @@ def _disk_tile(warning: tuple[tuple[str, int], ...], scale: int,
 def _lit_dot_tile(index: int, scale: int) -> tuple[Image.Image, tuple[int, int]]:
     """The amber dot for one meter position, and where its tile goes (base units).
 
-    One tile per position, not one moved about: the dots are 8.4 units apart, so
+    One tile per position, not one moved about: the dots are 5.5 units apart, so
     each sits at a different fraction of a pixel.
     """
     x = _dot_x(index)
@@ -621,8 +647,10 @@ def render_live(
           *_METER_TEXT_BOX[:2])
     dot, origin = _lit_dot_tile(_lit_dot(reading.deviation_ev), scale)
     paste(dot, *origin)
+    paste(_menu_tile(state.pressed is Action.MENU, scale), *_MENU_BOX[:2])
 
-    pressed = state.pressed if state.pressed in PRESS_KEYS else None
+    pressed = state.pressed if state.pressed in (Action.PLUS, Action.MINUS,
+                                                 Action.SHUTTER) else None
     paste(_controls_tile(pressed, scale), *_CONTROLS_BOX[:2])
     battery = None
     if reading.battery_percent is not None:

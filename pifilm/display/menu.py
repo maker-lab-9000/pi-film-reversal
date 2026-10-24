@@ -6,9 +6,10 @@ Design intent:
   open the viewfinder does not ask the frame thread for frames (as for a review)
   and the page is the same whatever the camera sees.
 - ``DONE`` sits where the shutter button is, with the shutter's centre and hit
-  circle. The thumb that pressed ``MENU`` just below the shutter finds the way
-  back in the same place, and a tap that misses ``DONE`` lands on nothing rather
-  than on a row: no setting changes by accident on the way out.
+  circle, on every page: the way out is always the live view's main key, while
+  ``MENU`` itself is in the live view's bottom strip, which the page covers. A
+  tap that misses ``DONE`` lands on nothing rather than on a row: no setting
+  changes by accident on the way out.
 - One row per line, label left and value right, 20 units tall from y 8. Rows run
   from x 8 to 248 and ``DONE``'s hit circle (centre 287, radius 34) starts at
   x 253, so the two regions never meet and a gap of nothing lies between them.
