@@ -147,10 +147,11 @@ def render_pages(scale: int, frame: np.ndarray) -> list[tuple[str, str, Image.Im
         loop = _menu_loop(Path(state_dir))
         snap = loop._controller.snapshot()
         for stem, label, page in PAGES:
-            loop._open_page(page)
+            loop._open_page(page, 0.0)
             rows = loop._menu_rows(snap, 0.0)
             # A copy: render_menu's image is cached and shared.
-            image = render_menu(rows, scale=scale, title=loop._menu_title()).copy()
+            image = render_menu(rows, scale=scale, title=loop._menu_title(),
+                                gap=loop._menu_gap(rows)).copy()
             images.append((stem, label, image))
     return images
 

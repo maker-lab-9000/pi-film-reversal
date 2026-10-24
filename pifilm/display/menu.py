@@ -20,7 +20,15 @@ Design intent:
   a title on its first line, amber and not a row: the rows start one line lower,
   and a tap on the title lands on nothing. The fullest page of the viewfinder's
   tree is a settings page, a title and five rows (three settings, RESET, BACK),
-  which end at y 128; the first page has at most five rows. The page has room
+  which end at y 128; the first page has at most five rows and an empty line.
+- The first page leaves one empty line before its RESET (``gap``), drawn as
+  nothing and not a row, like a title. Without it RESET would sit on the fifth
+  line, where a full category page's BACK is: a second tap where BACK was would
+  arm RESET on the first page, and one more would undo every setting. With it
+  every BACK that leads to the first page (a category's, on the fifth line at
+  most) lies on the empty line or above RESET's. The viewfinder also ignores
+  taps on rows for a moment after a page changes (``MENU_PAGE_GUARD_SECONDS``).
+  The page has room
   for eleven lines (they end at y 228, inside the 240-unit page at every scale,
   since the geometry is in base units).
 
@@ -150,40 +158,52 @@ def _done_tile(pressed: bool, scale: int) -> Image.Image:
     return canvas.finish()
 
 
+def _line(index: int, title: bool, gap: int | None) -> int:
+    """The line row ``index`` is drawn on: one lower after a title, and one lower
+    again from the row ``gap`` on."""
+    return index + (1 if title else 0) + (1 if gap is not None and index >= gap else 0)
+
+
 @lru_cache(maxsize=16)
 def _render(rows: tuple[MenuRow, ...], scale: int, done_pressed: bool,
-            title: str | None = None) -> Image.Image:
+            title: str | None = None, gap: int | None = None) -> Image.Image:
     img = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), BLACK)
-    first = 0
     if title is not None:
         tile = _title_tile(title, scale)
         img.paste(tile, (ROW_X0 * scale, ROW_Y0 * scale), tile)
-        first = 1
-    for index, row in enumerate(rows, start=first):
+    for index, row in enumerate(rows):
         tile = _row_tile(row, scale)
-        img.paste(tile, (ROW_X0 * scale, (ROW_Y0 + index * ROW_HEIGHT) * scale), tile)
+        line = _line(index, title is not None, gap)
+        img.paste(tile, (ROW_X0 * scale, (ROW_Y0 + line * ROW_HEIGHT) * scale), tile)
     tile = _done_tile(done_pressed, scale)
     img.paste(tile, (_DONE_BOX[0] * scale, _DONE_BOX[1] * scale), tile)
     return img
 
 
 def render_menu(rows: Sequence[MenuRow], *, scale: int = 1,
-                done_pressed: bool = False, title: str | None = None) -> Image.Image:
+                done_pressed: bool = False, title: str | None = None,
+                gap: int | None = None) -> Image.Image:
     """The menu page: RGB, ``(320 * scale, 240 * scale)``. Shared; do not draw on it.
 
-    ``title`` puts a page title on the first line and the rows below it."""
-    return _render(tuple(rows), scale, done_pressed, title)
+    ``title`` puts a page title on the first line and the rows below it; ``gap``
+    leaves one empty line before the row of that index."""
+    return _render(tuple(rows), scale, done_pressed, title, gap)
 
 
 def menu_hit(x: int, y: int, row_count: int, scale: int = 1, *,
-             title: bool = False) -> int | str | None:
+             title: bool = False, gap: int | None = None) -> int | str | None:
     """``DONE``, the index of the row under a panel pixel, or None.
 
-    With ``title`` the first line is the page's title, which is not a row."""
+    With ``title`` the first line is the page's title, which is not a row; with
+    ``gap`` the line before row ``gap`` is empty and not a row either."""
     x, y = x // scale, y // scale
     if math.hypot(x - SHUTTER_CENTRE[0], y - SHUTTER_CENTRE[1]) <= SHUTTER_HIT_RADIUS:
         return DONE
     top = ROW_Y0 + (ROW_HEIGHT if title else 0)
-    if ROW_X0 <= x < ROW_X1 and top <= y < top + row_count * ROW_HEIGHT:
-        return (y - top) // ROW_HEIGHT
-    return None
+    lines = row_count + (1 if gap is not None and gap < row_count else 0)
+    if not (ROW_X0 <= x < ROW_X1 and top <= y < top + lines * ROW_HEIGHT):
+        return None
+    line = (y - top) // ROW_HEIGHT
+    if gap is None or line < gap:
+        return line
+    return None if line == gap else line - 1

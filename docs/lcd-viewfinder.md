@@ -275,8 +275,9 @@ The check runs with every display mode, headless too, for the journal lines.
 
 A tap on `MENU` opens a black page in the live view's fonts and colours, one setting
 per row: a grey label on the left, the value in white on the right. A tap anywhere
-on a row steps it to its next value, wrapping round; a dimmer label marks a row that
-only shows something and ignores taps. `DONE`, drawn where the shutter button is,
+on a setting's row steps it to its next value, wrapping round, and a tap on a row
+with `>` (or on `BACK`) opens another page; a dimmer label marks a row that only
+shows something and ignores taps. `DONE`, drawn where the shutter button is,
 returns to the live view from any page. Nothing in it needs sudo.
 
 The settings are grouped in a tree of pages:
@@ -287,6 +288,7 @@ MENU (the first page, no title)
   PIPELINE      >
   NETWORK       >
   LOOK          <look name>      read-only
+                                 (an empty line)
   RESET         TAP TWICE        every setting
 CAMERA
   IMAGE         >                the image page
@@ -311,6 +313,13 @@ image page to CAMERA, the stabilise page to PIPELINE, a category to the first pa
 The menu always opens on the first page. A category is dim with `-` when none of its
 rows can be used (CAMERA and PIPELINE under `--fake`); NETWORK always opens, for its
 addresses. The fullest page, a title and five rows, ends at y 128.
+
+Two guards keep a quick second tap from acting on the page it opens. The first
+page leaves an empty line before `RESET`, so `RESET` is on the sixth line, below
+every category's `BACK` (the fifth line at most): a tap where `BACK` was lands on
+nothing. And for 0.5 s after a page changes, taps on its rows are ignored
+(`DONE` still closes the menu): a double tap on `PIPELINE` would otherwise also
+toggle `SAVE DNG`, the row under it on the new page.
 
 | Row | Page | Values | Shown when | Effect |
 | --- | --- | --- | --- | --- |

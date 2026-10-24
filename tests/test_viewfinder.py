@@ -3237,10 +3237,16 @@ def _title(page):
 def _key_xy(page, key):
     """Where the row ``key`` of the drawn ``page`` is tapped."""
     index = _keys(page).index(key)
+    gap = page[1].get("gap")
+    if gap is not None and index >= gap:
+        index += 1  # the empty line before the first page's RESET
     return _page2_xy(index) if _title(page) is not None else _row_xy(index)
 
 
 def _tap_key(loop, touch, clock, pages, key):
+    """Tap the row ``key`` as a person would: once the page has been up long
+    enough to be read (taps on rows just after a page change are ignored)."""
+    clock.t += viewfinder.MENU_PAGE_GUARD_SECONDS
     _tap(loop, touch, clock, _key_xy(pages[-1], key))
 
 
@@ -3255,6 +3261,8 @@ def _open_path(loop, touch, clock, pages, *keys):
     _open_menu(loop, touch, clock)
     for key in keys:
         _tap_key(loop, touch, clock, pages, key)
+    # Read the page before tapping it (see ``_tap_key``).
+    clock.t += viewfinder.MENU_PAGE_GUARD_SECONDS
 
 
 def _menu_loop(camera, ctl, tmp_path, **kw):
@@ -3291,7 +3299,7 @@ def test_menu_key_opens_the_menu_and_done_returns_to_live(controller, tmp_path, 
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
     _open_menu(loop, touch, clock)
     assert pages and display.images[-1] is viewfinder.render_menu(
-        pages[-1][0], scale=1, done_pressed=False)
+        pages[-1][0], scale=1, done_pressed=False, gap=4)
     _tap(loop, touch, clock, SHUTTER_CENTRE)
     assert loop.state == "LIVE"
     loop.step()
@@ -3348,6 +3356,106 @@ def test_back_goes_up_one_level(controller, tmp_path, monkeypatch, path, title, 
     assert _title(pages[-1]) == title
     _tap_key(loop, touch, clock, pages, "back")
     assert loop.state == "MENU" and _title(pages[-1]) == parent
+
+
+def _at_scale(xy, scale):
+    return (xy[0] * scale, xy[1] * scale)
+
+
+class _Scaled2Display(FakeDisplay):
+    width, height = 640, 480
+    dimmable = False
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("path, title, parent", TREE[1:])
+def test_taps_where_back_was_never_reach_the_first_pages_reset(
+        controller, tmp_path, monkeypatch, scale, path, title, parent):
+    """BACK's place, tapped at once and then again and again, on every page and at
+    both scales: the first tap goes up, the next at once is ignored, and the later
+    ones land on nothing (IMAGE's and STABILISE's BACK is below the category's
+    last line; a category's is on the first page's empty line). RESET is never
+    armed and no setting changes."""
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    control = _settings(tmp_path, overrides={"ae_metering": "spot"})
+    resets = []
+    monkeypatch.setattr(control, "reset", lambda: resets.append(1))
+    display = _Scaled2Display() if scale == 2 else FakeDisplay()
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path, settings=control,
+                                             display=display)
+    loop.step()
+    _tap(loop, touch, clock, _at_scale(MENU_CENTRE, scale))
+    for key in path:
+        clock.t += viewfinder.MENU_PAGE_GUARD_SECONDS
+        _tap(loop, touch, clock, _at_scale(_key_xy(pages[-1], key), scale))
+    assert _title(pages[-1]) == title
+    clock.t += viewfinder.MENU_PAGE_GUARD_SECONDS
+    back = _at_scale(_key_xy(pages[-1], "back"), scale)
+    _tap(loop, touch, clock, back)
+    assert _title(pages[-1]) == parent
+    shown = pages[-1]
+    _tap(loop, touch, clock, back)  # at once: ignored
+    assert loop.state == "MENU" and pages[-1] == shown
+    for _ in range(3):
+        clock.t += viewfinder.MENU_PAGE_GUARD_SECONDS
+        _tap(loop, touch, clock, back)
+        assert loop.state == "MENU" and pages[-1] == shown
+    if parent is None:
+        assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
+        assert menu_hit(*back, len(shown[0]), scale, gap=shown[1]["gap"]) is None
+    assert resets == [] and control.current.ae_metering == "spot"
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_no_back_shares_a_line_with_the_first_pages_reset(
+        controller, tmp_path, monkeypatch, scale):
+    """Geometry: the first page's RESET is on a line of its own, below the empty
+    line, and every category page's BACK (the BACK that leads to the first page)
+    is above RESET's line."""
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path)
+    _open_menu(loop, touch, clock)
+    first = pages[-1]
+    reset_y = _key_xy(first, "reset")[1] * scale
+    assert first[1]["gap"] == _keys(first).index("reset")
+    for category in viewfinder._CATEGORIES:
+        _tap_key(loop, touch, clock, pages, category)
+        page = pages[-1]
+        back_y = _key_xy(page, "back")[1] * scale
+        assert back_y // (ROW_HEIGHT * scale) < reset_y // (ROW_HEIGHT * scale)
+        _tap_key(loop, touch, clock, pages, "back")
+        assert _title(pages[-1]) is None
+
+
+def test_a_double_tap_on_a_row_that_opens_a_page_does_not_act_on_the_new_page(
+        controller, tmp_path, monkeypatch):
+    """PIPELINE is on the line where its page shows SAVE DNG: the second tap of a
+    double tap is ignored, and a tap once the page has been up acts."""
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path)
+    _open_menu(loop, touch, clock)
+    xy = _key_xy(pages[-1], "pipeline")
+    _tap(loop, touch, clock, xy)
+    assert _title(pages[-1]) == "PIPELINE" and _key_xy(pages[-1], "save_dng") == xy
+    _tap(loop, touch, clock, xy)
+    assert _values_by_key(pages[-1])["save_dng"] == "ON"
+    clock.t += viewfinder.MENU_PAGE_GUARD_SECONDS
+    _tap(loop, touch, clock, xy)
+    assert _values_by_key(pages[-1])["save_dng"] == "OFF"
+
+
+def test_done_closes_the_menu_at_once_after_a_page_change(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path)
+    _open_menu(loop, touch, clock)
+    _tap(loop, touch, clock, _key_xy(pages[-1], "camera"))
+    assert _title(pages[-1]) == "CAMERA"
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    assert loop.state == "LIVE"
 
 
 @pytest.mark.parametrize("path, title, parent", TREE)
@@ -3533,17 +3641,17 @@ def test_reset_needs_a_second_tap_within_three_seconds(controller, tmp_path, mon
     reset = len(pages[-1][0]) - 1
     assert reset == 4 and _keys(pages[-1])[reset] == "reset"
     assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
-    _tap(loop, touch, clock, _row_xy(reset))
+    _tap(loop, touch, clock, _key_xy(pages[-1], "reset"))
     assert _values_by_key(pages[-1])["reset"] == "TAP AGAIN"
     # Too late: the arming has run out, so this tap only arms it again.
     clock.t += 3.1
     loop.step()
     assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
-    _tap(loop, touch, clock, _row_xy(reset))
+    _tap(loop, touch, clock, _key_xy(pages[-1], "reset"))
     assert resets == []
     assert _values_by_key(pages[-1])["reset"] == "TAP AGAIN"
     clock.t += 1.0
-    _tap(loop, touch, clock, _row_xy(reset))
+    _tap(loop, touch, clock, _key_xy(pages[-1], "reset"))
     assert resets == [1]
     assert control.current == UNIT
     assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
@@ -3554,7 +3662,7 @@ def test_leaving_the_menu_disarms_the_reset(controller, tmp_path, monkeypatch):
     pages = _spy_menu(monkeypatch)
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
     _open_menu(loop, touch, clock)
-    _tap(loop, touch, clock, _row_xy(len(pages[-1][0]) - 1))
+    _tap(loop, touch, clock, _key_xy(pages[-1], "reset"))
     _tap(loop, touch, clock, SHUTTER_CENTRE)
     _open_menu(loop, touch, clock)
     assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
@@ -4111,9 +4219,9 @@ def test_the_first_pages_reset_puts_the_stabilise_settings_back_too(
     _open_menu(loop, touch, clock)
     reset = len(pages[-1][0]) - 1
     assert pages[-1][0][reset].key == "reset"
-    _tap(loop, touch, clock, _row_xy(reset))
+    _tap(loop, touch, clock, _key_xy(pages[-1], "reset"))
     clock.t += 1.0
-    _tap(loop, touch, clock, _row_xy(reset))
+    _tap(loop, touch, clock, _key_xy(pages[-1], "reset"))
     assert sorted(applied) == [("multi_frame", 1), ("shutter_delay", 0.0)]
     assert control.current == UNIT
 

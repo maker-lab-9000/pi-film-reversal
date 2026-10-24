@@ -23,7 +23,11 @@ for frames in MENU (nothing of the picture is behind the page), the page is
 pushed only when its rows or ``DONE``'s press change (an upload's elapsed time
 changes once a second, and an identical page would only occupy the SPI bus), and
 the idle dim and screen-off apply as in LIVE. ``RESET`` takes two taps within
-``RESET_ARM_SECONDS``, so one stray touch cannot undo every setting.
+``RESET_ARM_SECONDS``, so one stray touch cannot undo every setting, and the
+first page leaves an empty line before it, so no BACK that leads there is on
+RESET's line. For ``MENU_PAGE_GUARD_SECONDS`` after a row changes the page, taps
+on rows are ignored (``DONE`` still closes): a double tap on a row that opens a
+page, or on BACK, would otherwise act on the row under it on the new page.
 The menu is a tree of pages (``_CATEGORIES`` and ``_PAGES``, each naming its
 parent). The first page, untitled, has CAMERA, PIPELINE and NETWORK (``>``), the
 read-only LOOK and the RESET of every setting. CAMERA holds IMAGE (``>``), AE
@@ -267,6 +271,14 @@ PROCESSING_DOUBLE = "Developing double exposure..."
 # The settings menu: how long the first tap on RESET waits for the second, and
 # the look's name when ``--artifacts`` is the bundled starter.
 RESET_ARM_SECONDS = 3.0
+# How long after a page of the menu changes a tap on one of its rows is ignored
+# (``DONE`` still works). A row that opens a page, and BACK, are tapped where a
+# row of the next page will be: a double tap, or a second tap that the
+# photographer meant for the page they were leaving, would otherwise act on the
+# new page's row at that place (PIPELINE on SAVE DNG, IMAGE on SHARPNESS,
+# STABILISE on SHUTTER DELAY, a category's BACK on the first page's lines).
+# Half a second outlasts a double tap and is shorter than reading the new page.
+MENU_PAGE_GUARD_SECONDS = 0.5
 STARTER_LOOK = "starter (bundled)"
 # The menu's tree. The first page (``MENU_MAIN``, untitled) opens three category
 # pages; CAMERA opens IMAGE and PIPELINE opens STABILISE, the two settings pages.
@@ -505,8 +517,10 @@ class ViewfinderLoop:
         self._menu_shown: tuple[str | None, tuple[MenuRow, ...], bool] | None = None
         self._reset_until: float | None = None
         # The page shown in MENU: ``MENU_MAIN``, or a key of ``_CATEGORIES`` or
-        # ``_PAGES``.
+        # ``_PAGES``; and when (loop clock) a row last changed it, for
+        # ``MENU_PAGE_GUARD_SECONDS``.
         self._menu_page = MENU_MAIN
+        self._page_changed: float | None = None
 
     def _shutter_delay(self) -> float:
         """The menu's shutter delay for a press of the shutter key, read now.
@@ -1258,9 +1272,21 @@ class ViewfinderLoop:
         index = values.index(current) if current in values else -1
         return values[(index + 1) % len(values)]
 
-    def _open_page(self, name: str) -> None:
-        """Show page ``name`` (any page change disarms a RESET)."""
-        self._menu_page, self._reset_until = name, None
+    def _open_page(self, name: str, now: float) -> None:
+        """Show page ``name`` (any page change disarms a RESET and starts the
+        ``MENU_PAGE_GUARD_SECONDS`` in which taps on rows are ignored)."""
+        self._menu_page, self._reset_until, self._page_changed = name, None, now
+
+    def _page_guarded(self, now: float) -> bool:
+        return (self._page_changed is not None
+                and now - self._page_changed < MENU_PAGE_GUARD_SECONDS)
+
+    def _menu_gap(self, rows: tuple[MenuRow, ...]) -> int | None:
+        """The first page's empty line before its RESET (see ``menu.py``): the
+        index of RESET there, None on any other page or without a RESET."""
+        if self._menu_page == MENU_MAIN and rows and rows[-1].key == "reset":
+            return len(rows) - 1
+        return None
 
     def _menu_tap(self, key: str, now: float) -> None:
         """Act on a tap on the active row ``key``."""
@@ -1282,10 +1308,10 @@ class ViewfinderLoop:
         elif key == "ae_metering":
             settings.set(key, self._next(AE_METERINGS, settings.current.ae_metering))
         elif key in _PAGES or key in _CATEGORIES:
-            self._open_page(key)
+            self._open_page(key, now)
         elif key == "back":
             page = _PAGES.get(self._menu_page) or _CATEGORIES.get(self._menu_page)
-            self._open_page(page.parent if page is not None else MENU_MAIN)
+            self._open_page(page.parent if page is not None else MENU_MAIN, now)
         elif key in _PAGE_RESETS:
             if self._reset_armed(now):
                 self._reset_until = None
@@ -1309,24 +1335,30 @@ class ViewfinderLoop:
         rows = self._menu_rows(snap, now)
         title = self._menu_title()
         if tap is not None:
-            target = menu_hit(tap.x, tap.y, len(rows), self._scale, title=title is not None)
+            target = menu_hit(tap.x, tap.y, len(rows), self._scale, title=title is not None,
+                              gap=self._menu_gap(rows))
             if target == DONE:
                 self.state = "LIVE"
                 self._reset_until = None
                 self._menu_page = MENU_MAIN
+                self._page_changed = None
                 self._menu_shown = None
                 self._restart_rate_window()
                 return
-            if isinstance(target, int) and rows[target].active:
+            if (isinstance(target, int) and rows[target].active
+                    and not self._page_guarded(now)):
                 self._menu_tap(rows[target].key, now)
                 rows = self._menu_rows(snap, now)
                 title = self._menu_title()
+        gap = self._menu_gap(rows)
         finger = self._finger
         pressed = finger is not None and menu_hit(
-            finger[0], finger[1], len(rows), self._scale, title=title is not None) == DONE
+            finger[0], finger[1], len(rows), self._scale, title=title is not None,
+            gap=gap) == DONE
         page = (title, rows, pressed)
         if page != self._menu_shown and self._show(
-                render_menu(rows, scale=self._scale, done_pressed=pressed, title=title)):
+                render_menu(rows, scale=self._scale, done_pressed=pressed, title=title,
+                            gap=gap)):
             # Remembered only once pushed, so a refused page is tried again.
             self._menu_shown = page
 
@@ -1409,6 +1441,7 @@ class ViewfinderLoop:
                 self._flash = None
                 self._reset_until = None
                 self._menu_page = MENU_MAIN
+                self._page_changed = None
                 self._menu_shown = None
                 self._menu_step(snap, None, now)
                 return
