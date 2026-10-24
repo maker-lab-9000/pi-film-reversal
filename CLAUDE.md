@@ -174,7 +174,7 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   else one of `REASONS`: `ecc_failed`, `low_correlation`, `shift`, `angle`, and `unreadable`,
   which only a caller sets, through `unused_entry`), `align_ms`, `merge_ms`). Deterministic; another machine's OpenCV may differ in the last bits.
   The sRGB/linear tables it shares with `double.py` live in `color.py`. Six 12 MP frames take
-  about 1.8 s on the Mac (align 0.84 s, merge 0.90 s) and PI4_MERGE_TIMING_TBD on the Pi 4
+  about 1.8 s on the Mac (align 0.84 s, merge 0.90 s) and about 9.4 s on the Pi 4 (2 frames 2.9 s, 4 frames 6.1 s)
   (`scripts/bench_stack.py`).
 - `raw.py`: reads a Picamera2 DNG and develops it with the camera's own libcamera tuning file
   (black level, lens shading, digital gain and white balance, OpenCV demosaic, colour matrix,
@@ -294,8 +294,9 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   the merge; a recovered grade merges the JPEGs on disk, leaving out (one log line, `reason`
   `unreadable`) any frame after the reference it cannot read or that is not the reference's size;
   only an unreadable reference fails it. The quick grade is the reference alone.
-  No DNG for a stacked shot; a double exposure never takes a burst. Memory: about 1.5 GB peak
-  with four 6-frame shots queued, on the 8 GB Pi 4. Picamera2 records gain `shutter_delay_s`
+  No DNG for a stacked shot; a double exposure never takes a burst. Memory: one 6-frame merge
+  peaks at about 640 MB; about 1.5 GB estimated with four 6-frame shots queued, on the 4 GB Pi 4.
+  Writing the frames holds the camera about 0.47 s per frame (a 6-frame shot about 4 s). Picamera2 records gain `shutter_delay_s`
   (the delay waited; 0.0 for the Stick) right after the last `stream_info` field and, for a
   stack, `stack` after it: `frames` (names, reference first), `reference`, `exposure_us` and
   `gain` (the reference frame's metadata), `requested_exposure_us`, `requested_gain`, `split`,

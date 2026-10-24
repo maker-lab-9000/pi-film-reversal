@@ -861,7 +861,7 @@ and the panel in live view, SHUTTER and ISO on `AUTO`:
 | 5 | After a burst the live view comes back and its auto exposure settles within a second or two (no stuck short shutter or high gain); the shutter, ISO and WB cells read as before | Not yet run |
 | 6 | Check each multi-frame record's `stack.aligned`: on a steady handheld scene every frame has `used: true`. Note any `used: false` (a dropped frame) with its `reason` and `rho`, and the scene: a plain wall or sky may fall under the correlation threshold | Not yet run |
 | 7 | Six frames, four shots as fast as the camera allows: all four graded files appear; `stage_ms` has `burst`, `save_frames` and `merge`; peak memory stays near 1.5 GB (`systemctl status pifilm-capture`) | Not yet run |
-| 8 | `scripts/bench_stack.py --folder ~/Pictures/pifilm/<day> --shot <HHMMSS>` on a 6-frame shot prints align, merge and total times; compare with `merge` in the record | Not yet run |
+| 8 | `scripts/bench_stack.py --folder ~/Pictures/pifilm/<day> --shot <HHMMSS>` on a 6-frame shot prints align, merge and total times; compare with `merge` in the record | Bench only, 2026-10-24: six frames made from one Pi photograph (shift up to 12 px, roll up to 0.3°, noise) merged in 9.4 s, all six used, peak 640 MB. A real 6-frame shot is still to run |
 | 9 | The stabilise page's `RESET`, tapped twice: the three are off, `STAB` goes, the image settings are unchanged. Restart with a value saved: the journal has the `settings: multi-frame 4` style line | Not yet run |
 
 ## 8. Troubleshooting

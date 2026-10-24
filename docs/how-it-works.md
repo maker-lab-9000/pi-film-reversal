@@ -308,9 +308,14 @@ any frame.
    of rows, so memory stays near the frames themselves.
 
 Six 12 MP frames take about 1.8 s on the Mac (0.84 s align, 0.90 s merge) and
-PI4_MERGE_TIMING_TBD on the Pi 4. The merge runs on the grade worker, behind the
-shutter; the review shows the reference frame's quick grade at once. With four
-6-frame shots queued the service peaks at about 1.5 GB on the 8 GB Pi 4.
+about 9.4 s on the Pi 4 (3.8 s align, 5.6 s merge; 2 frames 2.9 s, 4 frames
+6.1 s; `scripts/bench_stack.py`, 2026-10-24). The merge runs on the grade worker,
+behind the shutter; the review shows the reference frame's quick grade at once.
+The capture side does pay for writing every frame before the camera is free:
+about 0.47 s per 12 MP JPEG on the Pi 4, so a 6-frame shot holds the camera for
+about 4 s against about 1.3 s for a single one. One 6-frame merge peaks at about
+640 MB; with four 6-frame shots queued the service is estimated at about 1.5 GB,
+on a Pi 4 with 4 GB (3.4 GB available at start).
 `pifilm-process` merges the frames on disk the same way to regrade a multi-frame
 record; as the Pi merged frames from memory and the files are JPEGs, the result
 is close, not byte for byte.
