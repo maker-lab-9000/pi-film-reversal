@@ -171,8 +171,9 @@ def test_the_rows_stay_clear_of_dones_hit_circle():
 
 @pytest.mark.parametrize("scale", [1, 2])
 def test_the_fullest_page_fits_on_the_panel(scale):
-    """Every row the viewfinder can show (``ROWS`` is all of them): the last one
-    ends above the panel's foot, and every row is hit at its centre."""
+    """The page's capacity, eleven rows (more than any page of the viewfinder's
+    tree has): the last one ends above the panel's foot, and every row is hit at
+    its centre."""
     bottom = ROW_Y0 + len(ROWS) * ROW_HEIGHT
     assert len(ROWS) == 11 and bottom == 228 and bottom <= HEIGHT
     pixels = _pixels(scale=scale)

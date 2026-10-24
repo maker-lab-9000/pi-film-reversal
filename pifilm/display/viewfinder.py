@@ -24,23 +24,32 @@ pushed only when its rows or ``DONE``'s press change (an upload's elapsed time
 changes once a second, and an identical page would only occupy the SPI bus), and
 the idle dim and screen-off apply as in LIVE. ``RESET`` takes two taps within
 ``RESET_ARM_SECONDS``, so one stray touch cannot undo every setting.
+The menu is a tree of pages (``_CATEGORIES`` and ``_PAGES``, each naming its
+parent). The first page, untitled, has CAMERA, PIPELINE and NETWORK (``>``), the
+read-only LOOK and the RESET of every setting. CAMERA holds IMAGE (``>``), AE
+CONSTRAINT and AE METERING; PIPELINE holds SAVE DNG, HALATION and STABILISE
+(``>``); NETWORK holds the read-only ETH and WLAN and, with an uploader, UPLOAD.
+Every page below the first has an amber title line that is not a row, and ends
+with BACK, which goes up one level (IMAGE to CAMERA, STABILISE to PIPELINE, a
+category to the first page). ``DONE`` closes the menu from any page, and the menu
+always opens on the first. A category row is dim with ``-`` when none of its rows
+is active (CAMERA and PIPELINE on a V4L2 or fake camera); NETWORK is always
+tappable. A setting row the camera does not take is left out of its category.
 The ``HALATION`` row is shown only to a camera with the setting rows, and it is
 dim with ``-`` for a look without halation (``look_halation`` False): there is
 nothing to turn off, so a tap on it does nothing, as on the rows that only show.
-The ``IMAGE`` row, after the setting rows, opens a second page titled IMAGE:
-SHARPNESS, CONTRAST and SATURATION (a tap steps to the next of
-``IMAGE_STEPS``, 1.5 wrapping to 0.5), a RESET that puts only those three back
-to 1.0 (two taps, like the first page's), and BACK to the first page. ``DONE``
-closes the menu from either page, and the menu always opens on the first. The
-IMAGE row is dim with ``-`` when the camera can change none of the three (a
-V4L2 or fake camera), and a control the camera does not list is dim on the page.
-While any of the three is not 1.0 the live view shows an amber ``IMG`` tag.
-The ``STABILISE`` row, after IMAGE, opens a third page the same way (one
-mechanism, ``_PAGES``), titled STABILISE: SHORT EXPOSURE (``ON``/``OFF``),
-SHUTTER DELAY (``OFF``/``0.2 S``/``0.5 S``) and MULTI-FRAME (``OFF``/``2``/``4``/
-``6``), each tap stepping to the next value and wrapping, a RESET for only those
-three, and BACK. It is dim with ``-`` on a V4L2 or fake camera (no setting rows),
-and SHORT EXPOSURE is dim on a camera without libcamera's exposure modes or under
+The ``IMAGE`` row opens a settings page titled IMAGE: SHARPNESS, CONTRAST and
+SATURATION (a tap steps to the next of ``IMAGE_STEPS``, 1.5 wrapping to 0.5), a
+RESET that puts only those three back to 1.0 (two taps, like the first page's),
+and BACK. The IMAGE row is dim with ``-`` when the camera can change none of the
+three (a V4L2 or fake camera), and a control the camera does not list is dim on
+the page. While any of the three is not 1.0 the live view shows an amber ``IMG``
+tag. The ``STABILISE`` row opens a settings page the same way (one mechanism,
+``_PAGES``), titled STABILISE: SHORT EXPOSURE (``ON``/``OFF``), SHUTTER DELAY
+(``OFF``/``0.2 S``/``0.5 S``) and MULTI-FRAME (``OFF``/``2``/``4``/``6``), each
+tap stepping to the next value and wrapping, a RESET for only those three, and
+BACK. It is dim with ``-`` on a V4L2 or fake camera (no setting rows), and SHORT
+EXPOSURE is dim on a camera without libcamera's exposure modes or under
 ``--ae-lock``, where it would change nothing. While any of the three this camera
 takes is not off the live view shows an amber ``STAB`` tag beside ``IMG``.
 The live screen (``liveview.py``) is select-and-adjust: a tap on one of the strip's
@@ -259,9 +268,12 @@ PROCESSING_DOUBLE = "Developing double exposure..."
 # the look's name when ``--artifacts`` is the bundled starter.
 RESET_ARM_SECONDS = 3.0
 STARTER_LOOK = "starter (bundled)"
-# The menu's second page: the camera's image controls.
+# The menu's tree. The first page (``MENU_MAIN``, untitled) opens three category
+# pages; CAMERA opens IMAGE and PIPELINE opens STABILISE, the two settings pages.
+MENU_MAIN = "main"
+# The camera's image controls, under CAMERA.
 IMAGE_TITLE = "IMAGE"
-# The menu's third page: the helps against camera shake.
+# The helps against camera shake, under PIPELINE.
 STABILISE_TITLE = "STABILISE"
 STABILISE_LABELS = {
     "short_exposure": "SHORT EXPOSURE", "shutter_delay": "SHUTTER DELAY",
@@ -282,25 +294,43 @@ def _stabilise_value(key: str, value: object) -> str:
 
 
 @dataclass(frozen=True)
-class _Page:
-    """A page the first page's row opens: its title, its settings, its RESET's
-    row key and the ``SettingsControl`` method that RESET calls, and how a row is
-    labelled, shown and stepped."""
+class _Category:
+    """A page a first-page row opens that only groups others: its title and
+    the page its BACK returns to. Its rows are built by the loop
+    (``_category_rows``), since they show settings, the network and the upload."""
 
     title: str
+    parent: str
+
+
+@dataclass(frozen=True)
+class _Page:
+    """A settings page a category's row opens: its title, its parent (where BACK
+    goes), its settings, its RESET's row key and what that RESET does to the
+    ``SettingsControl``, and how a row is labelled, shown and stepped."""
+
+    title: str
+    parent: str
     keys: tuple[str, ...]
     reset: str
-    reset_method: str
+    reset_settings: Callable[[SettingsControl], None]
     label: Callable[[str], str]
     value: Callable[[str, object], str]
     steps: Callable[[str], tuple]
 
 
+_CATEGORIES = {
+    "camera": _Category("CAMERA", MENU_MAIN),
+    "pipeline": _Category("PIPELINE", MENU_MAIN),
+    "network": _Category("NETWORK", MENU_MAIN),
+}
 _PAGES = {
-    "image": _Page(IMAGE_TITLE, IMAGE_KEYS, "image_reset", "reset_image", str.upper,
+    "image": _Page(IMAGE_TITLE, "camera", IMAGE_KEYS, "image_reset",
+                   lambda settings: settings.reset_image(), str.upper,
                    lambda key, value: format_step(value), lambda key: IMAGE_STEPS),
     "stabilise": _Page(
-        STABILISE_TITLE, STABILISE_KEYS, "stabilise_reset", "reset_stabilise",
+        STABILISE_TITLE, "pipeline", STABILISE_KEYS, "stabilise_reset",
+        lambda settings: settings.reset_stabilise(),
         STABILISE_LABELS.__getitem__,
         _stabilise_value,
         lambda key: {"short_exposure": (False, True), "shutter_delay": SHUTTER_DELAYS,
@@ -474,8 +504,9 @@ class ViewfinderLoop:
         self._menu_resettable = settings is not None and menu_rows is not None
         self._menu_shown: tuple[str | None, tuple[MenuRow, ...], bool] | None = None
         self._reset_until: float | None = None
-        # The page shown in MENU: "main", or a key of ``_PAGES``.
-        self._menu_page = "main"
+        # The page shown in MENU: ``MENU_MAIN``, or a key of ``_CATEGORIES`` or
+        # ``_PAGES``.
+        self._menu_page = MENU_MAIN
 
     def _shutter_delay(self) -> float:
         """The menu's shutter delay for a press of the shutter key, read now.
@@ -1125,11 +1156,16 @@ class ViewfinderLoop:
                    for key in STABILISE_KEYS if key in self._menu_optional)
 
     def _menu_title(self) -> str | None:
-        page = _PAGES.get(self._menu_page)
+        """The shown page's title; None on the first page, which has none."""
+        page = _PAGES.get(self._menu_page) or _CATEGORIES.get(self._menu_page)
         return page.title if page is not None else None
 
+    def _reset_row(self, key: str, now: float, active: bool) -> MenuRow:
+        return MenuRow(key, "RESET", "TAP AGAIN" if self._reset_armed(now) else "TAP TWICE",
+                       active)
+
     def _page_rows(self, page: _Page, now: float) -> tuple[MenuRow, ...]:
-        """A second page's rows: its settings, its RESET and BACK. A setting this
+        """A settings page's rows: its settings, its RESET and BACK. A setting this
         camera does not take is dim with ``-``."""
         current = self._settings.current
         rows = [
@@ -1137,58 +1173,83 @@ class ViewfinderLoop:
             if key in self._menu_optional else MenuRow(key, page.label(key), "-", False)
             for key in page.keys
         ]
-        rows.append(MenuRow(page.reset, "RESET",
-                            "TAP AGAIN" if self._reset_armed(now) else "TAP TWICE",
-                            self._page_active(page)))
+        rows.append(self._reset_row(page.reset, now, self._page_active(page)))
         rows.append(MenuRow("back", "BACK", "", True))
         return tuple(rows)
 
     def _page_active(self, page: _Page) -> bool:
-        return any(key in self._menu_optional for key in page.keys)
+        return self._settings is not None and any(
+            key in self._menu_optional for key in page.keys)
 
     def _page_entry(self, name: str) -> MenuRow:
-        """The first page's row that opens ``name``: ``>``, or dim with ``-``
-        when the camera takes none of its settings."""
+        """The category's row that opens the settings page ``name``: ``>``, or dim
+        with ``-`` when the camera takes none of its settings."""
         page = _PAGES[name]
         if self._page_active(page):
             return MenuRow(name, page.title, ">", True)
         return MenuRow(name, page.title, "-", False)
 
-    def _menu_rows(self, snap: Any, now: float) -> tuple[MenuRow, ...]:
-        """The menu's rows as they are now, in the spec's order."""
-        page = _PAGES.get(self._menu_page)
-        if page is not None and self._settings is not None:
-            return self._page_rows(page, now)
+    def _category_rows(self, name: str, snap: Any) -> list[MenuRow]:
+        """A category page's rows, BACK not included. A setting row this camera
+        does not take is left out, as the first page left it out before the
+        categories; the settings pages' rows are always there, dim when the
+        camera takes none of their settings."""
         rows: list[MenuRow] = []
         settings = self._settings
-        if settings is not None:
-            current = settings.current
-            if "save_dng" in self._menu_optional:
-                rows.append(MenuRow("save_dng", "SAVE DNG",
-                                    "ON" if current.save_dng else "OFF", True))
-            if "halation" in self._menu_optional:
-                if self._look_halation:
-                    rows.append(MenuRow("halation", "HALATION",
-                                        "ON" if current.halation else "OFF", True))
-                else:
-                    rows.append(MenuRow("halation", "HALATION", "-", False))
-            if "ae_constraint" in self._menu_optional:
-                rows.append(MenuRow("ae_constraint", "AE CONSTRAINT",
-                                    current.ae_constraint.upper(), True))
-            if "ae_metering" in self._menu_optional:
-                rows.append(MenuRow("ae_metering", "AE METERING",
-                                    current.ae_metering.upper(), True))
+        optional = self._menu_optional
+        if name == "camera":
             rows.append(self._page_entry("image"))
+            if settings is not None:
+                current = settings.current
+                if "ae_constraint" in optional:
+                    rows.append(MenuRow("ae_constraint", "AE CONSTRAINT",
+                                        current.ae_constraint.upper(), True))
+                if "ae_metering" in optional:
+                    rows.append(MenuRow("ae_metering", "AE METERING",
+                                        current.ae_metering.upper(), True))
+        elif name == "pipeline":
+            if settings is not None:
+                current = settings.current
+                if "save_dng" in optional:
+                    rows.append(MenuRow("save_dng", "SAVE DNG",
+                                        "ON" if current.save_dng else "OFF", True))
+                if "halation" in optional:
+                    if self._look_halation:
+                        rows.append(MenuRow("halation", "HALATION",
+                                            "ON" if current.halation else "OFF", True))
+                    else:
+                        rows.append(MenuRow("halation", "HALATION", "-", False))
             rows.append(self._page_entry("stabilise"))
-        if self._upload is not None:
-            rows.append(MenuRow("upload", "UPLOAD", self._upload.status(), True))
-        network = dict(getattr(snap, "network", ()) or ())
-        rows.append(MenuRow("eth", "ETH", network.get("ETH") or "-", False))
-        rows.append(MenuRow("wlan", "WLAN", network.get("WLAN") or "-", False))
+        else:  # network
+            network = dict(getattr(snap, "network", ()) or ())
+            rows.append(MenuRow("eth", "ETH", network.get("ETH") or "-", False))
+            rows.append(MenuRow("wlan", "WLAN", network.get("WLAN") or "-", False))
+            if self._upload is not None:
+                rows.append(MenuRow("upload", "UPLOAD", self._upload.status(), True))
+        return rows
+
+    def _category_entry(self, name: str, snap: Any) -> MenuRow:
+        """The first page's row that opens category ``name``: ``>``, or dim with
+        ``-`` when none of its rows is active (CAMERA and PIPELINE under
+        ``--fake``). NETWORK is always tappable: its addresses only inform, but
+        they are what one opens it for."""
+        title = _CATEGORIES[name].title
+        if name == "network" or any(row.active for row in self._category_rows(name, snap)):
+            return MenuRow(name, title, ">", True)
+        return MenuRow(name, title, "-", False)
+
+    def _menu_rows(self, snap: Any, now: float) -> tuple[MenuRow, ...]:
+        """The shown page's rows as they are now, in the spec's order."""
+        name = self._menu_page
+        page = _PAGES.get(name)
+        if page is not None and self._settings is not None:
+            return self._page_rows(page, now)
+        if name in _CATEGORIES:
+            return (*self._category_rows(name, snap), MenuRow("back", "BACK", "", True))
+        rows = [self._category_entry(category, snap) for category in _CATEGORIES]
         rows.append(MenuRow("look", "LOOK", self._look or STARTER_LOOK, False))
         if self._menu_resettable:
-            rows.append(MenuRow("reset", "RESET",
-                                "TAP AGAIN" if self._reset_armed(now) else "TAP TWICE", True))
+            rows.append(self._reset_row("reset", now, True))
         return tuple(rows)
 
     @staticmethod
@@ -1196,6 +1257,10 @@ class ViewfinderLoop:
         """The value after ``current`` in ``values``, wrapping round."""
         index = values.index(current) if current in values else -1
         return values[(index + 1) % len(values)]
+
+    def _open_page(self, name: str) -> None:
+        """Show page ``name`` (any page change disarms a RESET)."""
+        self._menu_page, self._reset_until = name, None
 
     def _menu_tap(self, key: str, now: float) -> None:
         """Act on a tap on the active row ``key``."""
@@ -1216,14 +1281,15 @@ class ViewfinderLoop:
             settings.set(key, self._next(AE_CONSTRAINTS, settings.current.ae_constraint))
         elif key == "ae_metering":
             settings.set(key, self._next(AE_METERINGS, settings.current.ae_metering))
-        elif key in _PAGES:
-            self._menu_page, self._reset_until = key, None
+        elif key in _PAGES or key in _CATEGORIES:
+            self._open_page(key)
         elif key == "back":
-            self._menu_page, self._reset_until = "main", None
+            page = _PAGES.get(self._menu_page) or _CATEGORIES.get(self._menu_page)
+            self._open_page(page.parent if page is not None else MENU_MAIN)
         elif key in _PAGE_RESETS:
             if self._reset_armed(now):
                 self._reset_until = None
-                getattr(settings, _PAGES[_PAGE_RESETS[key]].reset_method)()
+                _PAGES[_PAGE_RESETS[key]].reset_settings(settings)
             else:
                 self._reset_until = now + RESET_ARM_SECONDS
         elif key in _PAGE_KEYS:
@@ -1247,7 +1313,7 @@ class ViewfinderLoop:
             if target == DONE:
                 self.state = "LIVE"
                 self._reset_until = None
-                self._menu_page = "main"
+                self._menu_page = MENU_MAIN
                 self._menu_shown = None
                 self._restart_rate_window()
                 return
@@ -1342,7 +1408,7 @@ class ViewfinderLoop:
                 self.state = "MENU"
                 self._flash = None
                 self._reset_until = None
-                self._menu_page = "main"
+                self._menu_page = MENU_MAIN
                 self._menu_shown = None
                 self._menu_step(snap, None, now)
                 return

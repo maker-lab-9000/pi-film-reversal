@@ -15,11 +15,13 @@ Design intent:
   Each row is drawn on a tile that ends at x 248, so no long value can spill
   towards ``DONE`` either; the value is also cut with ``...`` to the room the
   label leaves it.
-- A second page (the camera's image controls) has a title on its first line,
-  amber and not a row: the rows start one line lower, and a tap on the title
-  lands on nothing. The first page at its fullest has eleven rows (its IMAGE and
-  STABILISE rows each open such a page), which end at y 228, inside the 240-unit
-  page at every scale, since the geometry is in base units.
+- Every page below the first (a category, or a settings page such as IMAGE) has
+  a title on its first line, amber and not a row: the rows start one line lower,
+  and a tap on the title lands on nothing. The fullest page of the viewfinder's
+  tree is a settings page, a title and five rows (three settings, RESET, BACK),
+  which end at y 128; the first page has at most five rows. The page has room
+  for eleven lines (they end at y 228, inside the 240-unit page at every scale,
+  since the geometry is in base units).
 
 Drawing reuses the live view's canvas, fonts, colours and supersampling, so the
 page reads as the same instrument. Geometry is in 320x240 base units at the

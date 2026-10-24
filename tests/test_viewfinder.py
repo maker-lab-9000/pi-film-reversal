@@ -22,6 +22,7 @@ from pifilm.display.liveview import (
     CELL_HIT_X0,
     CELL_PITCH,
     DOUBLE_BOX,
+    HEIGHT,
     MENU_CENTRE,
     MINUS_CENTRE,
     PLUS_CENTRE,
@@ -29,7 +30,7 @@ from pifilm.display.liveview import (
     Action,
     Cell,
 )
-from pifilm.display.menu import ROW_HEIGHT, ROW_X0, ROW_Y0
+from pifilm.display.menu import ROW_HEIGHT, ROW_X0, ROW_X1, ROW_Y0, menu_hit
 from pifilm.display.viewfinder import (
     CAMERA_STALL_LIMIT,
     ISO_CELL,
@@ -3189,11 +3190,35 @@ class FakeUpload:
 
 
 def _row_xy(index):
+    """A row of the first page, which has no title."""
     return (ROW_X0 + 40, ROW_Y0 + index * ROW_HEIGHT + ROW_HEIGHT // 2)
+
+
+def _page2_xy(index):
+    """A row of a titled page: the title takes the first line."""
+    return (ROW_X0 + 40, ROW_Y0 + (index + 1) * ROW_HEIGHT + ROW_HEIGHT // 2)
 
 
 def _values_by_key(page):
     return {row.key: row.value for row in page[0]}
+
+
+def _keys(page):
+    return [row.key for row in page[0]]
+
+
+def _title(page):
+    return page[1].get("title")
+
+
+def _key_xy(page, key):
+    """Where the row ``key`` of the drawn ``page`` is tapped."""
+    index = _keys(page).index(key)
+    return _page2_xy(index) if _title(page) is not None else _row_xy(index)
+
+
+def _tap_key(loop, touch, clock, pages, key):
+    _tap(loop, touch, clock, _key_xy(pages[-1], key))
 
 
 def _open_menu(loop, touch, clock):
@@ -3202,10 +3227,39 @@ def _open_menu(loop, touch, clock):
     assert loop.state == "MENU"
 
 
+def _open_path(loop, touch, clock, pages, *keys):
+    """Open the menu and tap the rows ``keys`` in turn (a category, then a page)."""
+    _open_menu(loop, touch, clock)
+    for key in keys:
+        _tap_key(loop, touch, clock, pages, key)
+
+
 def _menu_loop(camera, ctl, tmp_path, **kw):
     kw.setdefault("settings", _settings(tmp_path))
     kw.setdefault("menu_rows", ALL_ROWS)
     return _loop(camera, ctl, **kw)
+
+
+# Every row a Picamera2 camera can show, and a look with halation: the fullest tree.
+FULL_ROWS = ("save_dng", "halation", "ae_constraint", "ae_metering", "sharpness",
+             "contrast", "saturation", "short_exposure", "shutter_delay", "multi_frame")
+# Each page of the tree: the rows tapped to reach it from the first page, its
+# title, and the title BACK leads to (None: the first page).
+TREE = [
+    ((), None, None),
+    (("camera",), "CAMERA", None),
+    (("pipeline",), "PIPELINE", None),
+    (("network",), "NETWORK", None),
+    (("camera", "image"), "IMAGE", "CAMERA"),
+    (("pipeline", "stabilise"), "STABILISE", "PIPELINE"),
+]
+
+
+def _full_loop(camera, ctl, tmp_path, **kw):
+    kw.setdefault("menu_rows", FULL_ROWS)
+    kw.setdefault("look_halation", True)
+    kw.setdefault("upload", FakeUpload())
+    return _menu_loop(camera, ctl, tmp_path, **kw)
 
 
 def test_menu_key_opens_the_menu_and_done_returns_to_live(controller, tmp_path, monkeypatch):
@@ -3221,12 +3275,99 @@ def test_menu_key_opens_the_menu_and_done_returns_to_live(controller, tmp_path, 
     assert display.images[-1].size == (320, 240)
 
 
+def test_the_first_page_has_the_three_categories_look_and_reset(
+        controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path, look="imx477-v4")
+    _open_menu(loop, touch, clock)
+    rows = pages[-1][0]
+    assert _title(pages[-1]) is None
+    assert [(row.key, row.label, row.value, row.active) for row in rows] == [
+        ("camera", "CAMERA", ">", True),
+        ("pipeline", "PIPELINE", ">", True),
+        ("network", "NETWORK", ">", True),
+        ("look", "LOOK", "imx477-v4", False),
+        ("reset", "RESET", "TAP TWICE", True),
+    ]
+
+
+@pytest.mark.parametrize("category, title, rows", [
+    ("camera", "CAMERA", [("image", "IMAGE", ">"), ("ae_constraint", "AE CONSTRAINT", "NORMAL"),
+                          ("ae_metering", "AE METERING", "CENTRE"), ("back", "BACK", "")]),
+    ("pipeline", "PIPELINE", [("save_dng", "SAVE DNG", "ON"), ("halation", "HALATION", "ON"),
+                              ("stabilise", "STABILISE", ">"), ("back", "BACK", "")]),
+    ("network", "NETWORK", [("eth", "ETH", "-"), ("wlan", "WLAN", "-"),
+                            ("upload", "UPLOAD", "READY"), ("back", "BACK", "")]),
+])
+def test_each_category_page_has_its_rows_in_order_under_an_amber_title(
+        controller, tmp_path, monkeypatch, category, title, rows):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path)
+    _open_path(loop, touch, clock, pages, category)
+    assert _title(pages[-1]) == title
+    assert display.images[-1] is viewfinder.render_menu(
+        pages[-1][0], scale=1, done_pressed=False, title=title)
+    assert [(row.key, row.label, row.value) for row in pages[-1][0]] == rows
+    # The title line is not a row: a tap on it does nothing.
+    drawn = len(pages)
+    _tap(loop, touch, clock, (ROW_X0 + 40, ROW_Y0 + ROW_HEIGHT // 2))
+    assert loop.state == "MENU" and len(pages) == drawn
+
+
+@pytest.mark.parametrize("path, title, parent", TREE[1:])
+def test_back_goes_up_one_level(controller, tmp_path, monkeypatch, path, title, parent):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path)
+    _open_path(loop, touch, clock, pages, *path)
+    assert _title(pages[-1]) == title
+    _tap_key(loop, touch, clock, pages, "back")
+    assert loop.state == "MENU" and _title(pages[-1]) == parent
+
+
+@pytest.mark.parametrize("path, title, parent", TREE)
+def test_done_closes_the_menu_from_every_page_and_it_reopens_on_the_first(
+        controller, tmp_path, monkeypatch, path, title, parent):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path)
+    _open_path(loop, touch, clock, pages, *path)
+    assert _title(pages[-1]) == title
+    _tap(loop, touch, clock, SHUTTER_CENTRE)
+    assert loop.state == "LIVE"
+    _open_menu(loop, touch, clock)
+    assert _title(pages[-1]) is None and _keys(pages[-1])[0] == "camera"
+
+
+@pytest.mark.parametrize("path, title, parent", TREE)
+@pytest.mark.parametrize("scale", [1, 2])
+def test_every_page_of_the_tree_fits_and_stays_clear_of_done(
+        controller, tmp_path, monkeypatch, path, title, parent, scale):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path)
+    _open_path(loop, touch, clock, pages, *path)
+    rows = pages[-1][0]
+    lines = len(rows) + (title is not None)
+    assert ROW_Y0 + lines * ROW_HEIGHT < HEIGHT
+    pixels = np.asarray(viewfinder.render_menu(rows, scale=scale, title=title)).astype(int)
+    assert pixels[:, ROW_X1 * scale + 1:253 * scale].max() == 0
+    for index in range(len(rows)):
+        x, y = _page2_xy(index) if title is not None else _row_xy(index)
+        assert menu_hit(x * scale, y * scale, len(rows), scale,
+                        title=title is not None) == index
+        assert menu_hit(ROW_X1 * scale - 1, y * scale, len(rows), scale,
+                        title=title is not None) == index
+
+
 def test_the_menu_is_only_redrawn_when_its_rows_change(controller, tmp_path, monkeypatch):
     camera, ctl = controller
     pages = _spy_menu(monkeypatch)
     upload = FakeUpload("READY")
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, upload=upload)
-    _open_menu(loop, touch, clock)
+    _open_path(loop, touch, clock, pages, "network")
     before = len(display.images)
     for _ in range(3):
         clock.t += 0.1
@@ -3250,6 +3391,25 @@ def test_a_shot_finished_in_the_menu_never_opens_review(controller, tmp_path, mo
     _tap(loop, touch, clock, SHUTTER_CENTRE)
     loop.step()
     assert loop.state == "LIVE"
+    assert calls["review"] == [] and calls["message"] == []
+
+
+@pytest.mark.parametrize("path, title, parent", TREE[1:])
+def test_a_gpio_shot_on_a_page_below_the_first_keeps_that_page(
+        controller, tmp_path, monkeypatch, path, title, parent):
+    camera, ctl = controller
+    calls = _record_renderers(monkeypatch)
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _full_loop(camera, ctl, tmp_path)
+    _open_path(loop, touch, clock, pages, *path)
+    ctl.submit("from-the-gpio-button")
+    _until(lambda: ctl.snapshot().finished_count == 1)
+    assert ctl.snapshot().last_finished_job.state == "complete"
+    loop.step()
+    clock.t += 0.1
+    loop.step()
+    assert loop.state == "MENU" and loop._menu_title() == title
+    assert _title(pages[-1]) == title
     assert calls["review"] == [] and calls["message"] == []
 
 
@@ -3283,28 +3443,28 @@ def test_the_menu_key_does_nothing_while_a_job_runs(tmp_path):
         ctl.close()
 
 
-@pytest.mark.parametrize("index, key, values", [
-    (0, "save_dng", [False, True]),
-    (1, "ae_constraint", ["highlight", "shadows", "normal"]),
-    (2, "ae_metering", ["spot", "matrix", "centre"]),
+@pytest.mark.parametrize("category, key, values", [
+    ("pipeline", "save_dng", [False, True]),
+    ("camera", "ae_constraint", ["highlight", "shadows", "normal"]),
+    ("camera", "ae_metering", ["spot", "matrix", "centre"]),
 ])
 def test_a_setting_row_steps_to_its_next_value_and_is_saved(
-        controller, tmp_path, monkeypatch, index, key, values):
+        controller, tmp_path, monkeypatch, category, key, values):
     camera, ctl = controller
     pages = _spy_menu(monkeypatch)
     applied = []
     control = _settings(tmp_path, applied)
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control)
-    _open_menu(loop, touch, clock)
+    _open_path(loop, touch, clock, pages, category)
     for value in values:
-        _tap(loop, touch, clock, _row_xy(index))
+        _tap_key(loop, touch, clock, pages, key)
         assert applied[-1] == (key, value)
         assert getattr(control.current, key) == value
     assert [v for k, v in applied] == values
     assert _values_by_key(pages[-1])[key] == {True: "ON", False: "OFF"}.get(
         values[-1], str(values[-1]).upper())
     # The first value differs from the unit's flag, so it was written to the file.
-    _tap(loop, touch, clock, _row_xy(index))
+    _tap_key(loop, touch, clock, pages, key)
     saved = json.loads((tmp_path / "state" / "settings.json").read_text())
     assert saved[key] == values[0]
 
@@ -3319,8 +3479,8 @@ def test_a_refused_setting_keeps_its_value(controller, tmp_path, monkeypatch):
 
     control.register("ae_metering", refuse)
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control)
-    _open_menu(loop, touch, clock)
-    _tap(loop, touch, clock, _row_xy(2))
+    _open_path(loop, touch, clock, pages, "camera")
+    _tap_key(loop, touch, clock, pages, "ae_metering")
     loop.step()
     assert control.current.ae_metering == "centre"
     assert _values_by_key(pages[-1])["ae_metering"] == "CENTRE"
@@ -3331,16 +3491,10 @@ def test_the_upload_row_starts_an_upload_and_shows_its_status(controller, tmp_pa
     pages = _spy_menu(monkeypatch)
     upload = FakeUpload("LAST 12:04 OK")
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, upload=upload)
-    _open_menu(loop, touch, clock)
-    rows = pages[-1][0]
-    assert [row.key for row in rows] == [
-        "save_dng", "ae_constraint", "ae_metering", "image", "stabilise", "upload", "eth",
-        "wlan", "look", "reset"]
-    assert [row.label for row in rows] == [
-        "SAVE DNG", "AE CONSTRAINT", "AE METERING", "IMAGE", "STABILISE", "UPLOAD", "ETH",
-        "WLAN", "LOOK", "RESET"]
+    _open_path(loop, touch, clock, pages, "network")
+    assert _keys(pages[-1]) == ["eth", "wlan", "upload", "back"]
     assert _values_by_key(pages[-1])["upload"] == "LAST 12:04 OK"
-    _tap(loop, touch, clock, _row_xy(5))
+    _tap(loop, touch, clock, _page2_xy(2))
     assert upload.starts == 1
 
 
@@ -3354,6 +3508,7 @@ def test_reset_needs_a_second_tap_within_three_seconds(controller, tmp_path, mon
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control)
     _open_menu(loop, touch, clock)
     reset = len(pages[-1][0]) - 1
+    assert reset == 4 and _keys(pages[-1])[reset] == "reset"
     assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
     _tap(loop, touch, clock, _row_xy(reset))
     assert _values_by_key(pages[-1])["reset"] == "TAP AGAIN"
@@ -3382,28 +3537,66 @@ def test_leaving_the_menu_disarms_the_reset(controller, tmp_path, monkeypatch):
     assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
 
 
-def test_rows_are_left_out_when_their_part_is_missing(controller, tmp_path, monkeypatch):
+def test_opening_a_category_disarms_the_reset(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+    _open_menu(loop, touch, clock)
+    _tap_key(loop, touch, clock, pages, "reset")
+    assert _values_by_key(pages[-1])["reset"] == "TAP AGAIN"
+    _tap_key(loop, touch, clock, pages, "camera")
+    _tap_key(loop, touch, clock, pages, "back")
+    assert _values_by_key(pages[-1])["reset"] == "TAP TWICE"
+
+
+def test_under_fake_camera_and_pipeline_are_dim_and_network_opens(
+        controller, tmp_path, monkeypatch):
     camera, ctl = controller
     pages = _spy_menu(monkeypatch)
     # Settings but no setting rows (``--fake``): no RESET either, since it would only
-    # delete the real camera's saved settings. IMAGE stays, dim.
+    # delete the real camera's saved settings.
     loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path))
     _open_menu(loop, touch, clock)
-    assert [row.key for row in pages[-1][0]] == ["image", "stabilise", "eth", "wlan", "look"]
-    assert pages[-1][0][0].active is False and pages[-1][0][1].active is False
+    rows = pages[-1][0]
+    assert [(row.key, row.value, row.active) for row in rows[:3]] == [
+        ("camera", "-", False), ("pipeline", "-", False), ("network", ">", True)]
+    assert _keys(pages[-1]) == ["camera", "pipeline", "network", "look"]
+    for key in ("camera", "pipeline"):
+        _tap_key(loop, touch, clock, pages, key)
+        assert loop.state == "MENU" and _title(pages[-1]) is None
+    _tap_key(loop, touch, clock, pages, "network")
+    assert _title(pages[-1]) == "NETWORK"
+    assert _keys(pages[-1]) == ["eth", "wlan", "back"]
+
+
+def test_rows_are_left_out_when_their_part_is_missing(controller, tmp_path, monkeypatch):
+    camera, ctl = controller
+    pages = _spy_menu(monkeypatch)
+    # Setting rows but none of them: RESET is there, the categories are dim.
     loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path),
                                         menu_rows=())
     _open_menu(loop, touch, clock)
-    assert [row.key for row in pages[-1][0]] == ["image", "stabilise", "eth", "wlan", "look",
-                                                 "reset"]
+    assert _keys(pages[-1]) == ["camera", "pipeline", "network", "look", "reset"]
+    assert [row.active for row in pages[-1][0][:3]] == [False, False, True]
+    # One AE row: CAMERA opens, with IMAGE dim; PIPELINE has only a dim STABILISE.
     loop, touch, display, clock = _loop(camera, ctl, settings=_settings(tmp_path),
                                         menu_rows=("ae_metering",))
     _open_menu(loop, touch, clock)
-    assert [row.key for row in pages[-1][0]] == [
-        "ae_metering", "image", "stabilise", "eth", "wlan", "look", "reset"]
+    assert [row.active for row in pages[-1][0][:3]] == [True, False, True]
+    _tap_key(loop, touch, clock, pages, "camera")
+    rows = pages[-1][0]
+    assert [(row.key, row.active) for row in rows] == [
+        ("image", False), ("ae_metering", True), ("back", True)]
+    # No settings at all: the categories stay, UPLOAD only with an uploader.
     loop, touch, display, clock = _loop(camera, ctl, menu_rows=ALL_ROWS, upload=FakeUpload())
     _open_menu(loop, touch, clock)
-    assert [row.key for row in pages[-1][0]] == ["upload", "eth", "wlan", "look"]
+    assert _keys(pages[-1]) == ["camera", "pipeline", "network", "look"]
+    assert [row.active for row in pages[-1][0][:3]] == [False, False, True]
+    _tap_key(loop, touch, clock, pages, "network")
+    assert _keys(pages[-1]) == ["eth", "wlan", "upload", "back"]
+    loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
+    _open_path(loop, touch, clock, pages, "network")
+    assert _keys(pages[-1]) == ["eth", "wlan", "back"]
 
 
 class _NetworkController:
@@ -3423,16 +3616,21 @@ def test_the_network_and_look_rows_are_read_only(controller, tmp_path, monkeypat
     net = _NetworkController(ctl, (("ETH", "192.168.1.20"),))
     loop, touch, display, clock = _menu_loop(camera, net, tmp_path, look="imx477-v4")
     _open_menu(loop, touch, clock)
+    assert _values_by_key(pages[-1])["look"] == "imx477-v4"
+    look = pages[-1][0][_keys(pages[-1]).index("look")]
+    assert look.active is False
+    drawn = len(pages)
+    _tap_key(loop, touch, clock, pages, "look")  # nothing happens
+    assert loop.state == "MENU" and len(pages) == drawn
+    _tap_key(loop, touch, clock, pages, "network")
     values = _values_by_key(pages[-1])
     assert values["eth"] == "192.168.1.20" and values["wlan"] == "-"
-    assert values["look"] == "imx477-v4"
-    assert not any(row.active for row in pages[-1][0]
-                   if row.key in ("eth", "wlan", "look"))
+    assert not any(row.active for row in pages[-1][0] if row.key in ("eth", "wlan"))
     net.network = (("ETH", "192.168.1.20"), ("WLAN", "10.42.0.1"))
     loop.step()
     assert _values_by_key(pages[-1])["wlan"] == "10.42.0.1"
     drawn = len(pages)
-    _tap(loop, touch, clock, _row_xy(4))  # ETH: nothing happens
+    _tap_key(loop, touch, clock, pages, "eth")  # nothing happens
     assert loop.state == "MENU" and len(pages) == drawn
 
 
@@ -3480,9 +3678,10 @@ def test_a_dark_screen_in_the_menu_draws_nothing_and_redraws_on_wake(controller,
         clock.t += 0.1
         loop.step()
     assert len(display.images) == before
-    # The tap that wakes it changes nothing, but the page comes back.
+    # The tap that wakes it changes nothing (CAMERA does not open), but the page
+    # comes back.
     _tap(loop, touch, clock, _row_xy(0))
-    assert loop._settings.current.save_dng is True
+    assert loop._menu_title() is None
     assert loop.state == "MENU"
     assert len(display.images) == before + 1
 
@@ -3533,18 +3732,16 @@ def test_the_halation_row_follows_save_dng_and_toggles(controller, tmp_path, mon
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
                                              menu_rows=HALATION_ROWS, look_halation=True,
                                              upload=FakeUpload())
-    _open_menu(loop, touch, clock)
+    _open_path(loop, touch, clock, pages, "pipeline")
     rows = pages[-1][0]
-    assert [row.key for row in rows] == [
-        "save_dng", "halation", "ae_constraint", "ae_metering", "image", "stabilise",
-        "upload", "eth", "wlan", "look", "reset"]
+    assert _keys(pages[-1]) == ["save_dng", "halation", "stabilise", "back"]
     assert rows[1].label == "HALATION" and rows[1].value == "ON" and rows[1].active
-    _tap(loop, touch, clock, _row_xy(1))
+    _tap(loop, touch, clock, _page2_xy(1))
     assert applied == [("halation", False)] and control.current.halation is False
     assert _values_by_key(pages[-1])["halation"] == "OFF"
     saved = json.loads((tmp_path / "state" / "settings.json").read_text())
     assert saved == {"version": 1, "halation": False}
-    _tap(loop, touch, clock, _row_xy(1))
+    _tap(loop, touch, clock, _page2_xy(1))
     assert applied[-1] == ("halation", True)
     assert _values_by_key(pages[-1])["halation"] == "ON"
 
@@ -3556,14 +3753,15 @@ def test_reset_puts_the_halation_row_back_on(controller, tmp_path, monkeypatch):
     control = _halation_settings(tmp_path, applied)
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
                                              menu_rows=HALATION_ROWS, look_halation=True)
-    _open_menu(loop, touch, clock)
-    _tap(loop, touch, clock, _row_xy(1))
+    _open_path(loop, touch, clock, pages, "pipeline")
+    _tap_key(loop, touch, clock, pages, "halation")
     assert _values_by_key(pages[-1])["halation"] == "OFF"
-    reset = len(pages[-1][0]) - 1
-    _tap(loop, touch, clock, _row_xy(reset))
+    _tap_key(loop, touch, clock, pages, "back")
+    _tap_key(loop, touch, clock, pages, "reset")
     clock.t += 1.0
-    _tap(loop, touch, clock, _row_xy(reset))
+    _tap_key(loop, touch, clock, pages, "reset")
     assert control.current.halation is True and applied[-1] == ("halation", True)
+    _tap_key(loop, touch, clock, pages, "pipeline")
     assert _values_by_key(pages[-1])["halation"] == "ON"
 
 
@@ -3575,10 +3773,10 @@ def test_the_halation_row_is_dim_and_ignores_taps_without_a_look_halation(
     control = _halation_settings(tmp_path, applied)
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
                                              menu_rows=HALATION_ROWS)
-    _open_menu(loop, touch, clock)
+    _open_path(loop, touch, clock, pages, "pipeline")
     row = pages[-1][0][1]
     assert (row.key, row.label, row.value, row.active) == ("halation", "HALATION", "-", False)
-    _tap(loop, touch, clock, _row_xy(1))
+    _tap(loop, touch, clock, _page2_xy(1))
     assert applied == [] and control.current.halation is True
     assert loop.state == "MENU"
     assert not (tmp_path / "state" / "settings.json").exists()
@@ -3587,7 +3785,6 @@ def test_the_halation_row_is_dim_and_ignores_taps_without_a_look_halation(
 # -- the IMAGE page ----------------------------------------------------------------
 
 IMAGE_MENU_ROWS = ALL_ROWS + ("sharpness", "contrast", "saturation")
-IMAGE_ROW = 3  # SAVE DNG, AE CONSTRAINT, AE METERING, IMAGE
 
 
 def _image_settings(tmp_path, applied, overrides=None):
@@ -3597,16 +3794,9 @@ def _image_settings(tmp_path, applied, overrides=None):
     return control
 
 
-def _page2_xy(index):
-    """A row of a titled page: the title takes the first line."""
-    return (ROW_X0 + 40, ROW_Y0 + (index + 1) * ROW_HEIGHT + ROW_HEIGHT // 2)
-
-
 def _open_image_page(loop, touch, clock, pages):
-    _open_menu(loop, touch, clock)
-    assert pages[-1][0][IMAGE_ROW].key == "image"
-    _tap(loop, touch, clock, _row_xy(IMAGE_ROW))
-    assert pages[-1][1]["title"] == "IMAGE"
+    _open_path(loop, touch, clock, pages, "camera", "image")
+    assert _title(pages[-1]) == "IMAGE"
 
 
 def test_the_image_row_opens_the_image_page(controller, tmp_path, monkeypatch):
@@ -3615,11 +3805,11 @@ def test_the_image_row_opens_the_image_page(controller, tmp_path, monkeypatch):
     loop, touch, display, clock = _menu_loop(
         camera, ctl, tmp_path, settings=_image_settings(tmp_path, []),
         menu_rows=IMAGE_MENU_ROWS)
-    _open_menu(loop, touch, clock)
-    row = pages[-1][0][IMAGE_ROW]
-    assert (row.label, row.value, row.active) == ("IMAGE", ">", True)
-    assert pages[-1][1].get("title") is None
-    _tap(loop, touch, clock, _row_xy(IMAGE_ROW))
+    _open_path(loop, touch, clock, pages, "camera")
+    row = pages[-1][0][0]
+    assert (row.key, row.label, row.value, row.active) == ("image", "IMAGE", ">", True)
+    assert _title(pages[-1]) == "CAMERA"
+    _tap(loop, touch, clock, _page2_xy(0))
     rows, kwargs = pages[-1]
     assert kwargs["title"] == "IMAGE"
     assert display.images[-1] is viewfinder.render_menu(
@@ -3677,8 +3867,7 @@ def test_the_image_pages_reset_puts_back_only_the_three(controller, tmp_path, mo
     assert loop.state == "MENU" and pages[-1][1]["title"] == "IMAGE"
 
 
-def test_back_returns_to_the_first_page_and_disarms_the_reset(
-        controller, tmp_path, monkeypatch):
+def test_back_returns_to_camera_and_disarms_the_reset(controller, tmp_path, monkeypatch):
     camera, ctl = controller
     pages = _spy_menu(monkeypatch)
     loop, touch, display, clock = _menu_loop(
@@ -3688,24 +3877,9 @@ def test_back_returns_to_the_first_page_and_disarms_the_reset(
     _tap(loop, touch, clock, _page2_xy(3))  # arm the page's RESET
     _tap(loop, touch, clock, _page2_xy(4))  # BACK
     assert loop.state == "MENU"
-    assert pages[-1][1].get("title") is None
-    assert pages[-1][0][IMAGE_ROW].key == "image"
-    _tap(loop, touch, clock, _row_xy(IMAGE_ROW))
+    assert _title(pages[-1]) == "CAMERA"
+    _tap_key(loop, touch, clock, pages, "image")
     assert _values_by_key(pages[-1])["image_reset"] == "TAP TWICE"
-
-
-def test_done_on_the_image_page_closes_the_menu_and_it_reopens_on_the_first(
-        controller, tmp_path, monkeypatch):
-    camera, ctl = controller
-    pages = _spy_menu(monkeypatch)
-    loop, touch, display, clock = _menu_loop(
-        camera, ctl, tmp_path, settings=_image_settings(tmp_path, []),
-        menu_rows=IMAGE_MENU_ROWS)
-    _open_image_page(loop, touch, clock, pages)
-    _tap(loop, touch, clock, SHUTTER_CENTRE)
-    assert loop.state == "LIVE"
-    _open_menu(loop, touch, clock)
-    assert pages[-1][1].get("title") is None
 
 
 def test_the_first_pages_reset_puts_the_image_settings_back_too(
@@ -3717,10 +3891,9 @@ def test_the_first_pages_reset_puts_the_image_settings_back_too(
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path, settings=control,
                                              menu_rows=IMAGE_MENU_ROWS)
     _open_menu(loop, touch, clock)
-    reset = len(pages[-1][0]) - 1
-    _tap(loop, touch, clock, _row_xy(reset))
+    _tap_key(loop, touch, clock, pages, "reset")
     clock.t += 1.0
-    _tap(loop, touch, clock, _row_xy(reset))
+    _tap_key(loop, touch, clock, pages, "reset")
     assert applied == [("contrast", 1.0)]
     assert control.current == UNIT
 
@@ -3730,11 +3903,11 @@ def test_the_image_row_is_dim_and_ignores_taps_without_image_controls(
     camera, ctl = controller
     pages = _spy_menu(monkeypatch)
     loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)  # ALL_ROWS
-    _open_menu(loop, touch, clock)
-    row = pages[-1][0][IMAGE_ROW]
+    _open_path(loop, touch, clock, pages, "camera")
+    row = pages[-1][0][0]
     assert (row.key, row.value, row.active) == ("image", "-", False)
-    _tap(loop, touch, clock, _row_xy(IMAGE_ROW))
-    assert loop.state == "MENU" and pages[-1][1].get("title") is None
+    _tap(loop, touch, clock, _page2_xy(0))
+    assert loop.state == "MENU" and _title(pages[-1]) == "CAMERA"
 
 
 def test_an_image_control_the_camera_lacks_is_dim_on_the_page(
@@ -3799,7 +3972,6 @@ def test_no_img_tag_where_the_camera_takes_no_image_controls(controller, tmp_pat
 
 STABILISE = ("short_exposure", "shutter_delay", "multi_frame")
 STABILISE_MENU_ROWS = ALL_ROWS + STABILISE
-STABILISE_ROW = 4  # SAVE DNG, AE CONSTRAINT, AE METERING, IMAGE, STABILISE
 
 
 def _stabilise_settings(tmp_path, applied, overrides=None):
@@ -3810,10 +3982,8 @@ def _stabilise_settings(tmp_path, applied, overrides=None):
 
 
 def _open_stabilise_page(loop, touch, clock, pages):
-    _open_menu(loop, touch, clock)
-    assert pages[-1][0][STABILISE_ROW].key == "stabilise"
-    _tap(loop, touch, clock, _row_xy(STABILISE_ROW))
-    assert pages[-1][1]["title"] == "STABILISE"
+    _open_path(loop, touch, clock, pages, "pipeline", "stabilise")
+    assert _title(pages[-1]) == "STABILISE"
 
 
 def test_the_stabilise_row_opens_the_stabilise_page(controller, tmp_path, monkeypatch):
@@ -3822,10 +3992,10 @@ def test_the_stabilise_row_opens_the_stabilise_page(controller, tmp_path, monkey
     loop, touch, display, clock = _menu_loop(
         camera, ctl, tmp_path, settings=_stabilise_settings(tmp_path, []),
         menu_rows=STABILISE_MENU_ROWS)
-    _open_menu(loop, touch, clock)
-    row = pages[-1][0][STABILISE_ROW]
+    _open_path(loop, touch, clock, pages, "pipeline")
+    row = pages[-1][0][_keys(pages[-1]).index("stabilise")]
     assert (row.label, row.value, row.active) == ("STABILISE", ">", True)
-    _tap(loop, touch, clock, _row_xy(STABILISE_ROW))
+    _tap_key(loop, touch, clock, pages, "stabilise")
     rows, kwargs = pages[-1]
     assert kwargs["title"] == "STABILISE"
     assert display.images[-1] is viewfinder.render_menu(
@@ -3897,13 +4067,13 @@ def test_back_and_done_leave_the_stabilise_page(controller, tmp_path, monkeypatc
     _open_stabilise_page(loop, touch, clock, pages)
     _tap(loop, touch, clock, _page2_xy(3))  # arm the page's RESET
     _tap(loop, touch, clock, _page2_xy(4))  # BACK
-    assert loop.state == "MENU" and pages[-1][1].get("title") is None
-    _tap(loop, touch, clock, _row_xy(STABILISE_ROW))
+    assert loop.state == "MENU" and _title(pages[-1]) == "PIPELINE"
+    _tap_key(loop, touch, clock, pages, "stabilise")
     assert _values_by_key(pages[-1])["stabilise_reset"] == "TAP TWICE"
     _tap(loop, touch, clock, SHUTTER_CENTRE)  # DONE
     assert loop.state == "LIVE"
     _open_menu(loop, touch, clock)
-    assert pages[-1][1].get("title") is None
+    assert _title(pages[-1]) is None
 
 
 def test_the_first_pages_reset_puts_the_stabilise_settings_back_too(
@@ -3925,18 +4095,18 @@ def test_the_first_pages_reset_puts_the_stabilise_settings_back_too(
     assert control.current == UNIT
 
 
-def test_the_stabilise_row_is_dim_on_a_camera_without_setting_rows(
-        controller, tmp_path, monkeypatch):
+def test_the_stabilise_row_is_dim_without_its_settings(controller, tmp_path, monkeypatch):
     camera, ctl = controller
     pages = _spy_menu(monkeypatch)
-    # V4L2 and --fake: settings but no setting rows.
-    loop, touch, display, clock = _loop(camera, ctl, settings=_stabilise_settings(tmp_path, []))
-    _open_menu(loop, touch, clock)
+    # SAVE DNG keeps PIPELINE open, but the camera takes none of the three.
+    loop, touch, display, clock = _loop(camera, ctl, settings=_stabilise_settings(tmp_path, []),
+                                        menu_rows=("save_dng",))
+    _open_path(loop, touch, clock, pages, "pipeline")
     rows = pages[-1][0]
-    index = [row.key for row in rows].index("stabilise")
+    index = _keys(pages[-1]).index("stabilise")
     assert (rows[index].value, rows[index].active) == ("-", False)
-    _tap(loop, touch, clock, _row_xy(index))
-    assert loop.state == "MENU" and pages[-1][1].get("title") is None
+    _tap(loop, touch, clock, _page2_xy(index))
+    assert loop.state == "MENU" and _title(pages[-1]) == "PIPELINE"
 
 
 def test_short_exposure_is_dim_where_the_camera_cannot_use_it(
