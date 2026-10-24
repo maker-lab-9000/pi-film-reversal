@@ -46,9 +46,12 @@ KEY_HIT_RADIUS = 21
 DOUBLE_HIT_MARGIN = 6
 CELL_HIT_TOP = 204
 CELL_HIT_X0 = 8
-# The MENU pill (287, 199), 40 x 12, under -: hit over x 264 to 310 and y 190 to 214
-# (x0, y0 included, x1, y1 excluded), from one unit under -'s hit circle into the strip.
-MENU_HIT_BOX = (264, 190, 311, 215)
+# The MENU pill (200, 221), 40 x 12, in the strip between the WB cell and the meter:
+# hit over x 173 to 229 and y 204 to 239 (x0, y0 included, x1, y1 excluded), from
+# three units after the end of the cells' hit columns (x 170) to three units short
+# of the meter's - glyph. x 170 to 172 is neither the WB cell nor MENU.
+MENU_HIT_BOX = (173, 204, 230, 240)
+MENU_DEAD_BAND = (170, 173)
 FRAME_GREY = (128, 128, 128)
 
 
@@ -151,12 +154,12 @@ def test_render_live_is_an_rgb_image_of_the_panel_size(scale):
 
 def test_the_geometry_constants_are_the_ones_the_viewfinder_loop_is_planned_against():
     assert (WIDTH, HEIGHT, BAR_TOP) == (320, 240, 208)
-    assert (CELL_X0, CELL_PITCH) == (11, 61)
-    assert (METER_X0, METER_X1, METER_Y) == (205, 306, 226)
+    assert (CELL_X0, CELL_PITCH) == (11, 54)
+    assert (METER_X0, METER_X1, METER_Y) == (240, 306, 226)
     assert (SHUTTER_CENTRE, SHUTTER_RADIUS) == ((287, 39), 28)
     assert (PLUS_CENTRE, MINUS_CENTRE, KEY_RADIUS) == ((287, 125), (287, 168), 17)
     assert DOUBLE_BOX == (6, 5, 30, 16)
-    assert (MENU_CENTRE, MENU_SIZE, MENU_LABEL) == ((287, 199), (40, 12), "MENU")
+    assert (MENU_CENTRE, MENU_SIZE, MENU_LABEL) == ((200, 221), (40, 12), "MENU")
     assert liveview.MENU_HIT_BOX == MENU_HIT_BOX
     assert SELECT_ACTIONS == (Action.SELECT_SHUTTER, Action.SELECT_ISO, Action.SELECT_WB)
 
@@ -261,8 +264,9 @@ def test_a_disabled_cell_is_grey_even_when_it_is_the_selected_index(scale):
 
 def test_nothing_selected_draws_no_underline_anywhere():
     pixels = _pixels(_state(selected=None))
-    assert _crop(pixels, (0, 237, 192, 240)).max() < 40
-    assert not _near(_crop(pixels, (0, BAR_TOP, 192, HEIGHT)), AMBER).any()
+    cells_end = CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)
+    assert _crop(pixels, (0, 237, cells_end, 240)).max() < 40
+    assert not _near(_crop(pixels, (0, BAR_TOP, cells_end, HEIGHT)), AMBER).any()
 
 
 def test_a_fixed_control_has_no_auto_tag():
@@ -553,7 +557,7 @@ def test_the_same_state_renders_the_same_image_and_only_the_meter_follows_the_ne
 def test_a_frame_with_new_meter_values_does_not_redraw_the_static_parts():
     """The static tiles are cached; a Pi 4 cannot repaint them ten times a second."""
     static = (liveview._strip_tile, liveview._cell_tile, liveview._controls_tile,
-              liveview._tags_tile)
+              liveview._menu_tile, liveview._tags_tile)
     state = _state()
     render_live(_frame(), _reading(), state, scale=2)
     before = [tile.cache_info().misses for tile in static]
@@ -564,7 +568,7 @@ def test_a_frame_with_new_meter_values_does_not_redraw_the_static_parts():
     # A metered value in one cell repaints that cell only.
     render_live(_frame(), _reading(), _state(cells=_cells(c0=Cell("SHUTTER", "1/60"))), scale=2)
     after = [tile.cache_info().misses for tile in static]
-    assert [b - a for a, b in zip(before, after, strict=True)] == [0, 1, 0, 0]
+    assert [b - a for a, b in zip(before, after, strict=True)] == [0, 1, 0, 0, 0]
 
 
 def test_render_live_reads_only_the_fields_that_survive_the_ev_removal():
@@ -705,7 +709,8 @@ def test_the_disk_box_clears_the_tag_row_the_shutter_and_the_keys():
     assert y1 <= liveview._TAGS_BOX[3]
 
 
-# The MENU key: a pill under -, hit over MENU_HIT_BOX (x0, y0 included, x1, y1 excluded).
+# The MENU key: a pill in the strip between the WB cell and the meter, hit over
+# MENU_HIT_BOX (x0, y0 included, x1, y1 excluded).
 
 def test_live_state_has_no_network_field():
     # The addresses moved to the menu; ``ControllerSnapshot.network`` stays.
@@ -725,19 +730,134 @@ def test_menu_is_hit_at_its_centre_and_at_the_corners_of_its_box(scale):
         assert hit(x * scale, y * scale, scale) is not Action.MENU, (x, y)
 
 
-def test_the_menu_box_is_under_minus_and_holds_the_pill_in_the_controls_tile():
+def _minus_glyph_left():
+    """Where the meter's - glyph's ink starts, in base units, at the wider of the scales."""
+    lefts = []
+    for scale in (1, 2):
+        k = scale * liveview.SUPERSAMPLE
+        font = liveview._font(liveview.MEDIUM, round(liveview.METER_GLYPH_SIZE * k))
+        left, _, right, _ = font.getbbox("-", anchor="ls")
+        lefts.append(METER_X0 - liveview.METER_END_OFFSET - (right - left) / 2 / k)
+    return min(lefts)
+
+
+def test_the_menu_box_lies_in_the_strip_between_the_wb_cell_and_the_meter():
     (cx, cy), (w, h) = MENU_CENTRE, MENU_SIZE
     x0, y0, x1, y1 = MENU_HIT_BOX
-    # One unit under -'s hit circle (its bottom is y 189), into the strip's meter part.
-    assert y0 == MINUS_CENTRE[1] + KEY_HIT_RADIUS + 1
-    assert y1 > BAR_TOP and x0 >= CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)
-    # The pill (y 193 to 205) lies inside the box, under y 208 and in the controls tile.
+    # At least 32 x 26 units, the brief's smallest comfortable target.
+    assert x1 - x0 >= 32 and y1 - y0 >= 26
+    # From a few units after the end of WB's hit column (a dead band, no
+    # overlap) to short of the meter's - glyph; the cells' hit top to the bottom
+    # of the screen.
+    cells_end = CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)
+    assert 2 <= x0 - cells_end <= 3
+    assert x1 <= _minus_glyph_left()
+    assert (y0, y1) == (CELL_HIT_TOP, HEIGHT)
+    # The pill lies inside the box, in the strip, centred on the two text lines.
     assert x0 <= cx - w / 2 and cx + w / 2 <= x1 and y0 <= cy - h / 2 and cy + h / 2 <= y1
-    assert cy + h / 2 < BAR_TOP
-    tx0, ty0, tx1, ty1 = liveview._CONTROLS_BOX
-    assert liveview._CONTROLS_BOX == (256, 8, 318, 207)
+    assert BAR_TOP < cy - h / 2
+    assert abs(cy - (liveview.CELL_LABEL_Y + CELL_VALUE_Y) / 2) <= 0.5
+    # ... and inside its own tile, which the meter text's tile starts after.
+    tx0, ty0, tx1, ty1 = liveview._MENU_BOX
     assert tx0 <= cx - w / 2 and cx + w / 2 <= tx1 and ty0 <= cy - h / 2 and cy + h / 2 <= ty1
-    assert ty1 <= BAR_TOP
+    assert (tx0, tx1) == (cells_end, x1) and liveview._METER_TEXT_BOX[0] >= tx1
+    # The controls tile no longer reaches down towards the strip.
+    assert liveview._CONTROLS_BOX == (256, 8, 318, 188)
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_menu_key_is_drawn_in_the_strip_between_the_cells_and_the_meter(scale):
+    """The key's ink, over a black frame (the strip is black too), lies inside the
+    MENU box: right of WB's hit column and left of the meter's - glyph."""
+    pixels = _pixels(_state(selected=None), scale=scale, frame=0)
+    x0, y0, x1, y1 = MENU_HIT_BOX
+    key = _crop(pixels, (x0, BAR_TOP, x1, HEIGHT), scale)
+    assert _near(key, AMBER, 90).any() and _neutral_peak(key) > WHITE_INK
+    ink = np.argwhere(key.max(axis=-1) > 30) / scale
+    (cx, cy), (w, h) = MENU_CENTRE, MENU_SIZE
+    assert ink[:, 1].min() + x0 >= cx - w / 2 - 0.5 and ink[:, 1].max() + x0 < cx + w / 2 + 0.5
+    assert ink[:, 0].min() + BAR_TOP >= cy - h / 2 - 0.5
+    assert ink[:, 0].max() + BAR_TOP < cy + h / 2 + 0.5
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_nothing_is_drawn_where_the_menu_key_was(scale):
+    """The old pill (287, 199), 40 x 12 under -, and its hit box above the strip."""
+    for pressed in (None, Action.MENU, Action.MINUS):
+        for frame in (0, 255):
+            pixels = _pixels(_state(pressed=pressed), scale=scale, frame=frame)
+            # From y 189, under the - key's ring (it ends at y 185, its soft edge
+            # a little lower); the old pill was y 193 to 205.
+            old = _crop(pixels, (264, 189, 311, BAR_TOP), scale)
+            assert (old == frame).all(), (pressed, frame)
+    for y in range(186, BAR_TOP):  # the old hit box was y 190 to 214
+        for x in range(264, 311):
+            if math.hypot(x - MINUS_CENTRE[0], y - MINUS_CENTRE[1]) > KEY_HIT_RADIUS:
+                assert hit(x * scale, y * scale, scale) is Action.NONE, (x, y)
+
+
+# The widest value each cell shows: the shutter scale's fastest, the highest ISO, the
+# warmest white balance, and the automatic placeholder.
+WIDEST_VALUES = ("1/2000", "1/1000", "1600", "7500K", "AUTO")
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_widest_values_fit_their_cells_with_room_between_them(scale):
+    canvas = liveview._Canvas(liveview._CELL_BOX, scale)
+    value = canvas.font(liveview.SEMIBOLD, liveview.VALUE_SIZE)
+    small = canvas.font(liveview.MEDIUM, liveview.LABEL_SIZE)
+    widest = max(canvas.text_width(text, value) for text in WIDEST_VALUES)
+    tracking = liveview.LABEL_TRACKING
+    label = (canvas.text_width("SHUTTER ", small, tracking) + tracking
+             + canvas.text_width("AUTO", small, tracking))
+    underline = liveview.CELL_UNDERLINE[2]
+    # Everything a cell draws ends inside its tile (one pitch from CELL_HIT_X0) ...
+    for width in (widest, label, underline):
+        assert CELL_X0 + width < liveview._CELL_BOX[2], width
+    # ... and the next cell's text starts at least 8 units after the widest value.
+    assert CELL_PITCH - widest >= 8
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("text", WIDEST_VALUES)
+def test_a_wide_value_draws_nothing_outside_its_cell(text, scale):
+    """Against the same cell with no value: only that cell's column changes."""
+    for index in range(3):
+        wide, empty = list(_cells()), list(_cells())
+        wide[index] = Cell(wide[index].label, text)
+        empty[index] = Cell(empty[index].label, "")
+        a = _pixels(_state(cells=tuple(wide), selected=index), scale=scale, frame=0)
+        b = _pixels(_state(cells=tuple(empty), selected=index), scale=scale, frame=0)
+        changed = np.argwhere((a != b).any(axis=-1)) / scale
+        assert changed.size
+        left = CELL_HIT_X0 + CELL_PITCH * index
+        assert changed[:, 1].min() >= left and changed[:, 1].max() < left + CELL_PITCH
+        assert changed[:, 0].min() >= BAR_TOP
+
+
+def test_the_meter_keeps_13_dots_at_least_5_units_apart_and_its_text_centred_over_them():
+    assert liveview.METER_DOTS == 13
+    gaps = [liveview._dot_x(j + 1) - liveview._dot_x(j) for j in range(12)]
+    assert min(gaps) >= 5
+    assert liveview.METER_TEXT_CENTRE == ((METER_X0 + METER_X1) / 2, 215)
+    # The widest text fits inside the text tile, at both scales.
+    for scale in (1, 2):
+        canvas = liveview._Canvas(liveview._METER_TEXT_BOX, scale)
+        width = canvas.text_width("100000 LX   CLIP 100%",
+                                  canvas.font(liveview.MEDIUM, liveview.LABEL_SIZE),
+                                  liveview.LABEL_TRACKING)
+        cx = liveview.METER_TEXT_CENTRE[0]
+        assert liveview._METER_TEXT_BOX[0] < cx - width / 2
+        assert cx + width / 2 < liveview._METER_TEXT_BOX[2]
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_meter_text_is_drawn_centred_over_the_dots(scale):
+    pixels = _pixels(scale=scale, frame=0, lux=100000.0, clip_pct=100.0)
+    text = _crop(pixels, (liveview._METER_TEXT_BOX[0], 209, WIDTH, 221), scale)
+    cols = np.nonzero(text.max(axis=(0, 2)) > 30)[0] / scale + liveview._METER_TEXT_BOX[0]
+    assert abs((cols.min() + cols.max() + 1 / scale) / 2 - (METER_X0 + METER_X1) / 2) <= 1.0
+    assert cols.min() >= METER_X0 - liveview.METER_END_OFFSET
 
 
 def test_the_shutter_plus_and_minus_still_answer_everywhere_in_their_hit_circles():
@@ -751,7 +871,7 @@ def test_the_shutter_plus_and_minus_still_answer_everywhere_in_their_hit_circles
 
 
 @pytest.mark.parametrize("scale", [1, 2])
-def test_the_old_menu_place_is_nothing_again(scale):
+def test_the_menus_first_place_is_nothing_again(scale):
     assert hit(287 * scale, 88 * scale, scale) is Action.NONE
     for y in range(78, 99):
         for x in range(264, 311):
@@ -766,6 +886,21 @@ def test_no_point_outside_the_box_is_menu():
             assert (hit(x, y) is Action.MENU) is inside, (x, y)
 
 
+@pytest.mark.parametrize("scale", [1, 2])
+def test_between_the_wb_cell_and_menu_is_a_band_of_nothing(scale):
+    """A finger sliding from the WB cell to MENU (or back) crosses a few units that
+    are neither, so the key lit under it is never the one released on."""
+    lo, hi = MENU_DEAD_BAND
+    assert lo == CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS) and hi == MENU_HIT_BOX[0]
+    assert 2 <= hi - lo <= 3
+    for y in range(CELL_HIT_TOP, HEIGHT):
+        for x in range(lo, hi):
+            for dx in range(scale):
+                assert hit(x * scale + dx, y * scale, scale) is Action.NONE, (x, y)
+        assert hit((lo - 1) * scale, y * scale, scale) is Action.SELECT_WB
+        assert hit(hi * scale, y * scale, scale) is Action.MENU
+
+
 def test_the_cells_hit_columns_in_the_strip_are_unchanged():
     for y in range(CELL_HIT_TOP, HEIGHT):
         for x in range(CELL_HIT_X0, CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)):
@@ -774,7 +909,7 @@ def test_the_cells_hit_columns_in_the_strip_are_unchanged():
 
 def _without_the_menu_key(monkeypatch):
     """Render with the pill's drawing switched off; the tile cache is emptied both ways."""
-    liveview._controls_tile.cache_clear()
+    liveview._menu_tile.cache_clear()
     monkeypatch.setattr(liveview, "_menu_key", lambda canvas, lit: None)
 
 
@@ -786,7 +921,7 @@ def test_the_menu_key_changes_nothing_outside_its_hit_box(scale, pressed, monkey
               LiveState(cells=_cells(), selected=None, pressed=pressed, double=(True, 1),
                         developing=9, tuning_mismatch=True, disk_warning=WIDEST_DISK)]
     readings = [dict(), dict(battery_percent=None, focus=0.5, focus_peak=0.7)]
-    liveview._controls_tile.cache_clear()
+    liveview._menu_tile.cache_clear()
     try:
         with_key = [_pixels(s, scale=scale, frame=f, **r)
                     for s in states for r in readings for f in (0, 255)]
@@ -795,16 +930,15 @@ def test_the_menu_key_changes_nothing_outside_its_hit_box(scale, pressed, monkey
             without = [_pixels(s, scale=scale, frame=f, **r)
                        for s in states for r in readings for f in (0, 255)]
     finally:
-        liveview._controls_tile.cache_clear()
+        liveview._menu_tile.cache_clear()
     x0, y0, x1, y1 = MENU_HIT_BOX
     outside = np.ones((HEIGHT * scale, WIDTH * scale), dtype=bool)
     outside[y0 * scale:y1 * scale, x0 * scale:x1 * scale] = False
     for a, b in zip(with_key, without, strict=True):
         assert not np.array_equal(a, b)  # the key is drawn at all
         assert np.array_equal(a[outside], b[outside])
-        # Nothing in the strip, and nothing above y 190.
-        assert np.array_equal(a[BAR_TOP * scale:], b[BAR_TOP * scale:])
-        assert np.array_equal(a[:y0 * scale], b[:y0 * scale])
+        # Nothing above the strip.
+        assert np.array_equal(a[:BAR_TOP * scale], b[:BAR_TOP * scale])
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -820,8 +954,8 @@ def test_the_menu_key_is_an_outlined_pill_with_a_white_label(scale):
     dark = _crop(_pixels(frame=0, scale=scale),
                  (cx - w / 2 + 3, cy - h / 2 + 2, cx + w / 2 - 3, cy + h / 2 - 2), scale)
     assert _neutral_peak(dark) > WHITE_INK
-    # Outside the pill, the untouched frame.
-    assert tuple(pixels[cy * scale, (cx - w // 2 - 2) * scale]) == (255, 255, 255)
+    # Outside the pill, the strip's black.
+    assert tuple(pixels[cy * scale, (cx - w // 2 - 2) * scale]) == (0, 0, 0)
 
 
 # The IMG reminder: an image control is not 1.0. First in the disk tags' tile.

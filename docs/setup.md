@@ -398,8 +398,8 @@ keys in `.env`, `sudo apt install rclone`, and enable the timer. Full steps,
 including the app-password setup and how to test with a dry run, are in
 [docs/nextcloud-sync.md](nextcloud-sync.md).
 
-To also upload on demand from the LCD viewfinder's settings menu (its `UPLOAD`
-row), the example unit passes the same file to the capture service with
+To also upload on demand from the LCD viewfinder's settings menu (the `UPLOAD`
+row on its NETWORK page), the example unit passes the same file to the capture service with
 `--nextcloud-env /home/george/repos/pi-film-reversal/.env`. The service never reads
 it; it only hands the path to the sync it starts. Drop the flag from the unit if
 Nextcloud is not set up, and the row is left out. After changing the unit:

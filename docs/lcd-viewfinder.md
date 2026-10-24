@@ -157,7 +157,20 @@ The live screen is drawn in the style of an SLR finder: the image fills the scre
 and every read-out sits in a solid black strip along the bottom, amber on black.
 There is no screenshot of a real panel in the repo; the approved design mock-up is
 [2026-10-11-manual-controls-ui.png](superpowers/mockups/2026-10-11-manual-controls-ui.png)
-(left: all automatic; right: full manual, `+` pressed). The layout is in 320×240
+(left: all automatic; right: full manual, `+` pressed). To see the screen as the
+current code draws it, without a Pi, render the live view and every menu page to
+PNGs (the real drawing code and the viewfinder's own menu rows; no camera, panel or
+`.env`):
+
+```sh
+.venv/bin/python scripts/render_menu_preview.py /tmp/pifilm-screens            # 640x480, the DSI panel
+.venv/bin/python scripts/render_menu_preview.py /tmp/pifilm-screens-s1 --scale 1 # 320x240, the 2.8" panel
+```
+
+It writes `live.png`, `live-menu-pressed.png`, `menu-1-first.png` to
+`menu-6-stabilise.png` and a labelled `contact-sheet.png` of all of them; `--frame
+JPEG` puts a photograph behind the live view instead of the synthetic beach.
+The layout is in 320×240
 base units, drawn at 1× on the 2.8" panel and 2× on the DSI panel. The
 type is Barlow Condensed (SIL Open Font Licence 1.1; the licence text is
 `pifilm/data/fonts/OFL.txt`) on the live screen only; the review, processing and
@@ -166,11 +179,11 @@ message screens keep the default font.
 | Region | Shows | Tap does |
 | --- | --- | --- |
 | Live image | Full-screen letterboxed, ungraded ISP preview | — |
-| Strip cells `SHUTTER`, `ISO`, `WB` (bottom left, three columns) | Label, then the value. The selected cell is amber (label and value, with a white `AUTO` tag if automatic); the others are grey with a dim amber value. An automatic control shows `AUTO` beside its name and the live metered value (`1/125`, `400`, `5200K`); a fixed one shows only the value. A control the camera cannot change is drawn all grey | Selects the cell. `SHUTTER` is selected at start-up and the selection stays until another cell is tapped |
-| `MENU` key (right edge, under `-`, just above the strip) | An outlined pill in the keys' style; filled while a finger is on it. Absent while the colour bars show | Opens the [settings menu](#settings-menu). Its hit box (x 264 to 310, y 190 to 214) starts one unit under `-`'s hit circle and reaches into the strip's meter part, which has no tap action, so no tap that worked before changes meaning; the right edge above it holds only the shutter and `+`/`-` |
+| Strip cells `SHUTTER`, `ISO`, `WB` (bottom left, three columns 54 units wide, x 8 to 170) | Label, then the value. The selected cell is amber (label and value, with a white `AUTO` tag if automatic); the others are grey with a dim amber value. An automatic control shows `AUTO` beside its name and the live metered value (`1/125`, `400`, `5200K`); a fixed one shows only the value. A control the camera cannot change is drawn all grey | Selects the cell. `SHUTTER` is selected at start-up and the selection stays until another cell is tapped |
+| `MENU` key (in the strip, between the `WB` cell and the meter) | An outlined pill in the keys' style, centred on the strip's two text lines; filled while a finger is on it. Absent while the colour bars show | Opens the [settings menu](#settings-menu) on its first page. Its hit box (x 173 to 230, y 204 to the bottom, 57 × 36 units) starts 3 units after the `WB` cell's column ends (x 170 to 173 is neither, so a finger sliding from one to the other never lights one and fires the other) and stops 3 units short of the meter's `-`, so it overlaps neither; the right edge holds only the shutter and `+`/`-`, and the place under `-` is empty |
 | `+` and `-` keys (right edge, below the shutter button) | Outlined amber circles; filled amber while a finger is on them | Steps the selected control; see [Manual controls](#manual-controls) |
 | Shutter button (top right, ring with a white disc) | Filled amber while a finger is on it | Submits a capture through the shared controller; the processing screen holds until it finishes. It is at the top and `+`/`-` are low on the same edge, 31 units apart between their hit circles, so a slip while stepping a value does not take a photo |
-| Exposure meter (strip, right) | 13 dots from −3 to +3 stops in half stops; the dot nearest the measured deviation from mid-grey is lit amber. Small grey text above it: `NNN LX   CLIP NN%` | — |
+| Exposure meter (strip, right, x 240 to 306) | 13 dots from −3 to +3 stops in half stops, 5.5 units apart; the dot nearest the measured deviation from mid-grey is lit amber. Small grey text centred above it: `NNN LX   CLIP NN%` | — |
 | Focus gauge (vertical bar, left edge) | Absolute sharpness of the central quarter of the frame, 0 (far out of focus, or nothing to focus on) to full; an amber tick marks the best level of the last few seconds | — |
 | `2x` toggle (outlined tag, top left) | Outlined `2x` when off; amber `2x 0/2` / `2x 1/2` when on | Turns double exposure on or off. Off at `1/2` discards the pending first exposure (its original stays on disk) |
 | Battery tag (outlined, top left, right of `2x`) | `NN%` or `AC NN%` from the X728 gauge; absent without `--ups x728` | — |
@@ -262,34 +275,81 @@ The check runs with every display mode, headless too, for the journal lines.
 
 A tap on `MENU` opens a black page in the live view's fonts and colours, one setting
 per row: a grey label on the left, the value in white on the right. A tap anywhere
-on a row steps it to its next value, wrapping round; a dimmer label marks a row that
-only shows something and ignores taps. `DONE`, drawn where the shutter button is,
-returns to the live view. Nothing in it needs sudo.
+on a setting's row steps it to its next value, wrapping round, and a tap on a row
+with `>` (or on `BACK`) opens another page; a dimmer label marks a row that only
+shows something and ignores taps. `DONE`, drawn where the shutter button is,
+returns to the live view from any page. Nothing in it needs sudo.
 
-| Row | Values | Shown when | Effect |
-| --- | --- | --- | --- |
-| `SAVE DNG` | `ON` / `OFF` | Picamera2 | from the next photograph |
-| `HALATION` | `ON` / `OFF`; a dim `-` when the look has no halation | Picamera2 | from the next photograph |
-| `AE CONSTRAINT` | `NORMAL` / `HIGHLIGHT` / `SHADOWS` | the camera reports `AeConstraintMode`, and no `--ae-lock` | at once |
-| `AE METERING` | `CENTRE` / `SPOT` / `MATRIX` | the camera reports `AeMeteringMode`, and no `--ae-lock` | at once |
-| `IMAGE` | `>`; a dim `-` when the camera can change none of the three | a settings file (always on Picamera2; dim under `--fake`) | opens the image page |
-| `STABILISE` | `>`; a dim `-` without setting rows (`--fake`) | a settings file (always on Picamera2; dim under `--fake`) | opens the stabilise page |
-| `UPLOAD` | see below | `--nextcloud-env` given | starts a Nextcloud sync |
-| `ETH` | the Ethernet IPv4 address, or `-` | always | read-only |
-| `WLAN` | the Wi-Fi IPv4 address (the hotspot's own `10.42.0.1` included), or `-` | always | read-only |
-| `LOOK` | the `--artifacts` folder's name (for example `imx477-2026-09-v4-dark-hp5-tile`), cut with `...` if too wide; `starter (bundled)` for the bundled look | always | read-only |
-| `RESET` | `TAP TWICE` | a camera with setting rows (not `--fake`) | see below |
+The settings are grouped in a tree of pages:
+
+```text
+MENU (the first page, no title)
+  CAMERA        >
+  PIPELINE      >
+  NETWORK       >
+  LOOK          <look name>      read-only
+                                 (an empty line)
+  RESET         TAP TWICE        every setting
+CAMERA
+  IMAGE         >                the image page
+  AE CONSTRAINT <mode>
+  AE METERING   <mode>
+  BACK
+PIPELINE
+  SAVE DNG      ON / OFF
+  HALATION      ON / OFF / -
+  STABILISE     >                the stabilise page
+  BACK
+NETWORK
+  ETH           <address> / -    read-only
+  WLAN          <address> / -    read-only
+  UPLOAD        <status>         with --nextcloud-env
+  BACK
+```
+
+A row with `>` opens its page. Every page below the first has an amber title on its
+first line, which is not a row, and ends with `BACK`, which goes up one level: the
+image page to CAMERA, the stabilise page to PIPELINE, a category to the first page.
+The menu always opens on the first page. A category is dim with `-` when none of its
+rows can be used (CAMERA and PIPELINE under `--fake`); NETWORK always opens, for its
+addresses. The fullest page, a title and five rows, ends at y 128.
+
+Two guards keep a quick second tap from acting on the page it opens. The first
+page leaves an empty line before `RESET`, so `RESET` is on the sixth line, below
+every category's `BACK` (the fifth line at most): a tap where `BACK` was lands on
+nothing. And for 0.5 s after a page changes, taps on its rows are ignored
+(`DONE` still closes the menu): a double tap on `PIPELINE` would otherwise also
+toggle `SAVE DNG`, the row under it on the new page.
+
+| Row | Page | Values | Shown when | Effect |
+| --- | --- | --- | --- | --- |
+| `CAMERA` | first | `>`; a dim `-` when none of its rows can be used | always | opens CAMERA |
+| `PIPELINE` | first | `>`; a dim `-` likewise | always | opens PIPELINE |
+| `NETWORK` | first | `>` | always | opens NETWORK |
+| `LOOK` | first | the `--artifacts` folder's name (for example `imx477-2026-09-v4-dark-hp5-tile`), cut with `...` if too wide; `starter (bundled)` for the bundled look | always | read-only |
+| `RESET` | first | `TAP TWICE` | a camera with setting rows (not `--fake`) | see below |
+| `IMAGE` | CAMERA | `>`; a dim `-` when the camera can change none of the three | always (dim under `--fake`) | opens the image page |
+| `AE CONSTRAINT` | CAMERA | `NORMAL` / `HIGHLIGHT` / `SHADOWS` | the camera reports `AeConstraintMode`, and no `--ae-lock` | at once |
+| `AE METERING` | CAMERA | `CENTRE` / `SPOT` / `MATRIX` | the camera reports `AeMeteringMode`, and no `--ae-lock` | at once |
+| `SAVE DNG` | PIPELINE | `ON` / `OFF` | Picamera2 | from the next photograph |
+| `HALATION` | PIPELINE | `ON` / `OFF`; a dim `-` when the look has no halation | Picamera2 | from the next photograph |
+| `STABILISE` | PIPELINE | `>`; a dim `-` without setting rows (`--fake`) | always (dim under `--fake`) | opens the stabilise page |
+| `ETH` | NETWORK | the Ethernet IPv4 address, or `-` | always | read-only |
+| `WLAN` | NETWORK | the Wi-Fi IPv4 address (the hotspot's own `10.42.0.1` included), or `-` | always | read-only |
+| `UPLOAD` | NETWORK | see below | `--nextcloud-env` given | starts a Nextcloud sync |
+| `BACK` | every page but the first | | always | up one level |
 
 The Pi's libcamera does not report the two AE modes in its frame metadata, so a
 record's `ae_constraint` / `ae_metering` are what pifilm sent, and each change in the
 menu logs one line such as `settings: ae-metering matrix`. A dark scene at the
 exposure limits (the longest shutter and the top gain) looks the same in every mode.
 
-A row the camera cannot use is left out and the rows below move up. A USB camera
-(V4L2) runs without the display, so it has no menu at all; under `--fake` only a dim
-`IMAGE`, a dim `STABILISE`, `UPLOAD`, the addresses and `LOOK` are there.
+A setting row the camera cannot use is left out of its page and the rows below move
+up. A USB camera (V4L2) runs without the display, so it has no menu at all; under
+`--fake` the first page has a dim `CAMERA`, a dim `PIPELINE`, `NETWORK` and `LOOK`
+(no `RESET`), and NETWORK has the addresses and, with `--nextcloud-env`, `UPLOAD`.
 
-**Image page.** `IMAGE` opens a second page titled IMAGE with the camera's own
+**Image page.** `IMAGE` on the CAMERA page opens a page titled IMAGE with the camera's own
 image controls, which libcamera applies before pifilm's look:
 
 | Row | Values | Effect |
@@ -298,7 +358,7 @@ image controls, which libcamera applies before pifilm's look:
 | `CONTRAST` | the same | at once |
 | `SATURATION` | the same | at once |
 | `RESET` | `TAP TWICE` | puts only these three back to 1.0 |
-| `BACK` | | back to the first page |
+| `BACK` | | back to CAMERA |
 
 A tap steps to the next value; `1.5` wraps to `0.5`. 1.0 is the camera's normal
 rendering. `DONE` closes the menu from this page too, and the menu always opens on
@@ -312,9 +372,8 @@ look grades a picture it was not trained on, so the result can differ from the
 look's examples. Put them back to 1.0 for photographs you want the look to grade as
 trained, and for photographs meant as training sources.
 
-**Stabilise page.** `STABILISE` opens a third page, titled STABILISE, with three
-ways to fight camera shake. With its `STABILISE` row the first page has at most
-eleven rows, the last ending at y 228.
+**Stabilise page.** `STABILISE` on the PIPELINE page opens a page titled STABILISE,
+with three ways to fight camera shake.
 
 | Row | Values | Effect |
 | --- | --- | --- |
@@ -322,7 +381,7 @@ eleven rows, the last ending at y 228.
 | `SHUTTER DELAY` | `OFF` / `0.2 S` / `0.5 S` | from the next press: the photograph is taken this long after the shutter is released |
 | `MULTI-FRAME` | `OFF` / `2` / `4` / `6` | from the next photograph: a burst of that many frames, aligned and merged into one |
 | `RESET` | `TAP TWICE` | puts only these three back to off |
-| `BACK` | | back to the first page |
+| `BACK` | | back to PIPELINE |
 
 A tap steps to the next value and wraps. While any of the three is on, the live
 view shows an amber `STAB` tag right after `IMG`. Each Picamera2 record has
@@ -836,16 +895,16 @@ With the service running with `--nextcloud-env` and the panel in live view:
 
 | Step | Check | Result |
 | --- | --- | --- |
-| 1 | `MENU` opens the menu; `DONE` returns to the live view; the shutter, `+`, `-` and the cells work as before | Not yet run |
-| 2 | `SAVE DNG` off: the next photograph has no `.dng`; on: it has one. Restart the service: the setting is kept and the journal has the `settings:` line | Not yet run |
-| 3 | `HALATION` off (with a look that has halation): the next photograph has no glow round bright lights, and its record has `"halation": "off"` and no `halation_sha1`; on again: both back as before. Restart the service: the setting is kept and the journal has the `settings: halation off ...` line | Not yet run |
-| 4 | `AE CONSTRAINT` and `AE METERING`: after a change in the menu the journal has `settings: ae-metering <mode>` (or `ae-constraint`), the next photograph's record has `ae_metering` / `ae_constraint` with the new mode, and after a restart the journal has the `settings: ... (saved in the menu; the unit says ...)` line | Not yet run |
-| 5 | `UPLOAD` on home Wi-Fi: `UPLOADING`, then `DONE`; the files are on Nextcloud; `journalctl -u pifilm-capture \| grep nextcloud:` shows rclone's lines. In hotspot mode: `SKIPPED: NO NEXTCLOUD`. Started while the timer's run is going: `SKIPPED: BUSY` | Not yet run |
-| 6 | `ETH`/`WLAN` show the addresses (unplug the cable: `ETH` turns to `-` within about 10 s), and the live view no longer shows them. `LOOK` shows the deployed look's folder name, or `starter (bundled)` | Not yet run |
-| 7 | `RESET`, tapped twice: the unit's flags are back and `settings.json` is gone | Not yet run |
-| 8 | A GPIO button press while the menu is open takes a photograph, and the menu stays open | Not yet run |
-| 9 | `IMAGE` opens the image page. Step `SATURATION` to `0.5`: the live view loses colour at once and the amber `IMG` tag shows. Do the same with `CONTRAST` (flatter at `0.5`) and `SHARPNESS` (softer at `0.5`, crisper at `1.5`; easiest seen at `2x`). Take a photograph: it shows the same change, and its record has `sharpness`, `contrast` and `saturation` after `ae_metering` with the values shown. The journal has a `settings: saturation 0.5` line per change | Not yet run |
-| 10 | The image page's `RESET`, tapped twice: the three are back to `1.0`, the `IMG` tag goes, and the other settings are unchanged. `BACK` returns to the first page; `DONE` from the image page returns to the live view. Restart with a value saved: the journal has the `settings: ... (saved in the menu; the unit says ...)` line and the live view shows it | Not yet run |
+| 1 | `MENU`, in the strip between the `WB` cell and the meter, lights under the finger and opens the menu on its first page (`CAMERA`, `PIPELINE`, `NETWORK`, `LOOK`, `RESET`); a tap on the `WB` cell's right edge still selects `WB`, and the place under `-` does nothing. Walk every page: `CAMERA` → `IMAGE`, `PIPELINE` → `STABILISE`, `NETWORK`; each has its amber title, and `BACK` goes up one level (`IMAGE` to `CAMERA`, `STABILISE` to `PIPELINE`, a category to the first page). `DONE` from any page returns to the live view, and `MENU` again opens the first page. The shutter, `+`, `-` and the cells work as before. On the 2.8" panel too: the cells' values, the key and the narrower meter are legible | Not yet run |
+| 2 | `PIPELINE` → `SAVE DNG` off: the next photograph has no `.dng`; on: it has one. Restart the service: the setting is kept and the journal has the `settings:` line | Not yet run |
+| 3 | `PIPELINE` → `HALATION` off (with a look that has halation): the next photograph has no glow round bright lights, and its record has `"halation": "off"` and no `halation_sha1`; on again: both back as before. Restart the service: the setting is kept and the journal has the `settings: halation off ...` line | Not yet run |
+| 4 | `CAMERA` → `AE CONSTRAINT` and `AE METERING`: after a change in the menu the journal has `settings: ae-metering <mode>` (or `ae-constraint`), the next photograph's record has `ae_metering` / `ae_constraint` with the new mode, and after a restart the journal has the `settings: ... (saved in the menu; the unit says ...)` line | Not yet run |
+| 5 | `NETWORK` → `UPLOAD` on home Wi-Fi: `UPLOADING`, then `DONE`; the files are on Nextcloud; `journalctl -u pifilm-capture \| grep nextcloud:` shows rclone's lines. In hotspot mode: `SKIPPED: NO NEXTCLOUD`. Started while the timer's run is going: `SKIPPED: BUSY` | Not yet run |
+| 6 | `NETWORK`: `ETH`/`WLAN` show the addresses (unplug the cable: `ETH` turns to `-` within about 10 s), and the live view no longer shows them. On the first page, `LOOK` shows the deployed look's folder name, or `starter (bundled)` | Not yet run |
+| 7 | The first page's `RESET`, tapped twice: the unit's flags are back and `settings.json` is gone | Not yet run |
+| 8 | A GPIO button press while the menu is open (on any page) takes a photograph, and the menu stays on that page | Not yet run |
+| 9 | `CAMERA` → `IMAGE` opens the image page. Step `SATURATION` to `0.5`: the live view loses colour at once and the amber `IMG` tag shows. Do the same with `CONTRAST` (flatter at `0.5`) and `SHARPNESS` (softer at `0.5`, crisper at `1.5`; easiest seen at `2x`). Take a photograph: it shows the same change, and its record has `sharpness`, `contrast` and `saturation` after `ae_metering` with the values shown. The journal has a `settings: saturation 0.5` line per change | Not yet run |
+| 10 | The image page's `RESET`, tapped twice: the three are back to `1.0`, the `IMG` tag goes, and the other settings are unchanged. `BACK` returns to `CAMERA`; `DONE` from the image page returns to the live view. Restart with a value saved: the journal has the `settings: ... (saved in the menu; the unit says ...)` line and the live view shows it | Not yet run |
 
 #### Stabilise
 
@@ -854,7 +913,7 @@ and the panel in live view, SHUTTER and ISO on `AUTO`:
 
 | Step | Check | Result |
 | --- | --- | --- |
-| 1 | `STABILISE` opens the page; each row steps and wraps; the amber `STAB` tag shows while any is on and goes when all are off. With `IMG`, `STAB` and a disk warning all showing (`--disk-warn-percent 1`), the tags fit between the top-left row and the shutter button | Not yet run |
+| 1 | `PIPELINE` → `STABILISE` opens the page; each row steps and wraps; the amber `STAB` tag shows while any is on and goes when all are off. With `IMG`, `STAB` and a disk warning all showing (`--disk-warn-percent 1`), the tags fit between the top-left row and the shutter button | Not yet run |
 | 2 | `SHUTTER DELAY` `0.5 S`: after the shutter button is released the live view stays up for about half a second, then the colour bars; the delay is felt. Same with the GPIO button. A Stick shot is taken at once. Records: `shutter_delay_s` 0.5 for the panel and button shots, 0.0 for the Stick's | Not yet run |
 | 3 | `SHORT EXPOSURE` `ON` in indoor light: the shutter read-out gets shorter, and the next photograph's `camera_metadata` `ExposureTime` is lower than a shot just before with it off (gain higher); the record has `short_exposure: true`. Under `--ae-lock` the row is dim | Not yet run |
 | 4 | `MULTI-FRAME` `4`, handheld in dim light (about 1/15 s at auto): the graded file is sharper than a single shot taken just before, and less noisy than one frame at the same short exposure. The folder has `HHMMSS_original.jpg` and three `HHMMSS_frameN.jpg`, no `.dng`; the record's `stack.split` is true and `stack.exposure_us` about a quarter of the single shot's `ExposureTime` | Not yet run |

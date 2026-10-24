@@ -132,7 +132,7 @@ frequent schedule is cheap.
 ## From the viewfinder's menu
 
 The LCD viewfinder's [settings menu](lcd-viewfinder.md#settings-menu) has an
-`UPLOAD` row that runs this sync once, now, without waiting for the timer. It is
+`UPLOAD` row (on its NETWORK page) that runs this sync once, now, without waiting for the timer. It is
 there when `pifilm-capture` is given `--nextcloud-env PATH`, the same `.env` the
 timer's service reads:
 
