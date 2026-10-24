@@ -18,7 +18,9 @@ Design intent:
   opens the settings menu, so the right edge holds only the shutter and the
   camera's controls, and the place under ``-`` stays empty. The cells and the
   meter were narrowed to make room for it; its hit box lies between the cells'
-  hit columns and the meter's ``-`` end, and the meter has no tap action.
+  hit columns and the meter's ``-`` end, a few units clear of each (a finger
+  sliding from the WB cell to the key must not light one and fire the other),
+  and the meter has no tap action.
 
 Geometry is in 320x240 base units, as in ``ui.py``; every render takes the panel's
 integer ``scale`` (1 for the 2.8" SPI panel, 2 for the 640x480 DSI panel). Unlike
@@ -85,8 +87,9 @@ CELL_HIT_TOP = 204
 CELL_LABEL_Y, CELL_VALUE_Y = 215, 226
 CELL_UNDERLINE = (0, 237, 46, 238)  # relative to the cell's text origin in x
 # The meter's right end is where it always was; its left end moved from 205 to 240
-# to make room for the MENU key, so the 13 dots are 5.5 units apart (8.4 before):
-# the lit dot (4.5 across) still has a dark gap to its neighbours' places.
+# to make room for the MENU key, so the 13 dots are 5.5 units apart (8.4 before).
+# The lit dot (radius 2.25) and an unlit neighbour (radius 1.0 or 1.5) leave
+# 1.75 to 2.25 units of dark between them, about two pixels at scale 1.
 METER_X0, METER_X1, METER_Y = 240, 306, 226
 METER_DOTS = 13  # -3.0 to +3.0 stops in half stops
 METER_RANGE = 3.0
@@ -100,17 +103,24 @@ SHUTTER_HIT_RADIUS = 34
 PLUS_CENTRE, MINUS_CENTRE, KEY_RADIUS = (287, 125), (287, 168), 17
 KEY_HIT_RADIUS = 21
 # The MENU key: a pill in the keys' style in the strip, between the WB cell and
-# the meter. Its hit box is (x0, y0, x1, y1) with x0 and y0 included and x1 and y1
-# excluded: from the end of the cells' hit columns (x 170) to MENU_METER_GAP units
-# short of the meter's - glyph (its centre is x 233, its ink starts at about
-# 231.75), and from the cells' hit top (y 204) to the bottom of the screen: 60 x 36
-# units, which nothing else claims. The pill is centred in it across, and on the
+# the meter. Its room runs from the end of the cells' hit columns (x 170,
+# MENU_ROOM_X0) to MENU_METER_GAP units short of the meter's - glyph (its centre
+# is x 233, its ink starts at about 231.75), and from the cells' hit top (y 204)
+# to the bottom of the screen. The pill is centred in that room across, and on the
 # strip's two text lines (their middles are y 215 and 226; 221 rather than 220.5
 # keeps a 12-unit pill's edges on whole pixels at scale 1).
+# Its hit box is (x0, y0, x1, y1) with x0 and y0 included and x1 and y1 excluded:
+# the room less MENU_CELL_GAP units on the cells' side, 57 x 36 units, which
+# nothing else claims. Those 3 units (x 170 to 173) are neither the WB cell nor
+# MENU: the press light follows the finger and the action is where it lifts, so
+# with the two regions touching, a finger that slid from one to the other lit
+# one and fired the other.
 MENU_METER_GAP = 3
-MENU_HIT_BOX = (CELL_HIT_X0 + 3 * CELL_PITCH, CELL_HIT_TOP,
+MENU_CELL_GAP = 3
+MENU_ROOM_X0 = CELL_HIT_X0 + 3 * CELL_PITCH
+MENU_HIT_BOX = (MENU_ROOM_X0 + MENU_CELL_GAP, CELL_HIT_TOP,
                 METER_X0 - METER_END_OFFSET - MENU_METER_GAP, HEIGHT)
-MENU_CENTRE, MENU_SIZE = ((MENU_HIT_BOX[0] + MENU_HIT_BOX[2]) // 2, 221), (40, 12)
+MENU_CENTRE, MENU_SIZE = ((MENU_ROOM_X0 + MENU_HIT_BOX[2]) // 2, 221), (40, 12)
 MENU_LABEL = "MENU"
 DOUBLE_BOX = (6, 5, 30, 16)
 DOUBLE_HIT_MARGIN = 6
@@ -192,8 +202,8 @@ _TAGS_BOX = (0, 0, 124, 22)
 # (centre 287, radius 34: its leftmost point is x 253). "PHOTOS 100%" and "SD 100%"
 # together end at about 207 units (see the tests), so there is room to spare.
 _DISK_BOX = (_TAGS_BOX[2], 0, 252, _TAGS_BOX[3])
-# The MENU key's tile is its hit box's columns, the strip's full height.
-_MENU_BOX = (MENU_HIT_BOX[0], BAR_TOP, MENU_HIT_BOX[2], HEIGHT)
+# The MENU key's tile is its room's columns, the strip's full height.
+_MENU_BOX = (MENU_ROOM_X0, BAR_TOP, MENU_HIT_BOX[2], HEIGHT)
 # From where the MENU key's tile ends, so the two never overlap.
 _METER_TEXT_BOX = (_MENU_BOX[2], 209, WIDTH, 221)
 _FOCUS_BOX = (FOCUS_TICK_X[0], FOCUS_TRACK[1], FOCUS_TICK_X[1], FOCUS_TRACK[3])

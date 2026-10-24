@@ -47,9 +47,11 @@ DOUBLE_HIT_MARGIN = 6
 CELL_HIT_TOP = 204
 CELL_HIT_X0 = 8
 # The MENU pill (200, 221), 40 x 12, in the strip between the WB cell and the meter:
-# hit over x 170 to 229 and y 204 to 239 (x0, y0 included, x1, y1 excluded), from the
-# end of the cells' hit columns to three units short of the meter's - glyph.
-MENU_HIT_BOX = (170, 204, 230, 240)
+# hit over x 173 to 229 and y 204 to 239 (x0, y0 included, x1, y1 excluded), from
+# three units after the end of the cells' hit columns (x 170) to three units short
+# of the meter's - glyph. x 170 to 172 is neither the WB cell nor MENU.
+MENU_HIT_BOX = (173, 204, 230, 240)
+MENU_DEAD_BAND = (170, 173)
 FRAME_GREY = (128, 128, 128)
 
 
@@ -744,9 +746,11 @@ def test_the_menu_box_lies_in_the_strip_between_the_wb_cell_and_the_meter():
     x0, y0, x1, y1 = MENU_HIT_BOX
     # At least 32 x 26 units, the brief's smallest comfortable target.
     assert x1 - x0 >= 32 and y1 - y0 >= 26
-    # From the end of WB's hit column, with no gap and no overlap, to short of the
-    # meter's - glyph; the cells' hit top to the bottom of the screen.
-    assert x0 == CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)
+    # From a few units after the end of WB's hit column (a dead band, no
+    # overlap) to short of the meter's - glyph; the cells' hit top to the bottom
+    # of the screen.
+    cells_end = CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS)
+    assert 2 <= x0 - cells_end <= 3
     assert x1 <= _minus_glyph_left()
     assert (y0, y1) == (CELL_HIT_TOP, HEIGHT)
     # The pill lies inside the box, in the strip, centred on the two text lines.
@@ -756,7 +760,7 @@ def test_the_menu_box_lies_in_the_strip_between_the_wb_cell_and_the_meter():
     # ... and inside its own tile, which the meter text's tile starts after.
     tx0, ty0, tx1, ty1 = liveview._MENU_BOX
     assert tx0 <= cx - w / 2 and cx + w / 2 <= tx1 and ty0 <= cy - h / 2 and cy + h / 2 <= ty1
-    assert (tx0, tx1) == (x0, x1) and liveview._METER_TEXT_BOX[0] >= tx1
+    assert (tx0, tx1) == (cells_end, x1) and liveview._METER_TEXT_BOX[0] >= tx1
     # The controls tile no longer reaches down towards the strip.
     assert liveview._CONTROLS_BOX == (256, 8, 318, 188)
 
@@ -880,6 +884,21 @@ def test_no_point_outside_the_box_is_menu():
         for x in range(WIDTH):
             inside = x0 <= x < x1 and y0 <= y < y1
             assert (hit(x, y) is Action.MENU) is inside, (x, y)
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_between_the_wb_cell_and_menu_is_a_band_of_nothing(scale):
+    """A finger sliding from the WB cell to MENU (or back) crosses a few units that
+    are neither, so the key lit under it is never the one released on."""
+    lo, hi = MENU_DEAD_BAND
+    assert lo == CELL_HIT_X0 + CELL_PITCH * len(SELECT_ACTIONS) and hi == MENU_HIT_BOX[0]
+    assert 2 <= hi - lo <= 3
+    for y in range(CELL_HIT_TOP, HEIGHT):
+        for x in range(lo, hi):
+            for dx in range(scale):
+                assert hit(x * scale + dx, y * scale, scale) is Action.NONE, (x, y)
+        assert hit((lo - 1) * scale, y * scale, scale) is Action.SELECT_WB
+        assert hit(hi * scale, y * scale, scale) is Action.MENU
 
 
 def test_the_cells_hit_columns_in_the_strip_are_unchanged():
