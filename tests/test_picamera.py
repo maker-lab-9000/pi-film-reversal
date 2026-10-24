@@ -107,6 +107,7 @@ class _NoiseReductionModeEnum:
     """Mimics ``libcamera.controls.draft.NoiseReductionModeEnum``."""
 
     HighQuality = "NoiseReductionMode.HighQuality"
+    Minimal = "NoiseReductionMode.Minimal"
 
 
 class _AeConstraintModeEnum:
@@ -180,6 +181,7 @@ def install_picamera(monkeypatch):
         with_colour_temperature=True,
         with_analogue_gain_mode=False,
         ae_controls=("AeConstraintMode", "AeMeteringMode"),
+        image_controls=("Sharpness", "Contrast", "Saturation"),
     ):
         state = SimpleNamespace(instance=None, loaded_tuning=[])
 
@@ -198,6 +200,8 @@ def install_picamera(monkeypatch):
                 self.camera_controls = {"ExposureValue": (-8.0, 8.0, 0.0)}
                 for name in ae_controls:
                     self.camera_controls[name] = (0, 3, 0)
+                for name in image_controls:
+                    self.camera_controls[name] = (0.0, 16.0, 1.0)
                 if not fixed_lens:
                     self.camera_controls["AfMode"] = (0, 2, 0)
                     self.camera_controls["AfRange"] = (0, 2, 0)
@@ -376,6 +380,9 @@ def test_constructor_uses_explicit_native_still_configuration(install_picamera):
         "tuning_sha1": fingerprint({"loaded-from": "delivered-lens.json"}),
         "ae_constraint": "normal",
         "ae_metering": "centre",
+        "sharpness": 1.0,
+        "contrast": 1.0,
+        "saturation": 1.0,
         "autofocus": "continuous",
     }
     camera.close()
@@ -1378,9 +1385,11 @@ def test_neutral_controls_travel_with_both_configurations(install_picamera):
         "AeMeteringMode": _AeMeteringModeEnum.CentreWeighted,
         "ExposureValue": 0.0,
     }
+    # The one difference: the live view's own (Picamera2's preview) noise reduction.
+    preview = {**neutral, "NoiseReductionMode": _NoiseReductionModeEnum.Minimal}
     assert inst.created_config["controls"] == neutral
-    assert inst.preview_config["controls"] == neutral
-    assert inst.configured_controls == [neutral, neutral]
+    assert inst.preview_config["controls"] == preview
+    assert inst.configured_controls == [neutral, preview]
     camera.close()
 
 
@@ -2582,4 +2591,272 @@ def test_set_save_dng_false_means_the_next_still_has_no_dng(install_picamera):
     frame = camera.read()
     assert frame.dng[:4] == b"II*\x00"
     assert request.save_dng_calls == 1
+    camera.close()
+
+
+# --- the ISP's image controls: sharpness, contrast, saturation -----------------
+
+
+def test_the_image_controls_open_with_the_values_given(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True, sharpness=0.5, contrast=1.25, saturation=1.5)
+    inst = state.instance
+    for controls in (inst.created_config["controls"], inst.preview_config["controls"],
+                     inst.set_controls_calls[0]):
+        assert (controls["Sharpness"], controls["Contrast"], controls["Saturation"]) == (
+            0.5, 1.25, 1.5,
+        )
+    assert (camera.sharpness, camera.contrast, camera.saturation) == (0.5, 1.25, 1.5)
+    info = camera.stream_info
+    assert (info.sharpness, info.contrast, info.saturation) == (0.5, 1.25, 1.5)
+    assert camera.image_controls_supported == {"sharpness", "contrast", "saturation"}
+    camera.close()
+
+
+@pytest.mark.parametrize("bad", [True, "1.0", -0.5, float("nan"), float("inf"), None])
+def test_an_unusable_image_value_at_open_is_an_error(install_picamera, bad):
+    install_picamera()
+    with pytest.raises(CameraError, match="contrast"):
+        Picamera2Camera(contrast=bad)
+
+
+@pytest.mark.parametrize(("key", "control"), [
+    ("sharpness", "Sharpness"), ("contrast", "Contrast"), ("saturation", "Saturation"),
+])
+def test_set_image_control_sends_it_and_writes_both_configurations(
+    install_picamera, key, control,
+):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    camera.set_image_control(key, 1.25)
+    assert state.instance.set_controls_calls[-1] == {control: 1.25}
+    for config in (state.instance.created_config, state.instance.preview_config):
+        assert config["controls"][control] == 1.25
+    assert getattr(camera, key) == 1.25
+    assert getattr(camera.stream_info, key) == 1.25
+    assert camera.stream_info.to_dict()[key] == 1.25
+    camera.close()
+
+
+def test_a_still_after_an_image_change_is_configured_with_it(install_picamera):
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(big))
+    camera = Picamera2Camera(preview=True, save_dng=False)
+    camera.set_image_control("saturation", 0.5)
+    camera.read(full=True)
+    (still,) = state.instance.switch_calls
+    assert still["controls"]["Saturation"] == 0.5
+    camera.close()
+
+
+def test_an_unknown_image_control_or_value_is_refused(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    sent = len(state.instance.set_controls_calls)
+    with pytest.raises(CameraError, match="Unknown image control"):
+        camera.set_image_control("brightness", 1.0)
+    with pytest.raises(CameraError, match="sharpness"):
+        camera.set_image_control("sharpness", -1)
+    assert len(state.instance.set_controls_calls) == sent
+    assert camera.sharpness == 1.0
+    camera.close()
+
+
+def test_a_rejected_image_control_changes_nothing(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    preview_before = dict(state.instance.preview_config["controls"])
+    still_before = dict(state.instance.created_config["controls"])
+
+    def boom(controls):
+        raise RuntimeError("control rejected")
+
+    state.instance.set_controls = boom
+    with pytest.raises(CameraError, match="failed to set the contrast"):
+        camera.set_image_control("contrast", 1.5)
+    assert camera.contrast == 1.0
+    assert camera.stream_info.contrast == 1.0
+    assert state.instance.preview_config["controls"] == preview_before
+    assert state.instance.created_config["controls"] == still_before
+    camera.close()
+
+
+def test_an_image_control_on_a_closed_camera_is_an_error(install_picamera):
+    install_picamera()
+    camera = Picamera2Camera()
+    camera.close()
+    with pytest.raises(CameraError, match="closed"):
+        camera.set_image_control("contrast", 1.25)
+
+
+def test_an_image_control_the_camera_does_not_list_is_refused_and_left_out(
+    install_picamera, capsys,
+):
+    state = install_picamera(image_controls=("Sharpness", "Contrast"))
+    camera = Picamera2Camera(saturation=1.5, contrast=0.75)
+    assert camera.image_controls_supported == {"sharpness", "contrast"}
+    err = capsys.readouterr().err
+    assert "no Saturation control, so saturation 1.5 was not applied" in err
+    # Sent at normal, as it always was, but not claimed in the record.
+    assert state.instance.set_controls_calls[0]["Saturation"] == 1.0
+    assert camera.saturation == 1.0
+    assert camera.stream_info.saturation is None
+    values = camera.stream_info.to_dict()
+    assert "saturation" not in values
+    assert values["contrast"] == 0.75
+    sent = len(state.instance.set_controls_calls)
+    with pytest.raises(CameraError, match="no Saturation control"):
+        camera.set_image_control("saturation", 1.25)
+    assert len(state.instance.set_controls_calls) == sent
+    camera.close()
+
+
+def test_a_missing_image_control_at_normal_is_silent(install_picamera, capsys):
+    install_picamera(image_controls=())
+    camera = Picamera2Camera()
+    assert "warning" not in capsys.readouterr().err
+    assert not {"sharpness", "contrast", "saturation"} & set(camera.stream_info.to_dict())
+    camera.close()
+
+
+def _image_session(tmp_path, camera, **kwargs):
+    artifact_dir = tmp_path / "artifact"
+    write_artifact(
+        artifact_dir, LUT3D.identity(2), NormalizeParams(white_balance=False),
+        GrainParams(enabled=False),
+    )
+    return CaptureSession(
+        camera, Pipeline(Artifacts.load(artifact_dir)), tmp_path / "captures",
+        seed_rng=np.random.default_rng(0), save_dng=False, log=lambda _: None, **kwargs,
+    )
+
+
+def _image_records(tmp_path):
+    record_path, = (tmp_path / "captures").rglob("captures.jsonl")
+    return [json.loads(line) for line in record_path.read_text().splitlines()]
+
+
+def _image_fields(record):
+    return record["sharpness"], record["contrast"], record["saturation"]
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_a_record_after_an_image_change_carries_the_new_values(
+    install_picamera, tmp_path, background,
+):
+    array = np.broadcast_to(
+        np.array([[[10, 40, 230]]], dtype=np.uint8), (NATIVE_SIZE[1], NATIVE_SIZE[0], 3),
+    )
+    install_picamera(request=FakeRequest(array))
+    camera = Picamera2Camera(save_dng=False, contrast=1.25)
+    session = _image_session(tmp_path, camera, background=background,
+                             state_dir=tmp_path / "state")
+    try:
+        first = session.capture()
+        camera.set_image_control("sharpness", 0.5)
+        camera.set_image_control("saturation", 1.5)
+        second = session.capture()
+        # A later change does not reach a photo already taken.
+        camera.set_image_control("contrast", 0.75)
+        assert session.close_grades(timeout=30)
+    finally:
+        camera.close()
+    assert _image_fields(first.record) == (1.0, 1.25, 1.0)
+    assert _image_fields(second.record) == (0.5, 1.25, 1.5)
+    records = _image_records(tmp_path)
+    assert [_image_fields(r) for r in records] == [(1.0, 1.25, 1.0), (0.5, 1.25, 1.5)]
+    for record in records:
+        keys = list(record)
+        at = keys.index("ae_metering")
+        assert keys[at + 1:at + 4] == ["sharpness", "contrast", "saturation"]
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_both_records_of_a_double_carry_the_image_values_of_their_shutter(
+    install_picamera, tmp_path, background,
+):
+    array = np.broadcast_to(
+        np.array([[[10, 40, 230]]], dtype=np.uint8), (NATIVE_SIZE[1], NATIVE_SIZE[0], 3),
+    )
+    install_picamera(request=FakeRequest(array))
+    camera = Picamera2Camera(save_dng=False)
+    session = _image_session(tmp_path, camera, background=background,
+                             state_dir=tmp_path / "state")
+    try:
+        session.set_double_exposure(True)
+        session.capture()
+        camera.set_image_control("contrast", 1.5)
+        session.capture()
+        assert session.close_grades(timeout=30)
+    finally:
+        camera.close()
+    records = _image_records(tmp_path)
+    assert [r["double"]["index"] for r in records] == [1, 2]
+    assert [_image_fields(r) for r in records] == [(1.0, 1.0, 1.0), (1.0, 1.5, 1.0)]
+
+
+
+# --- noise reduction: HighQuality for stills, Minimal for the live view ------------
+
+
+def test_the_preview_takes_minimal_noise_reduction_and_the_still_high_quality(
+    install_picamera,
+):
+    state = install_picamera()
+    camera = Picamera2Camera(preview=True)
+    inst = state.instance
+    assert inst.created_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.HighQuality)
+    assert inst.preview_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.Minimal)
+    # The camera runs the preview, so it is started with the preview's mode.
+    assert inst.set_controls_calls[0]["NoiseReductionMode"] == _NoiseReductionModeEnum.Minimal
+    camera.close()
+
+
+def test_without_a_preview_the_camera_runs_high_quality(install_picamera):
+    state = install_picamera()
+    camera = Picamera2Camera()
+    assert state.instance.set_controls_calls[0]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.HighQuality)
+    camera.close()
+
+
+def test_an_older_libcamera_leaves_both_configurations_without_noise_reduction(
+    install_picamera,
+):
+    state = install_picamera(with_noise_reduction=False)
+    camera = Picamera2Camera(preview=True)
+    assert "NoiseReductionMode" not in state.instance.created_config["controls"]
+    assert "NoiseReductionMode" not in state.instance.preview_config["controls"]
+    assert "NoiseReductionMode" not in state.instance.set_controls_calls[0]
+    camera.close()
+
+
+def test_runtime_changes_keep_each_configurations_noise_reduction(install_picamera):
+    big = np.zeros((NATIVE_SIZE[1], NATIVE_SIZE[0], 3), dtype=np.uint8)
+    state = install_picamera(request=FakeRequest(big), with_exposure_time_mode=True,
+                             with_analogue_gain_mode=True)
+    camera = Picamera2Camera(preview=True, save_dng=False)
+    camera.set_ae_constraint("highlight")
+    camera.set_ae_metering("spot")
+    camera.set_image_control("contrast", 1.25)
+    camera.set_shutter(10_000)
+    camera.set_iso(400)
+    camera.set_colour_temperature(5600)
+    camera.reassert_controls()
+    camera.restart_preview()
+    inst = state.instance
+    for sent in inst.set_controls_calls[1:]:
+        assert "NoiseReductionMode" not in sent
+    assert inst.created_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.HighQuality)
+    assert inst.preview_config["controls"]["NoiseReductionMode"] == (
+        _NoiseReductionModeEnum.Minimal)
+    # A still from the live view is configured with the still's own mode.
+    camera.read(full=True)
+    (still,) = inst.switch_calls
+    assert still["controls"]["NoiseReductionMode"] == _NoiseReductionModeEnum.HighQuality
+    (restart, _wait), = inst.switch_mode_calls
+    assert restart["controls"]["NoiseReductionMode"] == _NoiseReductionModeEnum.Minimal
     camera.close()

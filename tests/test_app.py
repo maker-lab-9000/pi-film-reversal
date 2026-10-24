@@ -4285,3 +4285,87 @@ def test_the_viewfinder_is_told_whether_the_look_has_halation(tmp_path, monkeypa
     out = tmp_path / "shots"
     assert app.main(["--fake", "--display", "fake", "--no-preview", "--out", str(out)]) == 0
     assert seen["look_halation"] is enabled
+
+
+def _image_info(sharpness, contrast, saturation):
+    """A Picamera2-like stream_info with the ISP's image controls in it."""
+    return StreamInfo(width=160, height=90, fps=0.0, fourcc="RGB888", raw_mjpeg=False,
+                      ae_constraint="normal", ae_metering="centre",
+                      sharpness=sharpness, contrast=contrast, saturation=saturation)
+
+
+def test_a_recovered_grade_keeps_the_image_values_of_the_run_that_shot_it(tmp_path):
+    tuned = _tuned_pipeline(tmp_path)
+    held = _HeldPipeline(tuned)
+    held.artifacts = tuned.artifacts
+    camera = FakeCamera([synthetic_frame(90, 160)], stream_info=_image_info(1.5, 1.0, 0.75))
+    first = _tuned_session(tmp_path, camera, held, background=True,
+                           state_dir=tmp_path / "state")
+    result = first.capture()
+    held.wait_entered()
+    ((path, payload),) = read_entries(tmp_path / "state")
+    stored = payload["record"]
+    assert (stored["sharpness"], stored["contrast"], stored["saturation"]) == (1.5, 1.0, 0.75)
+    text = path.read_text()
+    held.release()
+    assert first.close_grades(timeout=5)
+    # Put the shot back as a power cut would have left it.
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+
+    camera = FakeCamera([synthetic_frame(90, 160)], stream_info=_image_info(1.0, 0.5, 1.0))
+    again = _tuned_session(tmp_path, camera, tuned, background=True,
+                           state_dir=tmp_path / "state")
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    (recovered,) = _lines(again.out_root)
+    assert recovered["recovered"] is True
+    assert (recovered["sharpness"], recovered["contrast"], recovered["saturation"]) == (
+        1.5, 1.0, 0.75,
+    )
+    keys = list(recovered)
+    at = keys.index("ae_metering")
+    assert keys[at + 1:at + 4] == ["sharpness", "contrast", "saturation"]
+
+
+class _ImageMenuCamera(_MenuCamera):
+    """A Picamera2 double with the image-control setter."""
+
+    def __init__(self, supported=("sharpness", "contrast", "saturation"), **kwargs):
+        super().__init__(**kwargs)
+        self.image_controls_supported = frozenset(supported)
+
+    def set_image_control(self, key, value):
+        self.calls.append((key, value))
+
+
+def test_saved_image_values_reach_the_picamera2_constructor(
+    camera_cli, monkeypatch, tmp_path, capsys,
+):
+    _save_settings(contrast=1.25, saturation=0.5)
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, _ImageMenuCamera())
+    kwargs = seen["camera_kwargs"]
+    assert (kwargs["sharpness"], kwargs["contrast"], kwargs["saturation"]) == (1.0, 1.25, 0.5)
+    assert ("settings: contrast 1.25, saturation 0.5 (saved in the menu; the unit says "
+            "contrast 1.0, saturation 1.0)") in capsys.readouterr().out
+
+
+def test_the_image_appliers_reach_the_camera_and_the_rows_follow_support(
+    camera_cli, monkeypatch, tmp_path,
+):
+    camera = _ImageMenuCamera(supported=("sharpness", "saturation"))
+    seen = _menu_main(camera_cli, monkeypatch, tmp_path, camera)
+    control = seen["settings"]
+    assert control.set("sharpness", 1.5)
+    assert control.set("saturation", 0.75)
+    assert camera.calls == [("sharpness", 1.5), ("saturation", 0.75)]
+    assert seen["menu_rows"] == (
+        "save_dng", "halation", "ae_constraint", "ae_metering", "sharpness", "saturation",
+    )
+
+
+def test_saved_image_values_do_not_reach_a_fake_camera(tmp_path, monkeypatch):
+    _save_settings(contrast=1.25)
+    kwargs = _viewfinder_kwargs(monkeypatch, tmp_path, [])
+    assert kwargs["menu_rows"] is None

@@ -397,7 +397,7 @@ def test_developing_and_the_tuning_flag_are_the_last_fields_with_off_defaults():
     # New fields go on the end, so an older positional construction keeps its meaning.
     assert LiveState(cells=_cells()).developing == 0
     assert LiveState(cells=_cells()).tuning_mismatch is False
-    assert list(LiveState.__dataclass_fields__)[-3:-1] == ["developing", "tuning_mismatch"]
+    assert list(LiveState.__dataclass_fields__)[-4:-2] == ["developing", "tuning_mismatch"]
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -623,9 +623,9 @@ def test_canvas_shapes_that_round_to_no_pixels_draw_nothing(box):
 
 # The disk-space warning: amber PHOTOS / SD tags between the tag row and the shutter.
 
-def test_the_disk_warning_is_the_last_field_and_empty_by_default():
+def test_the_disk_warning_is_a_late_field_and_empty_by_default():
     assert LiveState(cells=_cells()).disk_warning == ()
-    assert list(LiveState.__dataclass_fields__)[-1] == "disk_warning"
+    assert list(LiveState.__dataclass_fields__)[-2] == "disk_warning"
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -822,3 +822,42 @@ def test_the_menu_key_is_an_outlined_pill_with_a_white_label(scale):
     assert _neutral_peak(dark) > WHITE_INK
     # Outside the pill, the untouched frame.
     assert tuple(pixels[cy * scale, (cx - w // 2 - 2) * scale]) == (255, 255, 255)
+
+
+# The IMG reminder: an image control is not 1.0. First in the disk tags' tile.
+
+def test_the_image_flag_is_the_last_field_and_off_by_default():
+    assert LiveState(cells=_cells()).image_adjusted is False
+    assert list(LiveState.__dataclass_fields__)[-1] == "image_adjusted"
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_no_image_flag_draws_nothing(scale):
+    for warning in ((), WIDEST_DISK):
+        assert np.array_equal(
+            _pixels(_state(disk_warning=warning), scale=scale),
+            _pixels(_state(disk_warning=warning, image_adjusted=False), scale=scale))
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_the_img_tag_sits_first_in_the_disk_tile(scale):
+    full_row = dict(double=(True, 1), developing=99, tuning_mismatch=True)
+    reading = dict(battery_percent=100, external_power=True)
+    plain = _pixels(_state(**full_row), scale=scale, **reading)
+    tagged = _pixels(_state(**full_row, image_adjusted=True), scale=scale, **reading)
+    tag = _changed_box(plain, tagged, scale)
+    assert _near(_crop(tagged, tag, scale), AMBER, 60).any()
+    assert liveview._TAGS_BOX[2] <= tag[0]
+    assert DOUBLE_BOX[1] <= tag[1] and tag[3] <= DOUBLE_BOX[3]
+    _assert_clear_of_every_control(tag, scale)
+    # With the widest disk warning beside it, all of it still fits its tile and
+    # ends short of the shutter's hit circle; the disk tags move right past it.
+    alone = _changed_box(plain, _pixels(_state(**full_row, disk_warning=WIDEST_DISK),
+                                        scale=scale, **reading), scale)
+    both = _changed_box(plain, _pixels(_state(**full_row, disk_warning=WIDEST_DISK,
+                                              image_adjusted=True), scale=scale, **reading),
+                        scale)
+    assert both[0] == tag[0] and both[2] > alone[2]
+    assert both[2] < liveview._DISK_BOX[2] - 1
+    assert both[2] < SHUTTER_CENTRE[0] - SHUTTER_HIT_RADIUS
+    _assert_clear_of_every_control(both, scale)

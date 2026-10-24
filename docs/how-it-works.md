@@ -13,6 +13,10 @@ machine-learning runtime installed.
 Every graded frame goes through four steps, in a fixed order, in
 `pifilm/pipeline.py`: normalise, halation, LUT, grain. Halation is part of a look
 and off unless the look turns it on; a look without it has the other three only.
+Before them, on a Pi camera, libcamera's ISP has already applied its own
+sharpness, contrast and saturation: 1.0 (normal) unless the viewfinder menu's IMAGE
+page moved them. Looks are trained on frames taken at 1.0, so other values change
+what the look is given; the live view shows an amber `IMG` tag while they do.
 
 1. **Normalisation** (`pifilm/normalize.py`). Per-frame white balance (when the
    artifact enables it) and an exposure or levels correction, computed in

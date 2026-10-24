@@ -72,6 +72,11 @@ class StreamInfo:
     # has no such control, since libcamera's own default is then in force).
     ae_constraint: str | None = None
     ae_metering: str | None = None
+    # The ISP's Sharpness, Contrast and Saturation pifilm sent (Picamera2 only;
+    # None where the camera does not list the control).
+    sharpness: float | None = None
+    contrast: float | None = None
+    saturation: float | None = None
 
     def to_dict(self) -> dict:
         values = {
@@ -93,6 +98,10 @@ class StreamInfo:
             values["ae_constraint"] = self.ae_constraint
         if self.ae_metering is not None:
             values["ae_metering"] = self.ae_metering
+        for name in ("sharpness", "contrast", "saturation"):
+            value = getattr(self, name)
+            if value is not None:
+                values[name] = float(value)
         if self.autofocus is not None:
             values["autofocus"] = self.autofocus
         return values

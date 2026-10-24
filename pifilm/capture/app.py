@@ -189,13 +189,14 @@ The settings menu
 directory once the backend is known and before the panel or the camera is opened,
 so a saved value is in effect from the first frame: the unit's flags are the
 defaults, a value saved in the menu wins, and each ``settings:`` line says so in
-the journal. Only a real Picamera2 takes them (DNG saving and the two
-auto-exposure modes are its controls); under ``--fake`` or V4L2 the arguments
-stay as given, so a saved value can never trip the Picamera2-only check and stop
-the service starting. The ``SettingsControl`` gets one applier per row the
-backend can change, and the viewfinder gets the rows the camera supports (none of
-the auto-exposure ones under ``--ae-lock``, whose setters would change nothing),
-the look's name (the ``--artifacts`` folder) and, with ``--nextcloud-env`` and a
+the journal. Only a real Picamera2 takes them (DNG saving, the two auto-exposure
+modes and the ISP's sharpness, contrast and saturation are its controls); under
+``--fake`` or V4L2 the arguments stay as given, so a saved value can never trip
+the Picamera2-only check and stop the service starting. The ``SettingsControl``
+gets one applier per row the backend can change, and the viewfinder gets the rows
+the camera supports (none of the auto-exposure ones under ``--ae-lock``, whose
+setters would change nothing, and only the image controls the camera lists), the
+look's name (the ``--artifacts`` folder) and, with ``--nextcloud-env`` and a
 panel, an ``Upload`` that ``main`` closes beside the network monitor. Only the
 viewfinder's loop thread sets or resets a setting; the control has no lock.
 
@@ -279,7 +280,7 @@ from .network import Addresses, NetworkMonitor
 from .picamera import COLOUR_TEMPERATURE_RANGE_K, Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
 from .remote import RemoteCaptureServer
-from .settings import SETTINGS_FILE, Settings, SettingsControl
+from .settings import IMAGE_KEYS, SETTINGS_FILE, Settings, SettingsControl
 from .settings import load as load_settings
 from .thumbnail import render_exposure_card
 from .upload import Upload
@@ -2004,7 +2005,9 @@ def _main(argv: list[str] | None) -> int:
     effective, overrides, lines = load_settings(settings_path, settings_defaults)
     for line in lines:
         print(line)
+    image = {"sharpness": 1.0, "contrast": 1.0, "saturation": 1.0}
     if backend == "picamera2":
+        image = {key: getattr(effective, key) for key in IMAGE_KEYS}
         args.no_dng = not effective.save_dng
         args.ae_constraint = effective.ae_constraint
         args.ae_metering = effective.ae_metering
@@ -2031,6 +2034,7 @@ def _main(argv: list[str] | None) -> int:
                     ae_constraint=args.ae_constraint or "normal",
                     ae_metering=args.ae_metering or "centre",
                     preview=True if display_pair is not None else None,
+                    **image,
                 )
             else:
                 _reject_picamera2_only_flags(
@@ -2060,6 +2064,10 @@ def _main(argv: list[str] | None) -> int:
         settings.register("halation", lambda on: setattr(session, "halation", on))
         settings.register("ae_constraint", lambda name: camera.set_ae_constraint(name))
         settings.register("ae_metering", lambda name: camera.set_ae_metering(name))
+        for key in IMAGE_KEYS:
+            settings.register(
+                key, lambda value, key=key: camera.set_image_control(key, value),
+            )
         # Under --ae-lock the AE setters would succeed and change nothing.
         exposure = getattr(camera, "exposure_adjustable", True) is not False
         menu_rows = ("save_dng", "halation") + (
@@ -2068,6 +2076,9 @@ def _main(argv: list[str] | None) -> int:
         ) + (
             ("ae_metering",)
             if exposure and getattr(camera, "ae_metering_supported", False) else ()
+        ) + tuple(
+            key for key in IMAGE_KEYS
+            if key in getattr(camera, "image_controls_supported", ())
         )
     look = _look_name(args.artifacts)
     # Whether the HALATION row has anything to turn off.

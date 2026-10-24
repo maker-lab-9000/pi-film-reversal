@@ -36,7 +36,8 @@ it changes between frames, so the screen is assembled from small tiles:
   they show: the strip background, one tile per cell, the shutter, ``+``/``-`` and
   ``MENU`` keys (keyed by which is pressed), and the ``2x`` and battery tags with the
   count of photographs still developing and the ``TUNING`` warning, and the
-  ``PHOTOS``/``SD`` disk-space tags (a tile of their own, keyed by the warning);
+  ``IMG`` reminder with the ``PHOTOS``/``SD`` disk-space tags (a tile of their
+  own, keyed by what they show);
 - dynamic tiles: the lit meter dot and the lux/clip text (cached too, they repeat)
   and the focus gauge (drawn every frame; it is 7 units wide).
 
@@ -126,6 +127,11 @@ TUNING_LABEL = "TUNING"
 # own past the tag row and short of the shutter's hit circle, photos first. Its own
 # tile, at a fixed place, so it never moves the row and the row never moves it.
 DISK_X0 = 127
+# The camera's sharpness, contrast or saturation is not 1.0 (the menu's IMAGE
+# page): amber IMG in the same style, first in that tile, so a setting that
+# changes every photograph (and that no look was trained with) is not forgotten.
+# The tag row has no room left after TUNING; this tile has (see the tests).
+IMAGE_LABEL = "IMG"
 FOCUS_TRACK = (6, 22, 9, 198)
 FOCUS_TICK_X = (4, 11)
 FOCUS_TICK_HEIGHT = 1.5
@@ -201,6 +207,7 @@ class LiveState:
     developing: int = 0                      # photographs still being graded; 0 draws nothing
     tuning_mismatch: bool = False            # camera tuning differs from the look's; draws TUNING
     disk_warning: tuple[tuple[str, int], ...] = ()  # (label, percent) per low filesystem
+    image_adjusted: bool = False             # an image control is not 1.0; draws IMG
 
 
 @lru_cache(maxsize=4)
@@ -511,18 +518,21 @@ def _tags_tile(double: tuple[bool, int] | None, battery: str | None, scale: int,
 
 
 @lru_cache(maxsize=16)
-def _disk_tile(warning: tuple[tuple[str, int], ...], scale: int) -> Image.Image:
-    """One amber tag per filesystem low on space, left to right from ``DISK_X0``.
+def _disk_tile(warning: tuple[tuple[str, int], ...], scale: int,
+               image: bool = False) -> Image.Image:
+    """``IMG`` when ``image``, then one amber tag per filesystem low on space, left
+    to right from ``DISK_X0``.
 
     Styled as the TUNING tag: amber text, the battery tag's padding, the count's
-    dark patch, no outline (a warning, not a key). Keyed by the warning itself;
-    a percentage changes at most once a minute, so the cache holds few of these.
+    dark patch, no outline (a warning, not a key). Keyed by what it shows; a
+    percentage changes at most once a minute, so the cache holds few of these.
     """
     canvas = _Canvas(_DISK_BOX, scale)
     font = canvas.font(SEMIBOLD, TAG_SIZE)
     left = float(DISK_X0)
-    for label, percent in warning:
-        text = f"{label} {percent}%"
+    texts = ([IMAGE_LABEL] if image else []) + [
+        f"{label} {percent}%" for label, percent in warning]
+    for text in texts:
         box = (left, DOUBLE_BOX[1],
                min(left + canvas.text_width(text, font) + 2 * TAG_PADDING, _DISK_BOX[2] - 1),
                DOUBLE_BOX[3])
@@ -609,9 +619,9 @@ def render_live(
     tuning = bool(state.tuning_mismatch)
     if state.double is not None or battery is not None or developing or tuning:
         paste(_tags_tile(state.double, battery, scale, developing, tuning), *_TAGS_BOX[:2])
-    if state.disk_warning:
+    if state.disk_warning or state.image_adjusted:
         disk = tuple((str(label), int(percent)) for label, percent in state.disk_warning)
-        paste(_disk_tile(disk, scale), *_DISK_BOX[:2])
+        paste(_disk_tile(disk, scale, bool(state.image_adjusted)), *_DISK_BOX[:2])
     if reading.focus is not None:
         paste(_focus_tile(reading.focus, reading.focus_peak, scale), *_FOCUS_BOX[:2])
     return img

@@ -22,6 +22,14 @@ the idle dim and screen-off apply as in LIVE. ``RESET`` takes two taps within
 The ``HALATION`` row is shown only to a camera with the setting rows, and it is
 dim with ``-`` for a look without halation (``look_halation`` False): there is
 nothing to turn off, so a tap on it does nothing, as on the rows that only show.
+The ``IMAGE`` row, after the setting rows, opens a second page titled IMAGE:
+SHARPNESS, CONTRAST and SATURATION (a tap steps to the next of
+``IMAGE_STEPS``, 1.5 wrapping to 0.5), a RESET that puts only those three back
+to 1.0 (two taps, like the first page's), and BACK to the first page. ``DONE``
+closes the menu from either page, and the menu always opens on the first. The
+IMAGE row is dim with ``-`` when the camera can change none of the three (a
+V4L2 or fake camera), and a control the camera does not list is dim on the page.
+While any of the three is not 1.0 the live view shows an amber ``IMG`` tag.
 The live screen (``liveview.py``) is select-and-adjust: a tap on one of the strip's
 three cells (SHUTTER, ISO, WB) selects it, and one ``+``/``-`` pair steps whichever
 is selected. While a job is processing the colour bars hide the cells and the
@@ -104,7 +112,15 @@ from typing import Any
 from PIL import Image
 
 from ..capture.errors import CameraError, CameraStalled
-from ..capture.settings import AE_CONSTRAINTS, AE_METERINGS, SettingsControl
+from ..capture.settings import (
+    AE_CONSTRAINTS,
+    AE_METERINGS,
+    IMAGE_KEYS,
+    IMAGE_NORMAL,
+    IMAGE_STEPS,
+    SettingsControl,
+    format_step,
+)
 from ..imageio import load_rgb
 from . import DisplayError, iso, shutter, stepscale, whitebalance
 from .idle import IdleDimmer, Screen
@@ -227,6 +243,8 @@ PROCESSING_DOUBLE = "Developing double exposure..."
 # the look's name when ``--artifacts`` is the bundled starter.
 RESET_ARM_SECONDS = 3.0
 STARTER_LOOK = "starter (bundled)"
+# The menu's second page: the camera's image controls.
+IMAGE_TITLE = "IMAGE"
 
 
 @dataclass
@@ -378,7 +396,8 @@ class ViewfinderLoop:
         self._backlight: int | None = None
         # The settings menu. ``menu_rows`` names the optional setting rows this
         # camera supports (``save_dng``, ``halation``, ``ae_constraint``,
-        # ``ae_metering``); the caller decides, because only it knows the backend,
+        # ``ae_metering``, and on the IMAGE page ``sharpness``, ``contrast``,
+        # ``saturation``); the caller decides, because only it knows the backend,
         # and ``look_halation`` whether the look has a halation for the HALATION
         # row to turn off. The page last pushed, as (rows, DONE pressed), or None
         # to force the next push; and the time until which RESET is armed for its
@@ -389,8 +408,10 @@ class ViewfinderLoop:
         self._menu_optional = tuple(menu_rows or ())
         self._look_halation = bool(look_halation)
         self._menu_resettable = settings is not None and menu_rows is not None
-        self._menu_shown: tuple[tuple[MenuRow, ...], bool] | None = None
+        self._menu_shown: tuple[str | None, tuple[MenuRow, ...], bool] | None = None
         self._reset_until: float | None = None
+        # The page shown in MENU: "main", or "image" for the image controls.
+        self._menu_page = "main"
 
     # -- plumbing -------------------------------------------------------------
 
@@ -1004,8 +1025,39 @@ class ViewfinderLoop:
     def _reset_armed(self, now: float) -> bool:
         return self._reset_until is not None and now < self._reset_until
 
+    def _image_adjusted(self) -> bool:
+        """True while a sharpness, contrast or saturation this camera takes is not
+        1.0: the live view's IMG tag. A camera that takes none (V4L2, fake) never
+        shows it, since its saved values are not applied."""
+        settings = self._settings
+        if settings is None:
+            return False
+        current = settings.current
+        return any(getattr(current, key) != IMAGE_NORMAL
+                   for key in IMAGE_KEYS if key in self._menu_optional)
+
+    def _menu_title(self) -> str | None:
+        return IMAGE_TITLE if self._menu_page == "image" else None
+
+    def _image_rows(self, now: float) -> tuple[MenuRow, ...]:
+        """The image page's rows: the three controls, RESET and BACK."""
+        current = self._settings.current
+        rows = [
+            MenuRow(key, key.upper(), format_step(getattr(current, key)), True)
+            if key in self._menu_optional else MenuRow(key, key.upper(), "-", False)
+            for key in IMAGE_KEYS
+        ]
+        any_image = any(key in self._menu_optional for key in IMAGE_KEYS)
+        rows.append(MenuRow("image_reset", "RESET",
+                            "TAP AGAIN" if self._reset_armed(now) else "TAP TWICE",
+                            any_image))
+        rows.append(MenuRow("back", "BACK", "", True))
+        return tuple(rows)
+
     def _menu_rows(self, snap: Any, now: float) -> tuple[MenuRow, ...]:
         """The menu's rows as they are now, in the spec's order."""
+        if self._menu_page == "image" and self._settings is not None:
+            return self._image_rows(now)
         rows: list[MenuRow] = []
         settings = self._settings
         if settings is not None:
@@ -1025,6 +1077,10 @@ class ViewfinderLoop:
             if "ae_metering" in self._menu_optional:
                 rows.append(MenuRow("ae_metering", "AE METERING",
                                     current.ae_metering.upper(), True))
+            if any(key in self._menu_optional for key in IMAGE_KEYS):
+                rows.append(MenuRow("image", "IMAGE", ">", True))
+            else:
+                rows.append(MenuRow("image", "IMAGE", "-", False))
         if self._upload is not None:
             rows.append(MenuRow("upload", "UPLOAD", self._upload.status(), True))
         network = dict(getattr(snap, "network", ()) or ())
@@ -1061,6 +1117,18 @@ class ViewfinderLoop:
             settings.set(key, self._next(AE_CONSTRAINTS, settings.current.ae_constraint))
         elif key == "ae_metering":
             settings.set(key, self._next(AE_METERINGS, settings.current.ae_metering))
+        elif key == "image":
+            self._menu_page, self._reset_until = "image", None
+        elif key == "back":
+            self._menu_page, self._reset_until = "main", None
+        elif key == "image_reset":
+            if self._reset_armed(now):
+                self._reset_until = None
+                settings.reset_image()
+            else:
+                self._reset_until = now + RESET_ARM_SECONDS
+        elif key in IMAGE_KEYS:
+            settings.set(key, self._next(IMAGE_STEPS, getattr(settings.current, key)))
 
     def _menu_step(self, snap: Any, tap: Tap | None, now: float) -> None:
         """One step in MENU: the tap, then the page if it changed.
@@ -1073,23 +1141,26 @@ class ViewfinderLoop:
             self._menu_shown = None
             return
         rows = self._menu_rows(snap, now)
+        title = self._menu_title()
         if tap is not None:
-            target = menu_hit(tap.x, tap.y, len(rows), self._scale)
+            target = menu_hit(tap.x, tap.y, len(rows), self._scale, title=title is not None)
             if target == DONE:
                 self.state = "LIVE"
                 self._reset_until = None
+                self._menu_page = "main"
                 self._menu_shown = None
                 self._restart_rate_window()
                 return
             if isinstance(target, int) and rows[target].active:
                 self._menu_tap(rows[target].key, now)
                 rows = self._menu_rows(snap, now)
+                title = self._menu_title()
         finger = self._finger
         pressed = finger is not None and menu_hit(
-            finger[0], finger[1], len(rows), self._scale) == DONE
-        page = (rows, pressed)
+            finger[0], finger[1], len(rows), self._scale, title=title is not None) == DONE
+        page = (title, rows, pressed)
         if page != self._menu_shown and self._show(
-                render_menu(rows, scale=self._scale, done_pressed=pressed)):
+                render_menu(rows, scale=self._scale, done_pressed=pressed, title=title)):
             # Remembered only once pushed, so a refused page is tried again.
             self._menu_shown = page
 
@@ -1167,6 +1238,7 @@ class ViewfinderLoop:
                 self.state = "MENU"
                 self._flash = None
                 self._reset_until = None
+                self._menu_page = "main"
                 self._menu_shown = None
                 self._menu_step(snap, None, now)
                 return
@@ -1264,6 +1336,9 @@ class ViewfinderLoop:
                 tuning_mismatch=getattr(snap, "tuning_mismatch", False) is True,
                 # Changes at most once a minute; read like the count all the same.
                 disk_warning=getattr(snap, "disk_warning", ()),
+                # From the menu's own settings, not the snapshot: the session
+                # does not hold them. Cheap enough to read at every redraw.
+                image_adjusted=self._image_adjusted(),
             ),
             scale=self._scale,
         ))
