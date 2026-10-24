@@ -4636,6 +4636,7 @@ class _BurstCamera(FakeCamera):
 
 STACK_KEYS = ["frames", "reference", "exposure_us", "gain", "requested_exposure_us",
               "requested_gain", "split", "method", "aligned", "align_ms", "merge_ms"]
+ALIGNED_KEYS = ["dx", "dy", "angle_deg", "rho", "used", "reason", "exposure_us", "gain"]
 STACK_NAMES = ["210507_original.jpg", "210507_frame2.jpg", "210507_frame3.jpg",
                "210507_frame4.jpg"]
 
@@ -4667,7 +4668,12 @@ def _check_stack_record(record, camera):
     assert (stack["requested_exposure_us"], stack["requested_gain"]) == (2500, 4.0)
     assert stack["split"] is True and stack["method"] == "ecc-euclidean-ghost-weighted-mean"
     assert len(stack["aligned"]) == 4 and stack["aligned"][0]["used"] is True
-    assert all(set(f) == {"dx", "dy", "angle_deg", "used"} for f in stack["aligned"])
+    assert all(list(f) == ALIGNED_KEYS for f in stack["aligned"])
+    assert all(f["reason"] is None for f in stack["aligned"] if f["used"])
+    # Each frame's own exposure, in ``frames`` order: capture frames 1, 0, 2, 3.
+    assert [(f["exposure_us"], f["gain"]) for f in stack["aligned"]] == \
+        [(2501, 5.0), (2500, 4.0), (2502, 6.0), (2503, 7.0)]
+    assert stack["aligned"][0]["rho"] is None
     assert "dng" not in record
     assert record["camera_metadata"]["FocusFoM"] == 5.0
     assert {"burst", "save_original", "save_frames", "merge"} <= set(record["stage_ms"])
@@ -4724,7 +4730,7 @@ def test_a_background_multi_frame_shot_is_the_inline_one(tmp_path, pipeline):
     ((_, entry),) = read_entries(tmp_path / "state")
     assert entry["originals"] == [f"2026-09-03/{name}" for name in STACK_NAMES]
     assert entry["stack"] == {"reference_index": 1} and entry["double"] is None
-    assert list(entry["record"]["stack"]) == STACK_KEYS[:7]
+    assert list(entry["record"]["stack"]) == STACK_KEYS[:7] + ["frame_exposures"]
     assert "dng" not in entry["record"]
     # Every frame is on disk while the grade has not run.
     assert all((result.original.parent / name).exists() for name in STACK_NAMES)
@@ -4785,6 +4791,117 @@ def test_a_recovered_multi_frame_grade_merges_the_saved_frames(tmp_path, pipelin
     # From the JPEGs on disk: close to the grade from memory, not the same.
     expected = _expected_graded(pipeline, camera, record["grain_seed"])
     assert np.abs(load_rgb(result.graded)[0].astype(int) - expected.astype(int)).mean() < 3.0
+
+
+def _recover_stack(tmp_path, pipeline, damage):
+    """A background multi-frame shot whose grade is then done again from its
+    entry, after ``damage(day_dir)``; returns the log lines and the record."""
+    camera = _BurstCamera()
+    held = _SpyPipeline(pipeline)
+    session = _stack_session(tmp_path, held, camera, grade="background")
+    result = session.capture()
+    held.wait_entered()
+    ((path, _),) = read_entries(tmp_path / "state")
+    text = path.read_text()
+    held.release()
+    assert session.close_grades(timeout=5)
+    result.graded.unlink()
+    (result.graded.parent / "captures.jsonl").unlink()
+    path.write_text(text)
+    damage(result.original.parent)
+
+    lines = []
+    again = CaptureSession(FakeCamera([synthetic_frame(90, 160)]), pipeline,
+                           tmp_path / "shots", now=lambda: FIXED,
+                           seed_rng=np.random.default_rng(0), background=True,
+                           state_dir=tmp_path / "state", log=lines.append)
+    _settle(again)
+    assert again.close_grades(timeout=5)
+    records = _lines(again.out_root) if (result.original.parent / "captures.jsonl").exists() \
+        else []
+    return path, lines, records, result
+
+
+def test_a_recovered_multi_frame_grade_merges_without_an_unreadable_frame(tmp_path, pipeline):
+    def damage(day):
+        (day / "210507_frame3.jpg").write_bytes(b"\xff\xd8 cut short")
+        (day / "210507_frame4.jpg").unlink()
+
+    path, lines, records, result = _recover_stack(tmp_path, pipeline, damage)
+    assert not path.exists()
+    (record,) = records
+    assert record["recovered"] is True
+    aligned = record["stack"]["aligned"]
+    assert len(aligned) == 4 and all(list(f) == ALIGNED_KEYS for f in aligned)
+    for i in (2, 3):
+        assert aligned[i]["used"] is False and aligned[i]["reason"] == "unreadable"
+        assert aligned[i]["rho"] is None
+    assert aligned[0]["used"] is True and aligned[1]["reason"] in (None, "low_correlation",
+                                                                   "ecc_failed", "shift",
+                                                                   "angle")
+    # The frames' exposures still come from the entry.
+    assert (aligned[3]["exposure_us"], aligned[3]["gain"]) == (2503, 7.0)
+    assert sum("210507_frame3.jpg: unreadable" in line for line in lines) == 1
+    assert sum("210507_frame4.jpg: unreadable" in line for line in lines) == 1
+    assert result.graded.exists()
+    json.dumps(record)
+
+
+def test_a_recovered_multi_frame_grade_with_only_the_reference_grades_it_alone(
+    tmp_path, pipeline,
+):
+    camera_frames = _BurstCamera().burst_frames
+
+    def damage(day):
+        for name in STACK_NAMES[1:]:
+            (day / name).unlink()
+
+    _, lines, records, result = _recover_stack(tmp_path, pipeline, damage)
+    (record,) = records
+    assert [f["used"] for f in record["stack"]["aligned"]] == [True, False, False, False]
+    assert [f["reason"] for f in record["stack"]["aligned"]] == \
+        [None, "unreadable", "unreadable", "unreadable"]
+    expected = pipeline.process(load_rgb(result.original)[0],
+                                rng=np.random.default_rng(record["grain_seed"]))[0]
+    assert np.abs(load_rgb(result.graded)[0].astype(int) - expected.astype(int)).mean() < 1.0
+    assert _nearest(load_rgb(result.original)[0], camera_frames) == 1
+
+
+def test_a_recovered_frame_of_another_size_is_left_out(tmp_path, pipeline):
+    from pifilm.imageio import save_jpeg
+
+    def damage(day):
+        save_jpeg(np.zeros((40, 60, 3), np.uint8), day / "210507_frame2.jpg")
+
+    _, lines, records, _ = _recover_stack(tmp_path, pipeline, damage)
+    (record,) = records
+    assert record["stack"]["aligned"][1]["reason"] == "unreadable"
+    assert any("210507_frame2.jpg: unreadable (size 60x40" in line for line in lines)
+
+
+def test_an_unreadable_reference_fails_the_recovered_grade(tmp_path, pipeline):
+    def damage(day):
+        (day / STACK_NAMES[0]).write_bytes(b"not a jpeg")
+
+    path, lines, records, _ = _recover_stack(tmp_path, pipeline, damage)
+    assert records == []
+    assert path.exists()  # one attempt used; the entry stays for the next start
+    assert any(line.startswith("grade failed (2026-09-03_210507.json)") for line in lines)
+    assert not any("merged without it" in line for line in lines)
+
+
+def test_an_entry_without_frame_exposures_records_none(tmp_path):
+    from pifilm.capture.app import _stack_record
+
+    merged = {"method": "m", "frames": [{"used": True}, {"used": False}],
+              "align_ms": 1.0, "merge_ms": 2.0}
+    record = _stack_record({"frames": ["a", "b"]}, merged)
+    assert [(f["exposure_us"], f["gain"]) for f in record["aligned"]] == [(None, None)] * 2
+    assert "frame_exposures" not in record
+    record = _stack_record({"frames": ["a", "b"], "frame_exposures": [[10, 2.0], [11, 2.5]]},
+                           merged)
+    assert list(record) == ["frames", "method", "aligned", "align_ms", "merge_ms"]
+    assert record["aligned"][1] == {"used": False, "exposure_us": 11, "gain": 2.5}
 
 
 @pytest.mark.parametrize("grade", ["inline", "background"])

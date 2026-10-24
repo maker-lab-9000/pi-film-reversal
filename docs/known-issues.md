@@ -405,7 +405,8 @@ known and left as they are until real bursts show whether they matter.
   dropped. A scene with little texture (sky, a plain wall) at high gain may fall
   under it, and the photograph is then the reference alone or a merge of fewer
   frames. This is a safe failure: noisier, never misaligned. The record's
-  `stack.aligned` shows which frames were used.
+  `stack.aligned` shows which frames were used, each frame's ECC correlation
+  (`rho`) and the `reason` a frame was left out.
 - **Ghost weighting limits the noise drop at high gain.** `GHOST_SCALE` (0.05
   linear luma) assumes the noise between two frames is a few hundredths. At high
   gain in the dark the noise can approach it, so frames weigh less than 1 where

@@ -10,9 +10,12 @@ import pytest
 
 from pifilm._cv2 import require_cv2
 from pifilm.color import SRGB8_LINEAR
-from pifilm.stack import METHOD, merge, merge_aligned
+from pifilm.stack import METHOD, MIN_CORRELATION, REASONS, merge, merge_aligned, unused_entry
 
 cv2 = require_cv2()
+
+_REFERENCE_ENTRY = {"dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "rho": None, "used": True,
+                    "reason": None}
 
 H, W = 1200, 1800  # reduced by 2 for alignment
 
@@ -70,15 +73,17 @@ def test_known_shifts_and_rotations_are_recovered():
     assert info["method"] == METHOD == "ecc-euclidean-ghost-weighted-mean"
     assert len(info["frames"]) == 4
     for entry, truth in zip(info["frames"], truths, strict=True):
-        assert entry["used"] is True
+        assert entry["used"] is True and entry["reason"] is None
         assert _corner_error(entry, truth) < 0.5
+    assert info["frames"][0]["rho"] is None  # the reference is not fitted
+    assert all(MIN_CORRELATION <= e["rho"] <= 1.0 for e in info["frames"][1:])
     # The aligned frames agree with the reference away from the reflected border.
     inner = (slice(60, H - 60), slice(60, W - 60))
     diff = np.abs(out[inner].astype(int) - frames[0][inner].astype(int))
     assert diff.mean() < 1.5
     json.dumps(info)  # plain floats and bools only
     for entry in info["frames"]:
-        assert set(entry) == {"dx", "dy", "angle_deg", "used"}
+        assert list(entry) == ["dx", "dy", "angle_deg", "rho", "used", "reason"]
         assert all(type(entry[k]) is float for k in ("dx", "dy", "angle_deg"))
     assert type(info["align_ms"]) is float and type(info["merge_ms"]) is float
 
@@ -89,7 +94,7 @@ def test_reference_other_than_first():
     frames = [_frame_from(scene, t) for t in truths]
     _, info = merge(frames, reference=1)
     assert info["reference"] == 1
-    assert info["frames"][1] == {"dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "used": True}
+    assert info["frames"][1] == _REFERENCE_ENTRY
     for i in (0, 2):
         assert _corner_error(info["frames"][i], truths[i]) < 0.5
 
@@ -145,6 +150,8 @@ def test_a_huge_shift_is_dropped():
     out, info = merge(frames, reference=0)
     assert info["frames"][1]["used"] is True
     assert info["frames"][2]["used"] is False
+    # ECC does not reach a shift that large: it ends on a poor fit.
+    assert info["frames"][2]["reason"] in ("shift", "low_correlation", "ecc_failed")
     # The result equals the merge of the two used frames alone.
     alone, _ = merge(frames[:2], reference=0)
     assert np.array_equal(out, alone)
@@ -154,6 +161,7 @@ def test_an_unrelated_frame_is_dropped():
     frames = [_u8(_scene(seed=11)), _u8(_scene(seed=12))]
     out, info = merge(frames, reference=0)
     assert info["frames"][1]["used"] is False
+    assert info["frames"][1]["reason"] in ("ecc_failed", "low_correlation")
     assert out is frames[0]
 
 
@@ -161,7 +169,7 @@ def test_one_frame_comes_back_unchanged():
     frame = _u8(_scene(seed=13, height=240, width=320))
     out, info = merge([frame], reference=0)
     assert np.array_equal(out, frame)
-    assert info["frames"] == [{"dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "used": True}]
+    assert info["frames"] == [_REFERENCE_ENTRY]
     json.dumps(info)
 
 
@@ -225,4 +233,61 @@ def test_a_large_roll_is_dropped():
     frames = [_frame_from(scene, t) for t in truths]
     out, info = merge(frames, reference=0)
     assert info["frames"][1]["used"] is False
+    assert info["frames"][1]["reason"] == "angle"
     assert out is frames[0]
+
+
+def _two_frames():
+    scene = _scene(seed=31, height=240, width=320)
+    return [_u8(scene), _u8(scene)]
+
+
+def test_ecc_that_raises_is_recorded_as_ecc_failed(monkeypatch):
+    def failing(*args, **kwargs):
+        raise cv2.error("no convergence")
+
+    monkeypatch.setattr(cv2, "findTransformECC", failing)
+    frames = _two_frames()
+    out, info = merge(frames, reference=0)
+    assert out is frames[0]
+    assert info["frames"][1] == {"dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "rho": None,
+                                 "used": False, "reason": "ecc_failed"}
+    json.dumps(info)
+
+
+def test_a_low_correlation_is_recorded_with_its_rho(monkeypatch):
+    monkeypatch.setattr(cv2, "findTransformECC",
+                        lambda *a, **k: (0.31234567, np.eye(2, 3, dtype=np.float32)))
+    frames = _two_frames()
+    out, info = merge(frames, reference=0)
+    assert out is frames[0]
+    entry = info["frames"][1]
+    assert (entry["rho"], entry["used"], entry["reason"]) == (0.3123, False, "low_correlation")
+    assert type(entry["rho"]) is float
+
+
+def test_a_non_finite_correlation_is_ecc_failed(monkeypatch):
+    monkeypatch.setattr(cv2, "findTransformECC",
+                        lambda *a, **k: (float("nan"), np.eye(2, 3, dtype=np.float32)))
+    _, info = merge(_two_frames(), reference=0)
+    assert info["frames"][1]["rho"] is None and info["frames"][1]["reason"] == "ecc_failed"
+    json.dumps(info, allow_nan=False)
+
+
+def test_unused_entry_is_a_dropped_frame_for_a_reason():
+    assert unused_entry("unreadable") == {"dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "rho": None,
+                                          "used": False, "reason": "unreadable"}
+    assert set(REASONS) == {"ecc_failed", "low_correlation", "shift", "angle", "unreadable"}
+    with pytest.raises(ValueError, match="unknown reason"):
+        unused_entry("blurred")
+
+
+def test_a_good_fit_beyond_the_shift_limit_is_recorded_as_shift(monkeypatch):
+    warp = np.array([[1.0, 0.0, 40.0], [0.0, 1.0, 0.0]], np.float32)  # 40 of 320 px
+    monkeypatch.setattr(cv2, "findTransformECC", lambda *a, **k: (0.97, warp))
+    frames = _two_frames()
+    out, info = merge(frames, reference=0)
+    entry = info["frames"][1]
+    assert out is frames[0]
+    assert (entry["rho"], entry["used"], entry["reason"]) == (0.97, False, "shift")
+    assert entry["dx"] == 40.0

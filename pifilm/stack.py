@@ -39,6 +39,8 @@ Why these choices
   of the width or a roll over ``MAX_ANGLE_DEG`` (no hand shake within a burst
   is that large; it is a wrong fit or a different picture) leaves the frame
   out. A photograph from fewer frames is noisier; a misaligned one is broken.
+  Each frame's entry keeps ECC's correlation (``rho``) and why it was left out
+  (``reason``), so the thresholds can be judged from real bursts.
 * **Warped once at full size** with ``cv2.warpAffine`` (bilinear, reflected
   border so no black edges enter the mean), kept as uint8: five aligned 12 MP
   frames are 185 MB, where float32 copies would be four times that.
@@ -143,8 +145,13 @@ def _full_size_warp(small: np.ndarray, factor: int) -> np.ndarray:
     return full
 
 
-def _align(reference: np.ndarray, frame: np.ndarray, factor: int) -> np.ndarray | None:
-    """The full-size warp mapping reference pixels into ``frame``, or None (ECC failed)."""
+def _align(
+    reference: np.ndarray, frame: np.ndarray, factor: int
+) -> tuple[np.ndarray | None, float | None, str | None]:
+    """``(warp, rho, reason)``: the full-size warp mapping reference pixels into
+    ``frame`` (None when the fit is not usable), ECC's correlation (None when
+    ECC raised or gave none that is finite) and why the fit is not usable
+    (``"ecc_failed"``, ``"low_correlation"``; None when it is)."""
     cv2 = require_cv2()
     warp = np.eye(2, 3, dtype=np.float32)
     criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, ECC_ITERATIONS, ECC_EPSILON)
@@ -153,10 +160,13 @@ def _align(reference: np.ndarray, frame: np.ndarray, factor: int) -> np.ndarray 
             reference, frame, warp, cv2.MOTION_EUCLIDEAN, criteria, None, ECC_GAUSS_SIZE
         )
     except cv2.error:
-        return None
-    if not math.isfinite(rho) or rho < MIN_CORRELATION or not np.all(np.isfinite(warp)):
-        return None
-    return _full_size_warp(warp, factor)
+        return None, None, "ecc_failed"
+    rho = float(rho)
+    if not math.isfinite(rho) or not np.all(np.isfinite(warp)):
+        return None, None, "ecc_failed"
+    if rho < MIN_CORRELATION:
+        return None, rho, "low_correlation"
+    return _full_size_warp(warp, factor), rho, None
 
 
 def _motion(warp: np.ndarray, height: int, width: int) -> tuple[float, float, float]:
@@ -168,21 +178,46 @@ def _motion(warp: np.ndarray, height: int, width: int) -> tuple[float, float, fl
     return float(dx), float(dy), math.degrees(math.atan2(warp[1, 0], warp[0, 0]))
 
 
-def _entry(motion: tuple[float, float, float] | None, used: bool) -> dict:
-    if motion is None:
-        return {"dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "used": False}
-    dx, dy, angle = motion
+REASONS = ("ecc_failed", "low_correlation", "shift", "angle", "unreadable")
+"""Why a frame was left out, as ``reason`` in its entry: ECC raised (or gave
+nothing finite), its fit ended under ``MIN_CORRELATION``, the shift was over
+``MAX_SHIFT_FRACTION`` of the width, the roll over ``MAX_ANGLE_DEG``; and, set
+by a caller that could not read the frame at all (never by ``merge``),
+``unreadable``."""
+
+
+def _entry(
+    motion: tuple[float, float, float] | None, rho: float | None, reason: str | None
+) -> dict:
+    """One frame's entry in ``frames``: where it sat, ECC's ``rho``, ``used``
+    (no ``reason`` against it) and ``reason``."""
+    dx, dy, angle = motion if motion is not None else (0.0, 0.0, 0.0)
     return {
         "dx": round(dx, 3) + 0.0,  # + 0.0: no -0.0 in the record
         "dy": round(dy, 3) + 0.0,
         "angle_deg": round(angle, 4) + 0.0,
-        "used": bool(used),
+        "rho": None if rho is None else round(rho, 4) + 0.0,
+        "used": reason is None,
+        "reason": reason,
     }
 
 
-def _within_limits(motion: tuple[float, float, float], width: int) -> bool:
+def unused_entry(reason: str) -> dict:
+    """The entry of a frame left out for ``reason`` (one of ``REASONS``) before
+    any fit, for a caller that could not read it: zeros, no ``rho``."""
+    if reason not in REASONS:
+        raise ValueError(f"unknown reason {reason!r}; expected one of {REASONS}")
+    return _entry(None, None, reason)
+
+
+def _limit_reason(motion: tuple[float, float, float], width: int) -> str | None:
+    """``"shift"`` or ``"angle"`` for a fit beyond the limits, else None."""
     dx, dy, angle = motion
-    return math.hypot(dx, dy) <= MAX_SHIFT_FRACTION * width and abs(angle) <= MAX_ANGLE_DEG
+    if math.hypot(dx, dy) > MAX_SHIFT_FRACTION * width:
+        return "shift"
+    if abs(angle) > MAX_ANGLE_DEG:
+        return "angle"
+    return None
 
 
 def merge_aligned(
@@ -230,14 +265,15 @@ def merge(frames: Sequence[np.ndarray], *, reference: int) -> tuple[np.ndarray, 
     """Align every frame to ``frames[reference]`` and merge them; see the module
     docstring. Returns the sRGB uint8 photograph and an info dict (JSON-ready):
     ``reference``, ``method``, ``frames`` (per input frame ``dx``, ``dy``: the
-    shift at the image centre in full-size pixels, ``angle_deg``: the roll, ``used``;
-    zeros for a frame ECC could not fit), ``align_ms`` and ``merge_ms``.
+    shift at the image centre in full-size pixels, ``angle_deg``: the roll, zeros
+    for a frame ECC could not fit; ``rho``: ECC's correlation, None for the
+    reference and where ECC raised; ``used``; ``reason``: None when used, else
+    one of ``REASONS``), ``align_ms`` and ``merge_ms``.
     One frame, or no other frame used, returns the reference frame itself."""
     _check(frames, reference)
     ref_frame = frames[reference]
     height, width = ref_frame.shape[:2]
-    entries: list[dict] = [_entry(None, False) for _ in frames]
-    entries[reference] = {"dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "used": True}
+    entries: list[dict] = [_entry(None, None, None) for _ in frames]
 
     start = time.perf_counter()
     aligned: list[np.ndarray] = []
@@ -248,11 +284,12 @@ def merge(frames: Sequence[np.ndarray], *, reference: int) -> tuple[np.ndarray, 
         for i, frame in enumerate(frames):
             if i == reference:
                 continue
-            warp = _align(ref_small, _reduced_luma(frame, factor), factor)
+            warp, rho, reason = _align(ref_small, _reduced_luma(frame, factor), factor)
             motion = None if warp is None else _motion(warp, height, width)
-            used = motion is not None and _within_limits(motion, width)
-            entries[i] = _entry(motion, used)
-            if used:
+            if motion is not None:
+                reason = _limit_reason(motion, width)
+            entries[i] = _entry(motion, rho, reason)
+            if reason is None:
                 aligned.append(
                     cv2.warpAffine(
                         frame,

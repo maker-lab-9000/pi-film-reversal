@@ -293,7 +293,12 @@ any frame.
    IMX477), then the fit is mapped back to full size and the frame warped once.
    A frame is left out when ECC fails, its correlation ends under 0.5, it moved
    more than 5 % of the width, or it rolled more than 2°. A merge of fewer frames
-   is noisier; a misaligned one would be broken.
+   is noisier; a misaligned one would be broken. The record's `stack.aligned`
+   keeps, per frame, ECC's correlation (`rho`), why a frame was left out
+   (`reason`: `ecc_failed`, `low_correlation`, `shift`, `angle`, or `unreadable`
+   for a frame a recovered grade could not read from disk) and the exposure and
+   gain the frame's own metadata reports, so the thresholds can be checked on the
+   Pi's bursts.
 3. **Merge.** The frames are averaged in linear light, as light adds. Each pixel of
    another frame is weighted `exp(-(d / 0.05)²)`, d its linear luma difference from
    the reference; the reference has weight 1. Where the frames differ only by

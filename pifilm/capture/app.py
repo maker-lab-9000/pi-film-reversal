@@ -255,7 +255,10 @@ Behind the shutter the capture side writes the frames and an entry whose
 {"reference_index": i}`` (the reference's place in capture order); the worker
 syncs them, merges them with the first as the reference, frees the frames and
 grades the merge. A recovered grade does the same from the JPEGs on disk, so it
-is close to, not the same as, the grade from memory. An entry without ``stack``
+is close to, not the same as, the grade from memory; a frame after the reference
+that cannot be read there (or is not the reference's size) is one log line and
+is left out of the merge (``reason`` ``unreadable``), and only an unreadable
+reference fails the grade. An entry without ``stack``
 is one frame, as every entry before this was. The quick grade is the reference
 frame's alone: the merge is seconds of work, and the screen needs a picture now.
 Inline, the frames are written, merged and graded in turn.
@@ -268,7 +271,11 @@ its records say nothing about a stack. A multi-frame record has, after
 says), ``requested_exposure_us`` and ``requested_gain`` (what the burst asked
 for: the split values, else the first frame's), ``split``, then what the merge
 reports: ``method``, ``aligned`` (per frame in ``frames`` order: ``dx``, ``dy``,
-``angle_deg``, ``used``), ``align_ms`` and ``merge_ms``. Its ``stage_ms`` has
+``angle_deg``, ``rho`` (ECC's correlation; null for the reference and where ECC
+raised), ``used``, ``reason`` (null when used, else ``ecc_failed``,
+``low_correlation``, ``shift``, ``angle`` or ``unreadable``), then ``exposure_us``
+and ``gain`` from that frame's own metadata (null where it has none)),
+``align_ms`` and ``merge_ms``. Its ``stage_ms`` has
 ``burst`` (the whole burst) in place of ``capture``, ``save_frames``, and
 ``merge``, which is outside ``pipeline_ms``. ``camera_metadata`` is the reference
 frame's.
@@ -280,6 +287,7 @@ import argparse
 import contextlib
 import functools
 import json
+import math
 import os
 import select
 import signal
@@ -308,7 +316,7 @@ from ..double import COMPOSITE_METHOD, composite
 from ..gpu.grader import GpuGrader
 from ..imageio import load_rgb, save_jpeg
 from ..pipeline import Pipeline
-from ..stack import merge
+from ..stack import merge, unused_entry
 from ..tuning import check as check_tuning
 from .button import (
     MAX_PIN,
@@ -551,13 +559,36 @@ def _reference_index(frames: list[Frame]) -> int:
     return best
 
 
+def _metadata_number(metadata: dict | None, key: str) -> int | float | None:
+    """A finite number from a frame's metadata, else None (JSON-safe either way)."""
+    value = (metadata or {}).get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _stack_record(stack: dict, merged: dict) -> dict:
     """The record's ``stack`` once merged: the capture side's fields, then what
-    ``pifilm.stack.merge`` reports (per frame in ``frames`` order)."""
+    ``pifilm.stack.merge`` reports (per frame in ``frames`` order), each frame's
+    entry closed by the ``exposure_us`` and ``gain`` its metadata reported.
+
+    Those come from ``frame_exposures``, which the capture side keeps in its
+    ``stack`` (and so in the pending entry, for a recovered grade) and which
+    is not itself a record field; an entry without it gives None."""
+    fields = dict(stack)
+    exposures = fields.pop("frame_exposures", None)
+    if not isinstance(exposures, list):
+        exposures = []
+    aligned = []
+    for i, entry in enumerate(merged["frames"]):
+        pair = exposures[i] if i < len(exposures) else None
+        if not isinstance(pair, list | tuple) or len(pair) != 2:
+            pair = (None, None)
+        aligned.append({**entry, "exposure_us": pair[0], "gain": pair[1]})
     return {
-        **stack,
+        **fields,
         "method": merged["method"],
-        "aligned": merged["frames"],
+        "aligned": aligned,
         "align_ms": merged["align_ms"],
         "merge_ms": merged["merge_ms"],
     }
@@ -1001,8 +1032,9 @@ class CaptureSession:
             0.0 if recovered else round(max(0.0, job.started_at - job.queued_at) * 1000.0, 1)
         )
         frames = work.frames
+        unreadable: list[int] = []
         if frames is None:
-            frames = tuple(load_rgb(self.out_root / name)[0] for name in work.originals)
+            frames, unreadable = self._load_originals(work)
         else:
             with _stage(stages, "sync_original"):
                 self._sync_originals(work, day_dir)
@@ -1012,6 +1044,9 @@ class CaptureSession:
             # first in ``originals``, however the burst was ordered.
             with _stage(stages, "merge"):
                 rgb, merged = merge(frames, reference=0)
+            # Each frame left unread keeps its place in ``aligned``, as not used.
+            for index in unreadable:
+                merged["frames"].insert(index, unused_entry("unreadable"))
             # Up to six full frames: let them go before the grade needs its memory.
             frames, work.frames = (rgb,), None
         t0 = time.perf_counter()
@@ -1240,6 +1275,34 @@ class CaptureSession:
         self._append_record(day_dir, record)
         return CaptureResult(original, pifilm, record, exposure=(2, 2), graded=pifilm)
 
+    def _load_originals(self, work: _GradeWork) -> tuple[tuple[np.ndarray, ...], list[int]]:
+        """A recovered grade's originals read from disk, and the places in
+        ``originals`` of the frames left out.
+
+        Only a multi-frame photograph leaves any out: a frame after the
+        reference that cannot be read (gone, cut short by a power cut, not a
+        picture) or is not the reference's size is one log line, and the rest
+        are merged, or the reference graded alone. The reference, and either
+        exposure of a double, fail the grade as before."""
+        if work.stack is None:
+            return tuple(load_rgb(self.out_root / name)[0] for name in work.originals), []
+        reference = load_rgb(self.out_root / work.originals[0])[0]
+        frames, unreadable = [reference], []
+        for index, name in enumerate(work.originals[1:], start=1):
+            try:
+                frame = load_rgb(self.out_root / name)[0]
+                if frame.shape != reference.shape:
+                    raise ValueError(
+                        f"size {frame.shape[1]}x{frame.shape[0]}, the reference's is "
+                        f"{reference.shape[1]}x{reference.shape[0]}"
+                    )
+            except (OSError, ValueError) as exc:
+                self._say(f"multi-frame {name}: unreadable ({exc}); merged without it")
+                unreadable.append(index)
+                continue
+            frames.append(frame)
+        return tuple(frames), unreadable
+
     def _sync_originals(self, work: _GradeWork, day_dir: Path) -> None:
         """Force a fresh shot's originals and DNG onto the disk, first thing on the
         grade worker.
@@ -1310,6 +1373,9 @@ class CaptureSession:
                 paths.append(path)
         # The exposure the reference frame reports, beside what the burst asked for.
         metadata = burst.frames[burst.reference].metadata or {}
+        ordered = [burst.frames[burst.reference]] + [
+            frame for i, frame in enumerate(burst.frames) if i != burst.reference
+        ]
         stack = {
             "frames": [original.name] + [path.name for path in paths],
             "reference": original.name,
@@ -1318,6 +1384,13 @@ class CaptureSession:
             "requested_exposure_us": burst.info.get("exposure_us"),
             "requested_gain": burst.info.get("gain"),
             "split": bool(burst.info.get("split", False)),
+            # Each frame's own exposure, in ``frames`` order: folded into
+            # ``aligned`` by ``_stack_record``, not a record field itself.
+            "frame_exposures": [
+                [_metadata_number(f.metadata, "ExposureTime"),
+                 _metadata_number(f.metadata, "AnalogueGain")]
+                for f in ordered
+            ],
         }
         return paths, stack
 

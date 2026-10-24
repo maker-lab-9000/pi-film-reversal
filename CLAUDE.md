@@ -169,8 +169,10 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   the linear luma difference from the reference; the reference has weight 1), in bands of rows.
   A frame is dropped when ECC fails, its correlation is under `MIN_CORRELATION` (0.5), its shift
   is over 5% of the width or its roll over 2 degrees; none used returns the reference itself.
-  Returns the image and an info dict (`method`, per-frame `dx`/`dy`/`angle_deg`/`used`,
-  `align_ms`, `merge_ms`). Deterministic; another machine's OpenCV may differ in the last bits.
+  Returns the image and an info dict (`method`, per-frame `dx`/`dy`/`angle_deg`, `rho` (ECC's
+  correlation, null for the reference and where ECC raised), `used`, `reason` (null when used,
+  else one of `REASONS`: `ecc_failed`, `low_correlation`, `shift`, `angle`, and `unreadable`,
+  which only a caller sets, through `unused_entry`), `align_ms`, `merge_ms`). Deterministic; another machine's OpenCV may differ in the last bits.
   The sRGB/linear tables it shares with `double.py` live in `color.py`. Six 12 MP frames take
   about 1.8 s on the Mac (align 0.84 s, merge 0.90 s) and PI4_MERGE_TIMING_TBD on the Pi 4
   (`scripts/bench_stack.py`).
@@ -289,13 +291,16 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   others `HHMMSS_frame2.jpg` and on in capture order; all written on the capture side. The
   pending entry lists them reference first with `"stack": {"reference_index": i}`; the worker
   merges them (`stack.merge`, stage `merge`, outside `pipeline_ms`), frees the frames and grades
-  the merge; a recovered grade merges the JPEGs on disk. The quick grade is the reference alone.
+  the merge; a recovered grade merges the JPEGs on disk, leaving out (one log line, `reason`
+  `unreadable`) any frame after the reference it cannot read or that is not the reference's size;
+  only an unreadable reference fails it. The quick grade is the reference alone.
   No DNG for a stacked shot; a double exposure never takes a burst. Memory: about 1.5 GB peak
   with four 6-frame shots queued, on the 8 GB Pi 4. Picamera2 records gain `shutter_delay_s`
   (the delay waited; 0.0 for the Stick) right after the last `stream_info` field and, for a
   stack, `stack` after it: `frames` (names, reference first), `reference`, `exposure_us` and
   `gain` (the reference frame's metadata), `requested_exposure_us`, `requested_gain`, `split`,
-  `method`, `aligned` (per frame `dx`, `dy`, `angle_deg`, `used`), `align_ms`, `merge_ms`.
+  `method`, `aligned` (per frame `dx`, `dy`, `angle_deg`, `rho`, `used`, `reason`, then that
+  frame's own `exposure_us` and `gain`, null where its metadata has none), `align_ms`, `merge_ms`.
   A stack's `stage_ms` has `burst` in place of `capture`, plus `save_frames` and `merge`;
   `camera_metadata` is the reference frame's.
 - `settings.py`: the ten settings the LCD menu changes (DNG saving, halation, AE constraint, AE
