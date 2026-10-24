@@ -385,7 +385,7 @@ row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning
 `STAB` tag right after it while short exposure, shutter delay or multi-frame is on
 (`LiveState.stabilise_on`; IMG and STAB are padded 3 units a side, half the other tags, so IMG,
 STAB and the widest disk warning fit the tile), a `MENU`
-key in the bottom strip between the WB cell and the meter (`MENU_HIT_BOX` x 170 to 230, y 204
+key in the bottom strip between the WB cell and the meter (`MENU_HIT_BOX` x 173 to 230, a 3-unit dead band after the WB cell, y 204
 to the bottom; the cells' pitch is 54 and the meter's 13 dots run x 240 to 306 to make room;
 the place under `-` is empty) that opens the settings menu, and focus gauge, from cached
 anti-aliased tiles in the bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and
