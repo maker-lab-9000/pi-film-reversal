@@ -415,3 +415,23 @@ How to check: take multi-frame shots of a still scene in dim light (high gain) a
 of a plain wall, read `stack.aligned` and compare the merge's noise with a single
 frame at the same exposure. Changing either constant changes pixels, so a
 regrade of older records would differ.
+
+## A gain-capped split burst saves darker originals (on purpose)
+
+A split burst takes each of its `n` frames at `t / n` and gain `g * n`, capped at
+the sensor's maximum analogue gain (`Picamera2Camera._split`). When the cap
+bites (dim light, a high `g` already), the frames keep `t / n` and are darker
+than a single shot would be. This is chosen: the total light over the `n` frames
+is the same as one frame at `t`, so once normalisation lifts the level the
+merged noise is roughly what an uncapped burst would give. The cost is in the
+saved `*_original.jpg` frames, which are darker and use fewer of their 8-bit
+levels (more banding in deep shadows after the lift).
+
+The alternative is to lengthen each frame at the cap, `t_b = t * g / gain_max`,
+which keeps the frames' brightness but gives back part of the shorter exposure the
+split exists for. Revisit it if capped bursts show banding on the Pi.
+
+The split reads only `ExposureTime` and `AnalogueGain` from the frame metadata;
+`DigitalGain` (which libcamera applies when the analogue gain cannot reach the
+AE's target) is ignored, so a frame the AE was lifting digitally splits slightly
+darker than it was metered.

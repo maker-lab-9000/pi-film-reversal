@@ -85,7 +85,7 @@ raises the gain instead.
 A burst (``read_burst``, the frames of a multi-frame photograph) switches to
 the still configuration once and takes its frames back to back, rather than
 paying ``switch_mode_and_capture_request``'s two switches per frame. Splitting
-its exposure (``t / n`` at ``n`` times the gain, from the AE's latest values)
+its exposure (``t / n`` at ``n`` times the gain, from the AE's latest fresh values)
 writes manual exposure and gain into the still configuration only for the
 burst and puts back exactly what was there afterwards, failure included; the
 preview configuration and ``shutter_us``/``iso`` are never touched, so the live
@@ -170,6 +170,12 @@ ISO_RANGE = (100, 1600)
 _PREVIEW_TIMEOUT_S = 5.0
 _STILL_TIMEOUT_S = 30.0
 _TIMEOUT_SHUTTERS = 4
+# A burst splits its exposure from the latest preview frame's metadata only while
+# that frame is this recent (or two of its exposures, whichever is longer). The
+# viewfinder stops reading frames with the screen off, in its menu, on review and
+# notices, so a frame's AE values can be minutes old by the time a GPIO or Stick
+# shot is taken; older metadata is replaced by one frame's captured now.
+LIVE_METADATA_MAX_AGE_S = 1.0
 
 METADATA_KEYS = (
     "ExposureTime",
@@ -309,8 +315,10 @@ class Picamera2Camera:
         self._preview_config: Any | None = None
         self._tuning: Resolved | None = None
         # The metadata of the latest preview frame read, which a burst splits
-        # its exposure from (None until the live view has read one).
+        # its exposure from (None until the live view has read one), and when it
+        # was read (``time.monotonic``), so stale values are not used.
         self._live_metadata: dict | None = None
+        self._live_metadata_at: float | None = None
 
         try:
             from picamera2 import Picamera2
@@ -536,6 +544,7 @@ class Picamera2Camera:
             if not full and self._preview is not None:
                 # The latest live metadata, which a burst splits its exposure from.
                 self._live_metadata = frame.metadata
+                self._live_metadata_at = time.monotonic()
             return frame
 
     def read_burst(
@@ -560,10 +569,12 @@ class Picamera2Camera:
         ``split_exposure`` shares one exposure between the frames: when the
         shutter and the ISO are both auto (and auto-exposure is not locked), the
         exposure time ``t`` and analogue gain ``g`` the AE is using are taken
-        from the latest preview frame's metadata (with none, from one frame's
-        metadata captured from the camera as it runs, which without a preview
-        is the still mode; with none there either, nothing is split), and the
-        burst is taken at a fixed ``t / n`` and gain ``min(g * n, max_gain)``.
+        from the latest preview frame's metadata while it is fresh (read within
+        ``LIVE_METADATA_MAX_AGE_S`` or two of its exposures; with none, or an
+        older one, from one frame's metadata captured from the camera as it
+        runs, which without a preview is the still mode; with none there either,
+        nothing is split), and the burst is taken at a fixed ``t / n`` and gain
+        ``min(g * n, max_gain)``.
         Those controls go only into the still configuration, which the switch
         applies from the first frame; afterwards the still configuration gets
         back exactly the controls it had and the camera the ones it ran with
@@ -657,10 +668,30 @@ class Picamera2Camera:
     def _split(self, camera: Any, n: int, timeout: float) -> tuple[int, float] | None:
         """The fixed exposure time and gain of a split burst of ``n``, or None.
 
-        From the latest preview frame's metadata, else one frame's metadata
-        captured now; a camera that cannot say what its AE is using is not
-        split. Called with both locks held."""
+        From the latest preview frame's metadata while it is fresh, else one
+        frame's metadata captured now; a camera that cannot say what its AE is
+        using is not split. Called with both locks held.
+
+        Fresh means read within ``LIVE_METADATA_MAX_AGE_S`` or two of that
+        frame's exposures, whichever is longer. The viewfinder reads no frames
+        with the screen off, in its menu, on review or a notice, so a GPIO or
+        Stick shot taken then would otherwise split AE values minutes old,
+        several stops off. In preview mode the camera keeps streaming and the
+        AE keeps converging, so capturing the metadata costs at most one
+        preview frame.
+
+        The gain is capped at ``max_gain`` on purpose, keeping ``t / n``: the
+        total light over the ``n`` frames is the same as one frame at ``t``, so
+        the merged noise is roughly unchanged once normalisation lifts the
+        level. The cost is that the saved originals are darker than a single
+        shot's and use fewer of their 8-bit levels. The alternative, a longer
+        ``t_b = t * g / max_gain`` per frame at the cap, would keep each frame's
+        brightness but give back some of the shorter exposure the split is for.
+        ``DigitalGain`` is ignored: only ``ExposureTime`` and ``AnalogueGain``
+        are read (``docs/known-issues.md``)."""
         metadata = self._live_metadata
+        if not self._live_metadata_fresh():
+            metadata = None
         if _exposure_of(metadata) is None:
             try:
                 metadata = serialisable_metadata(camera.capture_metadata(wait=timeout))
@@ -685,6 +716,19 @@ class Picamera2Camera:
         if self.max_gain is not None:
             gain = min(gain, self.max_gain)
         return max(1, int(round(t / n))), gain
+
+    def _live_metadata_fresh(self) -> bool:
+        """Whether the latest preview frame's metadata is recent enough to split
+        a burst from: read within ``LIVE_METADATA_MAX_AGE_S`` or two of its
+        exposures, whichever is longer."""
+        at = self._live_metadata_at
+        if self._live_metadata is None or at is None:
+            return False
+        exposure = _exposure_of(self._live_metadata)
+        limit = LIVE_METADATA_MAX_AGE_S
+        if exposure is not None:
+            limit = max(limit, 2 * exposure[0] / 1_000_000)
+        return time.monotonic() - at <= limit
 
     def _end_burst(
         self, camera: Any, switched: bool, saved: dict[str, Any], timeout: float,

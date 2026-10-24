@@ -12,7 +12,7 @@ from pifilm.artifacts import Artifacts, write_artifact
 from pifilm.capture.app import CaptureSession
 from pifilm.capture.camera import CameraError, Frame
 from pifilm.capture.errors import CameraStalled
-from pifilm.capture.picamera import Picamera2Camera
+from pifilm.capture.picamera import LIVE_METADATA_MAX_AGE_S, Picamera2Camera
 from pifilm.capture.thumbnail import fitted_jpeg
 from pifilm.grain import GrainParams
 from pifilm.lut import LUT3D
@@ -3235,6 +3235,61 @@ def test_the_live_metadata_is_used_before_capturing_any(install_picamera):
     _record_burst(inst)
     _, info = camera.read_burst(2, split_exposure=True)
     assert info["exposure_us"] == 20_000 and inst.metadata_waits == []
+    camera.close()
+
+
+def test_stale_live_metadata_is_replaced_by_metadata_captured_now(install_picamera):
+    """The viewfinder reads no frames in its menu (or with the screen off, on
+    review, on a notice): a GPIO or Stick shot then must not split AE values
+    read minutes ago, so one frame's metadata is captured instead."""
+    camera, inst = _burst_camera(
+        install_picamera, analogue_gain=(1.0, 16.0, 1.0),
+        captured_metadata={"ExposureTime": 8_000, "AnalogueGain": 1.0},
+    )
+    # The last live frame before the viewfinder opened its menu, in the dark.
+    _live_frame(camera, inst, {"ExposureTime": 60_000, "AnalogueGain": 8.0})
+    # The menu stays open for a minute; then a burst is taken.
+    camera._live_metadata_at -= 60.0
+    _record_burst(inst)
+    _, info = camera.read_burst(2, split_exposure=True)
+    assert inst.metadata_waits == [pytest.approx(30.0)]
+    assert info == {"exposure_us": 4_000, "gain": 2.0, "split": True}
+    camera.close()
+
+
+def test_live_metadata_just_over_a_second_old_is_stale(install_picamera):
+    camera, inst = _burst_camera(
+        install_picamera, captured_metadata={"ExposureTime": 8_000, "AnalogueGain": 1.0},
+    )
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.0})
+    camera._live_metadata_at -= LIVE_METADATA_MAX_AGE_S + 0.1
+    _record_burst(inst)
+    _, info = camera.read_burst(2, split_exposure=True)
+    assert info["exposure_us"] == 4_000 and len(inst.metadata_waits) == 1
+    camera.close()
+
+
+def test_fresh_live_metadata_captures_none(install_picamera):
+    camera, inst = _burst_camera(
+        install_picamera, captured_metadata={"ExposureTime": 8_000, "AnalogueGain": 1.0},
+    )
+    _live_frame(camera, inst, {"ExposureTime": 40_000, "AnalogueGain": 1.0})
+    camera._live_metadata_at -= 0.5
+    _record_burst(inst)
+    _, info = camera.read_burst(2, split_exposure=True)
+    assert info["exposure_us"] == 20_000 and inst.metadata_waits == []
+    camera.close()
+
+
+def test_a_long_live_exposure_stays_fresh_for_two_of_its_frames(install_picamera):
+    camera, inst = _burst_camera(
+        install_picamera, captured_metadata={"ExposureTime": 8_000, "AnalogueGain": 1.0},
+    )
+    _live_frame(camera, inst, {"ExposureTime": 900_000, "AnalogueGain": 1.0})
+    camera._live_metadata_at -= 1.7
+    _record_burst(inst)
+    _, info = camera.read_burst(2, split_exposure=True)
+    assert info["exposure_us"] == 450_000 and inst.metadata_waits == []
     camera.close()
 
 

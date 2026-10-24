@@ -222,9 +222,12 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   not list the control. `read_burst(n, split_exposure=, dng=)` takes `n` stills as one still
   (both locks; one switch to the still configuration and back) and returns `(frames, info)`,
   `info` = `exposure_us`, `gain`, `split`. It splits the exposure only when SHUTTER and ISO are
-  both auto and AE is not locked: from the latest live metadata (else one `capture_metadata`),
+  both auto and AE is not locked: from the latest live metadata while it is fresh (read within
+  `LIVE_METADATA_MAX_AGE_S`, 1 s, or two of its exposures; the viewfinder reads none with the
+  screen off, in MENU, REVIEW or a notice), else one `capture_metadata`,
   each frame gets `t / n` and gain `min(g * n, max)`, written into the still configuration and
-  put back after the burst. A gain-capped burst is darker before normalisation; an exposure
+  put back after the burst. A gain-capped burst is darker before normalisation, on purpose
+  (same total light; `docs/known-issues.md`); `DigitalGain` is not read; an exposure
   below the sensor's minimum is clamped by the camera (the frames' metadata has the truth).
   `dng=False` saves no DNG for any frame. `FakeCamera`/`V4L2Camera.read_burst` are `n` reads,
   never split.
