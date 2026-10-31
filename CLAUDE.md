@@ -385,17 +385,26 @@ row and the shutter (`LiveState.disk_warning`, from the snapshot's `disk_warning
 `STAB` tag right after it while short exposure, shutter delay or multi-frame is on
 (`LiveState.stabilise_on`; IMG and STAB are padded 3 units a side, half the other tags, so IMG,
 STAB and the widest disk warning fit the tile), a `MENU`
-key under `-` that opens the settings menu, and focus gauge, from cached anti-aliased tiles in the
-bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and hit-tests its taps; `ui.py` now
-holds only the review, processing and message screens; `menu.py` draws the settings menu page
-(rows, `DONE` where the shutter is) and hit-tests it; a titled page (the second, IMAGE page:
-SHARPNESS, CONTRAST, SATURATION, its own RESET, BACK; opened by the first page's IMAGE row,
-dim on a camera that takes none of them) puts its title on the first line. The STABILISE page,
-opened by the `STABILISE >` row after IMAGE (page 1 then has eleven rows at most, ending at
-y 228), holds SHORT EXPOSURE (`ON`/`OFF`; dim under `--ae-lock` or when the camera lacks
-`AeExposureMode`), SHUTTER DELAY (`OFF`/`0.2 S`/`0.5 S`), MULTI-FRAME (`OFF`/`2`/`4`/`6`), its
-own RESET (these three only) and BACK; a tap steps a value and wraps. Both pages come from one
-table (`_PAGES` in `viewfinder.py`); STABILISE is dim on `--fake` (V4L2 has no menu). Both work in 320×240 base units at an
+key in the bottom strip between the WB cell and the meter (`MENU_HIT_BOX` x 173 to 230, a 3-unit dead band after the WB cell, y 204
+to the bottom; the cells' pitch is 54 and the meter's 13 dots run x 240 to 306 to make room;
+the place under `-` is empty) that opens the settings menu, and focus gauge, from cached
+anti-aliased tiles in the bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and
+hit-tests its taps; `ui.py` now holds only the review, processing and message screens;
+`menu.py` draws one settings menu page (rows, `DONE` where the shutter is; a titled page puts
+its amber title on the first line) and hit-tests it. The menu is a tree (`_CATEGORIES` and
+`_PAGES` in `viewfinder.py`, each page naming its parent): the untitled first page has
+CAMERA, PIPELINE, NETWORK (`>`), the read-only LOOK and RESET (all settings, two taps);
+CAMERA holds IMAGE (`>`), AE CONSTRAINT, AE METERING; PIPELINE holds SAVE DNG, HALATION,
+STABILISE (`>`); NETWORK holds the read-only ETH and WLAN and, with `--nextcloud-env`, UPLOAD.
+Every page below the first has a title and ends with BACK (up one level); DONE closes the
+menu from any page and it always opens on the first. A category is dim with `-` when none of
+its rows is active (CAMERA and PIPELINE under `--fake`; NETWORK always opens). The IMAGE page
+holds SHARPNESS, CONTRAST, SATURATION, its own RESET and BACK; the STABILISE page holds SHORT
+EXPOSURE (`ON`/`OFF`; dim under `--ae-lock` or when the camera lacks `AeExposureMode`),
+SHUTTER DELAY (`OFF`/`0.2 S`/`0.5 S`), MULTI-FRAME (`OFF`/`2`/`4`/`6`), its own RESET (these
+three only) and BACK; a tap steps a value and wraps. `scripts/render_menu_preview.py OUT_DIR
+[--scale 1|2]` renders the live view and every menu page to PNGs (and a contact sheet) with
+the real drawing code, no hardware. Both work in 320×240 base units at an
 integer `scale` (pure). `viewfinder.py`'s `ViewfinderLoop` is the LIVE/REVIEW/MENU state machine
 (it also lights `+`/`-`/shutter while a finger is on them) and takes the scale from the display's
 width. Under `run()` it reads preview frames on a `pifilm-frames` thread (touch is on `pifilm-touch`)

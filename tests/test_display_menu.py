@@ -171,8 +171,9 @@ def test_the_rows_stay_clear_of_dones_hit_circle():
 
 @pytest.mark.parametrize("scale", [1, 2])
 def test_the_fullest_page_fits_on_the_panel(scale):
-    """Every row the viewfinder can show (``ROWS`` is all of them): the last one
-    ends above the panel's foot, and every row is hit at its centre."""
+    """The page's capacity, eleven rows (more than any page of the viewfinder's
+    tree has): the last one ends above the panel's foot, and every row is hit at
+    its centre."""
     bottom = ROW_Y0 + len(ROWS) * ROW_HEIGHT
     assert len(ROWS) == 11 and bottom == 228 and bottom <= HEIGHT
     pixels = _pixels(scale=scale)
@@ -264,3 +265,46 @@ def test_the_stabilise_page_fits_and_stays_clear_of_done(scale, monkeypatch):
     for index in range(len(STABILISE_ROWS)):
         y = ROW_Y0 + (index + 1) * ROW_HEIGHT + ROW_HEIGHT // 2
         assert menu_hit(x * scale, y * scale, len(STABILISE_ROWS), scale, title=True) == index
+
+
+# -- the first page: an empty line before RESET ----------------------------------
+
+FIRST_ROWS = (
+    MenuRow("camera", "CAMERA", ">", True),
+    MenuRow("pipeline", "PIPELINE", ">", True),
+    MenuRow("network", "NETWORK", ">", True),
+    MenuRow("look", "LOOK", "imx477-v4", False),
+    MenuRow("reset", "RESET", "TAP TWICE", True),
+)
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_a_gap_is_an_empty_line_that_is_not_a_row(scale):
+    """The line before row ``gap`` hits nothing and the rows from ``gap`` on are
+    hit one line lower; nothing lies below the last."""
+    x = (ROW_X0 + ROW_X1) // 2
+    gap = 4
+
+    def at(line):
+        return menu_hit(x * scale, (ROW_Y0 + line * ROW_HEIGHT + ROW_HEIGHT // 2) * scale,
+                        len(FIRST_ROWS), scale, gap=gap)
+
+    assert [at(line) for line in range(7)] == [0, 1, 2, 3, None, 4, None]
+    # Every pixel row of the empty line, edges included, is nothing.
+    for y in range((ROW_Y0 + gap * ROW_HEIGHT) * scale, (ROW_Y0 + (gap + 1) * ROW_HEIGHT) * scale):
+        assert menu_hit(x * scale, y, len(FIRST_ROWS), scale, gap=gap) is None
+    cx, cy = SHUTTER_CENTRE
+    assert menu_hit(cx * scale, cy * scale, len(FIRST_ROWS), scale, gap=gap) == DONE
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_a_gap_is_drawn_empty_and_moves_the_rows_after_it_down(scale):
+    pixels = np.asarray(render_menu(FIRST_ROWS, scale=scale, gap=4)).astype(int)
+    gap_top, gap_bottom = ROW_Y0 + 4 * ROW_HEIGHT, ROW_Y0 + 5 * ROW_HEIGHT
+    # The empty line has nothing but the LOOK row's hairline on its top edge.
+    assert pixels[(gap_top + 1) * scale:gap_bottom * scale, :ROW_X1 * scale].max() == 0
+    reset = pixels[gap_bottom * scale:(gap_bottom + ROW_HEIGHT) * scale,
+                   ROW_X0 * scale:60 * scale]
+    assert reset.max() > 60  # RESET's label, one line lower
+    assert render_menu(FIRST_ROWS, scale=scale, gap=4) is not render_menu(
+        FIRST_ROWS, scale=scale)

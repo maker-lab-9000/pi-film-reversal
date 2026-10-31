@@ -44,6 +44,21 @@ def test_to_display_rotations():
     assert to_display(raw, 180) == TouchPoint(269, 10, 1)
 
 
+@pytest.mark.parametrize("rotate", [0, 180])
+@pytest.mark.parametrize("raw, edge", [
+    (RawPoint(240, 50, 1), {0: TouchPoint(50, 0, 1), 180: TouchPoint(269, 239, 1)}),
+    (RawPoint(4095, 4095, 1), {0: TouchPoint(319, 0, 1), 180: TouchPoint(0, 239, 1)}),
+    (RawPoint(-3, -7, 1), {0: TouchPoint(0, 239, 1), 180: TouchPoint(319, 0, 1)}),
+])
+def test_to_display_clamps_a_point_past_the_edge_to_the_frame(raw, edge, rotate):
+    """A raw point at or past the glass's edge lands on the 320x240 frame's edge:
+    never y 240 or more, which the strip's cells (any y below their top) would
+    take for a tap on them."""
+    point = to_display(raw, rotate)
+    assert point == edge[rotate]
+    assert 0 <= point.x < 320 and 0 <= point.y < 240
+
+
 class FakeI2C:
     def __init__(self, reports):
         self.reports = list(reports)  # each: (first9: bytes, extra: bytes)
