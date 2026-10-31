@@ -25,6 +25,20 @@ Without `--artifacts`, commands continue to use the untrained starter preset.
 
 ## Sample results
 
+### Latest LUT: Agfachrome
+
+Photos captured and graded on the Raspberry Pi with the HQ Camera (IMX477) and the latest look,
+`agfachrome-2026-10-d-dark`, a slide-film look after Agfachrome 50S
+([training report](docs/training-agfachrome-2026-10.md)). The first two have halation on, the
+third has it off:
+<p>
+  <img width="300" alt="Autumn path, Agfachrome look" src="docs/images/agfachrome-d-autumn-path.jpg" />
+  <img width="300" alt="Autumn trees, Agfachrome look" src="docs/images/agfachrome-d-autumn-trees.jpg" />
+  <img width="300" alt="Fallen logs and autumn leaves, Agfachrome look" src="docs/images/agfachrome-d-autumn-logs.jpg" />
+</p>
+
+### Earlier looks
+
 Photos captured and graded on the Raspberry Pi with the Camera Module 3 Wide (IMX708):
 <p>
   <img width="300" alt="Sample photo 2" src="https://github.com/user-attachments/assets/a626dde2-58c7-4406-ae52-45b3a5e5780a" />
