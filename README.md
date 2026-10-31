@@ -30,11 +30,12 @@ Without `--artifacts`, commands continue to use the untrained starter preset.
 Photos captured and graded on the Raspberry Pi with the HQ Camera (IMX477) and the latest look,
 `agfachrome-2026-10-d-dark`, a slide-film look after Agfachrome 50S
 ([training report](docs/training-agfachrome-2026-10.md)). The first two have halation on, the
-third has it off:
+last two have it off:
 <p>
   <img width="300" alt="Autumn path, Agfachrome look" src="docs/images/agfachrome-d-autumn-path.jpg" />
   <img width="300" alt="Autumn trees, Agfachrome look" src="docs/images/agfachrome-d-autumn-trees.jpg" />
   <img width="300" alt="Fallen logs and autumn leaves, Agfachrome look" src="docs/images/agfachrome-d-autumn-logs.jpg" />
+  <img width="300" alt="A walker passing a pond under autumn trees, Agfachrome look" src="docs/images/agfachrome-d-autumn-pond.jpg" />
 </p>
 
 ### Earlier looks
