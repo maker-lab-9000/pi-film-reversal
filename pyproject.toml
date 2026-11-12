@@ -37,8 +37,8 @@ pifilm = ["data/*.cube", "data/*.json", "data/fonts/*.ttf", "data/fonts/OFL.txt"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# tests import scripts/ and firmware/sticks3/scripts/ as namespace packages
-# from the repo root; without this only `python -m pytest` can collect them.
+# tests import scripts/ as a namespace package from the repo root;
+# without this only `python -m pytest` can collect them.
 pythonpath = ["."]
 addopts = "-ra"
 markers = ["slow: builds a wheel and installs it into a temporary venv"]

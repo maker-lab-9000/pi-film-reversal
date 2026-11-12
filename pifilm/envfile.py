@@ -1,9 +1,8 @@
 """Read the repository's ``.env`` as ``KEY=VALUE`` data, never evaluating a value.
 
-A copy of ``parse_env_file`` in ``firmware/sticks3/scripts/generate_config.py``,
-kept in step with it: that file runs as a PlatformIO pre-build script without
-the package installed, so it cannot import this one, and the package cannot
-import from ``firmware/`` once installed.
+The one parser for it: the Nextcloud sync, ``scripts/deploy_remote.py`` and
+``scripts/pi_hotspot.py`` all read the file through ``parse_env_file``. A value
+is data only; the file is never sourced, so nothing in it runs.
 """
 
 from __future__ import annotations
