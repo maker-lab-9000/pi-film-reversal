@@ -1,9 +1,10 @@
-"""Turn the Pi into the Stick's Wi-Fi access point, driven by the local .env.
+"""Turn the Pi into a field Wi-Fi access point, driven by the local .env.
 
-Run this ON THE PI. It reads the same ``.env`` the firmware build uses, so
-``WIFI_SSID`` / ``WIFI_PASSWORD`` become the hotspot credentials and the host
-part of ``PIFILM_REMOTE_URL`` becomes the hotspot address. One file, both sides,
-no chance of the Stick dialling an address the Pi does not own.
+Run this ON THE PI. Away from home a phone or laptop joins the Pi's own
+network and reaches it over SSH at the hotspot address. ``WIFI_SSID`` /
+``WIFI_PASSWORD`` in ``.env`` become the hotspot credentials and the optional
+``PI_HOTSPOT_ADDRESS`` (a plain IPv4 address, default ``10.42.0.1``) is the
+address the Pi owns on it, on a /24 it hands out by DHCP.
 
 The connection is written as a NetworkManager keyfile with mode 0600 rather
 than passed to ``nmcli`` on the command line, so the passphrase never appears
@@ -20,9 +21,9 @@ Raspberry Pi OS Trixie, NetworkManager 1.52, brcmfmac firmware 7.45.98.
 
 It also disables Wi-Fi power save (``powersave=2``). The brcmfmac driver
 otherwise enables power management on ``wlan0`` (observed when eth0's carrier
-drops), which makes the hotspot drop clients: the Stick associates and gets a
-lease, then re-associates every few minutes and its API calls stall. Measured
-on a Pi 4 running the migrated SD, 2026-09-19.
+drops), which makes the hotspot drop clients: a client associates and gets a
+lease, then re-associates every few minutes and its connections stall.
+Measured on a Pi 4 running the migrated SD, 2026-09-19.
 """
 
 from __future__ import annotations
@@ -36,13 +37,13 @@ import sys
 import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from firmware.sticks3.scripts.generate_config import parse_env_file
+from pifilm.envfile import parse_env_file
 
 CONNECTION_ID = "pifilm-ap"
 DEFAULT_KEYFILE = Path("/etc/NetworkManager/system-connections/pifilm-ap.nmconnection")
+DEFAULT_ADDRESS = "10.42.0.1"
 _UUID_NAMESPACE = uuid.UUID("6f1c2b3e-7a4d-4c1e-9b8a-2d5f0e7c1a90")
 _PSK_LINE = re.compile(r"^psk=.*$", re.MULTILINE)
 
@@ -69,15 +70,14 @@ def _psk(values: Mapping[str, str]) -> str:
 
 
 def _ap_address(values: Mapping[str, str]) -> str:
-    """The hotspot owns exactly the IPv4 address the firmware will call."""
-    url = _required(values, "PIFILM_REMOTE_URL")
-    host = urlsplit(url).hostname
+    """The IPv4 address the hotspot owns, as the /24 it serves."""
+    value = values.get("PI_HOTSPOT_ADDRESS") or DEFAULT_ADDRESS
     try:
-        address = ipaddress.IPv4Address(host or "")
+        address = ipaddress.IPv4Address(value)
     except ipaddress.AddressValueError as exc:
         raise ValueError(
-            f"PIFILM_REMOTE_URL must use a plain IPv4 host such as http://10.42.0.1:8765, "
-            f"got {url!r}"
+            f"PI_HOTSPOT_ADDRESS must be a plain IPv4 address such as {DEFAULT_ADDRESS}, "
+            f"got {value!r}"
         ) from exc
     return f"{address}/24"
 
@@ -103,9 +103,9 @@ def hotspot_keyfile(values: Mapping[str, str]) -> str:
         "band=bg\n"
         # powersave=2 disables NetworkManager Wi-Fi power save on the AP. The
         # brcmfmac driver otherwise enables power management on wlan0 (observed
-        # when eth0's carrier drops), which makes the hotspot drop clients: the
-        # Stick associates and gets a lease, then re-associates every few minutes
-        # and its API calls stall. Measured on a Pi 4 running the migrated SD,
+        # when eth0's carrier drops), which makes the hotspot drop clients: a
+        # client associates and gets a lease, then re-associates every few minutes
+        # and its connections stall. Measured on a Pi 4 running the migrated SD,
         # 2026-09-19; unplugging Ethernet made it obvious in the field.
         "powersave=2\n"
         "\n"
@@ -116,7 +116,7 @@ def hotspot_keyfile(values: Mapping[str, str]) -> str:
         # ("optional") makes hostapd install an AES-CMAC group key at start-up;
         # the Pi 3B / Zero W BCM43430 firmware has no MFP, the driver does not
         # advertise CMAC, and the kernel refuses the key, so the AP never comes
-        # up ("key setting validation failed"). The Stick does not use PMF.
+        # up ("key setting validation failed"). Clients connect without PMF.
         "pmf=1\n"
         f"psk={psk}\n"
         "\n"

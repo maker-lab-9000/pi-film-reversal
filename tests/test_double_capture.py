@@ -57,7 +57,7 @@ def test_exposure_one_saves_only_the_original_and_returns_the_card(tmp_path, pip
     assert result.original.exists()
     day = result.original.parent
     assert not list(day.glob("*_graded.jpg"))
-    # The card is served to the Stick but never lands in the synced photo folder.
+    # The card is the result's picture but never lands in the synced photo folder.
     assert result.pifilm.exists()
     assert session.out_root not in result.pifilm.parents
     (record,) = _records(session)

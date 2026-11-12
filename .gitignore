@@ -10,14 +10,10 @@ dist/
 .pytest_cache/
 .ruff_cache/
 
-# Local Pi deployment configuration and generated firmware secrets
+# Local Pi deployment configuration
 .env
 .env.*
 !.env.example
-/firmware/sticks3/.pio/
-/firmware/sticks3/build/
-/firmware/sticks3/include/generated_config.h
-/firmware/sticks3/generated_config.*
 
 # Data and generated output
 /data/

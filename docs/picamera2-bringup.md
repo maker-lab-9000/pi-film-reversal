@@ -89,8 +89,6 @@ check that requests are returned and the camera does not stall. Confirm:
 - The graded frame loads and shows the current artifact's look; this is not an
   IMX708-trained look yet.
 - Normal shutdown releases the camera so a second run can acquire it.
-- When the usual authenticated remote service is tested, the Stick receives
-  its existing thumbnail. Do not expose an unauthenticated test listener.
 
 Phase 1 originally produced `_ungraded.jpg`, not an original JPEG/DNG pair,
 before autofocus control, per-shot exposure/AWB metadata and retained request

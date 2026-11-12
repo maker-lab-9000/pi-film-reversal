@@ -25,8 +25,8 @@ installed timer unit works unchanged, and the `.env` parser it uses is
   Only the first interface with an address is checked; the connect follows
   the routing table either way. `--iface` overrides the list and can be
   repeated (`--iface wlan0 --iface eth0`); one given replaces the default.
-- **Hotspot mode skips on its own.** When the Pi runs its own hotspot for the
-  Stick, `wlan0` holds `10.42.0.1`, which passes the address check, but
+- **Hotspot mode skips on its own.** When the Pi runs its own field hotspot
+  (`scripts/pi_hotspot.py`), `wlan0` holds `10.42.0.1`, which passes the address check, but
   Nextcloud is not reachable from the hotspot, so the run logs the
   "not reachable" line and exits 0. No special case is needed.
 - **It can upload while you shoot.** On Wi-Fi the Pi may be shooting while a
@@ -141,9 +141,8 @@ timer's service reads:
 ```
 
 The capture service never opens that file. It only hands the path to a child,
-`python -m pifilm.nextcloud --apply --env PATH`, run without
-`PIFILM_REMOTE_TOKEN` in its environment, so the Nextcloud password lives only in
-the child and no hang or stall in the network can hold up a capture. Each line the
+`python -m pifilm.nextcloud --apply --env PATH`, so the Nextcloud password lives
+only in the child and no hang or stall in the network can hold up a capture. Each line the
 child prints is in the capture service's journal as `nextcloud: <line>`, and the
 row reads `UPLOADING 0:42` while it runs, then `DONE 14:05`, `SKIPPED: NO NETWORK`,
 `SKIPPED: NO NEXTCLOUD` (the hotspot), `SKIPPED: BUSY` (the lock above: the

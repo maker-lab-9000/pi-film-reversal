@@ -7,13 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A colour-grading pipeline that learns film and photographic looks from reference photographs
 (the first being Martin Parr's saturated colour-negative look) with two runtimes:
 a Mac side that trains 3D LUTs from reference photographs, and a Raspberry Pi side that captures
-from a USB camera, grades, and saves. An M5Stack StickS3 acts as a wireless shutter button and
-last-capture display, talking to the Pi over a token-authenticated HTTP API.
+from a camera, grades, and saves. Its triggers are the LCD viewfinder's on-screen shutter, a GPIO
+push button and the SPACE key; there is no network capture API.
 
 Forked from the user's `kodachrome-film` project (see `ORIGIN.md`). Package is `pifilm`, distribution is
 `pi-film-reversal`, commands are `pifilm-*`. `docs/setup.md` is the ordered install guide (Mac, `.env`,
-Pi network, Pi service, Stick, optional training) and says which machine each step runs on and why;
-`docs/sticks3-remote.md` holds the network and service detail; `firmware/sticks3/README.md` the Stick;
+Pi network, Pi service, optional training) and says which machine each step runs on and why;
+`docs/pi-service.md` holds the network (Ethernet, field hotspot) and service detail;
 `docs/training.md` is the step-by-step training procedure and explains every report gate;
 `docs/x728-ups.md` covers the Geekworm X728 UPS shield (pins, I2C, services, shutdown policy, RTC);
 `docs/how-it-works.md` explains the colour model (capture pipeline, training steps, libraries, dependency-by-role table);
@@ -35,9 +35,9 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -e '.[train,dev]'     # add ,deploy for scripts/deploy_remote.py
 
-# Tests. pyproject sets pytest `pythonpath = ["."]` because tests import `scripts/` and
-# `firmware/sticks3/scripts/` as namespace packages from the repo root.
-.venv/bin/pytest -q -m 'not slow'                     # ~180s, ~2650 tests
+# Tests. pyproject sets pytest `pythonpath = ["."]` because tests import `scripts/` as a
+# namespace package from the repo root.
+.venv/bin/pytest -q -m 'not slow'                     # ~220s, ~2730 tests
 .venv/bin/pytest -q tests/test_lut.py                 # one file
 .venv/bin/pytest -q tests/test_lut.py -k identity     # one test by name
 .venv/bin/pytest -q -m slow                           # builds a wheel, installs into a temp venv, runs pifilm-process
@@ -61,17 +61,12 @@ python3.12 -m venv .venv
 # Experiments have no console scripts; run as modules from the repo root
 .venv/bin/python -m pifilm.experiments.{regression,candidates,train,evaluate} ...
 
-# StickS3 firmware (PlatformIO; reads repo-root .env via pre-build script)
-pio run -d firmware/sticks3                # build
-pio run -d firmware/sticks3 -t upload      # flash
-pio test -d firmware/sticks3 -e native     # host-side Unity tests of the state machine only
-python3 firmware/sticks3/scripts/generate_config.py --env .env   # validate .env w/o printing secrets
-
 # Pi deployment (needs [deploy] extra, .env, and the Pi host key already in known_hosts)
 .venv/bin/python scripts/deploy_remote.py --env .env             # inspect only
 .venv/bin/python scripts/deploy_remote.py --env .env --restart   # guarded systemd restart
 
-# Pi hotspot (run ON the Pi, over Ethernet; dry run prints the redacted keyfile)
+# Pi field hotspot for SSH from a phone or laptop (run ON the Pi, over Ethernet;
+# dry run prints the redacted keyfile)
 .venv/bin/python scripts/pi_hotspot.py --env .env
 sudo .venv/bin/python scripts/pi_hotspot.py --env .env --apply
 
@@ -188,8 +183,8 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   OpenCV is deliberately not a base dependency (Pi uses apt `python3-opencv` for GTK).
 - `nextcloud.py`: the Pi→Nextcloud sync (`python -m pifilm.nextcloud`; `scripts/nextcloud_sync.py`
   is a wrapper the timer unit still runs), one at a time under a `flock` on
-  `nextcloud-sync.lock` in the state directory. `envfile.py` is its `.env` parser
-  (`firmware/sticks3/scripts/generate_config.py` keeps its own copy, as it runs without the package).
+  `nextcloud-sync.lock` in the state directory. `envfile.py` is the one `.env` parser (the sync,
+  `scripts/deploy_remote.py` and `scripts/pi_hotspot.py` all use it).
 
 ### Capture (`pifilm/capture/`)
 
@@ -244,7 +239,7 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   it (the menu's HALATION row, read at the shutter and kept in the pending entry; a double takes
   it from its second shutter); `params_version` is the build's `PARAMS_VERSION`, 5, whatever the look's). `--grade background` (the default) splits a shot into two sides: the
   capture side saves the original, writes a pending entry, makes a quick grade (reduced by a whole
-  factor to about 1,000 px on the long side, no grain; what the review screen and the Stick show) and frees the camera;
+  factor to about 1,000 px on the long side, no grain; what the review screen shows) and frees the camera;
   the grade side (`_run_grade`, on the queue's worker) grades at full size, saves the graded
   file, appends the record and removes the entry, in that order. Such a record gains
   `shutter_to_ready_ms`, `grade: "background"`, stages `preview` and `queued`, and
@@ -297,7 +292,7 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   No DNG for a stacked shot; a double exposure never takes a burst. Memory: one 6-frame merge
   peaks at about 640 MB; about 1.5 GB estimated with four 6-frame shots queued, on the 4 GB Pi 4.
   Writing the frames holds the camera about 0.47 s per frame (a 6-frame shot about 4 s). Picamera2 records gain `shutter_delay_s`
-  (the delay waited; 0.0 for the Stick) right after the last `stream_info` field and, for a
+  (the delay waited; 0.0 for the keyboard) right after the last `stream_info` field and, for a
   stack, `stack` after it: `frames` (names, reference first), `reference`, `exposure_us` and
   `gain` (the reference frame's metadata), `requested_exposure_us`, `requested_gain`, `split`,
   `method`, `aligned` (per frame `dx`, `dy`, `angle_deg`, `rho`, `used`, `reason`, then that
@@ -315,11 +310,12 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   three, `reset_stabilise` only the STABILISE three). Looks were trained at 1.0, so a value away from it grades a picture the look never
   saw. `upload.py`: `Upload`, the menu's
   UPLOAD row, runs `python -m pifilm.nextcloud` as a child (`--nextcloud-env PATH`, never read
-  by the service; the token stripped from its environment) and reads its last line for the status.
+  by the service; the child gets the service's environment) and reads its last line for the status.
 - Double exposure: `CaptureSession` owns the mode and pending first frame; `pifilm/double.py`
   adds the two ungraded frames in linear light (one stop down each), and the composite is
-  graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card in a temp dir
-  (never under the synced output folder); toggled via `CaptureController.set_double_exposure`.
+  graded once. Exposure 1's `CaptureResult.pifilm` is an "Exposure 1/2" card
+  (`display/ui.py`'s `render_exposure_card`, shown by the captures window; the LCD draws its own
+  notice) in a temp dir (never under the synced output folder); toggled via `CaptureController.set_double_exposure`.
 - `gradequeue.py`: `GradeQueue`, one `pifilm-grade` worker with three waiting places (a full
   queue makes the next capture wait), and the pending entries: atomically written JSON files
   that let the next start finish a grade a power cut interrupted. A failed grade is logged by its entry's name; an entry that fails twice is
@@ -328,11 +324,11 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   `on_stop` run on the worker thread before the first job and after the last (the GPU grader is
   opened and closed there); one that raises is logged. No camera, pipeline or display in it.
 - `controller.py`: `CaptureController` serializes captures on one worker thread, one active job at
-  a time, idempotent by `request_id`. Shared by the local SPACE key, the LCD, the GPIO shutter
-  button and the remote API. `ControllerSnapshot.pending_grades` is read live from the session
+  a time, idempotent by `request_id`. Shared by the local SPACE key, the LCD and the GPIO shutter
+  button. `ControllerSnapshot.pending_grades` is read live from the session
   (it includes a recovery backlog), and closing finishes this run's grades before the camera closes.
   `submit(request_id, delay_s=)` is the shutter delay (the menu's SHUTTER DELAY, asked for by the
-  LCD shutter and the GPIO button only; never the Stick or the keyboard): the job stays `queued`
+  LCD shutter and the GPIO button only; never the keyboard): the job stays `queued`
   with `ControllerSnapshot.delaying` True while the worker waits, so the live view keeps running
   and a second press is `busy`; it then passes the delay to `session.capture(delay_s=)` for the
   record. Closing during the wait fails the job `closed` without capturing.
@@ -340,12 +336,10 @@ restored (byte-identical to no GPU), `used["backend"]` is `"gpu-2"` or `"cpu"`, 
   ground on physical pin 39). gpiozero `Button` with the internal pull-up, lazy import; a press
   calls `CaptureController.submit` like an LCD tap (with the menu's shutter delay, read at each
   press), so a press during a capture is dropped as `busy`. Pins of the X728 and of the 2.8" LCD are refused when that hardware is selected; a pin
-  that cannot be claimed is one warning line, not a failure to start.
-- `remote.py`: `RemoteCaptureServer`, a stdlib `http.server` with bearer-token auth
-  (`PIFILM_REMOTE_TOKEN`). Endpoints: `GET /v1/status`, `POST /v1/captures` (`{"request_id": uuid}`,
-  409 when busy), `GET /v1/captures/{id}`, `GET /v1/captures/{id}/image.jpg`. Only jobs submitted
-  through this server instance are visible; `instance_id` changes on restart.
-- `thumbnail.py`: 240×135 letterboxed JPEG, ≤64 KiB, served to the Stick.
+  that cannot be claimed is one warning line, not a failure to start. A button selects the
+  shared-controller loops; with no screen and no terminal `main` waits for presses
+  (`_wait_for_button`). A viewfinder whose display fails repeatedly exits 1 for a systemd
+  restart, which brings the button back.
 - `batch.py`: `pifilm-process`. Skips `*_graded.*`, defaults to only `_original`/`_ungraded` files in a
   capture folder, refuses an output dir equal to or inside the input. When the folder has a
   `captures.jsonl`, each frame is graded with its logged `ev_comp` and `grain_seed`, so the same
@@ -389,7 +383,8 @@ key in the bottom strip between the WB cell and the meter (`MENU_HIT_BOX` x 173 
 to the bottom; the cells' pitch is 54 and the meter's 13 dots run x 240 to 306 to make room;
 the place under `-` is empty) that opens the settings menu, and focus gauge, from cached
 anti-aliased tiles in the bundled Barlow Condensed font (`pifilm/data/fonts/`, OFL), and
-hit-tests its taps; `ui.py` now holds only the review, processing and message screens;
+hit-tests its taps; `ui.py` now holds only the review, processing and message screens (and the double exposure's
+"Exposure 1/2" card);
 `menu.py` draws one settings menu page (rows, `DONE` where the shutter is; a titled page puts
 its amber title on the first line) and hit-tests it. The menu is a tree (`_CATEGORIES` and
 `_PAGES` in `viewfinder.py`, each page naming its parent): the untitled first page has
@@ -420,7 +415,7 @@ reports, the picture's R/G and B/G). The DSI panel has no brightness control, so
 skips the idle dim step and only turns off. All hardware imports (`pykms`, `spidev`, `gpiozero`,
 `smbus2`) are lazy, inside the `open_*` factories, so the package imports on a Mac and in tests.
 `fake.py` (`--display fake`) writes frames to a PNG instead. The loop shares the
-`CaptureController` with the Stick's remote server, so an LCD tap and a Stick request are the
+`CaptureController` with the GPIO button, so an LCD tap and a button press are the
 same kind of job.
 
 ### Trainer (`pifilm/train/`, Mac only; needs `[train]` extra: SciPy, requests)
@@ -446,48 +441,34 @@ snapshots of ungraded/graded triplets; `candidates.py` bakes starter-derived con
 deployable LUTs; `train.py`/`evaluate.py` run pilots and paired comparisons. Results are written up
 in `docs/experiments/`. `scripts/prepare_refinement.py` is a dated curation recipe for one run.
 
-### StickS3 firmware (`firmware/sticks3/`, PlatformIO, ESP32-S3, M5Unified)
-
-`capture_client.{h,cpp}` is a pure state machine (Connecting → Ready → Requesting → Processing →
-Downloading → Photo/Error) with no Arduino/Wi-Fi/display dependency so it can run under the `native`
-Unity test env; `display_power.{h,cpp}` is the second such pure module, the BtnB screen-off/on toggle
-(a debounced click toggles; `StickDisplay::setPower` sleeps the panel and forces a repaint on wake,
-and captures continue while the screen is dark). `main.cpp` runs networking in a FreeRTOS task and the UI loop on the main task;
-`display.cpp` draws colour bars, status, and the decoded JPEG. Config enters only as four
-`STICKS3_*` compile defines appended by `scripts/generate_config.py` from `.env`; empty defaults on a
-clean clone leave the device unable to join a network. Build outputs contain credentials.
-Every capture step is logged on the serial port (`STICK_LOG` in `main.cpp`, `[display]` lines in
-`display.cpp`), including the return value of each `drawJpg`; `clientStateName()` names states for
-the log and is unit-tested. `firmware/sticks3/README.md` has an annotated healthy log.
-
 ### Deployment (`scripts/deploy_remote.py`, `deploy/pifilm-capture.service.example`)
 
-Topology: the Pi runs its own WPA2 hotspot (`scripts/pi_hotspot.py`, a NetworkManager keyfile
-generated from `.env`) and the Stick joins it directly; SSH and photo transfer go over Ethernet
-(`parr.local` via avahi). `WIFI_SSID`/`WIFI_PASSWORD` in `.env` are therefore the hotspot's
-credentials, `PIFILM_REMOTE_URL`'s host is the hotspot address, `PI_HOST` is the SSH address, and
-`PIFILM_LISTEN` (default `0.0.0.0:8765`) is where `pifilm-capture` binds.
+Topology: at home SSH and photo transfer go over Ethernet (`parr.local` via avahi). In the field the
+Pi runs its own WPA2 hotspot (`scripts/pi_hotspot.py`, a NetworkManager keyfile generated from
+`.env`) and a phone or laptop joins it to SSH in. `WIFI_SSID`/`WIFI_PASSWORD` in `.env` are the
+hotspot's credentials, `PI_HOTSPOT_ADDRESS` (optional, a plain IPv4 address, default `10.42.0.1`,
+served as a /24) is its address, and `PI_HOST` is the SSH address.
 
 Facts verified on the real Pi (2026-09-08): Raspberry Pi OS Trixie, NetworkManager 1.52 with
 netplan-generated profiles (`netplan-eth0`, `netplan-wlan0-<SSID>`; `nmcli` changes persist as
 `/etc/netplan/90-NM-*.yaml`). The Pi 3B radio (BCM43430) has no management-frame protection, so the
-hotspot keyfile must set `pmf=1` or the AP never starts. The deployed look is the bundled starter
+hotspot keyfile must set `pmf=1` or the AP never starts; it also sets `powersave=2`, without which
+brcmfmac's power save made clients drop. The deployed look is the bundled starter
 (`--artifacts .../pifilm/data`); the example unit and `.env.example` match that. The user account has
 no passwordless sudo, so `deploy_remote.py --restart` needs the narrow sudoers rule from the guide.
 
 `deploy_remote.py` uses Paramiko with system known_hosts and `RejectPolicy`; it inspects the Pi
 (project dir, artifact, running `pifilm-capture`, `/dev/video*` owners, desktop sessions) and refuses
 to restart when a foreign process owns the camera. The systemd unit runs the LCD viewfinder when a
-panel is present and falls back to headless Stick-only otherwise (a missing panel, or a V4L2
-backend, is one warning line, not a failure to start); it reads `PIFILM_REMOTE_TOKEN` from
-`/etc/pifilm-capture.env`. Two-screen mode (`--show-captures`) must
-be launched from the Pi's desktop session, not over SSH. Full guide: `docs/sticks3-remote.md`.
+panel is present and falls back to headless with the GPIO button otherwise (a missing panel, or a
+V4L2 backend, is one warning line, not a failure to start). Two-screen mode (`--show-captures`)
+must be launched from the Pi's desktop session, not over SSH. Full guide: `docs/pi-service.md`.
 
 ## Conventions and constraints
 
-- `.env` holds Pi/Wi-Fi/token secrets and is gitignored. `.env.example` documents keys. Scripts parse
-  it as `KEY=VALUE` data only; never source it or echo values. Never put the token, Wi-Fi password,
-  or SSH password into a command line, source file, service unit, or commit.
+- `.env` holds Pi/Wi-Fi/Nextcloud secrets and is gitignored. `.env.example` documents keys. Scripts
+  parse it as `KEY=VALUE` data only; never source it or echo values. Never put the Wi-Fi password,
+  the SSH password or the Nextcloud password into a command line, source file, service unit, or commit.
 - `params.json` `version` follows the grain model (`GRAIN_MODEL_VERSIONS`): 2 for Gaussian,
   3 for `two_scale`, 4 for `two_scale_tile`, so an older build refuses grain it would misread;
   5 when halation is on (`HALATION_VERSION`), so an older build refuses a look it would grade

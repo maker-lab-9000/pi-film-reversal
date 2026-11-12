@@ -16,24 +16,22 @@ REQUIRED_ENV = {
     "PI_USER": "george",
     "PI_PROJECT_DIR": "/home/george/repos/pi-film-reversal",
     "PI_SSH_PASSWORD": "ssh-secret",
-    "PIFILM_REMOTE_TOKEN": "remote-secret",
     "PI_ARTIFACT_DIR": "/home/george/repos/pi-film-reversal/artifacts/personal-v1",
 }
 
 
-def test_listen_address_defaults_to_all_interfaces_when_env_omits_it():
-    # The SSH host (Ethernet, mDNS name) and the API bind address (hotspot)
-    # are different things in the direct-hotspot topology, so the listen
-    # address must not be derived from PI_HOST.
+def test_config_reads_the_ssh_and_artifact_keys():
     config = deployment_config(REQUIRED_ENV)
 
-    assert config.listen == "0.0.0.0:8765"
+    assert config.host == "parr.local"
+    assert config.artifact_dir == REQUIRED_ENV["PI_ARTIFACT_DIR"]
 
 
-def test_listen_address_is_read_from_env_when_present():
-    config = deployment_config({**REQUIRED_ENV, "PIFILM_LISTEN": "10.42.0.1:8765"})
+def test_config_refuses_an_env_without_a_required_key():
+    env = {k: v for k, v in REQUIRED_ENV.items() if k != "PI_ARTIFACT_DIR"}
 
-    assert config.listen == "10.42.0.1:8765"
+    with pytest.raises(ValueError, match="PI_ARTIFACT_DIR"):
+        deployment_config(env)
 
 
 class FakeClient:
@@ -83,26 +81,23 @@ class RestartClient:
         return None, FakeStream(output=self.replies.get(command, "")), FakeStream()
 
 
-def test_capture_command_uses_verified_artifact_directory_and_never_includes_token():
+def test_capture_command_uses_verified_artifact_directory_and_never_includes_a_secret():
     config = DeploymentConfig(
         host="parr.local",
         user="george",
         project_dir="/home/george/repos/pi-film-reversal",
         ssh_password="ssh-secret",
         artifact_dir="/home/george/pifilm artifacts/personal-v1",
-        remote_token="remote-secret",
-        listen="0.0.0.0:8765",
     )
 
     command = build_capture_command(config, show_captures=True)
 
     assert command == (
         "/home/george/repos/pi-film-reversal/.venv/bin/pifilm-capture --no-preview "
-        "--show-captures --remote-listen 0.0.0.0:8765 --artifacts "
+        "--show-captures --artifacts "
         "'/home/george/pifilm artifacts/personal-v1'"
     )
     assert "parr.local" not in command
-    assert "remote-secret" not in command
     assert "ssh-secret" not in command
 
 
@@ -113,8 +108,6 @@ def test_open_ssh_client_rejects_unknown_host_keys_before_password_connection():
         project_dir="/home/george/repos/pi-film-reversal",
         ssh_password="ssh-secret",
         artifact_dir="/home/george/artifacts/personal-v1",
-        remote_token="remote-secret",
-        listen="0.0.0.0:8765",
     )
 
     client = open_ssh_client(config, paramiko_module=FakeParamiko)

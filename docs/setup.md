@@ -1,30 +1,27 @@
-# Setup from zero: Mac, Raspberry Pi, StickS3
+# Setup from zero: Mac and Raspberry Pi
 
 This is the ordered install guide. Each section depends on the one before it,
 so do them in order. Training is optional and comes last: the camera works
 with the bundled starter look without any training data.
 
-Verified 2026-09-08 on: macOS with Python 3.12 and PlatformIO 6.1; Raspberry
-Pi 3B on Raspberry Pi OS Trixie (Debian 13, NetworkManager 1.52 with netplan);
-M5StickS3 with M5Unified.
+Verified 2026-09-08 on: macOS with Python 3.12; Raspberry Pi 3B on Raspberry
+Pi OS Trixie (Debian 13, NetworkManager 1.52 with netplan).
 
 ## 0. What runs where, and why
 
 | Machine | Runs | Why here |
 |---|---|---|
-| Mac | Development, tests, training, firmware build and flash, remote administration of the Pi | Training needs SciPy and a fast CPU. The PlatformIO toolchain lives here. There is one `.env` file, and it lives here. |
-| Raspberry Pi 3B | `pifilm-capture` as a systemd service: camera, grading, storage, the HTTP API, and its own Wi-Fi hotspot | The camera is plugged into it. It must boot unattended on battery. Its OpenCV comes from apt because the pip wheel has no GUI support for two-screen mode. |
-| M5StickS3 | Firmware: shutter button, status screen, last-photo thumbnail, battery badge | No compute of its own. It only talks to the Pi over the Pi's hotspot. Its Wi-Fi and token are baked in at build time. |
+| Mac | Development, tests, training, remote administration of the Pi | Training needs SciPy and a fast CPU. There is one `.env` file, and it lives here. |
+| Raspberry Pi 3B | `pifilm-capture` as a systemd service: camera, grading, storage, the LCD viewfinder and the GPIO shutter button, and its own Wi-Fi hotspot | The camera is plugged into it. It must boot unattended on battery. Its OpenCV comes from apt because the pip wheel has no GUI support for two-screen mode. |
 
-In the field there is no home network. The Pi is the access point, the Stick is
-its only client, and the Pi's Ethernet port is how you administer it and pull
-photos. The README's "From button press to displayed photo" section describes
-what happens at capture time; this guide is about getting there.
+At home the Pi's Ethernet port is how you administer it and pull photos. In the
+field there is no home network: the Pi is its own access point, and a phone or
+laptop joins it to SSH in. The README describes what happens at capture time;
+this guide is about getting there.
 
 ## 1. Mac workstation
 
-Everything else is driven from here, including the Pi's install over Ethernet
-and the Stick's flash over USB.
+Everything else is driven from here, including the Pi's install over Ethernet.
 
 ```bash
 git clone <repo-url> pi-film-reversal
@@ -32,7 +29,6 @@ cd pi-film-reversal
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -e '.[train,dev,deploy]'
-brew install platformio          # or: pip install platformio
 ```
 
 The extras: `train` adds SciPy and requests for `pifilm-train`, `dev` adds
@@ -41,11 +37,10 @@ pytest, ruff and build, `deploy` adds Paramiko for `scripts/deploy_remote.py`.
 Verify before going on:
 
 ```bash
-.venv/bin/pytest -q -m 'not slow'          # Python suite, about 40 s
-pio test -d firmware/sticks3 -e native      # firmware state machine, host-side
+.venv/bin/pytest -q -m 'not slow'          # Python suite, about 4 minutes
 ```
 
-## 2. The `.env` file: one file, three consumers
+## 2. The `.env` file: one file, every consumer
 
 Copy the example and fill it in. It is gitignored; never paste a value from it
 into a command, a source file, a service unit, or a commit.
@@ -53,22 +48,19 @@ into a command, a source file, a service unit, or a commit.
 ```bash
 cp .env.example .env
 chmod 600 .env
-python3 -c 'import secrets; print(secrets.token_urlsafe(32))'   # a token value
 ```
 
 | Key | Read by | Must match |
 |---|---|---|
 | `PI_HOST`, `PI_USER`, `PI_PROJECT_DIR`, `PI_SSH_PASSWORD` | `scripts/deploy_remote.py` on the Mac | The Pi's hostname (`parr.local` over Ethernet), account, and checkout path |
-| `WIFI_SSID`, `WIFI_PASSWORD` | `scripts/pi_hotspot.py` on the Pi (creates the hotspot) and the firmware build (joins it) | Each other, by construction. WPA2 needs 8 to 63 printable ASCII characters. |
-| `PIFILM_REMOTE_URL` | Firmware build (the address the Stick calls) and `pi_hotspot.py` (the hotspot's own address) | A plain IPv4 host, `http://10.42.0.1:8765` |
-| `PIFILM_LISTEN` | `deploy_remote.py`; mirrors the unit's `--remote-listen` | `0.0.0.0:8765` |
-| `PIFILM_REMOTE_TOKEN` | Firmware build, and the Pi's `/etc/pifilm-capture.env` | Identical on both sides, or every request gets 401 |
+| `WIFI_SSID`, `WIFI_PASSWORD` | `scripts/pi_hotspot.py` on the Pi (creates the hotspot) | What you type on the phone or laptop that joins it. WPA2 needs 8 to 63 printable ASCII characters. |
+| `PI_HOTSPOT_ADDRESS` (optional) | `pi_hotspot.py` (the hotspot's own address, as a /24) | A plain IPv4 address; `10.42.0.1` when left out |
 | `PI_ARTIFACT_DIR` | `deploy_remote.py` inspection; mirrors the unit's `--artifacts` | A directory on the Pi holding `params.json` and `pifilm.cube` |
+| `NEXTCLOUD_*` (optional) | The Nextcloud sync on the Pi | See [docs/nextcloud-sync.md](nextcloud-sync.md) |
 
-Why one file: the hotspot the Pi creates, the network the Stick joins, the
-address the Stick calls, and the address the Pi owns must all agree. They do
-because they come from one place. Change `.env`, and you re-run the hotspot
-script on the Pi and rebuild the Stick.
+Why one file: every script reads the same values, so there is one place to
+change them. Change a hotspot key in `.env`, and you re-run the hotspot script
+on the Pi.
 
 ## 3. Raspberry Pi: OS and network
 
@@ -139,13 +131,15 @@ first, run it with `python3` instead of `.venv/bin/python`; it has no third-part
 dependencies.)
 
 The script writes a root-only NetworkManager keyfile: access point on `wlan0`,
-WPA2, DHCP for clients on `10.42.0.0/24`, autoconnect at boot. It also disables
-Protected Management Frames, without which the Pi 3B's radio cannot start an
-access point at all. Details, the netplan notes and the recovery commands are in
-[the network and deployment guide](sticks3-remote.md).
+WPA2, DHCP for clients on `10.42.0.0/24` (or the /24 around
+`PI_HOTSPOT_ADDRESS`), autoconnect at boot. It also disables Protected
+Management Frames, without which the Pi 3B's radio cannot start an access point
+at all, and Wi-Fi power save, which made clients drop. Details, the netplan
+notes and the recovery commands are in
+[the network and service guide](pi-service.md).
 
 Why the Pi is the access point: the camera must work with no infrastructure,
-and the Stick is 2.4 GHz only, which the Pi 3B radio provides.
+and you still want to reach it over SSH away from home.
 
 ## 4. Raspberry Pi: application and service
 
@@ -203,20 +197,7 @@ Whichever you choose, use the same absolute path for `PI_ARTIFACT_DIR` in
 `captures.jsonl` carries the `lut_sha1` of the look that graded it, so you can
 always check which one was in use.
 
-### 4.3 The token file
-
-The service must not have the token on its command line, so it reads it from a
-root-only environment file. The key must be spelled exactly, with no `export`,
-quotes or Windows line endings; a misspelling puts the service in a restart
-loop with `error: --remote-listen requires PIFILM_REMOTE_TOKEN`.
-
-```sh
-sudo install -m 600 /dev/null /etc/pifilm-capture.env
-sudoedit /etc/pifilm-capture.env          # one line: PIFILM_REMOTE_TOKEN=<same value as .env>
-sudo sed -E 's/=.*/=<redacted>/' /etc/pifilm-capture.env | cat -A   # check the shape
-```
-
-### 4.4 Install and start the service
+### 4.3 Install and start the service
 
 Open `deploy/pifilm-capture.service.example` and check `User`,
 `WorkingDirectory`, the venv path and `--artifacts` match your Pi. Then:
@@ -226,19 +207,18 @@ sudo install -m 644 deploy/pifilm-capture.service.example /etc/systemd/system/pi
 sudo systemctl daemon-reload
 sudo systemctl enable --now pifilm-capture.service
 sleep 25 && systemctl status pifilm-capture.service --no-pager
-sudo ss -ltnp | grep 8765                                   # 0.0.0.0:8765 by pifilm-capture
-curl -s -o /dev/null -w '%{http_code}\n' http://10.42.0.1:8765/v1/status   # 401 without token
+journalctl -u pifilm-capture.service -n 30 --no-pager      # the start-up lines
 ```
 
-The unit runs `pifilm-capture --no-preview --remote-listen 0.0.0.0:8765
---artifacts <dir> --ups x728 --display waveshare35dsi --shutter-gpio 21`. It runs the LCD viewfinder
-when the [Waveshare DSI panel](lcd-viewfinder.md#9-the-35-dsi-panel) is fitted and falls back to
-headless Stick-only service when it is not, or when the camera is USB;
+The unit runs `pifilm-capture --no-preview --artifacts <dir> --ups x728
+--display waveshare35dsi --shutter-gpio 21` (plus the settings flags it
+explains). It runs the LCD viewfinder when the
+[Waveshare DSI panel](lcd-viewfinder.md#9-the-35-dsi-panel) is fitted and falls
+back to a headless service, where the GPIO shutter button still takes photos,
+when it is not, or when the camera is USB;
 `--no-preview` because it suppresses the OpenCV window, which needs a desktop
-session the service does not have (it does not disable the LCD);
-`0.0.0.0` because the hotspot address may not exist yet at the moment the
-service starts, and binding to all interfaces avoids that race; `--ups x728`
-reads the Geekworm fuel gauge for the Stick's Pi-battery badge and is dropped
+session the service does not have (it does not disable the LCD); `--ups x728`
+reads the Geekworm fuel gauge for the LCD's battery tag and is dropped
 on a Pi without the shield; `Restart=on-failure` with `StartLimitIntervalSec=0`
 because the camera can enumerate after the service starts and the retries
 must never give up. Start-up takes 15 to 25 seconds on a Pi 3B: OpenCV import,
@@ -246,9 +226,9 @@ LUT load, camera warm-up.
 
 For the optional two-screen mode, where a monitor on the Pi also shows each
 photo, the same command with `--show-captures` must be launched from the Pi's
-desktop session, not over SSH. See the deployment guide.
+desktop session, not over SSH. See [the network and service guide](pi-service.md).
 
-### 4.5 Passwordless restart for the deploy script (optional)
+### 4.4 Passwordless restart for the deploy script (optional)
 
 `scripts/deploy_remote.py --restart` on the Mac stops and starts the service
 through `sudo -n`, which needs a rule. Two short lines, because a long rule
@@ -272,7 +252,7 @@ The script refuses to restart while another process holds a video node. A
 desktop session's PipeWire and WirePlumber always do, only to monitor the
 devices, and are allowed; anything else (`rpicam-still`, a browser) blocks it.
 
-### 4.6 Reboot test
+### 4.5 Reboot test
 
 ```sh
 sudo reboot
@@ -288,10 +268,10 @@ You want `pifilm-ap:wlan0` and `active`. Everything from here on assumes the Pi
 comes back on its own after a power cycle, because in the field that is the
 only way it will ever start.
 
-### 4.7 UPS (optional)
+### 4.6 UPS (optional)
 
 For a battery-powered handheld, fit the Geekworm X728 UPS shield. `--ups
-x728` on the `pifilm-capture` service (§4.4) is the only project-side switch;
+x728` on the `pifilm-capture` service (§4.3) is the only project-side switch;
 reading the gauge needs the header I2C bus enabled, which is disabled by
 default ([docs/x728-ups.md](x728-ups.md) section 4). Geekworm's installer
 provides the power-button service, which is unrelated to reading the gauge.
@@ -299,10 +279,10 @@ The guide, [docs/x728-ups.md](x728-ups.md), covers that bus setup, the pin
 and address map, Geekworm's power-button service, the low-battery shutdown
 policy suitable for a camera, the DS1307 real-time clock that finally gives
 offline captures the right date, and a verification checklist. With `--ups
-x728`, the service publishes `pi_battery` and the Stick shows it bottom-left
-as `Pi 77%`, `Pi 77%+` on external power, and `Pi --%` when unknown.
+x728`, the LCD viewfinder shows the Pi's battery level in its top strip, and
+`pifilm-battery` prints it.
 
-### 4.8 Optional: LCD viewfinder
+### 4.7 Optional: LCD viewfinder
 
 For a live viewfinder with a light-meter readout and an on-screen shutter, fit
 the Waveshare 3.5" DSI LCD (E) and run the service with `--display
@@ -314,10 +294,10 @@ the hardware acceptance checklist are in
 Waveshare 2.8" SPI panel is still supported with `--display waveshare28`
 (sections 2 and 3 of the same guide).
 
-### 4.9 Optional: shutter button
+### 4.8 Optional: shutter button
 
-A push button on the GPIO header takes a photo, like the on-screen shutter or
-the Stick. Any momentary (normally open) button works; it needs two wires and no
+A push button on the GPIO header takes a photo, like the on-screen shutter. Any
+momentary (normally open) button works; it needs two wires and no
 resistor, because the Pi's internal pull-up holds the pin high until the button
 connects it to ground.
 
@@ -349,13 +329,13 @@ return before the second press. A press
 with the screen dark from idle takes the photo and wakes the screen to show it.
 To use another pin, change the number (BCM 4 to 27); pins that belong to the
 X728 are refused with `--ups x728`, and pins that belong to the 2.8" LCD with
-`--display waveshare28`. The button also works with neither `--remote-listen`
-nor an LCD, but it then puts the app in the same capture-only modes the remote
-API uses: run from the Pi's desktop session, the live preview window is replaced
-by a window that shows only each captured photo. The journal messages that mention the "remote
-API" in those modes (`Remote capture API active without terminal controls.`,
-`Capture display unavailable; remote API remains active.`) are shared with the
-remote API and appear even when only the button is in use.
+`--display waveshare28`. The button also works without an LCD, but it then puts
+the app in its capture-only modes: run from the Pi's desktop session, the live
+preview window is replaced by a window that shows only each captured photo; with
+no screen and no terminal (the headless service) the journal says `Shutter button
+active without a screen or terminal controls.` and the process waits for presses.
+If the LCD viewfinder fails repeatedly while running, the service exits for
+systemd to restart it, which brings the button back too.
 
 **If it does not work.** `warning: shutter button unavailable (...); continuing
 without it` in the journal names the cause, and the service carries on without
@@ -388,7 +368,7 @@ left no "Fatal Python error" in the journal. Not checked separately: a press
 with the screen dark from idle, and a run of ten spaced presses counted against
 ten files.
 
-### 4.10 Nextcloud photo sync (optional)
+### 4.9 Nextcloud photo sync (optional)
 
 To keep an off-device archive of every capture, push `~/Pictures/pifilm` to a
 Nextcloud folder over WebDAV. It runs from the Pi only when it is on the home
@@ -405,39 +385,14 @@ it; it only hands the path to the sync it starts. Drop the flag from the unit if
 Nextcloud is not set up, and the row is left out. After changing the unit:
 `sudo systemctl daemon-reload && sudo systemctl restart pifilm-capture`.
 
-## 5. StickS3
-
-Last, because it has nothing to show until the Pi is up, and because its
-network credentials and token are compiled in from `.env`.
-
-Connect the Stick over USB-C to the Mac:
-
-```sh
-python3 firmware/sticks3/scripts/generate_config.py --env .env    # validates, prints no secrets
-pio run -d firmware/sticks3 -t upload
-pio device monitor -d firmware/sticks3 -b 115200
-```
-
-On the serial monitor expect `StickS3 remote capture boot`, a battery line,
-then `status: HTTP 200 ready=1` and `state CONNECTING -> READY`. The screen
-shows colour bars with READY and the battery badge in the corner. Press the
-button once: one shutter tone, colour bars while waiting, then the graded
-thumbnail. The full healthy log, what each early stop means, and a hash recipe
-that proves the thumbnail came from the graded file are in
-[the firmware README](../firmware/sticks3/README.md).
-
-Rebuild and reflash after any change to `WIFI_SSID`, `WIFI_PASSWORD`,
-`PIFILM_REMOTE_URL` or `PIFILM_REMOTE_TOKEN`. Build outputs contain those values;
-keep them off shared machines.
-
-## 6. Training a look (optional)
+## 5. Training a look (optional)
 
 Skip this section entirely unless you want to replace the bundled starter. The
 camera does not need it. This section is the outline; the full step-by-step
 procedure, from an empty `data/` folder to a verified deployment, with the
 report explained gate by gate, is [the training guide](training.md).
 
-### 6.1 What training does and does not do
+### 5.1 What training does and does not do
 
 `pifilm-train` fits a 33³ colour lookup table so that the colour distribution of
 your camera's frames moves toward the colour distribution of a folder of
@@ -447,7 +402,7 @@ has none. The current roadmap for better results is in `todo.md`, section 1;
 the short version is: real camera captures as the source, a coherent reference
 set, and a flash.
 
-### 6.2 Data layout
+### 5.2 Data layout
 
 Both folders are gitignored. Nothing in them is ever committed.
 
@@ -465,7 +420,7 @@ rsync -av --include='*/' --include='*_ungraded.jpg' --include='*_original.jpg' -
 
 then select and copy the frames you want into `data/source/`.
 
-### 6.3 Train, inspect, test
+### 5.3 Train, inspect, test
 
 ```bash
 .venv/bin/pifilm-train --source data/source --target data/references --out artifacts/pifilm-v1
@@ -483,7 +438,7 @@ below the minimums and marks the held-out evaluation as unavailable,
 camera captures. The three dated `docs/training-*.md` reports show what past
 runs produced and why two of them were rejected.
 
-### 6.4 Deploy a trained look to the Pi
+### 5.4 Deploy a trained look to the Pi
 
 ```sh
 rsync -av artifacts/pifilm-v1/ george@parr.local:repos/pi-film-reversal/artifacts/pifilm-v1/
@@ -494,33 +449,30 @@ that directory, `daemon-reload`, restart, and take a capture. Its record in
 `captures.jsonl` must show the new `lut_sha1`. Update `PI_ARTIFACT_DIR` in
 `.env` to match.
 
-## 7. Day to day
+## 6. Day to day
 
-- **Power on.** Hotspot up in 10 to 20 s, service answering in about 30 s, Stick
-  READY shortly after. The Stick retries on its own.
+- **Power on.** Hotspot up in 10 to 20 s, the service ready (viewfinder live) in
+  about 30 s.
 - **Pull photos.** Plug in the cable: `rsync -av george@parr.local:Pictures/pifilm/ ~/Pictures/pifilm-pi/`
 - **Inspect or restart remotely.** `.venv/bin/python scripts/deploy_remote.py --env .env`
-  inspects; add `--restart` for the guarded restart (needs 4.5).
-- **Logs.** On the Pi: `journalctl -u pifilm-capture.service -n 100`. On the Stick:
-  the serial monitor.
-- **Change the token or passphrase.** Edit `.env`; update `/etc/pifilm-capture.env`
-  and restart the service (token), or re-run `pi_hotspot.py --apply` over
-  Ethernet (passphrase); rebuild and reflash the Stick.
+  inspects; add `--restart` for the guarded restart (needs 4.4).
+- **Logs.** On the Pi: `journalctl -u pifilm-capture.service -n 100`.
+- **Change the hotspot passphrase.** Edit `.env`, then re-run
+  `pi_hotspot.py --apply` over Ethernet.
 - **Back on home Wi-Fi temporarily.** Over Ethernet: `sudo nmcli connection down pifilm-ap`
   then `sudo nmcli connection up netplan-wlan0-<SSID>`; reverse to return.
 - **Stop.** `sudo systemctl stop pifilm-capture.service`.
 
-## 8. The order, on one page
+## 7. The order, on one page
 
-1. Mac: clone, venv, `pip install -e '.[train,dev,deploy]'`, PlatformIO, tests pass.
-2. `.env`: copy from example, fill in, `chmod 600`. Generate the token here.
+1. Mac: clone, venv, `pip install -e '.[train,dev,deploy]'`, tests pass.
+2. `.env`: copy from example, fill in, `chmod 600`.
 3. Pi OS: flash Trixie, first boot on home Wi-Fi, update.
 4. Pi network: hostname `pifilm`, wired link-local, Wi-Fi country, reboot, confirm `ssh parr.local` over the cable.
 5. Pi checkout: clone, copy `.env`.
 6. Pi app: venv with system packages, `pip install -e .`, `--fake` smoke test.
 7. Pi hotspot: dry run, `--apply`, disable the home profile.
 8. Pi look: `pifilm/data` or rsync a trained artifact; paths agree in `.env` and the unit.
-9. Pi service: token file, install unit, enable, check port 8765 and a 401 without token.
+9. Pi service: install unit, enable, check its start-up lines in the journal.
 10. Pi sudoers rule (optional), then reboot test: hotspot and service return unattended.
-11. Stick: validate `.env`, build, flash, watch the log, take a photo, verify it is graded.
-12. Later, optionally: collect camera frames, curate references, train, inspect, deploy, verify `lut_sha1`.
+11. Later, optionally: collect camera frames, curate references, train, inspect, deploy, verify `lut_sha1`.

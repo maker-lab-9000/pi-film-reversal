@@ -1,8 +1,8 @@
-"""Battery and external-power state of the Pi's UPS, for the status endpoint.
+"""Battery and external-power state of the Pi's UPS, for the LCD's battery tag.
 
 Only the Geekworm X728 is supported. Its fuel gauge is a MAX17040-class chip
 at I2C 0x36 and its power-loss pin is BCM 6; the maths below is Geekworm's
-own (``sample/x728-v2.x-bat.py``), so the number shown on the Stick matches
+own (``sample/x728-v2.x-bat.py``), so the number shown on the LCD matches
 what their tools print.
 
 Hardware access is injected: ``bus`` is anything with ``read_word_data`` and
@@ -89,7 +89,7 @@ class PowerMonitor:
 
     def poll_once(self) -> None:
         # Catches Exception, not just PowerError: a provider bug must not kill
-        # the polling thread silently, leaving /v1/status serving a frozen
+        # the polling thread silently, leaving the LCD showing a frozen
         # snapshot forever. last_error tracks ok/error state so the warning
         # and recovery lines print once each, not on every poll.
         try:
@@ -191,7 +191,7 @@ def build_ups(name: str, *, open_bus=None, open_pin=None) -> PowerMonitor | None
 
 
 def format_status(status: PowerStatus) -> str:
-    """One human line, matching what the Stick shows."""
+    """One human line for ``pifilm-battery``."""
     source = "external power" if status.external_power else "battery"
     return f"Battery: {status.percent}%  {status.voltage_mv / 1000:.2f} V  on {source}"
 

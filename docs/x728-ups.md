@@ -22,8 +22,8 @@ on 2026-09-10. Facts marked *verified* were checked on this Pi the same day.
   RTC, so today every offline boot starts with the wrong date and captures are
   filed under it. This closes that item from `todo.md`.
 - **A fuel gauge.** A MAX17040-class gauge on I2C reports cell voltage and state
-  of charge. The plan in `docs/superpowers/plans/2026-09-10-ups-battery-on-stick.md`
-  puts that number on the Stick next to the Stick's own battery.
+  of charge. With `--ups x728` the capture service shows that number on the
+  LCD viewfinder's battery tag, and `pifilm-battery` prints it.
 
 ## 2. State of this Pi before integration (verified 2026-09-10)
 
@@ -157,8 +157,8 @@ Geekworm ships two sample behaviours. Only one of them belongs on this device.
 - **Power-loss shutdown** (`sample/x728-v2.x-plsd*.py`, `sample/test.sh`):
   when pin 6 goes high, wait 5 s, pulse pin 26, shut down. **Do not install
   this.** For a handheld camera, running on the cells is the normal state,
-  not a fault. Pin 6 is still useful: the capture service reads it to show
-  "external power present" on the Stick.
+  not a fault. Pin 6 is still useful: the capture service reads it to mark
+  external power on the LCD's battery tag.
 - **Low-battery shutdown** (`sample/x728-v2.x-asd.py`): read the gauge every
   2 s, and below 3.00 V wait 10 s and pulse pin 26. **Install this**, as a
   service, so a flat battery ends in a clean halt rather than a brownout
@@ -201,7 +201,7 @@ this script can be retired in favour of one owner of the shutdown decision.
 - **Two readers of one gauge** are fine: the low-battery script and the capture
   service both do single-word I2C reads through the kernel's bus lock.
 - **Read the level anytime** with `pifilm-battery`, which does one gauge read and
-  prints e.g. `Battery: 64%  3.85 V  on battery` — the same maths the Stick
+  prints e.g. `Battery: 64%  3.85 V  on battery` — the same maths the LCD
   shows. `pifilm-battery --ups none` is a no-op for a Pi without the shield.
 - **Pin 6 and the gauge are read by user `george`**, who is in `gpio` and
   `i2c`. Pins 5, 12 and 26 are root-only through Geekworm's service; the
@@ -255,7 +255,7 @@ gpioget --numeric -c 0 6                            # 0 with charger connected, 
 ```
 
 While `pifilm-capture --ups x728` is running it holds BCM 6, so `gpioget` reports the
-line busy; stop the service first or read `external_power` from `/v1/status` instead.
+line busy; stop the service first.
 
 ```sh
 timedatectl | grep 'RTC time'                       # a plausible date, not n/a

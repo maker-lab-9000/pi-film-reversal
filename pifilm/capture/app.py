@@ -14,12 +14,12 @@ with ``FakeCamera``:
   back to headless rather than end the session.
 * ``run_headless_loop`` reads single keys from the terminal.
 * ``--display`` runs the LCD viewfinder (``pifilm/display/viewfinder.py``) on the
-  Pi's SPI panel instead of any OpenCV window. It shares one
-  ``CaptureController`` with the remote API, so a tap on the panel and a Stick
-  request are the same kind of job and never two owners of the camera.
+  Pi's panel instead of any OpenCV window. It shares one ``CaptureController``
+  with the GPIO button, so a tap on the panel and a press of the button are the
+  same kind of job and never two owners of the camera.
 * ``--shutter-gpio`` adds a GPIO push button (``pifilm/capture/button.py``) as one
-  more trigger through that shared ``CaptureController``; the remote API or the
-  button each select the shared-controller loops.
+  more trigger through that shared ``CaptureController``; a button selects the
+  shared-controller loops.
 
 A dropped frame prints and continues in both loops. The spec promises the
 session survives frame read failures, and that promise is only worth
@@ -64,7 +64,7 @@ Grading behind the shutter
 --------------------------
 With ``background=True`` (``--grade background``, the command's default) a shot is
 split in two. The capture side reads the frame, saves the original, writes a
-pending entry, makes a quick grade for the screen and the Stick, and hands the
+pending entry, makes a quick grade for the review screen, and hands the
 full frame to a ``GradeQueue``; the camera is then free. The grade side
 (``_run_grade``, on the queue's one worker) grades at full size, saves the graded
 file, appends the record and removes the entry, in that order.
@@ -211,7 +211,7 @@ session holds it: the LCD's shutter and the GPIO button read it at each press an
 pass it to ``CaptureController.submit``, whose worker waits it out before the
 capture (the job stays ``queued`` and the snapshot says ``delaying``, so the
 viewfinder keeps its live view and the captures-only window its last picture
-until the capture starts); the Stick and the keyboard never wait. The viewfinder reads it from its
+until the capture starts); the keyboard never waits. The viewfinder reads it from its
 ``SettingsControl`` only with setting rows (Picamera2), and the button through a
 getter ``main`` gives it that answers 0.0 on any other backend, so a value saved
 on the Pi never delays a ``--fake`` or V4L2 shot. The record's
@@ -313,6 +313,7 @@ from .. import __version__
 from .._cv2 import require_cv2
 from ..artifacts import PARAMS_VERSION, Artifacts, ArtifactsError
 from ..display import DisplayError
+from ..display.ui import render_exposure_card
 from ..display.viewfinder import ViewfinderLoop
 from ..double import COMPOSITE_METHOD, composite
 from ..gpu.grader import GpuGrader
@@ -345,10 +346,8 @@ from .gradequeue import (
 from .network import Addresses, NetworkMonitor
 from .picamera import COLOUR_TEMPERATURE_RANGE_K, Picamera2Camera
 from .power import UPS_CHOICES, PowerError, build_ups
-from .remote import RemoteCaptureServer
 from .settings import IMAGE_KEYS, SETTINGS_FILE, Settings, SettingsControl
 from .settings import load as load_settings
-from .thumbnail import render_exposure_card
 from .upload import Upload
 
 cv2 = require_cv2()
@@ -358,10 +357,10 @@ WINDOW_NAME = "Parr  [SPACE capture | P toggle grade | Q quit]"
 CAPTURE_WINDOW_NAME = "Parr captures  [SPACE capture | Q quit]"
 
 # The quick grade's long edge, in pixels: a quarter of the IMX477's 4056, which is
-# more than the 640 x 480 panel and the Stick's 240 x 135 thumbnail can show.
+# more than the 640 x 480 panel can show.
 QUICK_LONG_EDGE = 1014
 # Quick grades kept in the private directory. Only the newest is ever shown; the
-# rest are kept for a client still downloading an earlier one.
+# rest are kept so a screen still loading an earlier one never finds it gone.
 QUICK_KEEP = 16
 # How long the grade side waits to be told how long the shutter was held (see
 # ``_GradeWork.ready``). The capture side says so within microseconds of handing
@@ -611,7 +610,7 @@ def _delay_fields(frame: Frame, delay_s: float) -> dict[str, float]:
 
     The shutter delay is a setting, and settings apply on Picamera2 only, so a
     V4L2 or fake record never carries it. It is the delay waited for this shot
-    (0.0 for the Stick and the keyboard), not the menu's value at the time.
+    (0.0 for the keyboard), not the menu's value at the time.
     """
     return {"shutter_delay_s": float(delay_s)} if frame.source == "picamera2" else {}
 
@@ -789,7 +788,7 @@ class CaptureSession:
 
     def capture(self, *, delay_s: float = 0.0) -> CaptureResult:
         """Take one shot. ``delay_s`` is the shutter delay the controller waited
-        before calling (0.0 for the Stick); a Picamera2 record carries it as
+        before calling (0.0 for the keyboard); a Picamera2 record carries it as
         ``shutter_delay_s``, right after the camera's stream fields."""
         shutter = time.perf_counter()
         delay = float(delay_s)
@@ -967,7 +966,7 @@ class CaptureSession:
             return None
 
     def _quick_grade(self, work: _GradeWork, stem: str) -> Path:
-        """The picture for the screen and the Stick: reduced, no grain, never under ``out_root``."""
+        """The picture for the review screen: reduced, no grain, never under ``out_root``."""
         assert work.frames is not None
         with _stage(work.stages, "preview"):
             # A double's two frames make its picture; a multi-frame shot's quick
@@ -1426,7 +1425,7 @@ class CaptureSession:
             os.fsync(fh.fileno())
 
     def _exposure_card(self, index: int, of: int) -> Path:
-        """The Stick's picture for a partial double; never under ``out_root``.
+        """The screen's picture for a partial double; never under ``out_root``.
 
         Everything under ``out_root`` is uploaded by the Nextcloud sync, and a card is
         not a photograph, so it lives in a private temporary directory. The directory is
@@ -1660,7 +1659,7 @@ def run_preview_loop(
                     assert controller is not None
                     snapshot = controller.snapshot()
                     # Completed jobs may arrive entirely between GUI polls, so
-                    # observing only the active request would miss fast remote shots.
+                    # observing only the active request would miss fast button shots.
                     job = snapshot.last_completed_job
                     new_photo = job is not None and job.request_id != displayed_request_id
                     if new_photo:
@@ -1764,20 +1763,6 @@ def has_display() -> bool:
     )
 
 
-def _remote_listen(value: str) -> tuple[str, int]:
-    """Parse the intentionally simple IPv4/hostname ``host:port`` CLI value."""
-    host, separator, raw_port = value.rpartition(":")
-    if not separator or not host:
-        raise argparse.ArgumentTypeError("expected host:port")
-    try:
-        port = int(raw_port)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("port must be a number") from exc
-    if not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
-    return host, port
-
-
 def _white_balance(value: str) -> int:
     """Parse the ``--white-balance`` colour temperature in kelvin."""
     low, high = COLOUR_TEMPERATURE_RANGE_K
@@ -1822,7 +1807,8 @@ def _drop_display_on_v4l2(args: argparse.Namespace) -> None:
     whose camera is USB, refusing the flag would exit 2 and systemd would
     restart the service forever. The viewfinder genuinely cannot run there (the
     V4L2 backend has no preview-mode split and the meter needs libcamera
-    metadata), so say so once and serve the Stick.
+    metadata), so say so once and carry on headless (with the GPIO button, when
+    there is one).
     """
     if args.display == "none":
         return
@@ -1869,7 +1855,8 @@ def _open_display(args: argparse.Namespace, out_root: Path):
     """Open the requested display and touch, or None for --display none.
 
     Raises DisplayError; the caller downgrades that to a warning so a service
-    with a broken or absent LCD keeps serving the Stick instead of crash-looping.
+    with a broken or absent LCD carries on headless (the GPIO button still takes
+    photographs) instead of crash-looping.
     """
     if args.display == "none":
         return None
@@ -1907,9 +1894,13 @@ def _close_display(display_pair) -> None:
     display.close()
 
 
-def _serve_until_interrupt() -> int:
-    """Hold the process open for the remote API with no terminal controls."""
-    print("Remote capture API active without terminal controls. Press Ctrl-C to stop.")
+def _wait_for_button() -> int:
+    """Hold the process open for the GPIO button with no screen and no terminal.
+
+    The button has no loop of its own: its presses arrive on gpiozero's thread,
+    so without this the process would return at once and the service would end.
+    """
+    print("Shutter button active without a screen or terminal controls. Press Ctrl-C to stop.")
     try:
         while True:
             time.sleep(1)
@@ -1990,7 +1981,7 @@ def _run_viewfinder(
 ) -> int:
     display, touch = display_pair
     stop = threading.Event()
-    previous = signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     loop = ViewfinderLoop(
         camera, controller, display, touch,
         power_snapshot=power.snapshot if power is not None else None,
@@ -2016,14 +2007,13 @@ def _run_viewfinder(
         stalled = exc
         _arm_exit_deadline(STALL_EXIT_DEADLINE, 1)
     finally:
-        # Not ``previous`` yet: that is ``main``'s handler, which raises, and a
-        # SIGTERM while the panel closes would leave the rest of the clean-up undone.
+        # Not ``main``'s handler back: it raises, and a SIGTERM while the panel
+        # closes would leave the rest of the clean-up undone.
         _ignore_sigterm()
         touch.close()
         display.close()
     if stalled is not None:
-        # Unlike a dead screen, this leaves nothing worth serving: the Stick and
-        # the button would only queue shots behind the same camera. Exit 1 so
+        # The button would only queue shots behind the same camera. Exit 1 so
         # systemd restarts the service, which reopens the camera.
         print(f"error: camera stopped delivering frames: {stalled}; exiting for a restart",
               file=sys.stderr)
@@ -2031,16 +2021,10 @@ def _run_viewfinder(
     if failure is None:
         return 0
     print(f"error: display failed repeatedly: {failure}", file=sys.stderr)
-    # A dead screen must cost the screen only. Exiting here would be a restart
-    # loop under systemd, and the Stick would get a few seconds of service per
-    # cycle. Without a remote API the process exits 1 and systemd restarts it.
-    # That restart is also what brings a GPIO button back: the button has no
-    # loop of its own to keep the process alive.
-    if not args.remote_listen:
-        return 1
-    # Serving goes on, so a stop has to work again.
-    signal.signal(signal.SIGTERM, previous)
-    return _serve_until_interrupt()
+    # Exit 1 and systemd restarts the service, which reopens the panel (or, with
+    # it gone, starts headless). That restart is also what brings a GPIO button
+    # back: the button has no loop of its own to keep the process alive here.
+    return 1
 
 
 def _look_name(artifacts: Path | None) -> str:
@@ -2188,12 +2172,8 @@ def _main(argv: list[str] | None) -> int:
     parser.add_argument("--fake", action="store_true", help="synthetic camera, no hardware")
     parser.add_argument("--seed", type=int, default=None, help="seed the grain seed generator")
     parser.add_argument(
-        "--remote-listen", type=_remote_listen, metavar="HOST:PORT",
-        help="serve the authenticated remote capture API (requires PIFILM_REMOTE_TOKEN)",
-    )
-    parser.add_argument(
         "--ups", choices=UPS_CHOICES, default="none",
-        help="UPS to read the Pi's battery from and publish in /v1/status (default: none)",
+        help="UPS to read the Pi's battery from, shown on the LCD (default: none)",
     )
     parser.add_argument(
         "--display", choices=("none", "waveshare35dsi", "waveshare28", "fake"), default="none",
@@ -2266,11 +2246,6 @@ def _main(argv: list[str] | None) -> int:
 
     autofocus = args.autofocus or "continuous"
     af_range = args.af_range or "normal"
-
-    remote_token = os.environ.get("PIFILM_REMOTE_TOKEN") if args.remote_listen else None
-    if args.remote_listen and not remote_token:
-        print("error: --remote-listen requires PIFILM_REMOTE_TOKEN", file=sys.stderr)
-        return 2
 
     power = None
     try:
@@ -2410,7 +2385,6 @@ def _main(argv: list[str] | None) -> int:
     look_halation = bool(getattr(halation_params, "active", False))
     upload: Upload | None = None
     controller: CaptureController | None = None
-    remote: RemoteCaptureServer | None = None
     button: ShutterButton | None = None
     disk: DiskMonitor | None = None
     network: NetworkMonitor | None = None
@@ -2442,29 +2416,16 @@ def _main(argv: list[str] | None) -> int:
                     f"warning: shutter button unavailable ({exc}); continuing without it",
                     file=sys.stderr,
                 )
-        # The remote API and the button are both triggers that arrive on another
-        # thread, so either one needs the shared controller and the loops that
-        # tolerate it. A button that failed to open leaves the mode as it was.
-        shared = bool(args.remote_listen) or button is not None
+        # The button is a trigger that arrives on another thread, so it needs the
+        # shared controller and the loops that tolerate it. A button that failed
+        # to open leaves the mode as it was.
+        shared = button is not None
         if shared:
             controller = controller or CaptureController(session)
         if button is not None:
             assert controller is not None
             button.on_press(functools.partial(_button_capture, controller, shutter_delay))
             print(f"Shutter button on BCM {args.shutter_gpio}.")
-        if args.remote_listen:
-            assert controller is not None
-            try:
-                remote = RemoteCaptureServer(
-                    controller, remote_token, args.remote_listen,
-                    power=power.snapshot if power else None,
-                )
-                remote.start()
-            except OSError as exc:
-                print(f"error: could not start remote listener: {exc}", file=sys.stderr)
-                return 2
-            host, port = args.remote_listen
-            print(f"Remote capture API listening on {host}:{port}.")
         if shared:
             try:
                 if display_pair is not None:
@@ -2485,12 +2446,12 @@ def _main(argv: list[str] | None) -> int:
                         )
                     if displayed:
                         return 0
-                    print("Capture display unavailable; remote API remains active.")
+                    print("Capture display unavailable; the shutter button remains active.")
                 if sys.stdin.isatty():
                     with TerminalKeys() as keys:
                         run_headless_loop(session, keys.read, controller=controller)
                     return 0
-                return _serve_until_interrupt()
+                return _wait_for_button()
             except KeyboardInterrupt:
                 return 0
         if display_pair is not None:
@@ -2547,8 +2508,6 @@ def _main(argv: list[str] | None) -> int:
             network.close()
         if upload is not None:
             upload.close()
-        if remote is not None:
-            remote.close()
         if controller is not None:
             # Its worker finishes the queued grades, then closes the camera.
             controller.close()

@@ -253,7 +253,7 @@ def test_shutter_tap_submits_through_the_controller_and_reviews_the_result(
 
 
 def test_processing_shows_colour_bars_instead_of_the_live_view(tmp_path, monkeypatch):
-    """A grade takes about 3 s; the LCD must say so the way the Stick does."""
+    """A grade takes about 3 s; the LCD must say so the way the OpenCV window does."""
     camera, ctl, session = _gated_controller(tmp_path)
     try:
         bars = _spy_processing(monkeypatch)
@@ -687,13 +687,13 @@ def test_a_tap_on_a_dimmed_screen_restores_it_and_acts(controller, monkeypatch):
     assert display.levels[-1] == 80
 
 
-def test_a_stick_capture_wakes_the_screen_into_review(controller):
+def test_a_button_capture_wakes_the_screen_into_review(controller):
     camera, ctl = controller
     loop, touch, display, clock = _idle_loop(camera, ctl)
     clock.t = 300.0
     loop.step()
     assert display.levels[-1] == 0
-    ctl.submit("from-the-stick")
+    ctl.submit("from-the-button")
     _until(lambda: ctl.snapshot().finished_count == 1)
     loop.step()
     assert loop.state == "REVIEW"
@@ -3550,7 +3550,7 @@ def test_an_active_job_in_the_menu_shows_no_colour_bars(tmp_path, monkeypatch):
         bars = _spy_processing(monkeypatch)
         loop, touch, display, clock = _menu_loop(camera, ctl, tmp_path)
         _open_menu(loop, touch, clock)
-        ctl.submit("from-the-stick")
+        ctl.submit("from-the-button")
         _until(lambda: session.started.is_set())
         for _ in range(3):
             loop.step()

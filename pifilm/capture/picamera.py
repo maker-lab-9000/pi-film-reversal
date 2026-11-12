@@ -173,7 +173,7 @@ _TIMEOUT_SHUTTERS = 4
 # A burst splits its exposure from the latest preview frame's metadata only while
 # that frame is this recent (or two of its exposures, whichever is longer). The
 # viewfinder stops reading frames with the screen off, in its menu, on review and
-# notices, so a frame's AE values can be minutes old by the time a GPIO or Stick
+# notices, so a frame's AE values can be minutes old by the time a GPIO
 # shot is taken; older metadata is replaced by one frame's captured now.
 LIVE_METADATA_MAX_AGE_S = 1.0
 
@@ -674,8 +674,8 @@ class Picamera2Camera:
 
         Fresh means read within ``LIVE_METADATA_MAX_AGE_S`` or two of that
         frame's exposures, whichever is longer. The viewfinder reads no frames
-        with the screen off, in its menu, on review or a notice, so a GPIO or
-        Stick shot taken then would otherwise split AE values minutes old,
+        with the screen off, in its menu, on review or a notice, so a GPIO
+        shot taken then would otherwise split AE values minutes old,
         several stops off. In preview mode the camera keeps streaming and the
         AE keeps converging, so capturing the metadata costs at most one
         preview frame.

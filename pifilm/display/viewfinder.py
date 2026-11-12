@@ -1,10 +1,10 @@
 """The viewfinder state machine: LIVE ⇄ REVIEW, and LIVE ⇄ MENU.
 
-Every shot goes through the shared ``CaptureController`` exactly like a Stick
-request, so the LCD is one more trigger and one more screen, never a second
-owner of the camera. A finished job is noticed through the controller's
-``finished_count``, which is how a Stick shot appears here without the
-controller knowing about displays. Unlike a Stick request, a shutter tap asks
+Every shot goes through the shared ``CaptureController`` exactly like a press
+of the GPIO button, so the LCD is one more trigger and one more screen, never a
+second owner of the camera. A finished job is noticed through the controller's
+``finished_count``, which is how a button shot appears here without the
+controller knowing about displays. Like a button press, a shutter tap asks
 for the menu's shutter delay (``shutter_delay``, read at the tap; none without
 the setting rows), which the controller's worker waits out before the capture.
 Through the wait the snapshot says ``delaying`` and the live view stays up, keys
@@ -14,8 +14,8 @@ Double exposure adds a third state, NOTICE: after exposure 1 of a pair there is
 nothing developed to review, so a short "Exposure 1/2" message replaces the
 review and the loop returns to LIVE for the second exposure.
 The ``MENU`` key opens a fourth state, MENU: the settings page (``menu.py``),
-left by its ``DONE`` key. The camera is not the menu's, so the GPIO button and the
-Stick still take photographs while it is open; a shot that finishes then is
+left by its ``DONE`` key. The camera is not the menu's, so the GPIO button
+still takes photographs while it is open; a shot that finishes then is
 counted as seen but opens neither REVIEW nor NOTICE, and no colour bars cover the
 page while a job runs, because the photographer opened the menu to change
 something and a review would throw them out of it. The frame thread is not asked
@@ -485,7 +485,7 @@ class ViewfinderLoop:
         # leaves the mark where a few seconds of decay put it.
         self._focus = FocusTracker()
         # Activity is a touch or a capture (in progress or just finished, from
-        # this screen or the Stick). The backlight is written only when its level
+        # this screen or the GPIO button). The backlight is written only when its level
         # changes; None forces the first step to set it. A display that cannot
         # dim (``--display fake``) gets no idle handling at all: treating it as
         # off would freeze a screen that is still lit.
@@ -1117,7 +1117,7 @@ class ViewfinderLoop:
         shows the second exposure's values. Everything is caught: this
         runs on the loop thread, and after Task 9 that is the process's main thread, so an
         unreadable file or a malformed record must cost one screen, not the
-        Stick server.
+        process.
         """
         if job.state != "complete" or job.result is None:
             return render_message(
@@ -1391,7 +1391,7 @@ class ViewfinderLoop:
             self._processing_shown = False
             self._flash = None
             if self.state == "MENU":
-                # A GPIO or Stick shot: taken, but the menu stays open.
+                # A GPIO shot: taken, but the menu stays open.
                 self._menu_step(snap, tap, now)
                 return
             job = snap.last_finished_job
@@ -1466,7 +1466,7 @@ class ViewfinderLoop:
         if capturing:
             # The grade takes about three seconds, and the camera belongs to the
             # capture worker for the still in front of it: show the same colour
-            # bars the Stick and the OpenCV window show rather than a stale live
+            # bars the OpenCV window shows rather than a stale live
             # frame. Drawn once per job, because re-blitting identical bars at
             # 10 fps would only occupy the SPI bus. Touch keeps being polled
             # above, so a shutter tap still reaches the controller (which

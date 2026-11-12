@@ -1,8 +1,8 @@
 """The Pi hotspot script turns the local .env into a NetworkManager keyfile.
 
-The Stick joins the Pi's own access point, so WIFI_SSID and WIFI_PASSWORD in
-.env are the AP credentials, and the AP address is whatever host the firmware
-was told to call in PIFILM_REMOTE_URL. One file drives both sides.
+A phone or laptop joins the Pi's own access point in the field to SSH in, so
+WIFI_SSID and WIFI_PASSWORD in .env are the AP credentials, and the AP address
+is PI_HOTSPOT_ADDRESS (10.42.0.1 when it is left out).
 """
 
 import stat
@@ -14,7 +14,6 @@ from scripts.pi_hotspot import apply_keyfile, hotspot_keyfile, redact_psk
 ENV = {
     "WIFI_SSID": "pifilm-cam",
     "WIFI_PASSWORD": "correct-horse-battery",
-    "PIFILM_REMOTE_URL": "http://10.42.0.1:8765",
 }
 
 
@@ -31,7 +30,7 @@ def _section(text: str, name: str) -> dict[str, str]:
     return body
 
 
-def test_keyfile_is_an_ap_on_wlan0_with_wpa2_psk_and_shared_ipv4_from_remote_url():
+def test_keyfile_is_an_ap_on_wlan0_with_wpa2_psk_and_shared_ipv4_on_the_default_address():
     text = hotspot_keyfile(ENV)
 
     assert _section(text, "connection")["id"] == "pifilm-ap"
@@ -50,8 +49,8 @@ def test_keyfile_is_an_ap_on_wlan0_with_wpa2_psk_and_shared_ipv4_from_remote_url
 
 def test_keyfile_disables_wifi_power_save_so_the_ap_stays_reliable():
     # brcmfmac enables power management on wlan0 (seen when eth0's carrier drops),
-    # which makes the access point drop clients: the Stick associates, gets a DHCP
-    # lease, then keeps re-associating every few minutes and its API calls stall.
+    # which makes the access point drop clients: a client associates, gets a DHCP
+    # lease, then keeps re-associating every few minutes and its connections stall.
     # powersave=2 disables NM power save on the AP so the hotspot is steady with
     # or without Ethernet. Measured on a Pi 4 running the migrated SD, 2026-09-19.
     assert _section(hotspot_keyfile(ENV), "wifi")["powersave"] == "2"
@@ -91,15 +90,27 @@ def test_rejects_an_ssid_longer_than_32_bytes():
         hotspot_keyfile({**ENV, "WIFI_SSID": "s" * 33})
 
 
+def test_hotspot_address_is_read_from_env_when_present():
+    text = hotspot_keyfile({**ENV, "PI_HOTSPOT_ADDRESS": "192.168.50.1"})
+
+    assert _section(text, "ipv4")["address1"] == "192.168.50.1/24"
+
+
+def test_an_empty_hotspot_address_means_the_default():
+    text = hotspot_keyfile({**ENV, "PI_HOTSPOT_ADDRESS": ""})
+
+    assert _section(text, "ipv4")["address1"] == "10.42.0.1/24"
+
+
 @pytest.mark.parametrize(
-    "url",
-    ["http://parr.local:8765", "http://[fe80::1]:8765", "10.42.0.1:8765", ""],
-    ids=["hostname", "ipv6", "no-scheme", "missing"],
+    "address",
+    ["parr.local", "fe80::1", "http://10.42.0.1:8765", "10.42.0.1/24", "10.42.0.256"],
+    ids=["hostname", "ipv6", "url", "prefix", "out-of-range"],
 )
-def test_rejects_a_remote_url_whose_host_is_not_a_plain_ipv4_address(url):
-    # The firmware has no mDNS and the hotspot must own exactly this address.
-    with pytest.raises(ValueError, match="PIFILM_REMOTE_URL"):
-        hotspot_keyfile({**ENV, "PIFILM_REMOTE_URL": url})
+def test_rejects_a_hotspot_address_that_is_not_a_plain_ipv4_address(address):
+    # The hotspot must own exactly this address, so only a plain IPv4 one will do.
+    with pytest.raises(ValueError, match="PI_HOTSPOT_ADDRESS"):
+        hotspot_keyfile({**ENV, "PI_HOTSPOT_ADDRESS": address})
 
 
 def test_redacted_keyfile_keeps_everything_except_the_psk():

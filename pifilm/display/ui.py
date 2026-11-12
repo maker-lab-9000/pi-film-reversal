@@ -1,5 +1,5 @@
 """Pillow rendering for the viewfinder's processing, review and message screens,
-in 320x240 base units. Pure.
+in 320x240 base units, and the double exposure's "Exposure 1/2" card. Pure.
 
 The live screen and its hit regions are in ``liveview.py``; these three screens
 take no taps of their own (any tap ends a review or a notice), so there are no hit
@@ -11,6 +11,7 @@ The constants below never change with it.
 
 from __future__ import annotations
 
+import io
 from typing import Any
 
 import numpy as np
@@ -26,9 +27,12 @@ PROCESSING_BARS = (
     (191, 0, 191), (191, 0, 0), (0, 0, 191),
 )
 # The LCD sits close to the eye and is often used in a dim room, where the bars
-# at full strength glared; it draws them at this fraction. Only the LCD: the
-# Stick and the OpenCV window keep PROCESSING_BARS as they are.
+# at full strength glared; it draws them at this fraction. The exposure card uses
+# it too; the OpenCV window's loading screen keeps PROCESSING_BARS as they are.
 PROCESSING_DIM = 0.55
+# The exposure card's size in pixels (16:9, like the OpenCV window it is shown in;
+# the window letterboxes it to its own size).
+EXPOSURE_CARD_SIZE = (240, 135)
 # The placeholder for a missing readout in the review caption: a plain hyphen,
 # because the default font has no en dash glyph and renders one as a tofu box.
 DASH = "-"
@@ -97,13 +101,13 @@ def iso_label(iso: int | None) -> str:
 
 
 def render_processing(label: str = "Processing photo...", *, scale: int = 1) -> Image.Image:
-    """TV colour bars while a shot is graded: the Stick's screen, on the LCD.
+    """TV colour bars while a shot is graded, on the LCD.
 
     A grade takes about three seconds on the Pi 4, and during it the camera is
     the capture worker's, not the viewfinder's. Showing the live view with a
-    small marker read as "nothing happened"; the bars are what the Stick and the
-    Pi's own OpenCV window already show, so every screen says "working" the same
-    way. Bar order and geometry mirror ``pifilm.capture.app``'s
+    small marker read as "nothing happened"; the bars are what the Pi's own
+    OpenCV window already shows, so every screen says "working" the same way.
+    Bar order and geometry mirror ``pifilm.capture.app``'s
     ``_capture_loading_screen``, dimmed to ``PROCESSING_DIM`` for the panel; the
     label stays full white and is ASCII because the default font has no glyphs
     beyond it.
@@ -140,3 +144,29 @@ def render_message(title: str, detail: str, *, scale: int = 1) -> Image.Image:
     draw.text((WIDTH // 2, HEIGHT // 2 + 14), detail[:60],
               fill=(200, 200, 200), font=draw.font(12), anchor="mm")
     return img
+
+
+def render_exposure_card(
+    index: int, of: int, *, size: tuple[int, int] = EXPOSURE_CARD_SIZE,
+) -> bytes:
+    """The picture a capture result carries after exposure ``index`` of a double.
+
+    Exposure 1 has no photo yet: the film has not been developed. Every finished
+    capture's ``CaptureResult.pifilm`` is a picture, which the captures window
+    (``--show-captures``) shows and the terminal names, so exposure 1 gets the
+    dimmed colour bars of the processing screen, labelled with the count, as a
+    JPEG. The LCD viewfinder does not show it: it draws its own "Exposure 1/2"
+    notice instead.
+    """
+    width, height = size
+    img = Image.new("RGB", size, "black")
+    draw = ImageDraw.Draw(img)
+    for i, colour in enumerate(PROCESSING_BARS):
+        left, right = i * width // 7, (i + 1) * width // 7
+        dimmed = tuple(round(c * PROCESSING_DIM) for c in colour)
+        draw.rectangle((left, 0, right - 1, height * 3 // 4 - 1), fill=dimmed)
+    draw.text((width // 2, height * 7 // 8), f"Exposure {index}/{of}",
+              fill=(255, 255, 255), font=ImageFont.load_default(size=16), anchor="mm")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()

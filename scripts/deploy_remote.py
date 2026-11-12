@@ -28,9 +28,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from firmware.sticks3.scripts.generate_config import parse_env_file
+from pifilm.envfile import parse_env_file
 
-DEFAULT_LISTEN = "0.0.0.0:8765"
 SERVICE = "pifilm-capture.service"
 CAPTURE_PROCESS_COMMAND = "pgrep -af '[p]ifilm-capture' || true"
 # PID and name of every process with a video node open, one per line.
@@ -48,8 +47,6 @@ class DeploymentConfig:
     project_dir: str
     ssh_password: str
     artifact_dir: str
-    remote_token: str
-    listen: str
 
 
 def _required(values: Mapping[str, str], key: str) -> str:
@@ -60,17 +57,14 @@ def _required(values: Mapping[str, str], key: str) -> str:
 
 
 def deployment_config(values: Mapping[str, str]) -> DeploymentConfig:
-    # PI_HOST is where SSH goes (Ethernet, usually an mDNS name). The API bind
-    # address is a separate setting because, with the Pi running its own
-    # hotspot, the Stick reaches a different interface than the admin does.
+    # PI_HOST is where SSH goes: Ethernet at home (usually an mDNS name), or the
+    # hotspot address in the field.
     return DeploymentConfig(
         host=_required(values, "PI_HOST"),
         user=_required(values, "PI_USER"),
         project_dir=_required(values, "PI_PROJECT_DIR"),
         ssh_password=_required(values, "PI_SSH_PASSWORD"),
         artifact_dir=_required(values, "PI_ARTIFACT_DIR"),
-        remote_token=_required(values, "PIFILM_REMOTE_TOKEN"),
-        listen=values.get("PIFILM_LISTEN") or DEFAULT_LISTEN,
     )
 
 
@@ -82,14 +76,7 @@ def build_capture_command(config: DeploymentConfig, *, show_captures: bool) -> s
     ]
     if show_captures:
         parts.append("--show-captures")
-    parts.extend(
-        [
-            "--remote-listen",
-            config.listen,
-            "--artifacts",
-            config.artifact_dir,
-        ]
-    )
+    parts.extend(["--artifacts", config.artifact_dir])
     return shlex.join(parts)
 
 
