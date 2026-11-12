@@ -54,9 +54,14 @@ Photos captured and graded on the Raspberry Pi with the Camera Module 3 Wide (IM
 <img width="350" alt="Current Raspberry Pi camera build" src="https://github.com/user-attachments/assets/0fa1a043-e4fe-44cd-b581-5edf5939938f" />
 
 ## 3D printed case prototype
-<img width="450" alt="3D printed camera enclosure prototype" src="https://github.com/user-attachments/assets/df29fb9c-6b82-45ab-9d3a-7b00bcd2097e" />
+<p>
+  <img width="300" alt="πTone 500 camera body, front" src="camera-body/renders/hero_front.png" />
+  <img width="300" alt="πTone 500 camera body, back with the finder hood open" src="camera-body/renders/hero_back.png" />
+  <img width="300" alt="πTone 500 camera body, exploded view" src="camera-body/renders/exploded.png" />
+</p>
 
-I will commit the STL files once final design is approved and tested.
+The STL files are in [`camera-body/stl/`](camera-body/stl/), and [`camera-body/README.md`](camera-body/README.md)
+covers print settings, hardware and assembly. Not printed and tested yet, so print the two fit-test coupons first.
 
 ## The display
 
