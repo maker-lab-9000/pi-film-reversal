@@ -17,7 +17,7 @@ from pifilm.display.ui import (
 
 
 def test_render_processing_draws_the_same_colour_bars_as_the_opencv_screen():
-    """The LCD shows the Stick's screen while a shot is graded, not the live view.
+    """The LCD shows the OpenCV window's bars while a shot is graded, not the live view.
 
     ``pifilm.capture.app._capture_loading_screen`` lists the same seven bars in
     OpenCV's BGR order; the leftmost is grey and the rightmost blue on both.

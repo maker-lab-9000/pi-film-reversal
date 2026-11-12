@@ -1,16 +1,20 @@
-"""Serialized, idempotent capture jobs shared by local and remote triggers.
+"""Serialized, idempotent capture jobs shared by every trigger.
+
+The LCD's shutter, the GPIO button and the SPACE key all submit here, from
+whichever thread they run on, so there is one owner of the camera and one capture at a
+time. Each press carries a fresh ``request_id``; submitting the same one again
+returns that job rather than taking a second photograph.
 
 The shutter delay. A press on the LCD's shutter or the GPIO button moves the
 camera, so those triggers can ask for a delay (``submit(..., delay_s=)``, the
 menu's SHUTTER DELAY) and the worker waits that long before the capture starts,
-letting the hand that pressed stop moving. A Stick request asks for none: the
-Stick is already away from the camera. The job is accepted at the press and
+letting the hand that pressed stop moving. The SPACE key asks for none: the
+keyboard is not on the camera. The job is accepted at the press and
 stays active through the wait, so a second press is answered ``busy`` as during
 the capture itself, but it stays ``queued`` until the capture starts and the
 snapshot says ``delaying``: the photographer is holding the framing through the
 wait, so a display keeps the live view up (no colour bars) until the camera is
-actually taken, and the Stick's status API is not told a capture is under way
-before it is. The wait is on an event that ``close`` sets, so stopping the
+actually taken. The wait is on an event that ``close`` sets, so stopping the
 service never sits out a delay: a job still waiting then fails as ``closed`` and
 its capture never runs. The session is told the delay it waited
 (``capture(delay_s=)``) and writes it into the photograph's record.
@@ -44,11 +48,6 @@ class JobSnapshot:
     result: object | None = None
     error_message: str | None = None
 
-    @property
-    def id(self) -> str:
-        """Short alias for protocol clients that call the request identifier an ID."""
-        return self.request_id
-
 
 @dataclass(frozen=True)
 class ControllerSnapshot:
@@ -58,7 +57,7 @@ class ControllerSnapshot:
     last_completed_job: JobSnapshot | None
     closed: bool
     # Every job that ended, complete or failed. A display polls this counter to
-    # notice a shot taken from any trigger (Stick, SPACE, LCD) without the
+    # notice a shot taken from any trigger (GPIO button, SPACE, LCD) without the
     # controller knowing that displays exist.
     finished_count: int = 0
     last_finished_job: JobSnapshot | None = None
@@ -126,8 +125,8 @@ class CaptureController:
         """Accept ``request_id`` once, or return its current immutable snapshot.
 
         A second, distinct request is not accepted while a capture is active.  It
-        receives a standalone failed snapshot with ``busy`` so a transport can
-        translate it to its own conflict response without creating a fake job.
+        receives a standalone failed snapshot with ``busy`` so the trigger can
+        report it without creating a fake job.
         ``delay_s`` is the shutter delay the worker waits before the capture (see
         the module docstring); a repeated ``request_id`` keeps its first one.
         """

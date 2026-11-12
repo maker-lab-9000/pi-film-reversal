@@ -1,5 +1,4 @@
 import builtins
-import io
 import json
 import sys
 from types import SimpleNamespace
@@ -13,7 +12,6 @@ from pifilm.capture.app import CaptureSession
 from pifilm.capture.camera import CameraError, Frame
 from pifilm.capture.errors import CameraStalled
 from pifilm.capture.picamera import LIVE_METADATA_MAX_AGE_S, Picamera2Camera
-from pifilm.capture.thumbnail import fitted_jpeg
 from pifilm.grain import GrainParams
 from pifilm.lut import LUT3D
 from pifilm.normalize import NormalizeParams
@@ -1225,7 +1223,7 @@ def test_close_calls_close_if_stop_fails_and_preserves_stop_error(install_picame
     assert state.instance.close_count == 1
 
 
-def test_native_capture_session_saves_full_size_outputs_metadata_and_thumbnail(
+def test_native_capture_session_saves_full_size_outputs_and_metadata(
     install_picamera, tmp_path,
 ):
     bgr = np.broadcast_to(
@@ -1283,9 +1281,6 @@ def test_native_capture_session_saves_full_size_outputs_metadata_and_thumbnail(
     assert record["dng"] == dng_names[0]
     dng_path = day_dir / record["dng"]
     assert dng_path.read_bytes()[:4] == b"II*\x00"
-
-    with Image.open(io.BytesIO(fitted_jpeg(result.pifilm))) as thumbnail:
-        assert thumbnail.size == (240, 135)
 
 
 def test_native_capture_session_omits_dng_when_backend_disables_it(
@@ -3240,7 +3235,7 @@ def test_the_live_metadata_is_used_before_capturing_any(install_picamera):
 
 def test_stale_live_metadata_is_replaced_by_metadata_captured_now(install_picamera):
     """The viewfinder reads no frames in its menu (or with the screen off, on
-    review, on a notice): a GPIO or Stick shot then must not split AE values
+    review, on a notice): a GPIO shot then must not split AE values
     read minutes ago, so one frame's metadata is captured instead."""
     camera, inst = _burst_camera(
         install_picamera, analogue_gain=(1.0, 16.0, 1.0),

@@ -21,13 +21,9 @@ UPLOADING and the child keeps the sync's lock. If reading fails anyway, the line
 ``PYTHONUNBUFFERED=1`` makes the child's lines arrive as they are printed, not
 when its buffer fills, outside systemd too.
 
-Why the token is removed from the child's environment: ``PIFILM_REMOTE_TOKEN``
-is the bearer token of the capture API, read from the systemd unit's environment
-file. The sync has no use for it, and a child (and rclone, which it starts in
-turn) should not hold a secret it does not need, where a crash report or a
-process inspector could expose it. Every other variable is kept, so ``HOME``,
-``PATH`` and ``XDG_STATE_HOME`` lead the child to the same lock file and rclone
-as the timer's run (``PYTHONUNBUFFERED`` is the one variable added).
+Why the child gets the service's environment: ``HOME``, ``PATH`` and
+``XDG_STATE_HOME`` then lead it to the same lock file and rclone as the timer's
+run (``PYTHONUNBUFFERED`` is the one variable added).
 
 Why the status is read from the last line: the sync's guards (no network, no
 Nextcloud, another sync running) all exit 0, like a successful copy, because a
@@ -55,9 +51,6 @@ import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
-
-#: Removed from the child's environment: the capture API's token.
-TOKEN_ENV = "PIFILM_REMOTE_TOKEN"
 
 #: The exit recorded when the child cannot be started.
 EXIT_NOT_STARTED = 127
@@ -99,7 +92,7 @@ class Upload:
     def start(self) -> bool:
         """Start a sync; False, starting nothing, while one is running."""
         argv = [self._python, "-m", "pifilm.nextcloud", "--apply", "--env", str(self._env_path)]
-        env = {k: v for k, v in self._environ.items() if k != TOKEN_ENV}
+        env = dict(self._environ)
         env["PYTHONUNBUFFERED"] = "1"
         with self._lock:
             if self._running:

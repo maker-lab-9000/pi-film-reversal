@@ -19,9 +19,9 @@ does a second copy of this program. Neither raises in ``pykms``: the card opens
 and the mode-set returns the kernel's error code, so ``_PykmsBackend`` checks that
 return value, or every later swap would fail instead. That failure, like every
 other at open, is a ``DisplayError`` and costs the screen only; ``pifilm-capture``
-carries on headless for the Stick. The same holds while running: whatever type of
-exception the binding raises leaves ``KmsDisplay`` as a ``DisplayError``, the only
-one the viewfinder loop contains.
+carries on headless (the GPIO button still takes photographs). The same holds
+while running: whatever type of exception the binding raises leaves
+``KmsDisplay`` as a ``DisplayError``, the only one the viewfinder loop contains.
 
 The panel has no brightness control (``/sys/class/backlight`` is empty), so
 ``backlight`` is on/off: 0 powers the output down and anything else powers it up.

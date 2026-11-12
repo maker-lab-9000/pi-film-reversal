@@ -59,48 +59,43 @@ def _session(tmp_path, pipeline, camera=None, now=None):
                           seed_rng=np.random.default_rng(0))
 
 
-def test_remote_listener_refuses_to_start_without_a_token(monkeypatch, capsys):
-    """A listener without the shared secret would be an unauthenticated shutter button."""
-    monkeypatch.delenv("PIFILM_REMOTE_TOKEN", raising=False)
-
-    assert main(["--remote-listen", "127.0.0.1:8765"]) == 2
-
-    assert "PIFILM_REMOTE_TOKEN" in capsys.readouterr().err
-
-
-def test_remote_listener_keeps_running_without_a_tty(monkeypatch, tmp_path):
-    """The remote control path must not fall through to the terminal-only error."""
+def test_shutter_button_keeps_running_without_a_tty(monkeypatch, tmp_path):
+    """A button with no screen and no terminal must not fall through to the
+    terminal-only error: the process stays up for the button's presses."""
     from pifilm.capture import app
 
-    listeners = []
+    buttons = []
 
-    class Listener:
-        def __init__(self, controller, token, listen, power=None):
-            self.controller = controller
-            self.token = token
-            self.listen = listen
-            self.power = power
-            self.started = False
+    class Button:
+        def __init__(self):
+            self.callback = None
             self.closed = False
-            listeners.append(self)
+            buttons.append(self)
 
-        def start(self):
-            self.started = True
+        def on_press(self, callback):
+            self.callback = callback
 
         def close(self):
             self.closed = True
 
-    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "secret")
-    monkeypatch.setattr(app, "RemoteCaptureServer", Listener)
+    slept = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(app, "open_shutter_button", lambda pin: Button())
     monkeypatch.setattr(app.Artifacts, "resolve", lambda _: object())
     monkeypatch.setattr(app, "Pipeline", lambda _: object())
     monkeypatch.setattr(app, "has_display", lambda: False)
     monkeypatch.setattr(app.sys, "stdin", SimpleNamespace(isatty=lambda: False))
-    monkeypatch.setattr(app.time, "sleep", lambda _: (_ for _ in ()).throw(KeyboardInterrupt))
+    monkeypatch.setattr(app.time, "sleep", sleep)
 
-    assert app.main(["--fake", "--no-preview", "--remote-listen", "127.0.0.1:8765"]) == 0
-    assert len(listeners) == 1
-    assert listeners[0].started and listeners[0].closed
+    assert app.main(["--fake", "--no-preview", "--shutter-gpio", "21",
+                     "--out", str(tmp_path / "shots")]) == 0
+    assert slept == [1]
+    assert len(buttons) == 1
+    assert callable(buttons[0].callback) and buttons[0].closed
 
 
 def test_ups_monitor_is_never_left_running_when_startup_fails(tmp_path, monkeypatch):
@@ -516,7 +511,7 @@ def test_external_capture_updates_pi_display(
         release.set()
         assert finished.wait(timeout=2)
         for _ in range(200):
-            if controller.status("remote-shot").state == "complete":
+            if controller.status("button-shot").state == "complete":
                 return
             time.sleep(0.001)
         pytest.fail("capture did not complete")
@@ -527,7 +522,7 @@ def test_external_capture_updates_pi_display(
             return -1
         waits += 1
         if waits == 1:
-            controller.submit("remote-shot")
+            controller.submit("button-shot")
             if finish_between_polls:
                 finish_capture()
             return -1
@@ -535,7 +530,7 @@ def test_external_capture_updates_pi_display(
             assert len(np.unique(capture_gui[-1][0], axis=0)) == 7
             finish_capture()
             return -1
-        saved = controller.status("remote-shot").result.pifilm
+        saved = controller.status("button-shot").result.pifilm
         rgb, _ = load_rgb(saved)
         expected = cv2.resize(rgb, (640, 360), interpolation=cv2.INTER_AREA)[:, :, ::-1]
         assert np.array_equal(capture_gui[-1], expected)
@@ -1423,33 +1418,24 @@ def test_display_warns_and_continues_on_v4l2(camera_cli, monkeypatch, capsys):
     ) in capsys.readouterr().err
 
 
-def test_display_on_v4l2_still_serves_the_stick(camera_cli, monkeypatch):
-    """The service's own argument list: --display plus --remote-listen on a Pi
-    whose camera is USB must keep the remote API, not die."""
-    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
+def test_display_on_v4l2_still_serves_the_button(camera_cli, monkeypatch):
+    """The service's own argument list: --display plus --shutter-gpio on a Pi
+    whose camera is USB must keep the button, not die."""
     seen = {"viewfinder": 0}
-
-    class ServerDouble:
-        def __init__(self, controller, token, listen, power=None):
-            pass
-
-        def start(self):
-            return None
-
-        def close(self):
-            return None
+    button = _ButtonDouble()
 
     monkeypatch.setattr(camera_cli, "V4L2Camera", lambda device: _CameraDouble())
-    monkeypatch.setattr(camera_cli, "RemoteCaptureServer", ServerDouble)
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: button)
     monkeypatch.setattr(
         camera_cli, "_run_viewfinder",
         lambda *a, **k: seen.__setitem__("viewfinder", seen["viewfinder"] + 1),
     )
     assert camera_cli.main([
         "--camera", "v4l2", "--display", "waveshare28", "--no-preview",
-        "--remote-listen", "127.0.0.1:8765",
+        "--shutter-gpio", "21",
     ]) == 0
     assert seen["viewfinder"] == 0
+    assert callable(button.callback) and button.closed
 
 
 def test_display_is_dropped_before_the_panel_is_opened_on_an_auto_v4l2_backend(
@@ -1544,22 +1530,12 @@ def test_fake_display_writes_a_png_and_exits_on_stop(tmp_path, monkeypatch):
     assert (out / "viewfinder-last.png").exists()
 
 
-def test_remote_listener_and_display_share_one_controller(camera_cli, monkeypatch, tmp_path):
-    """The shipped service runs --remote-listen with --display: the viewfinder must
-    take over the foreground (not the sleep loop) and the Stick must submit jobs
+def test_button_and_display_share_one_controller(camera_cli, monkeypatch, tmp_path):
+    """The shipped service runs --shutter-gpio with --display: the viewfinder must
+    take over the foreground (not the sleep loop) and the button must submit jobs
     through the very controller the panel is watching."""
-    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
     seen = {"viewfinder_calls": 0}
-
-    class ServerDouble:
-        def __init__(self, controller, token, listen, power=None):
-            seen["server_controller"] = controller
-
-        def start(self):
-            return None
-
-        def close(self):
-            return None
+    button = _ButtonDouble()
 
     def viewfinder_double(camera, controller, display_pair, power, args, **kwargs):
         seen["viewfinder_calls"] += 1
@@ -1569,7 +1545,7 @@ def test_remote_listener_and_display_share_one_controller(camera_cli, monkeypatc
     def no_sleep(_seconds):
         raise KeyboardInterrupt  # the sleep loop must never be reached
 
-    monkeypatch.setattr(camera_cli, "RemoteCaptureServer", ServerDouble)
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: button)
     monkeypatch.setattr(camera_cli, "_run_viewfinder", viewfinder_double)
     monkeypatch.setattr(
         camera_cli, "time",
@@ -1578,30 +1554,23 @@ def test_remote_listener_and_display_share_one_controller(camera_cli, monkeypatc
 
     assert camera_cli.main([
         "--fake", "--display", "fake", "--no-preview",
-        "--remote-listen", "127.0.0.1:8765", "--out", str(tmp_path / "shots"),
+        "--shutter-gpio", "21", "--out", str(tmp_path / "shots"),
     ]) == 0
     assert seen["viewfinder_calls"] == 1
-    assert seen["viewfinder_controller"] is seen["server_controller"]
+    # The press handler is ``_button_capture`` bound to the controller.
+    assert button.callback.args[0] is seen["viewfinder_controller"]
 
 
-def test_display_breaker_keeps_the_remote_api_alive(camera_cli, monkeypatch, tmp_path, capsys):
-    """Five consecutive SPI failures must cost the screen, not the Stick: the
-    process used to return 1, systemd restarted it, and the Stick got a few
-    seconds of service per cycle."""
+def test_display_breaker_exits_for_a_restart_even_with_the_button(
+    camera_cli, monkeypatch, tmp_path, capsys,
+):
+    """Five consecutive SPI failures end the viewfinder. Nothing else keeps the
+    process alive (the button has no loop of its own), so it exits 1 for systemd
+    to restart it, which also brings the button back; the panel is released first
+    and the sleep loop is never entered."""
     from pifilm.display import DisplayError
 
-    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
     slept = []
-
-    class ServerDouble:
-        def __init__(self, controller, token, listen, power=None):
-            pass
-
-        def start(self):
-            return None
-
-        def close(self):
-            return None
 
     class DeadDisplay:
         closed = False
@@ -1622,12 +1591,13 @@ def test_display_breaker_keeps_the_remote_api_alive(camera_cli, monkeypatch, tmp
             self.closed = True
 
     display, touch = DeadDisplay(), Touch()
+    button = _ButtonDouble()
 
     def no_sleep(seconds):
         slept.append(seconds)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(camera_cli, "RemoteCaptureServer", ServerDouble)
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: button)
     monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: (display, touch))
     monkeypatch.setattr(
         camera_cli, "time",
@@ -1636,10 +1606,10 @@ def test_display_breaker_keeps_the_remote_api_alive(camera_cli, monkeypatch, tmp
 
     assert camera_cli.main([
         "--fake", "--display", "waveshare28", "--no-preview",
-        "--remote-listen", "127.0.0.1:8765", "--out", str(tmp_path / "shots"),
-    ]) == 0
-    assert slept == [1]                     # the remote sleep loop was entered
-    assert display.closed and touch.closed  # and the panel was released first
+        "--shutter-gpio", "21", "--out", str(tmp_path / "shots"),
+    ]) == 1
+    assert slept == []
+    assert display.closed and touch.closed and button.closed
     assert "display failed repeatedly" in capsys.readouterr().err
 
 
@@ -1886,26 +1856,15 @@ def test_main_still_shuts_down_when_the_button_does_not_close(camera_cli, monkey
     ) in capsys.readouterr().err
 
 
-def test_stalled_camera_exits_nonzero_even_with_the_remote_api(
+def test_stalled_camera_exits_nonzero_even_with_the_button(
     camera_cli, tmp_path, monkeypatch, capsys,
 ):
-    """A dead screen costs the screen only, but a camera that stopped delivering
-    frames leaves nothing to serve: the process must exit so systemd restarts it,
-    and a clean-up that hangs on the same camera must not keep it alive."""
+    """A camera that stopped delivering frames leaves nothing for the button to
+    do: the process must exit so systemd restarts it, and a clean-up that hangs on
+    the same camera must not keep it alive."""
     from pifilm.capture.errors import CameraStalled
 
-    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
     armed = []
-
-    class ServerDouble:
-        def __init__(self, controller, token, listen, power=None):
-            pass
-
-        def start(self):
-            return None
-
-        def close(self):
-            return None
 
     class Panel:
         closed = False
@@ -1927,7 +1886,7 @@ def test_stalled_camera_exits_nonzero_even_with_the_remote_api(
             raise CameraStalled("no preview frame within 5.0 s")
 
     display, touch = Panel(), Panel()
-    monkeypatch.setattr(camera_cli, "RemoteCaptureServer", ServerDouble)
+    monkeypatch.setattr(camera_cli, "open_shutter_button", lambda pin: _ButtonDouble())
     monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: (display, touch))
     monkeypatch.setattr(camera_cli, "ViewfinderLoop", StalledLoop)
     monkeypatch.setattr(
@@ -1936,7 +1895,7 @@ def test_stalled_camera_exits_nonzero_even_with_the_remote_api(
 
     assert camera_cli.main([
         "--fake", "--display", "waveshare28", "--no-preview",
-        "--remote-listen", "127.0.0.1:8765", "--out", str(tmp_path / "shots"),
+        "--shutter-gpio", "21", "--out", str(tmp_path / "shots"),
     ]) == 1
     assert armed == [(camera_cli.STALL_EXIT_DEADLINE, 1)]
     assert display.closed and touch.closed
@@ -2899,16 +2858,13 @@ def test_sigterm_ends_the_headless_service_cleanly(monkeypatch, tmp_path):
 
     signals, closed = _Signals(), []
 
-    class Listener:
-        def __init__(self, controller, token, listen, power=None):
-            pass
-
-        def start(self):
+    class Button:
+        def on_press(self, callback):
             pass
 
         def close(self):
             signals.deliver()  # a second SIGTERM, in the middle of the clean-up
-            closed.append("remote")
+            closed.append("button")
 
     real_close = app.CaptureSession.close_grades
 
@@ -2921,8 +2877,7 @@ def test_sigterm_ends_the_headless_service_cleanly(monkeypatch, tmp_path):
         signals.deliver()
         raise AssertionError("SIGTERM did not end the loop")
 
-    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "secret")
-    monkeypatch.setattr(app, "RemoteCaptureServer", Listener)
+    monkeypatch.setattr(app, "open_shutter_button", lambda pin: Button())
     monkeypatch.setattr(app.CaptureSession, "close_grades", close_grades)
     monkeypatch.setattr(app, "has_display", lambda: False)
     monkeypatch.setattr(app.sys, "stdin", SimpleNamespace(isatty=lambda: False))
@@ -2931,8 +2886,8 @@ def test_sigterm_ends_the_headless_service_cleanly(monkeypatch, tmp_path):
 
     assert app.main(["--fake", "--no-preview", "--out", str(tmp_path / "shots"),
                      "--state-dir", str(tmp_path / "state"),
-                     "--remote-listen", "127.0.0.1:8765"]) == 0
-    assert closed == ["remote", "grades"]
+                     "--shutter-gpio", "21"]) == 0
+    assert closed == ["button", "grades"]
     assert not any(t.name == "pifilm-grade" for t in threading.enumerate())
     # Installed for SIGTERM, silenced for the clean-up, and the handler that was
     # there before put back on the way out.
@@ -3132,12 +3087,12 @@ def test_a_twice_failed_grade_is_reported_as_given_up(tmp_path, background):
 
 
 class _Part:
-    """A display, a touch reader or a server that is sent SIGTERM while it closes."""
+    """A display, a touch reader or a button that is sent SIGTERM while it closes."""
 
     def __init__(self, signals, closed, name):
         self._signals, self._closed, self._name = signals, closed, name
 
-    def start(self):
+    def on_press(self, callback):
         return None
 
     def close(self):
@@ -3168,11 +3123,10 @@ def _viewfinder_main(camera_cli, monkeypatch, tmp_path, run):
         closed.append("grades")
         return real_close(self, timeout)
 
-    monkeypatch.setenv("PIFILM_REMOTE_TOKEN", "token")
     monkeypatch.setattr(camera_cli, "FakeCamera", Camera)
     monkeypatch.setattr(camera_cli.CaptureSession, "close_grades", close_grades)
-    monkeypatch.setattr(camera_cli, "RemoteCaptureServer",
-                        lambda *args, **kwargs: _Part(signals, closed, "remote"))
+    monkeypatch.setattr(camera_cli, "open_shutter_button",
+                        lambda pin: _Part(signals, closed, "button"))
     monkeypatch.setattr(camera_cli, "_open_display", lambda args, out: (
         _Part(signals, closed, "display"), _Part(signals, closed, "touch"),
     ))
@@ -3181,7 +3135,7 @@ def _viewfinder_main(camera_cli, monkeypatch, tmp_path, run):
     monkeypatch.setattr(camera_cli.signal, "signal", signals)
     code = camera_cli.main([
         "--fake", "--display", "waveshare28", "--no-preview",
-        "--remote-listen", "127.0.0.1:8765", "--out", str(tmp_path / "shots"),
+        "--shutter-gpio", "21", "--out", str(tmp_path / "shots"),
         "--state-dir", str(tmp_path / "state"),
     ])
     assert signals.calls[-1][1] is signals.previous
@@ -3200,7 +3154,7 @@ def test_a_second_sigterm_cannot_break_into_the_viewfinders_clean_up(
 
     code, closed = _viewfinder_main(camera_cli, monkeypatch, tmp_path, run)
     assert code == 0
-    assert closed == ["touch", "display", "remote", "grades", "camera"]
+    assert closed == ["touch", "display", "button", "grades", "camera"]
 
 
 def test_sigterm_cannot_break_into_the_stall_exits_clean_up(camera_cli, monkeypatch, tmp_path):
@@ -3211,7 +3165,7 @@ def test_sigterm_cannot_break_into_the_stall_exits_clean_up(camera_cli, monkeypa
 
     code, closed = _viewfinder_main(camera_cli, monkeypatch, tmp_path, run)
     assert code == 1  # still the exit that makes systemd restart the service
-    assert closed == ["touch", "display", "remote", "grades", "camera"]
+    assert closed == ["touch", "display", "button", "grades", "camera"]
 
 
 # --- grading on the GPU ------------------------------------------------------

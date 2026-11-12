@@ -132,14 +132,14 @@ def test_start_runs_the_sync_module_with_apply_and_the_env_path():
     assert kwargs["start_new_session"] is True
 
 
-def test_child_environment_lacks_the_remote_token_and_keeps_the_rest():
-    environ = {"HOME": "/home/pi", "PATH": "/usr/bin", "PIFILM_REMOTE_TOKEN": "secret"}
+def test_child_environment_is_the_services_plus_unbuffered_output():
+    environ = {"HOME": "/home/pi", "PATH": "/usr/bin", "XDG_STATE_HOME": "/home/pi/.st"}
     upload, popen, _ = make(FakeProcess([]), environ=environ)
     upload.start()
     finish(upload)
     env = popen.calls[0][1]["env"]
-    assert env == {"HOME": "/home/pi", "PATH": "/usr/bin", "PYTHONUNBUFFERED": "1"}
-    assert environ["PIFILM_REMOTE_TOKEN"] == "secret"
+    assert env == {**environ, "PYTHONUNBUFFERED": "1"}
+    assert "PYTHONUNBUFFERED" not in environ
 
 
 def test_each_line_is_logged_with_the_nextcloud_prefix():

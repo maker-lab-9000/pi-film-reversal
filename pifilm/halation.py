@@ -28,7 +28,7 @@ The model (``"mix"``), chosen by eye from two galleries on 2026-10-17
   (``k = max(1, floor(sigma_px / 2))``: 3 on the quick grade's 1014 px, 14 at 4056 px),
   and is read back with bilinear interpolation. The glow is soft, so this loses nothing
   visible. The rule was four reduced pixels until 2026-10-17, when the Pi 4 timed the
-  quick grade (the review screen and the Stick, on the capture side, so inside
+  quick grade (the review screen's picture, on the capture side, so inside
   ``shutter_to_ready_ms``) at 588 ms with halation against 137 without: four pixels
   left it unreduced, its blurs on the whole quick frame. Against the fall-off blurred
   directly on the full frame the glow is within 6 % of its peak at the spot's edge,

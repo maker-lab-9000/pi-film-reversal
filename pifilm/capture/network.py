@@ -1,6 +1,6 @@
 """The Pi's IPv4 addresses on Ethernet and Wi-Fi, for the viewfinder's ETH / WLAN tag.
 
-Reaching the Pi over SSH, or pointing a browser or the Stick at it, needs its
+Reaching the Pi over SSH, or pointing a browser at it, needs its
 address, and the Pi has no other screen to show it on: the address a router hands
 out on Ethernet changes from network to network, and ``parr.local`` needs mDNS,
 which not every network or client resolves. So the capture app reads the IPv4
@@ -28,8 +28,8 @@ Mac reads as nothing connected. IPv4 only, and only these two interfaces: those
 are what the Pi has and what a person types.
 
 The Pi's own hotspot (``scripts/pi_hotspot.py``) is shown like any other Wi-Fi
-link, ``WLAN 10.42.0.1``: that is the address the Stick and a phone joined to the
-hotspot reach the Pi on, so it is the one worth seeing, and telling an access
+link, ``WLAN 10.42.0.1``: that is the address a phone or laptop joined to the
+hotspot reaches the Pi on, so it is the one worth seeing, and telling an access
 point from a client would need NetworkManager for no gain on the screen.
 
 The poller is a daemon thread, ``pifilm-network``, shaped like the disk monitor
