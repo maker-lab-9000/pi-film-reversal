@@ -27,8 +27,8 @@ ERROR RPI  Alternatively, try another cable and/or sensor.
 ```
 
 In an interactive run both photos still saved (~20 s each); under the systemd
-service / remote (Stick) path the stall escalated to a capture that never
-returned (observed waiting >150 s).
+service, with shots triggered from the StickS3 remote (since removed), the stall
+escalated to a capture that never returned (observed waiting >150 s).
 
 ### Root cause (verified)
 
@@ -146,7 +146,7 @@ requested during the stall is lost. By the timeouts the camera should be back
 about 20 seconds after the freeze; that has not been timed on the Pi, because
 the stall cannot be produced on demand.
 
-Only the LCD viewfinder has this exit. In the headless Stick-only mode a
+Only the LCD viewfinder has this exit. In the headless mode (GPIO button only) a
 stalled still fails that one capture with the same message and the process
 keeps running.
 

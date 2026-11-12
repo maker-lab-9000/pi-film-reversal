@@ -141,7 +141,7 @@ frames cannot be normalised back. After training, `diagnostics.png` shows the
 white-balance gains the corpus needed; centred near 1.0 with a low clamp rate
 means the shoot was well behaved.
 
-**Shoot.** Use the Stick, or on the Pi `pifilm-capture --no-preview`. Frames land
+**Shoot.** Use the LCD's shutter or the GPIO button, or on the Pi `pifilm-capture --no-preview`. Frames land
 in `~/Pictures/pifilm/YYYY-MM-DD/` as `*_original.jpg` (the camera's own bytes)
 or `*_ungraded.jpg` (re-encoded when raw MJPEG was unavailable). Either is
 usable; prefer `_original` when both exist for a frame.

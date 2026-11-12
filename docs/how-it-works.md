@@ -98,7 +98,7 @@ default (`--grade background`) the camera does not wait for them:
 2. A pending entry is written: a small JSON file outside the photo folder
    (`~/.local/state/pifilm/pending/`, or `--state-dir PATH`) with the original's
    name, the grain seed, the EV and the camera fields of the record.
-3. A quick grade is made for the review screen and the Stick: the frame reduced
+3. A quick grade is made for the review screen: the frame reduced
    by a whole factor to about 1,000 pixels on the long side (four times each way,
    1014 × 760, from the IMX477), through the same pipeline without grain. The camera is now free for the next photograph.
 4. Behind the shutter, one worker thread grades the full frame, saves

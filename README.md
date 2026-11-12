@@ -81,7 +81,6 @@ More in [the viewfinder guide](docs/lcd-viewfinder.md).
 
 ## Hardware
 - Raspberry Pi 4, 4GB RAM
-- M5Stack StickS3 (display, trigger) - disabled
 - Waveshare 3.5 inch DSI LCD (E) touchscreen (viewfinder, shutter, manual shutter / ISO / white balance, light meter, focus gauge, battery)
 - A momentary push button on two jumper wires (physical shutter button, GPIO 21)
 - x728 UPS Shield + Geekworm X728-C1 Metal Case
@@ -95,8 +94,8 @@ More in [the viewfinder guide](docs/lcd-viewfinder.md).
 
 Full walkthrough: **[the setup guide](docs/setup.md)** — ordered by dependency, and it names the machine for every step. In brief:
 
-More detail lives in the docs: the [network & deployment guide](docs/sticks3-remote.md)
-(hotspot, Ethernet, service, rollback) and the [firmware README](firmware/sticks3/README.md)
+More detail lives in the docs: the [network & service guide](docs/pi-service.md)
+(hotspot, Ethernet, service, rollback).
 
 
 ## From shutter button to saved photo
@@ -129,41 +128,19 @@ The Pi does the grading on its graphics chip. It checks the chip at every start.
 
 A double exposure adds the two frames first, then grades the result once.
 
-## From button press to displayed photo
+## Running modes
 
-The Pi captures, grades and stores. 
-The M5Stack StickS3 is the wireless shutter and **last-capture display** — not a live viewfinder. It joins the Pi's own Wi-Fi hotspot and they talk over a token-authenticated HTTP API, so no home network or cloud is needed in the field. 
-Ethernet/SSH is only for admin and photo transfer.
-
-```text
-Stick joins hotspot → checks readiness → shows READY
-    ↓ button press
-POST /v1/captures → Pi accepts (one at a time) → Stick sounds shutter
-    ↓ colour bars while waiting
-Pi grabs one frame → normalize → LUT → grain
-    ↓
-Pi saves original + graded JPEG + captures.jsonl → job complete
-    └─ Stick polls, downloads the graded thumbnail, displays it
-```
-
-- **Ready** — the Pi app runs with its remote listener; the Stick joins the hotspot and polls `GET /v1/status` before showing READY.
-- **Shutter** — a debounced press sends `POST /v1/captures` with a unique ID. The Pi runs one capture at a time (extra requests get a busy `409`); the shutter tone means "accepted", not "saved".
-- **Feedback** — the Stick shows colour bars and polls `GET /v1/captures/{id}` while it works (two-screen mode shows the same bars on the Pi).
-- **Capture + grade** — one frame becomes both outputs: normalize → chosen 3D LUT → grain. `--artifacts DIR` picks a different look.
-- **Save** — to `~/Pictures/pifilm/YYYY-MM-DD/`: `*_original.jpg` (or `*_ungraded.jpg`), the full-res `*_graded.jpg`, and a `captures.jsonl` line (LUT hash, gains, grain seed, timings). The job completes only after these writes.
-- **Preview to Stick** — the Stick fetches `GET /v1/captures/{id}/image.jpg`; the Pi returns a 240×135, ≤64 KiB letterboxed JPEG of the graded file. No re-grading on the Stick.
-- **Display** — shown until the next capture. Full-res stays on the Pi (the Stick isn't the archive); failures show an error, not a fake success.
-- **LCD too** — the touchscreen on the Pi (`--display waveshare35dsi`, see [the display](#the-display)) has its own shutter; a Stick shot appears on the LCD and an LCD shot appears on the Stick, since both go through the same controller.
-
-**Running modes:**
+The Pi captures, grades and stores. Ethernet/SSH is for admin and photo
+transfer; in the field the Pi runs its own Wi-Fi hotspot, so a phone or laptop
+can still SSH in with no home network or cloud.
 
 | Mode | Command | Notes |
 | --- | --- | --- |
-| Headless (field) | `pifilm-capture --no-preview --remote-listen 0.0.0.0:8765` | battery, no monitor; the Stick still gets the preview |
-| Camera with screen and button | `pifilm-capture --no-preview --remote-listen 0.0.0.0:8765 --display waveshare35dsi --shutter-gpio 21` | the touchscreen is the viewfinder; the Stick still works |
+| Camera with screen and button | `pifilm-capture --no-preview --display waveshare35dsi --shutter-gpio 21` | the touchscreen is the viewfinder; the button and the on-screen shutter are the same kind of shot |
+| Headless with button | `pifilm-capture --no-preview --shutter-gpio 21` | battery, no screen; each press takes a photo |
 | Two-screen | `pifilm-capture --show-captures` | run in a Pi desktop session; the Pi also shows colour bars + a preview of the photo |
 
-Full config and rollback: the [deployment guide](docs/sticks3-remote.md).
+Full config and rollback: the [network & service guide](docs/pi-service.md).
 
 ## Using the tools directly
 
@@ -272,7 +249,7 @@ Full guide (app password, every key, troubleshooting): [docs/nextcloud-sync.md](
 
 Training is optional — the camera works with the bundled starter. Point `pifilm-train` at two local image folders (source frames, and reference photos you have the rights to use); it fits a 33³ `.cube` LUT by colour-distribution transfer and regularised least squares, evaluates on held-out images, and writes a report with quality gates. A LUT only shifts global colour and tone.
 
-- **How to train, gate by gate:** [the training guide](docs/training.md) (short outline in [setup §6](docs/setup.md#6-training-a-look-optional)).
+- **How to train, gate by gate:** [the training guide](docs/training.md) (short outline in [setup §5](docs/setup.md#5-training-a-look-optional)).
 
 ## How the colour model works
 

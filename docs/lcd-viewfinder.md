@@ -21,7 +21,7 @@ The commands in section 4 and the checklist in section 7 are written for the
 The LCD shows a live, ungraded feed from the camera with a light-meter-style
 exposure meter, an on-screen shutter button and three manual controls (shutter,
 ISO, white balance), sharing the same
-`CaptureController` as the Stick — a shot from either trigger shows up on both.
+`CaptureController` as the GPIO shutter button — a shot from either trigger shows up here.
 The SPACE key is not available while the viewfinder runs: the loop owns the
 process's main thread, so there is no terminal key reader.
 
@@ -146,10 +146,11 @@ and runs exactly as it would without the flag.
 `deploy/pifilm-capture.service.example`'s `ExecStart` already includes
 `--display waveshare35dsi`; it is harmless on a Pi without the panel and on a Pi
 with a USB camera — the service logs one `warning: display unavailable (...)`
-line and keeps serving the Stick instead of crash-looping. The same is true
-once the viewfinder is running: five consecutive display failures close the panel
-and leave the remote API serving the Stick, rather than exiting for systemd to
-restart.
+line and carries on headless (the GPIO button still takes photos) instead of
+crash-looping. Once the viewfinder is running, five consecutive display failures
+close the panel and the process exits 1 for systemd to restart it; the restart
+opens the panel again, or starts headless if it is gone, and brings the button
+back with it.
 
 ## 5. The screen
 
@@ -192,7 +193,7 @@ message screens keep the default font.
 | `PHOTOS NN%` / `SD NN%` tags (amber on a dark patch, top, between the top-left row and the shutter button) | The photo volume or the system SD card is at or above `--disk-warn-percent` (90 by default); see [Disk-space warning](#disk-space-warning). Absent otherwise | — |
 | `IMG` tag (amber on a dark patch, first in the same place as the disk tags) | Sharpness, contrast or saturation is not 1.0; see [Image page](#settings-menu). Absent otherwise | — |
 | `STAB` tag (amber on a dark patch, right after `IMG`) | Short exposure, a shutter delay or multi-frame is on; see [Stabilise page](#settings-menu). Absent otherwise. `IMG` and `STAB` have half the other tags' padding (3 units a side), so both fit beside the widest disk warning (`PHOTOS 100%`, `SD 100%`) | — |
-| Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the Stick — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the Stick and the OpenCV window show, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
+| Processing screen (TV colour bars, `Processing photo...`) | Replaces the live view while any capture — from this screen or the GPIO button — holds the camera: until the original is saved and the quick grade is made, or, with `--grade inline`, until the full grade is saved (roughly 3 s on the Pi 4). It stays longer when three grades are already waiting; the same bars the OpenCV window shows, dimmed to 55 % on the panel (`PROCESSING_DIM`) so they do not glare in a dark room. The camera is not read during it | — |
 | Review screen | Full-screen quick grade (the frame reduced by a whole factor to about 1,000 pixels on the long side, four times each way for the IMX477, graded without grain; the graded file itself with `--grade inline`), one-line caption (`1/250  ISO 400`, starting `2x` for a double exposure), "tap to continue" hint. The caption's ISO is analogue × digital gain as the camera measured it, so a shot at a fixed ISO 100 can read slightly higher (for example `ISO 120`) | Any tap, or 30 s untouched, returns to live view |
 
 Press feedback: `+`, `-` and the shutter button light while a finger is on them, not
@@ -226,7 +227,7 @@ grade that is running and the ones waiting. It disappears at zero.
   recovered grades are done.
 - Numbers above 99 are drawn as `99`.
 
-The review screen and the Stick show the quick grade, not the final file: it is
+The review screen shows the quick grade, not the final file: it is
 reduced and has no grain, and its tone can differ slightly from the graded file.
 
 ### Tuning warning
@@ -389,7 +390,7 @@ view shows an amber `STAB` tag right after `IMG`. Each Picamera2 record has
 always `false` under `--ae-lock`, whatever was saved), then `shutter_delay_s` (the delay actually waited) after the last camera field.
 
 *Shutter delay* applies to the LCD's shutter button and the GPIO button only. The
-Stick and the keyboard never wait. The live view keeps running during the wait (the
+keyboard never waits. The live view keeps running during the wait (the
 job is `queued`, the controller's snapshot says `delaying`), so the colour bars only
 appear once the capture starts; a second press during the wait is busy. The delay
 lets the shake of the press die down before the exposure.
@@ -461,7 +462,7 @@ an upload stops the sync and its rclone (SIGTERM to the sync's process group, th
 SIGKILL after 5 s); rclone copies each file whole, so the next run carries on.
 
 **While the menu is open** the camera is not read, as for a review. The GPIO button
-and the Stick still take photographs; a shot finished then does not open the review,
+still takes photographs; a shot finished then does not open the review,
 and the menu stays. The developing count and the warnings return with the live view.
 Idle dimming and screen-off apply as in the live view, and a tap in the menu counts
 as activity.
@@ -489,7 +490,7 @@ five-minute row, where its output is powered down (see
 [9.3](#93-what-differs-from-the-28-panel)).
 
 Any capture counts as activity: while one is being graded the screen stays
-lit, and a finished shot, from the LCD or the Stick, wakes it into the review.
+lit, and a finished shot, from the LCD or the GPIO button, wakes it into the review.
 `0` disables either step. `--display fake` has no backlight and is never dimmed.
 
 Touch is polled on its own thread, about 50 times a second, and finished taps are
@@ -506,12 +507,12 @@ described above. Wait for the colour bars to clear.
 
 With `2x` on, every two shots become one picture, the way two exposures on one frame
 of colour negative film do. Light adds: a dark area in one frame lets the other show
-through, and bright areas stack. Any trigger counts: the shutter button, the Stick,
-or both mixed.
+through, and bright areas stack. Any trigger counts: the on-screen shutter, the GPIO
+button, or both mixed.
 
 1. **Exposure 1:** colour bars labelled `Exposure 1 of 2...`, then `Exposure 1/2` for
    about a second, then the live view with the badge at `1/2`. Only the original is
-   saved; the Stick shows an "Exposure 1/2" card.
+   saved.
 2. **Exposure 2:** colour bars labelled `Developing double exposure...`, then the
    review screen with the composite (caption `2x  shutter  ISO NNN`, from the second
    exposure's metadata). The badge returns to `0/2` and the mode stays on.
@@ -762,15 +763,15 @@ per spec §4:
 3. Shutter tap → colour bars → result → tap returns to live. `captures.jsonl`
    gains a record with `sensor_mode 4056x3040`, `tuning_file auto:imx477`,
    `autofocus none`.
-4. Stick shot while the LCD is live: appears on both; the LCD returns to live
-   after 30 s untouched.
+4. GPIO button shot while the LCD is live: appears on the LCD, which returns to
+   live after 30 s untouched.
 5. (Removed 2026-10-11 with EV compensation.)
 6. Meter sanity: cover the lens → the leftmost meter dot is lit, `LX` near 0; point
    at a lamp → `CLIP` rises.
 7. Service: `systemctl restart pifilm-capture` with the LCD → live view at
    boot. Then provoke a fault that the *open* path can actually detect, and
    restart again: the journal must show one `warning: display unavailable (...)`
-   line and the Stick must still capture. Either
+   line and the GPIO button must still capture. Either
    - unplug the panel's ribbon cable entirely, so the touch probe at `0x58`
      gets no answer (`touch controller at 0x58 not answering on /dev/i2c-1`), or
    - `sudo gpasswd -d george spi` and reboot, so `/dev/spidev0.0` cannot be
@@ -788,13 +789,13 @@ per spec §4:
 10. Idle dimming: leave the screen untouched: at 1 minute it halves in brightness
     and the live view keeps moving; at 5 minutes it goes dark. A tap on the dark
     screen lights it without taking a photo (no new `captures.jsonl` line); a
-    Stick shot while dark wakes it into the review.
+    GPIO button shot while dark wakes it into the review.
 11. Double exposure: tap `2x` → badge `2x 0/2` in amber. Shoot a dark silhouette
     against a bright window, then a textured subject: `Exposure 1/2` shows briefly and
     the badge reads `1/2`; the second shot reviews a composite in which the texture
     fills the silhouette. The day folder gains two originals and one
-    `_double_graded.jpg`, and no `_graded.jpg` for exposure 1. Repeat with the Stick
-    as the trigger: it shows the `Exposure 1/2` card, then the composite. Tap `2x` at
+    `_double_graded.jpg`, and no `_graded.jpg` for exposure 1. Repeat with the GPIO
+    button as the trigger: the same notice, then the composite. Tap `2x` at
     `1/2`: the badge goes to the outlined `2x`. `systemctl restart pifilm-capture`:
     the mode comes back off. Exposure 2 on the IMX477 finishes within a few seconds of
     a single shot (colour bars not held noticeably longer).
@@ -820,7 +821,7 @@ Not yet run on hardware. The branch is `feat/manual-controls-ui`.
 | 5 | `+`/`-` light while the finger is down, and on a quick tap | Not yet run |
 | 6 | A shot at fixed shutter + ISO + WB: the record has `shutter_us`, `iso`, `colour_temperature_k`, and `camera_metadata` agrees. Also `--white-balance 6500`: the `WB` cell reads `6500K` from the first frame | Record part passed 2026-10-12: a shot with shutter 1/125, ISO 1600 and 7500 K fixed logged `shutter_us` 8000, `iso` 1600, `colour_temperature_k` 7500, and `camera_metadata` reported 7986 us, gain 16.0 and 7500 K; ten shots at a fixed white balance all matched their metadata. The `--white-balance` start-up flag: not yet run |
 | 7 | The shutter button is not hit while working `+`/`-` | Not yet run |
-| 8 | `2x`, focus gauge, battery, review, idle screen-off, Stick and GPIO button work as before | Not yet run |
+| 8 | `2x`, focus gauge, battery, review, idle screen-off and GPIO button work as before | Not yet run |
 | 9 | About 10 fps is kept (`viewfinder: N fps` in the journal) | Not yet run |
 
 #### Background grading
@@ -833,7 +834,7 @@ Not yet run on hardware. The branch is `feat/background-grade`; the design is
 | 1 | A single shot: the review appears and the camera is free in about 1.6 s; the graded file appears a few seconds later; the record has `shutter_to_ready_ms` | |
 | 2 | Five shots as fast as the camera allows: all five graded files and records are present, in order; the developing count rises and returns to zero | |
 | 3 | A double exposure: the card, then the composite's review; one graded file | |
-| 4 | Stick: the picture arrives after each shot, as before | |
+| 4 | GPIO button: each press reviews its picture on the LCD, as before | |
 | 5 | Power cut with the count above zero (pull the supply with the UPS off, or `kill -9`): after the restart the missing graded files appear, and their records are marked `recovered` | |
 | 6 | `--grade inline`: behaves as before this change | |
 | 7 | Ten minutes of ordinary use: no preview stall, and the live view is acceptable | |
@@ -851,7 +852,7 @@ first, so that `pifilm-gpu-check` exists.
 | 1 | The service starts with the display on. The journal has `gpu grading on (..., self-test passed)`. This is the first time the GPU context runs beside the display in one process. If the start hangs here, the next start logs `gpu grading off: the last start did not finish opening the GPU; delete <path> to try again` and grades on the CPU: note it, and delete the file only to try again | |
 | 2 | `pifilm-gpu-check --artifacts DIR --image FILE` on a real photograph: within 1 level of the reference, and timings near the spike's (upload 142 ms, shader 239 ms, read-back 180 ms) | |
 | 3 | Ten photographs: every record has `pipeline_backend: gpu-2`; `stage_ms` shows the grade near 0.6 s without halation, about 1.0 s with (`normalize` plus `gpu`); the graded files look right at 100 %, grain included | |
-| 4 | A double exposure and a Stick shot work as before | |
+| 4 | A double exposure and a GPIO button shot work as before | |
 | 5 | `--grade-backend cpu`: records have `pipeline_backend: cpu`, and the timings are as before | |
 | 6 | `pifilm-process` on today's folder: it runs, and prints the note about the records graded on the GPU | |
 | 7 | Ten minutes of ordinary use: no preview stall, and the live view is no worse than now | |
@@ -914,7 +915,7 @@ and the panel in live view, SHUTTER and ISO on `AUTO`:
 | Step | Check | Result |
 | --- | --- | --- |
 | 1 | `PIPELINE` → `STABILISE` opens the page; each row steps and wraps; the amber `STAB` tag shows while any is on and goes when all are off. With `IMG`, `STAB` and a disk warning all showing (`--disk-warn-percent 1`), the tags fit between the top-left row and the shutter button | Not yet run |
-| 2 | `SHUTTER DELAY` `0.5 S`: after the shutter button is released the live view stays up for about half a second, then the colour bars; the delay is felt. Same with the GPIO button. A Stick shot is taken at once. Records: `shutter_delay_s` 0.5 for the panel and button shots, 0.0 for the Stick's | Not yet run |
+| 2 | `SHUTTER DELAY` `0.5 S`: after the shutter button is released the live view stays up for about half a second, then the colour bars; the delay is felt. Same with the GPIO button. A SPACE-key shot (terminal run) is taken at once. Records: `shutter_delay_s` 0.5 for the panel and button shots, 0.0 for the keyboard's | Not yet run |
 | 3 | `SHORT EXPOSURE` `ON` in indoor light: the shutter read-out gets shorter, and the next photograph's `camera_metadata` `ExposureTime` is lower than a shot just before with it off (gain higher); the record has `short_exposure: true`. Under `--ae-lock` the row is dim | Not yet run |
 | 4 | `MULTI-FRAME` `4`, handheld in dim light (about 1/15 s at auto): the graded file is sharper than a single shot taken just before, and less noisy than one frame at the same short exposure. The folder has `HHMMSS_original.jpg` and three `HHMMSS_frameN.jpg`, no `.dng`; the record's `stack.split` is true and `stack.exposure_us` about a quarter of the single shot's `ExposureTime` | Not yet run |
 | 5 | After a burst the live view comes back and its auto exposure settles within a second or two (no stuck short shutter or high gain); the shutter, ISO and WB cells read as before | Not yet run |
@@ -1042,7 +1043,7 @@ pifilm-capture` brings the login prompt back.
 
 Each message below is printed by `pifilm-capture` as
 `warning: display unavailable (<message>); continuing without it`, and the
-service carries on without the screen, still serving the Stick.
+service carries on without the screen; the GPIO button still takes photos.
 
 | Message contains | Cause | Fix |
 | --- | --- | --- |
@@ -1059,7 +1060,9 @@ service carries on without the screen, still serving the Stick.
 
 Run on 2026-10-10 on the Pi 4 with the IMX477, Raspberry Pi OS Trixie booted to the
 console, branch `feat/dsi-viewfinder` at `2d2b6fc`. Idle was checked with
-`--display-off-after 20` rather than the five-minute default.
+`--display-off-after 20` rather than the five-minute default. Items 5, 7 and 9 were
+run with the StickS3 remote as the trigger, since removed; the procedure below now
+uses the GPIO button.
 
 | Item | Result |
 | --- | --- |
@@ -1084,16 +1087,16 @@ console, branch `feat/dsi-viewfinder` at `2d2b6fc`. Idle was checked with
    `--touch-debug` prints coordinates within 0..639 × 0..479.
 4. Shutter tap, the manual controls, `2x` and review behave as in items 3 and 11 and
    the manual-controls table of [section 7](#7-hardware-acceptance-checklist).
-5. A Stick shot appears on the panel, which returns to live after 30 s untouched.
+5. A GPIO button shot appears on the panel, which returns to live after 30 s untouched.
 6. Idle: no dimming at one minute; dark at five; a tap wakes it without taking a
    photo (no new `captures.jsonl` line).
-7. With the screen dark from idle, take a shot from the Stick: the panel wakes
+7. With the screen dark from idle, take a shot with the GPIO button: the panel wakes
    into the review, and the journal (`journalctl -u pifilm-capture`) shows no
    `display:` error lines. This checks drawing straight after the output is
    powered back on.
 8. `sudo systemctl stop pifilm-capture`: the login prompt returns to the panel.
 9. Unplug the DSI cable and restart the service: one `warning: display unavailable`
-   line in the journal, and the Stick still captures.
+   line in the journal, and the GPIO button still captures.
 10. `--display-rotate 180`: the image is inverted and taps still land on the controls.
 11. Optional, only if the 2.8" panel is still wired: `--display waveshare28` works.
 12. The open-time check, with the desktop running. This is the only way to prove on
